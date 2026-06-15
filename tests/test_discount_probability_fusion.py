@@ -81,6 +81,28 @@ def test_no_applicable_relation_does_not_apply_joint_support_penalty():
     assert outputs["discount_joint"].item() == outputs["total_reliability"].item()
 
 
+def test_inactive_calibrator_fallback_features_use_configured_missing_support():
+    evidence = _evidence(1)
+    evidence[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
+    evidence[:, EvidenceIndex.MANIFEST_ALIVE] = 0.0
+    evidence[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = 0.0
+    evidence[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = 0.0
+    outputs = _run(
+        evidence,
+        config={
+            "reliability_calibration": {
+                "enabled": True,
+                "missing_relation_support": 0.75,
+            }
+        },
+    )
+
+    features = outputs["reliability_features_api"]
+    assert features[0, 2].item() == 0.75
+    assert features[0, 3].item() == 0.75
+    assert features[0, 4].item() == 0.75
+
+
 def test_high_manifest_conflict_reduces_manifest_discount():
     low = _evidence(1)
     high = low.clone()

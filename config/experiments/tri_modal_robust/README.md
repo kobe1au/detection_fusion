@@ -35,6 +35,7 @@ The Cross-Attention module:
   residual tokens per modality;
 - injects observable reliability, support, conflict, and relation applicability;
 - blocks unavailable modalities as attention sources;
+- constructs API-Manifest and Graph-Manifest applicability separately;
 - excludes the reconstruction target modality from enhanced reconstruction sources.
 
 ## Run Groups
@@ -175,7 +176,7 @@ Calibration and selective prediction:
 Cross-Attention analysis:
 
 - mean semantic reliability prior per modality;
-- mean attention received by each source modality;
+- mean attention received by each source modality over alive target queries;
 - mean cross-modal attention and attention entropy;
 - behavior under missing modalities and high Manifest-Code conflict.
 

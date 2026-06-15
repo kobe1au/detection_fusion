@@ -115,6 +115,8 @@ GATE_DIAGNOSTIC_KEYS = (
     "api_graph_support_applicable",
     "manifest_code_conflict_applicable",
     "manifest_code_relation_applicable",
+    "api_manifest_relation_applicable",
+    "graph_manifest_relation_applicable",
     "total_reliability",
     "final_uncertainty_proxy",
     "effective_conflict",

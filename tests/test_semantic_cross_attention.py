@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch_geometric.data import Batch, Data
 
-from fusion.constants import EvidenceIndex
+from fusion.constants import EvidenceIndex, GateConstants
 from fusion.model import TriModalRobustModel
 from fusion.semantic_cross_attention import ReliabilityAwareSemanticCrossAttention
 
@@ -69,6 +69,26 @@ def test_unobserved_manifest_code_relation_blocks_cross_modal_propagation():
     assert attention[:, :, manifest_tokens, code_tokens].abs().max().item() < 1.0e-7
 
 
+def test_manifest_code_applicability_is_pair_specific():
+    evidence = _evidence()
+    evidence[:, EvidenceIndex.API_ALIVE] = 0.0
+    evidence[:, EvidenceIndex.API_INTEGRITY] = 0.0
+    output = _module()(*_embeddings(), evidence)
+    applicable = output["semantic_relation_applicable"]
+    support = output["semantic_support_matrix"]
+    conflict = output["semantic_conflict_matrix"]
+
+    assert not applicable[:, 0, 2].any()
+    assert not applicable[:, 2, 0].any()
+    assert applicable[:, 1, 2].all()
+    assert applicable[:, 2, 1].all()
+    assert torch.equal(support[:, 0, 2], torch.zeros(4))
+    assert torch.equal(conflict[:, 0, 2], torch.zeros(4))
+    assert output["api_manifest_relation_applicable"].sum().item() == 0
+    assert output["graph_manifest_relation_applicable"].sum().item() == 4
+    assert output["manifest_code_relation_applicable"].sum().item() == 4
+
+
 def test_semantic_presence_modulates_security_tokens_but_not_residual_tokens():
     presence = {
         name: torch.ones(4, 12)
@@ -79,6 +99,55 @@ def test_semantic_presence_modulates_security_tokens_but_not_residual_tokens():
     prior = output["semantic_reliability_prior"]
     assert torch.all(prior[:, 0, 0] < prior[:, 0, 1])
     assert torch.allclose(prior[:, 0, 12:], prior[:, 0, 12:13].expand(-1, 4))
+
+
+def test_attention_diagnostics_average_only_alive_target_queries():
+    evidence = _evidence()
+    evidence[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
+    evidence[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.0
+    output = _module(use_relation_mask=False)(*_embeddings(), evidence)
+    attention = output["semantic_attention"]
+    alive_targets = torch.cat([attention[:, :, :16], attention[:, :, 32:]], dim=2)
+    expected_to_api = alive_targets[..., :16].mean(dim=(1, 2, 3))
+
+    cross_mask = (
+        ~torch.eye(3, dtype=torch.bool)
+    ).repeat_interleave(16, dim=0).repeat_interleave(16, dim=1)
+    alive_target_mask = torch.cat(
+        [torch.ones(16, dtype=torch.bool), torch.zeros(16, dtype=torch.bool), torch.ones(16, dtype=torch.bool)]
+    )
+    expected_cross = attention[
+        :, :, alive_target_mask
+    ][..., cross_mask[alive_target_mask]].mean(dim=(1, 2))
+    entropy = -(
+        attention.clamp_min(GateConstants.EPS)
+        * torch.log(attention.clamp_min(GateConstants.EPS))
+    ).sum(dim=-1)
+    expected_entropy = entropy[:, :, alive_target_mask].mean(dim=(1, 2))
+
+    assert torch.allclose(
+        output["mean_semantic_attention_to_api"], expected_to_api, atol=1.0e-7
+    )
+    assert torch.allclose(
+        output["mean_cross_modal_attention"], expected_cross, atol=1.0e-7
+    )
+    assert torch.allclose(
+        output["mean_semantic_attention_entropy"], expected_entropy, atol=1.0e-7
+    )
+
+
+def test_all_unavailable_modalities_produce_zero_joint_and_diagnostics():
+    evidence = _evidence()
+    evidence[:, EvidenceIndex.API_ALIVE] = 0.0
+    evidence[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
+    evidence[:, EvidenceIndex.MANIFEST_ALIVE] = 0.0
+    output = _module()(*_embeddings(), evidence)
+
+    assert torch.equal(output["enhanced_joint"], torch.zeros(4, 128))
+    assert torch.equal(output["mean_cross_modal_attention"], torch.zeros(4))
+    assert torch.equal(output["mean_semantic_attention_entropy"], torch.zeros(4))
+    for name in ("api", "graph", "manifest"):
+        assert torch.equal(output[f"mean_semantic_attention_to_{name}"], torch.zeros(4))
 
 
 def test_high_manifest_code_conflict_reduces_cross_modal_attention():

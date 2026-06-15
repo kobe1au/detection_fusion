@@ -274,7 +274,13 @@ class DiscountProbabilityFusion(nn.Module):
                 for name in BRANCH_NAMES
             ]
         else:
-            features, feature_diagnostics = build_monotonic_reliability_features(evidence)
+            reliability_cfg = cfg.get("reliability_calibration", {}) or {}
+            features, feature_diagnostics = build_monotonic_reliability_features(
+                evidence,
+                missing_relation_support=float(
+                    reliability_cfg.get("missing_relation_support", 0.0)
+                ),
+            )
             reliability_outputs.update(feature_diagnostics)
             for name, value in features.items():
                 reliability_outputs[f"reliability_features_{name}"] = value

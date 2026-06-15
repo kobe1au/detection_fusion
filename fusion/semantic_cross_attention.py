@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -70,7 +69,6 @@ def build_semantic_reliability_priors(
     api_alive = _column(evidence, EvidenceIndex.API_ALIVE).bool()
     graph_alive = _column(evidence, EvidenceIndex.GRAPH_ALIVE).bool()
     manifest_alive = _column(evidence, EvidenceIndex.MANIFEST_ALIVE).bool()
-    code_alive = api_alive | graph_alive
 
     api_graph_applicable = api_alive & graph_alive
     manifest_code_relation_observed = (
@@ -78,9 +76,13 @@ def build_semantic_reliability_priors(
         | (manifest_conflict > 0.0)
         | (code_conflict > 0.0)
     )
-    manifest_code_applicable = (
-        manifest_alive & code_alive & manifest_code_relation_observed
+    api_manifest_applicable = (
+        api_alive & manifest_alive & manifest_code_relation_observed
     )
+    graph_manifest_applicable = (
+        graph_alive & manifest_alive & manifest_code_relation_observed
+    )
+    manifest_code_applicable = api_manifest_applicable | graph_manifest_applicable
 
     zero = torch.zeros_like(anchor_support)
     anchor_good = torch.where(api_graph_applicable, anchor_support, zero)
@@ -166,21 +168,19 @@ def build_semantic_reliability_priors(
     )
     applicable_matrix[:, 0, 1] = applicable_matrix[:, 1, 0] = api_graph_applicable
 
-    manifest_code_support = torch.where(
-        manifest_code_applicable, manifest_support, zero
-    )
-    manifest_code_conflict = torch.where(
-        manifest_code_applicable,
-        torch.maximum(manifest_conflict, code_conflict),
-        zero,
-    )
-    for code_index in (0, 1):
-        support_matrix[:, code_index, 2] = manifest_code_support
-        support_matrix[:, 2, code_index] = manifest_code_support
-        conflict_matrix[:, code_index, 2] = manifest_code_conflict
-        conflict_matrix[:, 2, code_index] = manifest_code_conflict
-        applicable_matrix[:, code_index, 2] = manifest_code_applicable
-        applicable_matrix[:, 2, code_index] = manifest_code_applicable
+    manifest_code_conflict = torch.maximum(manifest_conflict, code_conflict)
+    for code_index, pair_applicable in (
+        (0, api_manifest_applicable),
+        (1, graph_manifest_applicable),
+    ):
+        pair_support = torch.where(pair_applicable, manifest_support, zero)
+        pair_conflict = torch.where(pair_applicable, manifest_code_conflict, zero)
+        support_matrix[:, code_index, 2] = pair_support
+        support_matrix[:, 2, code_index] = pair_support
+        conflict_matrix[:, code_index, 2] = pair_conflict
+        conflict_matrix[:, 2, code_index] = pair_conflict
+        applicable_matrix[:, code_index, 2] = pair_applicable
+        applicable_matrix[:, 2, code_index] = pair_applicable
 
     return {
         "semantic_reliability_prior": semantic_reliability_prior,
@@ -190,6 +190,8 @@ def build_semantic_reliability_priors(
         "semantic_conflict_matrix": conflict_matrix,
         "semantic_relation_applicable": applicable_matrix,
         "api_graph_relation_applicable": api_graph_applicable,
+        "api_manifest_relation_applicable": api_manifest_applicable,
+        "graph_manifest_relation_applicable": graph_manifest_applicable,
         "manifest_code_relation_applicable": manifest_code_applicable,
     }
 
@@ -398,18 +400,52 @@ class ReliabilityAwareSemanticCrossAttention(nn.Module):
             pooled / denominator.clamp_min(1.0),
             torch.zeros_like(pooled),
         )
-        enhanced_joint = self.joint_projection(pooled)
+        enhanced_joint = torch.where(
+            denominator > 0,
+            self.joint_projection(pooled),
+            torch.zeros_like(pooled),
+        )
 
         attention_entropy = -(
             attention.clamp_min(GateConstants.EPS)
             * torch.log(attention.clamp_min(GateConstants.EPS))
         ).sum(dim=-1)
+        target_alive = priors["modality_alive"].repeat_interleave(
+            self.num_tokens, dim=1
+        )
+        target_alive_float = target_alive.to(dtype=attention.dtype)
+        target_row_mask = target_alive_float.unsqueeze(1)
+
+        def alive_target_mean(
+            value: torch.Tensor,
+            extra_denominator: int = 1,
+        ) -> torch.Tensor:
+            numerator = (value * target_row_mask.unsqueeze(-1)).sum(
+                dim=tuple(range(1, value.ndim))
+            )
+            denominator = (
+                target_alive_float.sum(dim=-1)
+                * self.num_heads
+                * int(extra_denominator)
+            )
+            return torch.where(
+                denominator > 0,
+                numerator / denominator.clamp_min(1.0),
+                torch.zeros_like(numerator),
+            )
+
+        mean_attention_entropy = alive_target_mean(
+            attention_entropy.unsqueeze(-1)
+        )
         cross_modal_mask = (
             ~torch.eye(3, device=tokens.device, dtype=torch.bool)
         ).repeat_interleave(self.num_tokens, dim=0).repeat_interleave(
             self.num_tokens, dim=1
         )
-        cross_modal_attention = attention[..., cross_modal_mask].mean(dim=-1).mean(dim=-1)
+        cross_modal_attention = alive_target_mean(
+            attention * cross_modal_mask.view(1, 1, 3 * self.num_tokens, -1),
+            extra_denominator=2 * self.num_tokens,
+        )
 
         outputs: dict[str, torch.Tensor] = {
             "base_semantic_tokens": tokens,
@@ -423,7 +459,7 @@ class ReliabilityAwareSemanticCrossAttention(nn.Module):
             "semantic_relation_applicable": priors["semantic_relation_applicable"],
             "semantic_support_matrix": priors["semantic_support_matrix"],
             "semantic_conflict_matrix": priors["semantic_conflict_matrix"],
-            "mean_semantic_attention_entropy": attention_entropy.mean(dim=(1, 2)),
+            "mean_semantic_attention_entropy": mean_attention_entropy,
             "mean_cross_modal_attention": cross_modal_attention,
             "semantic_residual_gate": torch.sigmoid(self.residual_gate).view(1).expand(
                 tokens.size(0)
@@ -436,9 +472,10 @@ class ReliabilityAwareSemanticCrossAttention(nn.Module):
             outputs[f"mean_semantic_reliability_prior_{name}"] = priors[
                 "semantic_reliability_prior"
             ][:, index].mean(dim=-1)
-            outputs[f"mean_semantic_attention_to_{name}"] = attention[
-                ..., source_slice
-            ].mean(dim=(1, 2, 3))
+            outputs[f"mean_semantic_attention_to_{name}"] = alive_target_mean(
+                attention[..., source_slice],
+                extra_denominator=self.num_tokens,
+            )
         outputs.update(excluded_source_outputs)
         outputs.update(
             {
@@ -449,6 +486,8 @@ class ReliabilityAwareSemanticCrossAttention(nn.Module):
                     "modality_reliability_prior",
                     "modality_alive",
                     "api_graph_relation_applicable",
+                    "api_manifest_relation_applicable",
+                    "graph_manifest_relation_applicable",
                     "manifest_code_relation_applicable",
                 }
             }
