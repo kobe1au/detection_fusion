@@ -33,10 +33,9 @@ from fusion.quality import (
     compute_api_quality,
     compute_graph_quality,
     compute_align_quality,
-    compute_manifest_quality,
-    graph_structure_stats,
     refresh_observable_signals,
 )
+from fusion.pt_schema import CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS, PT_SCHEMA_VERSION
 from fusion.utils import scalar_float
 
 logger = logging.getLogger(__name__)
@@ -48,98 +47,19 @@ class FatalDatasetConfigError(RuntimeError):
     """Configuration/data schema error that must not be converted to a dummy sample."""
 
 
-def build_isolation_groups(
+def build_package_isolation_groups(
     sample_sids: list[str],
     packages: dict[str, str],
-    families: dict[str, str],
 ) -> list[str]:
-    """Build connected groups so neither package nor family crosses a split."""
+    """Group samples by package when available, otherwise by sample ID."""
     ignored_packages = {"", "nan", "none", "null"}
-    ignored_families = ignored_packages | {"benign", "goodware"}
-    parent = {sid: sid for sid in sample_sids}
-
-    def find(sid: str) -> str:
-        while parent[sid] != sid:
-            parent[sid] = parent[parent[sid]]
-            sid = parent[sid]
-        return sid
-
-    def union(left: str, right: str) -> None:
-        left_root, right_root = find(left), find(right)
-        if left_root != right_root:
-            parent[max(left_root, right_root)] = min(left_root, right_root)
-
-    for values, ignored in ((packages, ignored_packages), (families, ignored_families)):
-        first_by_value: dict[str, str] = {}
-        for sid in sample_sids:
-            value = str(values.get(sid, "") or "").strip().lower()
-            if value in ignored:
-                continue
-            if value in first_by_value:
-                union(sid, first_by_value[value])
-            else:
-                first_by_value[value] = sid
-
-    return [f"isolation:{find(sid)}" for sid in sample_sids]
-
-
-def _precompute_category_maps_from_vocab(vocab_path: str | Path) -> dict | None:
-    """Pre-compute Manifest semantic category maps from vocab for old-PT fallback.
-
-    Old tri-modal .pt files do not contain ``manifest_permission_category_map``
-    or ``manifest_intent_category_map``.  Those maps are a pure function of the
-    Manifest vocab term list and the keyword→category table, so they can be
-    reconstructed at dataset init time without re-extracting APKs.
-    """
-    from fusion.manifest_features import (
-        load_manifest_vocab,
-        category_counts_from_strings,
-        DEFAULT_CATEGORIES,
-    )
-
-    try:
-        vocab = load_manifest_vocab(vocab_path, require_train_metadata=False, allow_empty=True)
-    except Exception as exc:
-        logger.warning("Cannot load manifest vocab for old-PT map fallback (%s): %s", vocab_path, exc)
-        return None
-
-    permission_vocab = list(vocab.get("permission_vocab") or [])
-    intent_vocab = list(vocab.get("intent_vocab") or [])
-    feature_vocab = list(vocab.get("feature_vocab") or [])
-    categories = list(vocab.get("categories") or DEFAULT_CATEGORIES)
-
-    perm_dim = len(permission_vocab)
-    intent_dim = len(intent_vocab)
-    feat_dim = len(feature_vocab)
-
-    if perm_dim + intent_dim + feat_dim + SEMANTIC_CATEGORY_DIM + 11 == 0:
-        return None
-
-    perm_map = (
-        torch.stack(
-            [category_counts_from_strings([token], categories) for token in permission_vocab],
-            dim=0,
-        ).float()
-        if permission_vocab
-        else torch.zeros((0, len(categories)), dtype=torch.float32)
-    )
-
-    intent_map = (
-        torch.stack(
-            [category_counts_from_strings([token], categories) for token in intent_vocab],
-            dim=0,
-        ).float()
-        if intent_vocab
-        else torch.zeros((0, len(categories)), dtype=torch.float32)
-    )
-
-    return {
-        "perm_map": perm_map,
-        "intent_map": intent_map,
-        "perm_dim": perm_dim,
-        "intent_dim": intent_dim,
-        "feat_dim": feat_dim,
-    }
+    groups = []
+    for sid in sample_sids:
+        package = str(packages.get(sid, "") or "").strip().lower()
+        groups.append(
+            f"package:{package}" if package not in ignored_packages else f"sample:{sid}"
+        )
+    return groups
 
 
 def _stable_seed(*parts: object) -> int:
@@ -221,134 +141,59 @@ def _first_present(sources: list[dict[str, Any]], key: str):
     return None
 
 
-def _first_int(sources: list[dict[str, Any]], key: str, default: int) -> int:
-    value = _first_present(sources, key)
-    if value is None:
-        return int(default)
-    try:
-        if isinstance(value, torch.Tensor):
-            value = value.detach().view(-1)[0].item()
-        elif isinstance(value, (list, tuple)):
-            value = value[0]
-        return max(0, int(value))
-    except (IndexError, TypeError, ValueError):
-        return int(default)
-
-
-def _normalize_loaded_pt(raw) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if isinstance(raw, list):
-        dex_list = [d for d in raw if isinstance(d, dict)]
-        return dex_list, dex_list
-    if isinstance(raw, dict):
-        if isinstance(raw.get("dex_list"), list):
-            dex_list = [d for d in raw["dex_list"] if isinstance(d, dict)]
-            return dex_list, [raw] + dex_list
-        if isinstance(raw.get("dexes"), list):
-            dex_list = [d for d in raw["dexes"] if isinstance(d, dict)]
-            return dex_list, [raw] + dex_list
-        return [raw], [raw]
-    return [], []
-
-
-def _merged_observable_metadata(sources: list[dict[str, Any]]) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    # Sources are [top_level, dex...]. Let the top-level sample metadata win.
-    for source in reversed(sources):
-        value = source.get("observable_metadata") if isinstance(source, dict) else None
-        if isinstance(value, dict):
-            merged.update(value)
-    return merged
-
-
-def _sum_nested_meta(dex_list: list[dict[str, Any]], section: str, key: str) -> int:
-    total = 0
-    for dex in dex_list:
-        meta = dex.get("meta", {}) if isinstance(dex, dict) else {}
-        nested = meta.get(section, {}) if isinstance(meta, dict) else {}
-        try:
-            total += max(0, int(nested.get(key, 0))) if isinstance(nested, dict) else 0
-        except (TypeError, ValueError):
-            pass
-    return total
-
-
-def _fallback_observable_metadata(
-    data: dict[str, Any],
-    sources: list[dict[str, Any]],
-    dex_list: list[dict[str, Any]],
-    saved: dict[str, Any],
-) -> dict[str, Any]:
-    out = dict(saved)
-    api_ids = data.get("api_ids")
-    api_types = data.get("api_type_ids")
-    kept = int(api_ids.numel()) if isinstance(api_ids, torch.Tensor) else 0
-    raw = int(out.get("api_event_count_raw", 0) or 0)
-    if raw <= 0:
-        raw = _sum_nested_meta(dex_list, "api", "num_api_events_raw") or kept
-    known = int((api_types.long().view(-1) > 0).sum().item()) if isinstance(api_types, torch.Tensor) else 0
-
-    x = data.get("x")
-    real_nodes = int(data.get("real_num_nodes", 0))
-    if real_nodes <= 0 and isinstance(x, torch.Tensor) and x.ndim == 2:
-        real_nodes = int(x.size(0))
-    edge = data.get("edge_index")
-    edge_count = int(edge.size(1)) if isinstance(edge, torch.Tensor) and edge.ndim == 2 else 0
-    isolated, lcc = graph_structure_stats(edge, real_nodes)
-
-    direct_meta = _first_present(sources, "direct_build_meta")
-    direct_meta = direct_meta if isinstance(direct_meta, dict) else {}
-    dex_file_count = int(out.get("dex_file_count", direct_meta.get("dex_file_count", len(dex_list))) or 0)
-    success_ratio = scalar_float(direct_meta.get("dex_success_ratio", 1.0), 1.0)
-
-    manifest_meta = data.get("manifest_meta")
-    manifest_meta = manifest_meta if isinstance(manifest_meta, dict) else {}
-    manifest_error = str(out.get("manifest_parse_error", manifest_meta.get("parse_error", "")) or "")
-    coverage_values = [
-        scalar_float(manifest_meta.get(key), 1.0)
-        for key in (
-            "permission_vocab_coverage",
-            "intent_vocab_coverage",
-            "feature_vocab_coverage",
+def _validate_current_pt_payload(
+    raw: Any,
+    pt_path: str | Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate and expose only the current direct-builder PT structure."""
+    if not isinstance(raw, dict):
+        raise FatalDatasetConfigError(
+            f"PT must be a current schema-{PT_SCHEMA_VERSION} top-level mapping: {pt_path}"
         )
-        if key in manifest_meta
+    missing_top_level = [
+        key for key in CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS if key not in raw
     ]
-    manifest_coverage = sum(coverage_values) / len(coverage_values) if coverage_values else 1.0
+    if missing_top_level:
+        raise FatalDatasetConfigError(
+            f"PT schema-{PT_SCHEMA_VERSION} payload is missing top-level fields "
+            f"{missing_top_level}: {pt_path}"
+        )
 
-    fallback = {
-        "api_parse_ok": bool(dex_list),
-        "api_parse_error": "",
-        "api_event_count_raw": raw,
-        "api_event_count_kept": kept,
-        "api_truncated": kept < raw,
-        "api_truncation_ratio": (1.0 - kept / raw) if raw > 0 else 0.0,
-        "api_known_type_count": known,
-        "api_unknown_type_count": max(0, kept - known),
-        "dex_parse_ok": bool(dex_list),
-        "dex_file_count": max(dex_file_count, len(dex_list)),
-        "dex_parse_success_ratio": max(0.0, min(1.0, success_ratio)),
-        "class_count": int(out.get("class_count", 0) or 0),
-        "method_count": int(out.get("method_count", _sum_nested_meta(dex_list, "graph", "num_methods_all")) or 0),
-        "graph_parse_ok": bool(dex_list),
-        "graph_parse_error": "",
-        "graph_timeout": False,
-        "graph_node_count_raw": real_nodes,
-        "graph_edge_count_raw": edge_count,
-        "graph_isolated_node_count": isolated,
-        "graph_largest_component_ratio": lcc,
-        "manifest_parse_ok": not bool(manifest_error),
-        "manifest_parse_error": manifest_error,
-        "manifest_has_content": bool(
-            data.get("manifest_x") is not None
-            and scalar_float(data.get("q_manifest"), 0.0) > 0.0
-        ),
-        "manifest_vocab_coverage": manifest_coverage,
-        "manifest_permission_count": int(data.get("manifest_permission_ids").numel()) if isinstance(data.get("manifest_permission_ids"), torch.Tensor) else 0,
-        "manifest_component_count": int(manifest_meta.get("component_count", 0) or 0),
-        "manifest_intent_count": int(data.get("manifest_intent_ids").numel()) if isinstance(data.get("manifest_intent_ids"), torch.Tensor) else 0,
-        "schema_version": str(out.get("schema_version") or "legacy-fallback"),
-    }
-    fallback.update(out)
-    return fallback
+    direct_meta = raw["direct_build_meta"]
+    if not isinstance(direct_meta, dict):
+        raise FatalDatasetConfigError(f"PT direct_build_meta must be a mapping: {pt_path}")
+    try:
+        version = int(direct_meta.get("pt_schema_version", 0))
+    except (TypeError, ValueError):
+        version = 0
+    if version != PT_SCHEMA_VERSION:
+        raise FatalDatasetConfigError(
+            f"PT schema version {version} does not match required current version "
+            f"{PT_SCHEMA_VERSION}: {pt_path}"
+        )
+    if direct_meta.get("schema_version") != OBSERVABLE_SCHEMA_VERSION:
+        raise FatalDatasetConfigError(
+            f"PT direct_build_meta.schema_version must be {OBSERVABLE_SCHEMA_VERSION!r}: "
+            f"{pt_path}"
+        )
+    if not str(direct_meta.get("build_fingerprint") or "").strip():
+        raise FatalDatasetConfigError(f"PT is missing direct build fingerprint: {pt_path}")
+
+    observable = raw["observable_metadata"]
+    if not isinstance(observable, dict):
+        raise FatalDatasetConfigError(f"PT observable_metadata must be a mapping: {pt_path}")
+    missing_observable = [key for key in OBSERVABLE_REQUIRED_FIELDS if key not in observable]
+    if observable.get("schema_version") != OBSERVABLE_SCHEMA_VERSION or missing_observable:
+        raise FatalDatasetConfigError(
+            f"PT observable schema is incomplete for {pt_path}: "
+            f"schema_version={observable.get('schema_version')!r}, "
+            f"missing={missing_observable}"
+        )
+
+    dex_list = raw["dex_list"]
+    if not isinstance(dex_list, list) or any(not isinstance(dex, dict) for dex in dex_list):
+        raise FatalDatasetConfigError(f"PT dex_list must be a list of mappings: {pt_path}")
+    return dex_list, [raw, *dex_list]
 
 
 def apply_dex_success_ratio(data: dict[str, Any], sources: list[dict[str, Any]]) -> None:
@@ -399,21 +244,7 @@ class RobustTriModalDataset(Dataset):
         label_map: dict | None = None,
         strict_split_integrity: bool = True,
         allow_pt_superset: bool = False,
-        require_manifest_semantic_maps: bool = False,
-        allow_legacy_pt_compat: bool = False,
-        min_pt_schema_version: int = 0,
-        manifest_vocab_path: str = "",
-        strict_observable_schema: bool = False,
-        **_unused,
     ):
-        # Pre-compute semantic category maps from the Manifest vocab so that
-        # old tri-modal .pt files (which lack the maps) can still benefit from
-        # coherent semantic-count updates during perturbation.
-        self._vocab_maps: dict | None = None
-        if manifest_vocab_path:
-            self._vocab_maps = _precompute_category_maps_from_vocab(manifest_vocab_path)
-        else:
-            self._vocab_maps = None
         if eval_perturb_type not in EVAL_PERTURB_TYPES:
             raise ValueError(f"Unsupported eval_perturb_type: {eval_perturb_type}")
         self.pt_dir = Path(pt_dir)
@@ -458,13 +289,6 @@ class RobustTriModalDataset(Dataset):
         self.graph_semantic_source = src
         self.strict_split_integrity = bool(strict_split_integrity)
         self.allow_pt_superset = bool(allow_pt_superset)
-        self.require_manifest_semantic_maps = bool(require_manifest_semantic_maps)
-        self.allow_legacy_pt_compat = bool(allow_legacy_pt_compat)
-        self.min_pt_schema_version = max(0, int(min_pt_schema_version))
-        self.strict_observable_schema = bool(strict_observable_schema)
-        self._warned_legacy_schema = False
-        self._warned_manifest_map_fallback = False
-        self._warned_observable_schema = False
 
         df = pd.read_csv(csv_path)
         id_col = next((c for c in ["id", "ID", "Id", "sha256"] if c in df.columns), None)
@@ -475,10 +299,6 @@ class RobustTriModalDataset(Dataset):
         year_col = next((c for c in ["year", "Year", "vt_year", "dex_year"] if c in df.columns), None)
         package_col = next(
             (c for c in ["pkg_name", "package_name", "package"] if c in df.columns),
-            None,
-        )
-        family_col = next(
-            (c for c in ["family", "malware_family", "family_name", "avclass_family"] if c in df.columns),
             None,
         )
 
@@ -538,21 +358,6 @@ class RobustTriModalDataset(Dataset):
             if package_col
             else {sid: "" for sid in sid_series}
         )
-        families = (
-            dict(
-                zip(
-                    sid_series,
-                    df[family_col]
-                    .fillna("")
-                    .astype(str)
-                    .str.strip()
-                    .str.lower(),
-                )
-            )
-            if family_col
-            else {sid: "" for sid in sid_series}
-        )
-
         pt_files = sorted(self.pt_dir.rglob("*.pt"))
         pt_by_sid: dict[str, Path] = {}
         duplicate_pt_ids: list[str] = []
@@ -590,7 +395,7 @@ class RobustTriModalDataset(Dataset):
             raise RuntimeError(f"No matching .pt samples found in {self.pt_dir} for {csv_path}")
         self.sample_sids = [sid for _, _, sid, _ in self.samples]
         self.sample_years = [year for _, _, _, year in self.samples]
-        self.sample_groups = build_isolation_groups(self.sample_sids, groups, families)
+        self.sample_groups = build_package_isolation_groups(self.sample_sids, groups)
         self.feature_dim = self._infer_feature_dim(default_dim=515)
         logger.info("Loaded %d robust tri-modal samples from %s", len(self.samples), self.pt_dir)
 
@@ -601,7 +406,7 @@ class RobustTriModalDataset(Dataset):
         for pt_file, _, _, _ in self.samples:
             try:
                 raw = torch.load(pt_file, map_location="cpu", weights_only=False)
-                dex_list, _ = _normalize_loaded_pt(raw)
+                dex_list, _ = _validate_current_pt_payload(raw, pt_file)
                 for dex in dex_list:
                     x = dex.get("call_x") if isinstance(dex, dict) else None
                     if isinstance(x, torch.Tensor) and x.ndim == 2 and x.size(1) > 0:
@@ -892,9 +697,36 @@ class RobustTriModalDataset(Dataset):
             "mask": torch.empty((x.size(0), 0), dtype=torch.float32),
         }
 
-    def _manifest_payload(self, sources: list[dict[str, Any]]) -> dict[str, Any]:
-        manifest_x_raw = _first_present(sources, "manifest_x")
-        has_manifest = manifest_x_raw is not None or _first_present(sources, "manifest_category_counts") is not None
+    def _manifest_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        manifest_x_raw = payload["manifest_x"]
+        required_tensors = (
+            "manifest_x",
+            "manifest_permission_ids",
+            "manifest_intent_ids",
+            "manifest_category_counts",
+            "manifest_component_category_counts",
+            "manifest_permission_category_map",
+            "manifest_intent_category_map",
+            "manifest_stats",
+            "q_manifest",
+            "pert_manifest",
+        )
+        invalid_tensors = [
+            key for key in required_tensors if not isinstance(payload.get(key), torch.Tensor)
+        ]
+        if invalid_tensors:
+            raise FatalDatasetConfigError(
+                f"Current PT Manifest fields must be tensors: {invalid_tensors}"
+            )
+        for key in ("manifest_category_counts", "manifest_component_category_counts"):
+            if payload[key].numel() != SEMANTIC_CATEGORY_DIM:
+                raise FatalDatasetConfigError(
+                    f"Current PT {key} must contain exactly {SEMANTIC_CATEGORY_DIM} values"
+                )
+        if payload["manifest_stats"].numel() != self.manifest_stats_dim:
+            raise FatalDatasetConfigError(
+                f"Current PT manifest_stats must contain exactly {self.manifest_stats_dim} values"
+            )
         raw_manifest_dim = _flat_numel(manifest_x_raw)
         if raw_manifest_dim > self.manifest_dim:
             raise FatalDatasetConfigError(
@@ -902,19 +734,18 @@ class RobustTriModalDataset(Dataset):
                 "regenerate tri-modal .pt files or increase model.manifest_encoder.in_dim"
             )
         manifest_x = _as_float_tensor(manifest_x_raw, self.manifest_dim)
-        manifest_counts = sanitize_semantic_counts(_first_present(sources, "manifest_category_counts"))
-        manifest_component_counts = sanitize_semantic_counts(
-            _first_present(sources, "manifest_component_category_counts")
+        manifest_counts = sanitize_semantic_counts(
+            payload["manifest_category_counts"], require_exact=True
         )
-        graph_raw = _first_present(sources, "graph_semantic_category_counts")
-        if graph_raw is None:
-            graph_raw = _first_present(sources, "graph_category_counts")
-        graph_counts = sanitize_semantic_counts(graph_raw, require_exact=True)
-        manifest_stats = _as_float_tensor(_first_present(sources, "manifest_stats"), self.manifest_stats_dim)
-        permission_dim = _first_int(sources, "manifest_permission_dim", self.manifest_permission_dim)
-        intent_dim = _first_int(sources, "manifest_intent_dim", self.manifest_intent_dim)
-        permission_map_raw = _first_present(sources, "manifest_permission_category_map")
-        intent_map_raw = _first_present(sources, "manifest_intent_category_map")
+        manifest_component_counts = sanitize_semantic_counts(
+            payload["manifest_component_category_counts"], require_exact=True
+        )
+        manifest_stats = _as_float_tensor(payload["manifest_stats"], self.manifest_stats_dim)
+        permission_dim = int(payload["manifest_permission_dim"])
+        intent_dim = int(payload["manifest_intent_dim"])
+        feature_dim = int(payload["manifest_feature_dim"])
+        permission_map_raw = payload["manifest_permission_category_map"]
+        intent_map_raw = payload["manifest_intent_category_map"]
         maps_available = (
             isinstance(permission_map_raw, torch.Tensor)
             and permission_map_raw.ndim == 2
@@ -923,81 +754,25 @@ class RobustTriModalDataset(Dataset):
             and intent_map_raw.ndim == 2
             and intent_map_raw.shape == (intent_dim, SEMANTIC_CATEGORY_DIM)
         )
-
-        # ── old-PT fallback: reconstruct maps from vocab ──────────────────
-        vocab_feature_dim: int | None = None
-        if not maps_available and self._vocab_maps is not None:
-            vm = self._vocab_maps
-            # Old PTs do not store dims; use vocab-derived values.
-            if _first_present(sources, "manifest_permission_dim") is None and vm["perm_dim"] > 0:
-                permission_dim = vm["perm_dim"]
-            if _first_present(sources, "manifest_intent_dim") is None and vm["intent_dim"] > 0:
-                intent_dim = vm["intent_dim"]
-            if _first_present(sources, "manifest_feature_dim") is None and vm["feat_dim"] > 0:
-                vocab_feature_dim = vm["feat_dim"]
-            permission_map_raw = vm["perm_map"]
-            intent_map_raw = vm["intent_map"]
-            maps_available = (
-                isinstance(permission_map_raw, torch.Tensor)
-                and permission_map_raw.ndim == 2
-                and permission_map_raw.shape == (permission_dim, SEMANTIC_CATEGORY_DIM)
-                and isinstance(intent_map_raw, torch.Tensor)
-                and intent_map_raw.ndim == 2
-                and intent_map_raw.shape == (intent_dim, SEMANTIC_CATEGORY_DIM)
+        if not maps_available:
+            raise FatalDatasetConfigError(
+                "Current PT is missing valid Manifest term-to-category maps. "
+                "Regenerate it with build_tri_modal_pts_direct.py."
             )
-        meta = _first_present(sources, "manifest_meta")
-        meta = meta if isinstance(meta, dict) else {}
-        q_raw = _first_present(sources, "q_manifest")
-        p_raw = _first_present(sources, "pert_manifest")
-        if q_raw is None:
-            q_manifest = compute_manifest_quality(
-                manifest_x,
-                manifest_counts,
-                manifest_stats,
-                meta,
-            ) if has_manifest else 0.0
-        else:
-            q_manifest = float(torch.as_tensor(q_raw).float().view(-1)[0].item())
+        meta = payload["manifest_meta"]
+        if not isinstance(meta, dict):
+            raise FatalDatasetConfigError("Current PT manifest_meta must be a mapping")
+        q_manifest = float(torch.as_tensor(payload["q_manifest"]).float().view(-1)[0].item())
         if not math.isfinite(q_manifest):
-            q_manifest = 0.0
-        manifest_available = has_manifest and q_manifest > 0.0
-        if self.require_manifest_semantic_maps and manifest_available and not maps_available:
-            if not self.allow_legacy_pt_compat:
-                raise FatalDatasetConfigError(
-                    "PT is missing Manifest term-to-category maps required by the configured "
-                    "consistency evidence/loss. Regenerate PT files with the current direct builder."
-                )
-            if not self._warned_manifest_map_fallback:
-                logger.warning(
-                    "Using legacy PT compatibility mode: Manifest term-to-category maps are "
-                    "missing, so Manifest perturbations will use approximate semantic-count "
-                    "updates. Prefer schema-3 PTs for final formal experiments."
-                )
-                self._warned_manifest_map_fallback = True
-        if p_raw is None:
-            pert_manifest = 0.0
-        else:
-            pert_manifest = float(torch.as_tensor(p_raw).float().view(-1)[0].item())
+            raise FatalDatasetConfigError("Current PT q_manifest must be finite")
+        pert_manifest = float(torch.as_tensor(payload["pert_manifest"]).float().view(-1)[0].item())
         if not math.isfinite(pert_manifest):
-            pert_manifest = 0.0
-
-        # ── derive permission/intent IDs from manifest_x bits (old-PT fallback) ──
-        permission_ids_raw = _first_present(sources, "manifest_permission_ids")
-        if permission_ids_raw is None and manifest_available and permission_dim > 0:
-            perm_vec = manifest_x[:permission_dim]
-            active = (perm_vec > 0.5).nonzero(as_tuple=True)[0]
-            permission_ids_raw = active + 1  # +1: 0 = padding / unmatched
-
-        intent_ids_raw = _first_present(sources, "manifest_intent_ids")
-        if intent_ids_raw is None and manifest_available and intent_dim > 0:
-            intent_vec = manifest_x[permission_dim : permission_dim + intent_dim]
-            active = (intent_vec > 0.5).nonzero(as_tuple=True)[0]
-            intent_ids_raw = active + 1
+            raise FatalDatasetConfigError("Current PT pert_manifest must be finite")
 
         return {
             "manifest_x": manifest_x,
-            "manifest_permission_ids": _as_long_tensor(permission_ids_raw),
-            "manifest_intent_ids": _as_long_tensor(intent_ids_raw),
+            "manifest_permission_ids": _as_long_tensor(payload["manifest_permission_ids"]),
+            "manifest_intent_ids": _as_long_tensor(payload["manifest_intent_ids"]),
             "manifest_permission_category_map": _as_category_map(
                 permission_map_raw,
                 permission_dim,
@@ -1010,14 +785,12 @@ class RobustTriModalDataset(Dataset):
             "manifest_component_category_counts": manifest_component_counts,
             "manifest_stats": manifest_stats,
             "manifest_meta": meta,
-            "graph_semantic_category_counts": graph_counts,
-            "graph_category_counts": graph_counts,
             "q_manifest": max(0.0, min(1.0, q_manifest)),
             "pert_manifest": max(0.0, min(1.0, pert_manifest)),
             "manifest_aug_type": "none",
             "manifest_permission_dim": permission_dim,
             "manifest_intent_dim": intent_dim,
-            "manifest_feature_dim": vocab_feature_dim if vocab_feature_dim is not None else _first_int(sources, "manifest_feature_dim", self.manifest_feature_dim),
+            "manifest_feature_dim": feature_dim,
         }
 
     def _to_data_object(self, data: dict[str, Any], label: int, sid: str, year: int) -> Data:
@@ -1066,90 +839,13 @@ class RobustTriModalDataset(Dataset):
         pt_path, label, sid, year = self.samples[idx]
         try:
             raw = torch.load(pt_path, map_location="cpu", weights_only=False)
-            if self.min_pt_schema_version > 0:
-                meta = raw.get("direct_build_meta", {}) if isinstance(raw, dict) else {}
-                try:
-                    version = int(meta.get("pt_schema_version", 0)) if isinstance(meta, dict) else 0
-                except (TypeError, ValueError):
-                    version = 0
-                if version < self.min_pt_schema_version:
-                    if not self.allow_legacy_pt_compat:
-                        raise FatalDatasetConfigError(
-                            f"PT schema version {version} is below required version "
-                            f"{self.min_pt_schema_version}: {pt_path}. Regenerate PT files."
-                        )
-                    if not self._warned_legacy_schema:
-                        logger.warning(
-                            "Using legacy PT compatibility mode: observed PT schema version "
-                            "%s below configured min_pt_schema_version=%s. This avoids APK "
-                            "re-extraction but should be reported as a compatibility run.",
-                            version,
-                            self.min_pt_schema_version,
-                        )
-                        self._warned_legacy_schema = True
-                if self.min_pt_schema_version >= 3:
-                    required_fields = (
-                        "manifest_permission_category_map",
-                        "manifest_intent_category_map",
-                        "manifest_component_category_counts",
-                    )
-                    missing_fields = [
-                        key for key in required_fields
-                        if not isinstance(raw, dict) or key not in raw
-                    ]
-                    if missing_fields:
-                        if not self.allow_legacy_pt_compat:
-                            raise FatalDatasetConfigError(
-                                f"PT declares schema version {version} but is missing "
-                                f"required fields {missing_fields}: {pt_path}. Regenerate PT files."
-                            )
-                        if not self._warned_legacy_schema:
-                            logger.warning(
-                                "Using legacy PT compatibility mode: current-schema Manifest "
-                                "fields are missing from at least one PT. Missing fields from "
-                                "first observed sample: %s",
-                                missing_fields,
-                            )
-                            self._warned_legacy_schema = True
-            dex_list, sources = _normalize_loaded_pt(raw)
+            dex_list, sources = _validate_current_pt_payload(raw, pt_path)
             data = self._aggregate_api_graph(dex_list)
             if data is None:
                 return self._dummy(label, sid, year, "empty valid sample", pt_path)
-            # Graph counts computed via the configured source (alignment /
-            # full_api / zero) always win over whatever the .pt happens to
-            # carry — manifest_payload only provides a fallback for legacy
-            # files.
-            graph_counts_from_source = data.get("graph_semantic_category_counts")
             apply_dex_success_ratio(data, sources)
-            manifest_payload = self._manifest_payload(sources)
-            data.update(manifest_payload)
-            if isinstance(graph_counts_from_source, torch.Tensor):
-                data["graph_semantic_category_counts"] = graph_counts_from_source
-                data["graph_category_counts"] = graph_counts_from_source
-            saved_observable = _merged_observable_metadata(sources)
-            strict_observable = (
-                raw.get("observable_metadata", {})
-                if isinstance(raw, dict) and isinstance(raw.get("dex_list"), list)
-                else {}
-            )
-            checked_observable = strict_observable if self.strict_observable_schema else saved_observable
-            missing_observable = [
-                key for key in OBSERVABLE_REQUIRED_FIELDS
-                if key not in checked_observable
-            ]
-            invalid_version = checked_observable.get("schema_version") != OBSERVABLE_SCHEMA_VERSION
-            if missing_observable or invalid_version:
-                detail = (
-                    f"PT observable schema is incomplete for {pt_path}: "
-                    f"schema_version={checked_observable.get('schema_version')!r}, "
-                    f"missing={missing_observable}"
-                )
-                if self.strict_observable_schema:
-                    raise FatalDatasetConfigError(detail)
-                if not self._warned_observable_schema:
-                    logger.warning("%s. Deriving compatibility fallbacks.", detail)
-                    self._warned_observable_schema = True
-            data.update(_fallback_observable_metadata(data, sources, dex_list, saved_observable))
+            data.update(self._manifest_payload(raw))
+            data.update(raw["observable_metadata"])
             refresh_observable_signals(data)
             if self.robust_aug and self.is_train:
                 perturb_type, strength = sample_training_perturbation(self.perturb_prob, self.perturb_strengths)

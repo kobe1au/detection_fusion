@@ -245,7 +245,6 @@ def main() -> None:
     parser.add_argument("--split", default="unknown")
     parser.add_argument("--scenarios", nargs="+", default=list(DEFAULT_SCENARIOS))
     parser.add_argument("--strengths", nargs="+", type=float, default=[0.1, 0.3, 0.5, 0.7, 0.9])
-    parser.add_argument("--strict-observable-schema", action="store_true")
     parser.add_argument("--paired-csv", default="")
     parser.add_argument("--fail-on-check-error", action="store_true")
     args = parser.parse_args()
@@ -263,7 +262,6 @@ def main() -> None:
                 robust_aug=False,
                 eval_perturb_type=None if scenario == "clean" else scenario,
                 eval_perturb_strength=float(strength),
-                strict_observable_schema=bool(args.strict_observable_schema),
             )
             rows.extend(_signal_rows(dataset, args.split, scenario, float(strength)))
 

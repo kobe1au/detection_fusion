@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 from torch_geometric.data import Data
 
-from fusion.dataset import FatalDatasetConfigError, RobustTriModalDataset, robust_collate_fn
+from fusion.dataset import FatalDatasetConfigError, RobustTriModalDataset
 from fusion.evidence import build_evidence
 from fusion.manifest_features import DEFAULT_CATEGORIES, vectorize_manifest_record
 from fusion.perturbations import apply_manifest_permission_mask
@@ -28,7 +28,7 @@ from scripts.build_tri_modal_pts_direct import build_observable_payload
 from scripts.diagnose_observable_signals import _distribution_table, _output_checks, _trend_table
 
 
-def _legacy_pt(tmp_path: Path, sid: str = "sample") -> tuple[Path, Path]:
+def _old_list_pt(tmp_path: Path, sid: str = "sample") -> tuple[Path, Path]:
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     torch.save(
@@ -63,32 +63,15 @@ def _legacy_pt(tmp_path: Path, sid: str = "sample") -> tuple[Path, Path]:
 
 
 def test_observable_schema_strict_missing_fields(tmp_path: Path):
-    pt_dir, csv_path = _legacy_pt(tmp_path, "strict_missing")
+    pt_dir, csv_path = _old_list_pt(tmp_path, "strict_missing")
     dataset = RobustTriModalDataset(
         str(pt_dir),
         str(csv_path),
         is_train=False,
         manifest_dim=16,
-        strict_observable_schema=True,
     )
-    with pytest.raises(FatalDatasetConfigError, match="observable schema is incomplete"):
+    with pytest.raises(FatalDatasetConfigError, match="top-level mapping"):
         dataset[0]
-
-
-def test_observable_schema_non_strict_fallback(tmp_path: Path):
-    pt_dir, csv_path = _legacy_pt(tmp_path, "compat")
-    dataset = RobustTriModalDataset(
-        str(pt_dir),
-        str(csv_path),
-        is_train=False,
-        manifest_dim=16,
-        strict_observable_schema=False,
-    )
-    sample = dataset[0]
-    batch = robust_collate_fn([sample])
-    assert sample.schema_version == "legacy-fallback"
-    assert batch["graph_batch"].api_integrity.shape == (1, 1)
-    assert batch["observable_metadata"]["schema_version"] == ["legacy-fallback"]
 
 
 def test_observable_schema_strict_accepts_complete_merged_payload(tmp_path: Path):
@@ -137,7 +120,14 @@ def test_observable_schema_strict_accepts_complete_merged_payload(tmp_path: Path
         "manifest_permission_ids": torch.tensor([1], dtype=torch.long),
         "manifest_intent_ids": torch.tensor([1], dtype=torch.long),
         "manifest_category_counts": torch.ones(12),
+        "manifest_component_category_counts": torch.zeros(12),
+        "manifest_permission_category_map": torch.zeros((1, 12)),
+        "manifest_intent_category_map": torch.zeros((1, 12)),
         "manifest_stats": torch.ones(11),
+        "manifest_meta": {},
+        "manifest_permission_dim": 1,
+        "manifest_intent_dim": 1,
+        "manifest_feature_dim": 0,
         "q_manifest": torch.tensor([1.0]),
         "pert_manifest": torch.tensor([0.0]),
         "observable_metadata": {
@@ -170,14 +160,13 @@ def test_observable_schema_strict_accepts_complete_merged_payload(tmp_path: Path
         str(csv_path),
         is_train=False,
         manifest_dim=16,
-        strict_observable_schema=True,
     )
     assert dataset[0].schema_version == OBSERVABLE_SCHEMA_VERSION
 
 
-def test_observable_schema_strict_rejects_legacy_list_with_nested_metadata(tmp_path: Path):
-    pt_dir, csv_path = _legacy_pt(tmp_path, "nested_legacy")
-    path = pt_dir / "nested_legacy.pt"
+def test_current_schema_rejects_list_payload_even_with_nested_metadata(tmp_path: Path):
+    pt_dir, csv_path = _old_list_pt(tmp_path, "nested_old")
+    path = pt_dir / "nested_old.pt"
     raw = torch.load(path, map_location="cpu", weights_only=False)
     nested = {key: 0 for key in OBSERVABLE_REQUIRED_FIELDS}
     nested.update(
@@ -195,9 +184,8 @@ def test_observable_schema_strict_rejects_legacy_list_with_nested_metadata(tmp_p
         str(csv_path),
         is_train=False,
         manifest_dim=16,
-        strict_observable_schema=True,
     )
-    with pytest.raises(FatalDatasetConfigError, match="observable schema is incomplete"):
+    with pytest.raises(FatalDatasetConfigError, match="top-level mapping"):
         dataset[0]
 
 

@@ -106,9 +106,6 @@ execution:
   # 第一次正式生成建议 false，避免复用旧 PT
   resume: true
 
-  # 正式实验必须 false，避免旧 schema PT 混进来
-  allow_legacy_resume: false
-
   # split 目录为空时是否允许继续
   allow_empty_splits: false
 

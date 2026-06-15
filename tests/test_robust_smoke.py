@@ -12,7 +12,7 @@ from torch_geometric.data import Batch, Data
 from fusion.dataset import (
     FatalDatasetConfigError,
     RobustTriModalDataset,
-    build_isolation_groups,
+    build_package_isolation_groups,
     robust_collate_fn,
 )
 from fusion.gates import heuristic_reliability_gate
@@ -21,6 +21,7 @@ from fusion.quality import compute_align_quality
 from fusion.manifest_features import DEFAULT_CATEGORIES, load_manifest_vocab, vectorize_manifest_record
 from fusion.model import ApiSequenceEncoder, TriModalRobustModel
 from fusion.train import (
+    _dataset_common_kwargs,
     _metrics,
     _normalize_robust_val_scenarios,
     checkpoint_score,
@@ -40,6 +41,7 @@ from fusion.semantic_categories import (
 from scripts.build_tri_modal_pts_direct import (
     PT_SCHEMA_VERSION,
     _build_fingerprint,
+    _load_direct_config,
     _resume_existing,
     _validate_unique_hashes,
 )
@@ -57,6 +59,7 @@ from fusion.perturbations import (
     apply_manifest_permission_injection,
     apply_manifest_permission_mask,
 )
+from tests.pt_factory import current_pt_payload, save_current_pt
 
 
 def test_metrics_report_macro_f1_as_primary_f1():
@@ -77,14 +80,14 @@ def test_metrics_report_macro_f1_as_primary_f1():
     assert "mean_confidence" in metrics
 
 
-def test_internal_isolation_groups_connect_package_and_family_relations():
+def test_internal_isolation_groups_use_package_or_sample_id():
     sids = ["a", "b", "c", "d"]
     packages = {"a": "pkg-one", "b": "pkg-one", "c": "pkg-two", "d": "pkg-three"}
-    families = {"a": "fam-a", "b": "fam-b", "c": "fam-b", "d": "benign"}
 
-    groups = build_isolation_groups(sids, packages, families)
+    groups = build_package_isolation_groups(sids, packages)
 
-    assert groups[0] == groups[1] == groups[2]
+    assert groups[0] == groups[1]
+    assert groups[2] != groups[0]
     assert groups[3] != groups[0]
 
 
@@ -165,6 +168,22 @@ def test_config_loader_allows_shared_parent_defaults(tmp_path: Path):
     assert cfg["loss"] == {"left": 1, "right": 2}
 
 
+def test_unknown_data_and_builder_settings_fail_fast(tmp_path: Path):
+    with pytest.raises(ValueError, match="Unsupported data settings"):
+        _dataset_common_kwargs(
+            {
+                "data": {"removed_option": True},
+                "model": {},
+            },
+            is_train=False,
+        )
+
+    path = tmp_path / "build.yaml"
+    path.write_text("execution:\n  removed_option: false\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported execution settings"):
+        _load_direct_config(path)
+
+
 def test_tuning_mode_forbids_test_evaluation():
     with pytest.raises(ValueError, match="forbids test evaluation"):
         run_training(
@@ -229,11 +248,11 @@ def test_eval_only_requires_checkpoint_path():
 def test_eval_only_checkpoint_config_rejects_semantic_mismatch():
     saved = {
         "model": {"fusion_mode": "tri_modal_ours", "graph_encoder": {"use_behavior_hint": False}},
-        "data": {"graph_semantic_source": "alignment", "min_pt_schema_version": 2},
+        "data": {"graph_semantic_source": "alignment"},
     }
     current = {
         "model": {"fusion_mode": "tri_modal_ours", "graph_encoder": {"use_behavior_hint": True}},
-        "data": {"graph_semantic_source": "alignment", "min_pt_schema_version": 2},
+        "data": {"graph_semantic_source": "alignment"},
     }
     with pytest.raises(ValueError, match="changes model/data semantics"):
         validate_eval_checkpoint_config(current, saved)
@@ -256,35 +275,6 @@ def test_partition_validation_rejects_cross_split_package_leakage(tmp_path: Path
         }
     }
     with pytest.raises(ValueError, match="package_overlap=1"):
-        validate_split_partitions(cfg, include_test=False)
-
-
-def test_partition_validation_rejects_cross_split_family_leakage(tmp_path: Path):
-    for split, sid in (("train", "a"), ("val", "b")):
-        path = tmp_path / f"{split}.csv"
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f, fieldnames=["id", "label", "split", "pkg_name", "family"]
-            )
-            writer.writeheader()
-            writer.writerow(
-                {
-                    "id": sid,
-                    "label": 1,
-                    "split": split,
-                    "pkg_name": f"{split}.package",
-                    "family": "same-family",
-                }
-            )
-    cfg = {
-        "data": {
-            "root": str(tmp_path),
-            "train_csv": "train.csv",
-            "val_csv": "val.csv",
-            "strict_partition_isolation": True,
-        }
-    }
-    with pytest.raises(ValueError, match="family_overlap=1"):
         validate_split_partitions(cfg, include_test=False)
 
 
@@ -564,7 +554,8 @@ def test_robust_dataset_collate(tmp_path: Path):
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     sid = "sample1"
-    torch.save(
+    save_current_pt(
+        pt_dir / f"{sid}.pt",
         [
             {
                 "call_x": torch.randn(3, 8),
@@ -583,7 +574,7 @@ def test_robust_dataset_collate(tmp_path: Path):
                 "pert_manifest": torch.tensor([0.0]),
             }
         ],
-        pt_dir / f"{sid}.pt",
+        manifest_dim=16,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -628,7 +619,8 @@ def test_dataset_allows_pt_superset_for_real_failure_slice(tmp_path: Path):
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     for sid in ("selected", "not_selected"):
-        torch.save(
+        save_current_pt(
+            pt_dir / f"{sid}.pt",
             {
                 "call_x": torch.ones(1, 8),
                 "call_edge_index": torch.empty((2, 0), dtype=torch.long),
@@ -636,7 +628,7 @@ def test_dataset_allows_pt_superset_for_real_failure_slice(tmp_path: Path):
                 "api_type_ids": torch.tensor([1]),
                 "manifest_x": torch.ones(16),
             },
-            pt_dir / f"{sid}.pt",
+            manifest_dim=16,
         )
     csv_path = tmp_path / "slice.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -659,7 +651,8 @@ def test_all_ghost_graph_has_integrity_but_is_not_alive(tmp_path: Path):
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     sid = "ghost"
-    torch.save(
+    save_current_pt(
+        pt_dir / f"{sid}.pt",
         {
             "call_x": torch.empty((0, 8)),
             "call_edge_index": torch.empty((2, 0), dtype=torch.long),
@@ -669,7 +662,7 @@ def test_all_ghost_graph_has_integrity_but_is_not_alive(tmp_path: Path):
             "method_api_edge_index": torch.tensor([[0], [0]], dtype=torch.long),
             "manifest_x": torch.ones(16),
         },
-        pt_dir / f"{sid}.pt",
+        manifest_dim=16,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -696,7 +689,8 @@ def test_multidex_api_limit_is_sample_level_and_preserves_alignment(tmp_path: Pa
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     sid = "sample2"
-    torch.save(
+    save_current_pt(
+        pt_dir / f"{sid}.pt",
         [
             {
                 "call_x": torch.randn(2, 8),
@@ -726,7 +720,7 @@ def test_multidex_api_limit_is_sample_level_and_preserves_alignment(tmp_path: Pa
                 "method_api_edge_index": torch.tensor([[0, 1], [0, 1]], dtype=torch.long),
             },
         ],
-        pt_dir / f"{sid}.pt",
+        manifest_dim=16,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -752,7 +746,8 @@ def test_manifest_perturbation_uses_payload_vocab_dims(tmp_path: Path):
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     sid = "sample_manifest_dims"
-    torch.save(
+    save_current_pt(
+        pt_dir / f"{sid}.pt",
         {
             "call_x": torch.randn(2, 8),
             "call_edge_index": torch.empty((2, 0), dtype=torch.long),
@@ -771,7 +766,7 @@ def test_manifest_perturbation_uses_payload_vocab_dims(tmp_path: Path):
             "q_manifest": torch.tensor([1.0]),
             "pert_manifest": torch.tensor([0.0]),
         },
-        pt_dir / f"{sid}.pt",
+        manifest_dim=16,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -799,7 +794,8 @@ def test_dataset_rejects_manifest_x_larger_than_configured_dim(tmp_path: Path):
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     sid = "sample_manifest_too_wide"
-    torch.save(
+    save_current_pt(
+        pt_dir / f"{sid}.pt",
         {
             "call_x": torch.randn(2, 8),
             "call_edge_index": torch.empty((2, 0), dtype=torch.long),
@@ -814,7 +810,7 @@ def test_dataset_rejects_manifest_x_larger_than_configured_dim(tmp_path: Path):
             "manifest_category_counts": torch.ones(12),
             "manifest_stats": torch.ones(11),
         },
-        pt_dir / f"{sid}.pt",
+        manifest_dim=20,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -827,46 +823,36 @@ def test_dataset_rejects_manifest_x_larger_than_configured_dim(tmp_path: Path):
         dataset[0]
 
 
-def test_dataset_requires_manifest_semantic_maps_for_consistency_runs(tmp_path: Path):
+def test_dataset_requires_current_manifest_semantic_maps(tmp_path: Path):
     pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="missing_manifest_maps")
+    path = pt_dir / "missing_manifest_maps.pt"
+    raw = torch.load(path, map_location="cpu", weights_only=False)
+    del raw["manifest_permission_category_map"]
+    torch.save(raw, path)
     dataset = RobustTriModalDataset(
         str(pt_dir),
         str(csv_path),
         is_train=False,
         manifest_dim=16,
-        require_manifest_semantic_maps=True,
     )
-    with pytest.raises(FatalDatasetConfigError, match="term-to-category maps"):
+    with pytest.raises(FatalDatasetConfigError, match="missing top-level fields"):
         dataset[0]
 
 
-def test_dataset_rejects_legacy_pt_when_schema_is_locked(tmp_path: Path):
-    pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="legacy_schema")
+def test_dataset_rejects_non_current_pt_schema_version(tmp_path: Path):
+    pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="old_schema")
+    path = pt_dir / "old_schema.pt"
+    raw = torch.load(path, map_location="cpu", weights_only=False)
+    raw["direct_build_meta"]["pt_schema_version"] = PT_SCHEMA_VERSION - 1
+    torch.save(raw, path)
     dataset = RobustTriModalDataset(
         str(pt_dir),
         str(csv_path),
         is_train=False,
         manifest_dim=16,
-        min_pt_schema_version=2,
     )
-    with pytest.raises(FatalDatasetConfigError, match="schema version"):
+    with pytest.raises(FatalDatasetConfigError, match="does not match required current version"):
         dataset[0]
-
-
-def test_dataset_allows_legacy_pt_in_explicit_compat_mode(tmp_path: Path):
-    pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="legacy_compat")
-    dataset = RobustTriModalDataset(
-        str(pt_dir),
-        str(csv_path),
-        is_train=False,
-        manifest_dim=16,
-        min_pt_schema_version=2,
-        require_manifest_semantic_maps=True,
-        allow_legacy_pt_compat=True,
-    )
-    sample = dataset[0]
-    assert sample.y.item() == 1
-    assert sample.manifest_category_counts.numel() == 12
 
 
 def test_heuristic_joint_gate_uses_manifest_reliability():
@@ -926,10 +912,16 @@ def _perturbation_sample():
         "graph_semantic_category_counts": torch.ones(12),
         "graph_category_counts": torch.ones(12),
         "manifest_x": torch.ones(16),
-        "manifest_permission_ids": torch.tensor([1, 2, 3], dtype=torch.long),
+        "manifest_permission_ids": torch.tensor([1, 2, 3, 4], dtype=torch.long),
         "manifest_intent_ids": torch.tensor([1, 2], dtype=torch.long),
+        "manifest_permission_category_map": torch.ones((4, 12)),
+        "manifest_intent_category_map": torch.ones((2, 12)),
+        "manifest_component_category_counts": torch.zeros(12),
         "manifest_category_counts": torch.ones(12),
         "manifest_stats": torch.ones(11),
+        "manifest_permission_dim": 4,
+        "manifest_intent_dim": 2,
+        "manifest_feature_dim": 0,
         "q_api": 1.0,
         "q_graph": 1.0,
         "q_manifest": 1.0,
@@ -1055,6 +1047,7 @@ def test_sparse_manifest_mask_and_injection_always_change_eligible_positions():
     data["manifest_x"][[1, 7]] = 1.0
     data["manifest_permission_dim"] = 16
     data["manifest_permission_ids"] = torch.tensor([2, 8], dtype=torch.long)
+    data["manifest_permission_category_map"] = torch.ones((16, 12))
     masked = apply_manifest_permission_mask(data, 0.5)
     assert int((masked["manifest_x"][:16] > 0).sum().item()) == 1
     assert masked["manifest_permission_ids"].numel() == 1
@@ -1370,7 +1363,6 @@ def test_direct_resume_requires_matching_current_schema(tmp_path: Path):
     job = {"split": "train", "apk_path": "a.apk", "sha256": "abc"}
     cfg = {
         "resume": True,
-        "allow_legacy_resume": False,
         "out_dirs": {"train": out_dir},
     }
     path = out_dir / "abc.pt"
@@ -1383,24 +1375,28 @@ def test_direct_resume_requires_matching_current_schema(tmp_path: Path):
             "schema_version": OBSERVABLE_SCHEMA_VERSION,
         }
     )
-    torch.save(
+    payload = current_pt_payload(
         {
-            "direct_build_meta": {
-                "pt_schema_version": PT_SCHEMA_VERSION,
-                "build_fingerprint": "match",
-            },
-            "observable_metadata": observable,
-            "manifest_permission_category_map": torch.zeros(1, 12),
-            "manifest_intent_category_map": torch.zeros(1, 12),
-            "manifest_component_category_counts": torch.zeros(12),
-        },
-        path,
+            "call_x": torch.ones(1, 8),
+            "call_edge_index": torch.empty((2, 0), dtype=torch.long),
+            "api_ids": torch.tensor([1]),
+            "api_type_ids": torch.tensor([1]),
+        }
     )
+    payload["observable_metadata"] = observable
+    payload["direct_build_meta"]["build_fingerprint"] = "match"
+    torch.save(payload, path)
     status, row = _resume_existing(job, cfg, "match")
     assert status is True
     assert row["status"] == "ok"
 
     status, row = _resume_existing(job, cfg, "different")
+    assert status is False
+    assert row["status"] == "failed"
+
+    del payload["manifest_permission_category_map"]
+    torch.save(payload, path)
+    status, row = _resume_existing(job, cfg, "match")
     assert status is False
     assert row["status"] == "failed"
 
@@ -1425,7 +1421,8 @@ def _make_graph_source_pt(tmp_path: Path, sid: str = "graph_src_sample"):
     """
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
+    save_current_pt(
+        pt_dir / f"{sid}.pt",
         [
             {
                 "call_x": torch.randn(4, 8),
@@ -1444,7 +1441,7 @@ def _make_graph_source_pt(tmp_path: Path, sid: str = "graph_src_sample"):
                 "pert_manifest": torch.tensor([0.0]),
             }
         ],
-        pt_dir / f"{sid}.pt",
+        manifest_dim=16,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:

@@ -200,23 +200,14 @@ def resolve(root: str | Path, path: str | Path) -> str:
 def _read_split_identities(
     csv_path: str | Path,
     expected_split: str,
-) -> tuple[set[str], set[str], set[str]]:
+) -> tuple[set[str], set[str]]:
     ids: set[str] = set()
     packages: set[str] = set()
-    families: set[str] = set()
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         fields = set(reader.fieldnames or [])
         id_col = next((name for name in ("id", "ID", "Id", "sha256") if name in fields), None)
         pkg_col = next((name for name in ("pkg_name", "package_name", "package") if name in fields), None)
-        family_col = next(
-            (
-                name
-                for name in ("family", "malware_family", "family_name", "avclass_family")
-                if name in fields
-            ),
-            None,
-        )
         if id_col is None:
             raise ValueError(f"CSV {csv_path} must contain id or sha256")
         for row_idx, row in enumerate(reader, start=2):
@@ -235,11 +226,7 @@ def _read_split_identities(
                 package = str(row.get(pkg_col, "") or "").strip().lower()
                 if package and package not in {"nan", "none", "null"}:
                     packages.add(package)
-            if family_col is not None:
-                family = str(row.get(family_col, "") or "").strip().lower()
-                if family and family not in {"nan", "none", "null", "benign", "goodware"}:
-                    families.add(family)
-    return ids, packages, families
+    return ids, packages
 
 
 def validate_split_partitions(cfg: dict, include_test: bool) -> None:
@@ -248,7 +235,7 @@ def validate_split_partitions(cfg: dict, include_test: bool) -> None:
         return
     data_root = data_cfg.get("root", "")
     split_names = ["train", "val"] + (["test"] if include_test else [])
-    identities: dict[str, tuple[set[str], set[str], set[str]]] = {}
+    identities: dict[str, tuple[set[str], set[str]]] = {}
     for split in split_names:
         csv_path = resolve(data_root, data_cfg[f"{split}_csv"])
         identities[split] = _read_split_identities(csv_path, split)
@@ -257,13 +244,11 @@ def validate_split_partitions(cfg: dict, include_test: bool) -> None:
         for right in split_names[i + 1 :]:
             id_overlap = sorted(identities[left][0] & identities[right][0])
             pkg_overlap = sorted(identities[left][1] & identities[right][1])
-            family_overlap = sorted(identities[left][2] & identities[right][2])
-            if id_overlap or pkg_overlap or family_overlap:
+            if id_overlap or pkg_overlap:
                 raise ValueError(
                     f"Split leakage between {left} and {right}: "
                     f"id_overlap={len(id_overlap)} examples={id_overlap[:10]}; "
-                    f"package_overlap={len(pkg_overlap)} examples={pkg_overlap[:10]}; "
-                    f"family_overlap={len(family_overlap)} examples={family_overlap[:10]}"
+                    f"package_overlap={len(pkg_overlap)} examples={pkg_overlap[:10]}"
                 )
 
 
@@ -280,10 +265,6 @@ def _checkpoint_semantic_signature(cfg: dict) -> dict[str, Any]:
             for key in (
                 "graph_semantic_source",
                 "max_api_events_per_sample",
-                "min_pt_schema_version",
-                "allow_legacy_pt_compat",
-                "strict_observable_schema",
-                "manifest_vocab_path",
                 "label_map",
             )
         },
@@ -320,26 +301,28 @@ def _dataset_common_kwargs(
     perturb_strength: float = 0.0,
 ) -> dict[str, Any]:
     data_cfg = cfg["data"]
+    allowed_data_keys = {
+        "root",
+        "train_pt_dir",
+        "val_pt_dir",
+        "test_pt_dir",
+        "train_csv",
+        "val_csv",
+        "test_csv",
+        "out_dir",
+        "max_failed_ratio",
+        "max_api_events_per_sample",
+        "graph_semantic_source",
+        "strict_split_integrity",
+        "strict_partition_isolation",
+        "label_map",
+    }
+    unknown_data_keys = sorted(set(data_cfg) - allowed_data_keys)
+    if unknown_data_keys:
+        raise ValueError(f"Unsupported data settings: {unknown_data_keys}")
     robust_cfg = cfg.get("robust", {})
     model_cfg = cfg.get("model", {})
     manifest_cfg = model_cfg.get("manifest_encoder", {})
-    gate_cfg = model_cfg.get("gate", {}) or {}
-    loss_cfg = cfg.get("loss", {}) or {}
-    require_manifest_semantic_maps = bool(
-        gate_cfg.get("use_consistency_evidence", False)
-        or gate_cfg.get("use_conflict_evidence", False)
-        or float(loss_cfg.get("cross_source_consistency_weight", 0.0)) > 0.0
-        or float(loss_cfg.get("semantic_reconstruction_weight", 0.0)) > 0.0
-        or bool((cfg.get("semantic_reconstruction", {}) or {}).get("enabled", False))
-    )
-    data_root = data_cfg.get("root", "")
-    # Resolve the manifest vocab path so old PTs can derive semantic maps at
-    # dataset init time.  Explicitly set data.manifest_vocab_path="" to disable.
-    manifest_vocab_path = str(data_cfg.get("manifest_vocab_path", ""))
-    if manifest_vocab_path == "" and "manifest_vocab_path" not in data_cfg:
-        manifest_vocab_path = "config/manifest_vocab.yaml"
-    if manifest_vocab_path:
-        manifest_vocab_path = resolve(data_root, manifest_vocab_path)
     return {
         "is_train": is_train,
         "robust_aug": bool(robust_cfg.get("train_aug", False)) if is_train else False,
@@ -360,11 +343,6 @@ def _dataset_common_kwargs(
         "label_map": data_cfg.get("label_map"),
         "strict_split_integrity": bool(data_cfg.get("strict_split_integrity", True)),
         "allow_pt_superset": False,
-        "require_manifest_semantic_maps": require_manifest_semantic_maps,
-        "allow_legacy_pt_compat": bool(data_cfg.get("allow_legacy_pt_compat", False)),
-        "min_pt_schema_version": int(data_cfg.get("min_pt_schema_version", 0)),
-        "strict_observable_schema": bool(data_cfg.get("strict_observable_schema", False)),
-        "manifest_vocab_path": manifest_vocab_path,
     }
 
 

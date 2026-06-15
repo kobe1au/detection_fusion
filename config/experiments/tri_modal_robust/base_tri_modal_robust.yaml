@@ -14,13 +14,6 @@ data:
   graph_semantic_source: alignment
   strict_split_integrity: true
   strict_partition_isolation: true
-  # Legacy PT compatibility avoids expensive APK re-extraction. Schema-3 PTs
-  # remain cleaner for final formal experiments, but older PTs can run through
-  # vocab/count fallbacks when this flag is enabled.
-  min_pt_schema_version: 0
-  allow_legacy_pt_compat: true
-  # Formal observable-reliability runs should keep this true and regenerate PTs.
-  strict_observable_schema: true
 
 train:
   exp_name: base_tri_modal_robust

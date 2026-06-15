@@ -65,7 +65,6 @@ storage:
 execution:
   workers: 4
   resume: true
-  allow_legacy_resume: false
   fail_on_error: false
   # Obfuscapk techniques are often generated incrementally; do not require
   # every configured technique directory to be non-empty in each extraction run.

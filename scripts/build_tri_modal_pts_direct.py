@@ -31,9 +31,9 @@ from fusion.quality import (
     OBSERVABLE_REQUIRED_FIELDS,
     OBSERVABLE_SCHEMA_VERSION,
 )
+from fusion.pt_schema import CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS, PT_SCHEMA_VERSION
 
 
-PT_SCHEMA_VERSION = 4
 logger = logging.getLogger("build_tri_modal_pts_direct")
 
 
@@ -95,10 +95,16 @@ def _resume_existing(job: dict[str, Any], cfg: dict, build_fingerprint: str) -> 
             and observable.get("schema_version") == OBSERVABLE_SCHEMA_VERSION
             and all(key in observable for key in OBSERVABLE_REQUIRED_FIELDS)
         )
-        if version == PT_SCHEMA_VERSION and fingerprint == build_fingerprint and observable_complete:
+        payload_complete = isinstance(raw, dict) and all(
+            key in raw for key in CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS
+        )
+        if (
+            version == PT_SCHEMA_VERSION
+            and fingerprint == build_fingerprint
+            and observable_complete
+            and payload_complete
+        ):
             return True, {**row, "status": "ok"}
-        if bool(cfg.get("allow_legacy_resume", False)):
-            return True, {**row, "status": "ok", "compatibility": "legacy"}
         return False, {**row, "status": "failed", "reason": "schema or build fingerprint mismatch"}
     except Exception as exc:
         return False, {**row, "status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
@@ -126,7 +132,7 @@ def build_observable_payload(
     *,
     build_fingerprint: str,
 ) -> dict[str, Any]:
-    """Build the top-level structure required by strict_observable_schema."""
+    """Build the only PT structure accepted by the training dataset."""
     observable = merge_observable_metadata(code_payload, manifest_payload)
     payload = {
         **manifest_payload,
@@ -152,6 +158,16 @@ def _load_direct_config(path: Path) -> dict[str, Any]:
     manifest = raw.get("manifest") or {}
     storage = raw.get("storage") or {}
     execution = raw.get("execution") or {}
+    allowed_execution_keys = {
+        "workers",
+        "resume",
+        "allow_empty_splits",
+        "fail_on_error",
+        "failed_json",
+    }
+    unknown_execution_keys = sorted(set(execution) - allowed_execution_keys)
+    if unknown_execution_keys:
+        raise ValueError(f"Unsupported execution settings: {unknown_execution_keys}")
 
     splits = [str(value) for value in data.get("splits", [])]
     split_dirs = {str(key): Path(value) for key, value in (data.get("split_dirs") or {}).items()}
@@ -200,7 +216,6 @@ def _load_direct_config(path: Path) -> dict[str, Any]:
         "keep_api_tokens": bool(storage.get("keep_api_tokens", False)),
         "workers": max(1, int(execution.get("workers", 1))),
         "resume": bool(execution.get("resume", False)),
-        "allow_legacy_resume": bool(execution.get("allow_legacy_resume", False)),
         "allow_empty_splits": bool(execution.get("allow_empty_splits", False)),
         "fail_on_error": bool(execution.get("fail_on_error", False)),
         "failed_json": failed_json,
@@ -382,7 +397,7 @@ def _build_one(
 
 def _write_index(rows: list[dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["split", "sha256", "path", "status", "reason", "compatibility"]
+    fields = ["split", "sha256", "path", "status", "reason"]
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
