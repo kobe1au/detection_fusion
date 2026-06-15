@@ -40,7 +40,7 @@ graph:
 
 api:
   num_hash_buckets: 8192
-  max_events_per_dex: 1024
+  max_events_per_dex: 2048
   max_events_per_method: 32
   event_scope: all_methods
   framework_only: true
@@ -48,7 +48,7 @@ api:
 
 manifest:
   # Reuse the train-only vocab from clean train. Do not rebuild from obfuscated test APKs.
-  vocab_path: "C:/pts_tri/manifest_vocab.yaml"
+  vocab_path: "D:/pts_robust/manifest_vocab.yaml"
   rebuild_vocab: false
   allow_empty_vocab: false
   manifest_dim: 256

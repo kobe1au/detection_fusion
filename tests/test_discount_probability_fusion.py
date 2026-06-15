@@ -88,6 +88,25 @@ def test_high_manifest_conflict_reduces_manifest_discount():
     assert _run(high)["discount_manifest"].item() < _run(low)["discount_manifest"].item()
 
 
+def test_support_discount_can_be_disabled():
+    low = _evidence(1)
+    low[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = 0.0
+    low[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = 0.0
+    high = low.clone()
+    high[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = 1.0
+    high[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = 1.0
+
+    low_out = _run(
+        low,
+        config={"use_support_discount": False, "use_confidence_proxy": False},
+    )
+    high_out = _run(
+        high,
+        config={"use_support_discount": False, "use_confidence_proxy": False},
+    )
+    assert torch.allclose(low_out["discounts"], high_out["discounts"])
+
+
 def test_high_entropy_reduces_branch_discount():
     evidence = _evidence(1)
     peaked = list(_logits(1))

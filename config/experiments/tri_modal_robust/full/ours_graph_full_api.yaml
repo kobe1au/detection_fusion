@@ -1,8 +1,0 @@
-defaults:
-  - ./ours.yaml
-
-train:
-  exp_name: full_ours_graph_full_api
-
-data:
-  graph_semantic_source: full_api

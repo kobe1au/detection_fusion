@@ -1,0 +1,8 @@
+defaults:
+  - ./_fusion_baseline_base.yaml
+
+train:
+  exp_name: baseline_heuristic_reliability_logit_fusion
+
+model:
+  fusion_mode: tri_modal_reliability_gate

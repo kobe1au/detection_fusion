@@ -1,0 +1,6 @@
+defaults:
+  - ../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: final_seed_2024
+  seed: 2024

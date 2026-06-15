@@ -46,7 +46,6 @@ def build_monotonic_reliability_features(
     evidence: torch.Tensor,
     *,
     missing_relation_support: float = 0.0,
-    neutral_support: float | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Build branch-specific features where larger always means more reliable."""
     if evidence.ndim != 2 or evidence.size(-1) < EvidenceIndex.BASE_DIM:
@@ -76,9 +75,6 @@ def build_monotonic_reliability_features(
     )
     manifest_code_applicable = manifest_alive & code_alive & manifest_code_relation_observed
 
-    if neutral_support is not None:
-        # Backward-compatible alias for older experiment configs/callers.
-        missing_relation_support = float(neutral_support)
     missing_support = torch.full_like(anchor_support, float(missing_relation_support))
     # Unavailable relations contribute no positive evidence. Applicability is
     # kept as a diagnostic mask rather than treating missing counterparts as
@@ -172,14 +168,11 @@ class MonotonicReliabilityCalibrator(nn.Module):
         self,
         hidden_dim: int = 16,
         missing_relation_support: float = 0.0,
-        neutral_support: float | None = None,
         apply_alive_mask: bool = True,
     ):
         super().__init__()
         if hidden_dim <= 0:
             raise ValueError("reliability_calibration.hidden_dim must be positive")
-        if neutral_support is not None:
-            missing_relation_support = float(neutral_support)
         if not 0.0 <= float(missing_relation_support) <= 1.0:
             raise ValueError("reliability_calibration.missing_relation_support must be within [0, 1]")
         self.missing_relation_support = float(missing_relation_support)

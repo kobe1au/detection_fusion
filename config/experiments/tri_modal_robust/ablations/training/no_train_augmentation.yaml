@@ -1,0 +1,8 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: training_no_train_augmentation
+
+robust:
+  train_aug: false

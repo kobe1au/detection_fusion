@@ -1,0 +1,10 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i3_no_probability_calibration
+
+fusion:
+  probability_calibration:
+    enabled: false
+    weight: 0.0

@@ -1,0 +1,14 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i1_integrity_alive_only
+
+model:
+  gate:
+    use_consistency_evidence: false
+    use_conflict_evidence: false
+
+fusion:
+  use_support_discount: false
+  use_conflict_discount: false

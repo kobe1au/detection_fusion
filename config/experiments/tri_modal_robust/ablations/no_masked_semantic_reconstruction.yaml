@@ -1,9 +1,0 @@
-defaults:
-  - ../observable_reliability_discount_fusion.yaml
-
-train:
-  exp_name: no_masked_semantic_reconstruction
-
-semantic_reconstruction:
-  enabled: false
-

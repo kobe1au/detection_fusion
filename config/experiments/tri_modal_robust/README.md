@@ -1,344 +1,159 @@
-# Tri-modal Robust Fusion Experiments
+# Tri-modal Robust Fusion Experiment Plan
 
-This directory contains the clean experiment plan for the robust API + Graph + Manifest framework.
+This plan is derived from the current implementation. It does not reuse the
+deleted legacy i1/i2/i3 experiment route.
 
-## Experiment Routes
+## Fixed Protocol
 
-- `observable_reliability_discount_fusion.yaml`: publication-facing final method.
-- `ablations/`: ablations for the final observable-reliability method.
-- `final_seed/`: multi-seed runs for the final observable-reliability method.
-- `i1/`, `i2/`, `i3/`, and `full/`: legacy development routes for the earlier gate-based method.
-- `seed/`: legacy gate-based multi-seed overrides; use `run.py legacy_seed` only for comparison.
-- `tune/`: sensitivity checks for innovation-related parameters. Do not mix these with the main ablation tables.
+- Data: strict current schema-4 PTs and `labels/{train,val,test}.csv`.
+- CSV membership is authoritative; extra unreferenced PT files are ignored,
+  while missing/duplicate PTs still fail validation.
+- Split isolation: sample ID and package name must not overlap across splits.
+- Model input limit: at most 2048 API events per sample.
+- Checkpoint selection: robust-composite macro-F1 on `val_selection`.
+- Validation holdout: every runnable experiment uses the same deterministic
+  package-isolated 50/50 split of Val.
+- Post-hoc calibration: discount-fusion experiments with calibration enabled fit
+  reliability and/or branch temperatures on clean `val_calibration`; non-discount
+  baselines do not.
+- Test: clean test plus degradation strengths 0.1, 0.3, 0.5, 0.7, and 0.9,
+  and one run for each missing-modality scenario.
+- Synthetic degradation may be used for training and robustness evaluation, but
+  model evidence never reads `pert_*` metadata.
 
-## Recommended Order
+## Experiment Groups
 
-Run the core method first:
-
-```bash
-python run.py final
-python run.py final_ablation --dry-run
-python run.py seed --dry-run
-```
-
-The helper runner can also select legacy grouped experiments:
-
-```bash
-python run.py main --dry-run
-python run.py i1 --dry-run
-python run.py i2 --dry-run
-python run.py i3 --dry-run
-python run.py i2,i3 --dry-run
-python run.py seed --dry-run
-```
-
-`run.py` deliberately excludes `tune/` configs. Use the Optuna driver for tuning so test
-evaluation cannot be mixed into parameter selection.
-
-Then run innovation-specific ablations:
-
-```bash
-python -m fusion.train --config config/experiments/tri_modal_robust/i1/api_graph_concat.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i1/tri_modal_concat.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i1/reliability_gate.yaml
-
-python -m fusion.train --config config/experiments/tri_modal_robust/i2/no_consistency.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i2/consistency_evidence_only.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i2/conflict_evidence_only.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i2/evidence_only.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i2/loss_only.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i2/semantic_reconstruction_only.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i2/evidence_plus_loss.yaml
-
-python -m fusion.train --config config/experiments/tri_modal_robust/i3/fixed_gate.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i3/confidence_gate.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i3/reliability_gate.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i3/learned_gate_no_alive_mask.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i3/learned_gate_no_prior.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/i3/learned_gate_with_prior.yaml
-```
-
-After the best setting is confirmed, run:
-
-```bash
-python -m fusion.train --config config/experiments/tri_modal_robust/seed/seed_42.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/seed/seed_2024.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/seed/seed_3407.yaml
-```
-
-## Stage-wise Optuna Tuning
-
-Optuna tuning uses representative robust validation for checkpoint selection and does not
-load or evaluate the test split. Run the stages in order:
-
-The fixed robust-validation checkpoint score is a weighted macro-F1 average:
-
-- clean validation: `0.40`
-- API+Graph degraded at strength `0.5`: `0.25`
-- Manifest degraded at strength `0.5`: `0.15`
-- all modalities degraded at strength `0.5`: `0.10`
-- API, Graph, and Manifest missing: `0.0333` each
-
-These scenarios and weights must be frozen before examining final test results. Changing
-them after observing test performance would make the final test no longer independent.
-
-Use a new output directory and study name for every protocol version. The study stores a
-configuration fingerprint and rejects incompatible resumed trials.
-
-```bash
-python scripts/tune_robust_optuna.py --stage i2 --trials 25 \
-  --study-name robust_v2_i2 --output-dir results/optuna/robust_v2
-
-python scripts/tune_robust_optuna.py --stage i3 --trials 25 \
-  --study-name robust_v2_i3 --output-dir results/optuna/robust_v2 \
-  --config config/experiments/tri_modal_robust/tune/optuna_base.yaml \
-  results/optuna/robust_v2/best_i2_override.yaml
-
-python scripts/tune_robust_optuna.py --stage aug --trials 9 \
-  --study-name robust_v2_aug --output-dir results/optuna/robust_v2 \
-  --config config/experiments/tri_modal_robust/tune/optuna_base.yaml \
-  results/optuna/robust_v2/best_i2_override.yaml \
-  results/optuna/robust_v2/best_i3_override.yaml
-```
-
-The augmentation stage is an exact 3-by-3 grid over perturbation probability and strength
-profile, so it has nine unique trials. The i2 search includes
-`cross_source_consistency_weight=0`; this allows the study to reject the cross-source
-loss if it does not improve representative robust validation. Semantic reconstruction
-and cross-source consistency are separate loss terms and must be reported separately.
-
-Tuning and final training use the same 60-epoch budget, early-stopping rule, deterministic
-mode, and robust-composite checkpoint metric. The only intended difference is that tuning
-does not load or evaluate test data.
-
-Use one seed during broad search. Do not use another Optuna search as a substitute for
-multi-seed confirmation. After all three stages are fixed, train the exact selected
-configuration with the three seed overrides:
-
-```bash
-python -m fusion.train --config config/experiments/tri_modal_robust/full/ours.yaml config/experiments/tri_modal_robust/seed/seed_42.yaml results/optuna/robust_v2/best_i2_override.yaml results/optuna/robust_v2/best_i3_override.yaml results/optuna/robust_v2/best_aug_override.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/full/ours.yaml config/experiments/tri_modal_robust/seed/seed_2024.yaml results/optuna/robust_v2/best_i2_override.yaml results/optuna/robust_v2/best_i3_override.yaml results/optuna/robust_v2/best_aug_override.yaml
-python -m fusion.train --config config/experiments/tri_modal_robust/full/ours.yaml config/experiments/tri_modal_robust/seed/seed_3407.yaml results/optuna/robust_v2/best_i2_override.yaml results/optuna/robust_v2/best_i3_override.yaml results/optuna/robust_v2/best_aug_override.yaml
-```
-
-The seed override must appear before the generated best-parameter overrides because each
-seed config inherits `full/ours.yaml`.
-
-After selecting the final parameters, run the complete test protocol from `full/ours.yaml`
-instead of `optuna_base.yaml`:
-
-```bash
-python scripts/make_post_optuna_configs.py \
-  --tag robust_v2 \
-  --best-i2 results/optuna/robust_v2/best_i2_override.yaml \
-  --best-i3 results/optuna/robust_v2/best_i3_override.yaml \
-  --best-aug results/optuna/robust_v2/best_aug_override.yaml
-
-python run.py post_optuna/robust_v2/full --dry-run
-python run.py post_optuna/robust_v2/full
-```
-
-The generated `post_optuna/<tag>` configs lock the safe override order:
-base method, best selected parameters, then the final ablation override. This prevents
-best gate parameters from overwriting fixed/reliability gate ablations.
-Use the generated configs for the final paper tables:
-
-```bash
-python run.py post_optuna/robust_v2/i1 --dry-run
-python run.py post_optuna/robust_v2/i2 --dry-run
-python run.py post_optuna/robust_v2/i3 --dry-run
-python run.py post_optuna/robust_v2/full --dry-run
-python run.py post_optuna/robust_v2/seed --dry-run
-
-python run.py post_optuna/robust_v2/i1
-python run.py post_optuna/robust_v2/i2
-python run.py post_optuna/robust_v2/i3
-python run.py post_optuna/robust_v2/full
-python run.py post_optuna/robust_v2/seed
-```
-
-The original `i1/`, `i2/`, `i3/`, and `full/` configs remain useful for development
-and sanity checks.  They are not the frozen post-tuning protocol once Optuna has been
-used.
-
-## External-Style Reference Baselines
-
-Use these as reference implementations, not claims of exact paper reproduction.
-They provide classical/static comparison points for the final method:
-
-```bash
-python scripts/train_static_baselines.py \
-  --config config/experiments/tri_modal_robust/base_tri_modal_robust.yaml \
-  --out-dir results/static_reference_baselines \
-  --run-test \
-  --robust-test
-```
-
-The script includes Drebin-style sparse static features, MaMaDroid-style API-type
-transition features, API bag-of-words, Manifest-only, and tri-modal static linear
-baselines. Report them separately from the internal neural ablations.
-
-## Real Failure Slices
-
-Build quality/failure slice CSVs before final robustness evaluation:
-
-```bash
-python scripts/build_real_failure_slices.py \
-  --config config/experiments/tri_modal_robust/base_tri_modal_robust.yaml \
-  --splits val test \
-  --out-dir results/robust_slices \
-  --extra-eval-yaml results/robust_slices/extra_eval_slices.yaml
-```
-
-Then evaluate the selected checkpoint/method on those slices by appending the generated
-override:
-
-```bash
-python -m fusion.train --config \
-  config/experiments/tri_modal_robust/post_optuna/robust_v2/full/full_ours.yaml \
-  results/robust_slices/extra_eval_slices.yaml
-```
-
-These slices are the main evidence for real extractor failures: low API quality, low
-graph quality, low API-Graph alignment, Manifest parse failures, and partial multi-DEX
-failures.
-
-## Calibration Diagnostics
-
-Every neural evaluation now reports `brier`, `ece_10`, `mean_confidence`, and
-`confidence_accuracy_gap` in `summary.yaml`. Per-sample `gate_diagnostics.csv` also
-contains final confidence and correctness, which supports calibration and gate-weight
-correlation plots.
-
-The publication-facing trustworthy fusion route is:
+Run commands:
 
 ```bash
 python run.py final
+python run.py baselines
+python run.py i1
+python run.py i2
+python run.py i3
+python run.py training_ablation
+python run.py sensitivity
+python run.py seed
+python run.py paper --dry-run
 ```
 
-`final` resolves to `observable_reliability_discount_fusion.yaml`. It consumes only the
-current schema-4 PTs generated by `build_tri_modal_pts_direct.py` and adds three
-runtime/model-level mechanisms:
+`paper` contains 33 unique runs: all baselines, innovation/training ablations,
+sensitivity analyses, and three final-method seeds. `seeds/seed_42.yaml` is the
+final-method reference inside that group, so the root final config is not run
+twice.
 
-- branch-specific monotonic reliability calibration from observable parsing evidence;
-- observable-integrity-conditioned masked security-semantic reconstruction regularization;
-- branch-temperature-calibrated probability discount fusion with relation-applicability masks and
-  validation-fitted selective rejection.
+### Main Method
 
-The reliability calibrator uses observable parsing evidence only. Entropy/margin
-confidence proxies are applied later by discount fusion; they are not calibrator inputs.
-Masked semantic reconstruction is conditioned by observable integrity and availability:
-low-integrity source representations are attenuated before reconstruction and their
-supervision is down-weighted. It is not conditioned by the post-hoc calibrated reliability
-outputs. A reconstruction target may use either or both remaining reliable modalities.
+`observable_reliability_discount_fusion.yaml` is the publication-facing method:
 
-The validation CSV is deterministically separated into disjoint `val_selection` and
-`val_calibration` subsets. Checkpoint selection and robust validation use only
-`val_selection`; after model selection, only the monotonic calibrators and branch
-temperatures are fitted on the clean `val_calibration` subset. Its acceptance-score quantile determines
-the rejection threshold, which is persisted in the checkpoint. Test and robustness
-summaries report `coverage`, `selective_risk`, `selective_macro_f1`, and `aurc`.
-Because `val_calibration` is used both to fit calibration parameters and to choose the
-rejection threshold, metrics reported on that subset are diagnostic only. Publication
-claims about calibration and selective prediction must use the untouched test split,
-external sets, or a stricter cross-fitted protocol.
+1. observable monotonic branch-reliability calibration;
+2. observable-integrity-conditioned cross-modal masked semantic reconstruction;
+3. calibrated probability discount fusion with selective rejection.
 
-## Notes
+### Baselines
 
-The default data paths target the AutoDL layout:
+Pure representation baselines disable final-method reconstruction, branch
+auxiliary loss, post-hoc calibration, and rejection:
 
-- train pt: `/root/autodl-tmp/pts/train`
-- val pt: `/root/autodl-tmp/pts/val`
-- test pt: `/pts/test`
-- labels: `labels/{train,val,test}.csv`
+- API only;
+- Graph only;
+- Manifest only;
+- API + Graph concatenation;
+- tri-modal concatenation.
 
-If these paths change, update only `base_tri_modal_robust.yaml`.
+Fusion baselines retain the final method's representation training and replace
+only the final fusion/calibration/rejection stage:
 
-The main gate uses observable post-extraction integrity, support/conflict, and raw-alive
-signals. Synthetic `pert_*` values are diagnostics only. The former
-`full/ours_oracle_perturbation_evidence.yaml` entry is retained as a deprecated diagnostic
-config and no longer exposes perturbation strength to the model.
+- fixed equal-weight logit fusion;
+- confidence-weighted logit fusion;
+- heuristic observable-reliability logit fusion;
+- learned observable-evidence logit fusion.
 
-Synthetic degradation augmentation remains enabled during training and robustness
-evaluation. The defensible claim is that fusion decisions never read synthetic
-perturbation labels or `pert_*` oracle metadata, not that training uses no synthetic
-degradation.
+All baselines use the same `val_selection` subset as the final method.
 
-Unavailable cross-modal relations do not apply explicit support/conflict discount
-factors. In the monotonic calibrator they contribute no positive relation evidence
-(`missing_relation_support=0.0`), so the learned reliability may still decrease because
-corroboration is absent even though no explicit conflict value or relation discount is
-applied. A Manifest-Code relation is also treated as unavailable when both sides are
-alive but neither side contains any category in the shared 12-D security-semantic space.
+### Innovation I1
 
-`manifest_code_support` is the symmetric category-presence Jaccard overlap. The two
-conflict signals remain directional: Manifest categories unsupported by code and code
-categories unsupported by Manifest. Branch reliability is post-hoc calibrated, while
-support, conflict, and confidence proxies provide an additional conservative discount;
-the resulting fusion weight is therefore a discount score, not itself a calibrated
-correctness probability.
+Observable monotonic reliability calibration:
 
-The final training config and API encoder consume at most 2048 API events per sample, and
-the canonical `config/build_pts.yaml` asks the direct extractor to retain at most 2048
-events per DEX. The actual content of already-generated PTs still depends on the
-extraction config recorded in their fingerprint, and multi-DEX aggregates are truncated
-to 2048 at dataset loading. Therefore, claim a 2048-event model input limit rather than
-claiming that every sample contains 2048 events. The dataset loader always requires
-schema 4, the direct-build fingerprint, complete top-level Manifest semantic fields, and
-the saved `observable-v1` metadata. Older or partially populated PT structures are
-rejected rather than repaired at runtime. Removed compatibility settings such as
-old-schema loading and resume overrides no longer exist; unknown data or execution
-settings fail fast instead of being silently ignored.
+- `no_reliability_calibration`: retain branch-temperature calibration but use
+  raw observable integrity as base reliability;
+- `integrity_alive_only`: remove cross-source support/conflict evidence and
+  explicit relation discounts, retaining integrity, availability, and confidence;
 
-## Observable Reliability Schema
+### Innovation I2
 
-The current main evidence is built from `observable-v1` extraction metadata. It separates:
+Cross-modal masked security-semantic reconstruction:
 
-- extraction integrity: `api_integrity`, `graph_integrity`, `manifest_integrity`, `code_integrity`;
-- semantic support/conflict: `api_graph_anchor_support`, `manifest_code_support`,
-  `manifest_to_code_conflict`, `code_to_manifest_conflict`;
-- raw availability: `api_alive`, `graph_alive`, `manifest_alive`.
+- remove the reconstruction mechanism;
+- mask-probability sensitivity at 0.05 and 0.30;
+- reconstruction-weight sensitivity at 0.01 and 0.05.
 
-`api_graph_anchor_support` is an API-to-call-graph anchor coverage signal, not an
-independent cross-modal consistency score. Main evidence never reads `pert_*`.
-Graph semantic reconstruction targets are API events explicitly anchored to graph
-methods; they are graph-context semantics, not independent graph-native labels.
+Masks are sampled only during training. A selected target modality is
+reconstructed from the other available, integrity-weighted modalities.
 
-The final ablation names are literal: `no_conflict_discount` removes only the explicit
-conflict multiplier, while the reliability calibrator may still learn from conflict
-evidence. `no_hard_alive_mask` removes both the explicit fusion mask and the calibrator's
-output alive mask. `no_discount_fusion` switches to the legacy learned gate, disables
-post-hoc calibration/rejection, and retains the same validation holdout for checkpoint
-selection.
+### Innovation I3
 
-An empty-but-successfully-parsed modality is not automatically incomplete. When
-the saved raw count is also zero, integrity remains high and the corresponding
-`*_alive` signal is zero. If raw content was observed but kept content is lost
-(for example API truncation), integrity decreases.
+Calibrated probability discount fusion and rejection:
 
-CSV partition isolation checks sample IDs and package names only; no other grouping
-column is read or used.
+- remove branch-temperature calibration;
+- remove explicit support discount;
+- remove explicit conflict discount;
+- remove entropy-margin confidence discount;
+- remove hard alive masking;
+- remove thresholded rejection;
+- remove all post-hoc calibration while retaining raw probability discount;
+- compare against learned observable-evidence logit fusion.
 
-Build strict tri-modal PT files with:
+`no_support_discount` and `no_conflict_discount` remove only explicit
+multipliers; the monotonic reliability calibrator can still use the
+corresponding observable evidence.
+
+### Training And Sensitivity
+
+- remove synthetic training degradation;
+- remove branch auxiliary supervision;
+- replace integrity-weighted branch auxiliary supervision with ordinary branch
+  auxiliary supervision;
+- treat unavailable relations as full positive support;
+- use product instead of minimum acceptance aggregation;
+- target selective coverage of 0.80 and 0.95.
+
+The acceptance-aggregation and coverage sensitivities are eval-only runs that
+reuse the calibrated `seed_42` checkpoint and refit only the rejection threshold
+on `val_calibration`. Run `python run.py seed` before `python run.py sensitivity`;
+the `paper` group already enforces this order.
+
+### Multi-seed
+
+The final method is repeated with seeds 42, 2024, and 3407. The validation
+holdout split remains fixed with `calibration.split_seed=42`.
+
+## Reporting
+
+Primary classification metrics:
+
+- macro-F1, accuracy, ROC-AUC, AP;
+- clean and every robustness scenario;
+- mean and standard deviation over the three final seeds.
+
+Calibration and selective metrics:
+
+- Brier score, ECE-10, confidence-accuracy gap;
+- coverage, selective risk, selective macro-F1, and AURC.
+
+Do not describe entropy/margin as calibrated uncertainty. It is a confidence
+proxy. Do not describe support/conflict-only ablations as removing those signals
+from the reliability calibrator unless the config explicitly disables relation
+evidence.
+
+Before training, validate observable-signal distributions and degradation trends:
 
 ```bash
-python scripts/build_tri_modal_pts_direct.py --config config/build_pts.yaml
+python scripts/diagnose_observable_signals.py --pt-dir D:/pts_robust/test --csv labels/test.csv --out-dir results/signal_diagnostics --split test --fail-on-check-error
 ```
 
-Signal diagnostics:
+Publication gaps not represented by runnable YAMLs yet:
 
-```bash
-python scripts/diagnose_observable_signals.py \
-  --pt-dir /path/to/pts \
-  --csv /path/to/labels.csv \
-  --split test \
-  --out-dir results/observable_diagnostics \
-  --strict-observable-schema
-```
-
-The diagnostic command writes distribution, trend, label-correlation, and output-check
-CSVs. Add `--fail-on-check-error` in automated runs to reject missing columns, non-finite
-values, out-of-range signals, invalid quantiles, or violated declared trend expectations.
-
-Because the current test split has already been inspected during development, publication
-claims require a newly locked final test or an external real-obfuscation/failure set.
+- external published malware-detection baselines;
+- paired real Obfuscapk evaluation. `config/extract_obfuscapk.yaml` is aligned
+  with the current PT protocol, but the paired APK/PT/CSV data is not present.

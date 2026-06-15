@@ -1,0 +1,8 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i3_no_selective_rejection
+
+selective_prediction:
+  enabled: false

@@ -1,8 +1,0 @@
-defaults:
-  - ./ours.yaml
-
-train:
-  exp_name: full_ours_no_branch_aux
-
-loss:
-  branch_aux_weight: 0.0

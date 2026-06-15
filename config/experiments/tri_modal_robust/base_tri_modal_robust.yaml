@@ -2,9 +2,9 @@ log_level: INFO
 
 data:
   root: ""
-  train_pt_dir: /root/autodl-tmp/pts/train
-  val_pt_dir: /root/autodl-tmp/pts/val
-  test_pt_dir: /pts/test
+  train_pt_dir: D:/pts_robust/train
+  val_pt_dir: D:/pts_robust/val
+  test_pt_dir: D:/pts_robust/test
   train_csv: labels/train.csv
   val_csv: labels/val.csv
   test_csv: labels/test.csv
@@ -14,6 +14,8 @@ data:
   graph_semantic_source: alignment
   strict_split_integrity: true
   strict_partition_isolation: true
+  # The curated CSV split is authoritative; extra unreferenced PTs are ignored.
+  allow_pt_superset: true
 
 train:
   exp_name: base_tri_modal_robust

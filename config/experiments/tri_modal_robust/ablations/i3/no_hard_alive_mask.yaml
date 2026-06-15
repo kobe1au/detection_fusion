@@ -1,0 +1,10 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i3_no_hard_alive_mask
+
+fusion:
+  use_hard_alive_mask: false
+  reliability_calibration:
+    apply_alive_mask: false

@@ -29,6 +29,7 @@ fusion:
   detach_discount: true
   detach_confidence_proxy: true
   use_confidence_proxy: true
+  use_support_discount: true
   use_conflict_discount: true
   use_hard_alive_mask: true
   acceptance_aggregation: min

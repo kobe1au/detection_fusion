@@ -40,6 +40,7 @@ from fusion.semantic_categories import (
 )
 from scripts.build_tri_modal_pts_direct import (
     PT_SCHEMA_VERSION,
+    _build_one,
     _build_fingerprint,
     _load_direct_config,
     _resume_existing,
@@ -1389,6 +1390,7 @@ def test_direct_resume_requires_matching_current_schema(tmp_path: Path):
     status, row = _resume_existing(job, cfg, "match")
     assert status is True
     assert row["status"] == "ok"
+    assert row["reason"] == ""
 
     status, row = _resume_existing(job, cfg, "different")
     assert status is False
@@ -1399,6 +1401,58 @@ def test_direct_resume_requires_matching_current_schema(tmp_path: Path):
     status, row = _resume_existing(job, cfg, "match")
     assert status is False
     assert row["status"] == "failed"
+
+
+def test_direct_build_clears_resume_mismatch_reason_after_success(
+    tmp_path: Path,
+    monkeypatch,
+):
+    out_dir = tmp_path / "train"
+    out_dir.mkdir()
+    path = out_dir / "abc.pt"
+    job = {"split": "train", "apk_path": str(tmp_path / "a.apk"), "sha256": "abc"}
+    cfg = {
+        "resume": True,
+        "out_dirs": {"train": out_dir},
+        "manifest_dim": 32,
+    }
+
+    stale = current_pt_payload(
+        {
+            "call_x": torch.ones(1, 8),
+            "call_edge_index": torch.empty((2, 0), dtype=torch.long),
+            "api_ids": torch.tensor([1]),
+            "api_type_ids": torch.tensor([1]),
+        }
+    )
+    stale["direct_build_meta"]["build_fingerprint"] = "stale"
+    torch.save(stale, path)
+
+    def fake_process_apk(*_args, **_kwargs):
+        current = current_pt_payload(stale["dex_list"], manifest_dim=32)
+        current["direct_build_meta"]["build_fingerprint"] = "temporary-code-stage"
+        torch.save(current, path)
+        return True, ""
+
+    monkeypatch.setattr(
+        "scripts.build_tri_modal_pts_direct.process_apk",
+        fake_process_apk,
+    )
+    result = _build_one(
+        job,
+        {"component_count": 1},
+        cfg,
+        {
+            "categories": list(DEFAULT_CATEGORIES),
+            "permission_vocab": [],
+            "intent_vocab": [],
+            "feature_vocab": [],
+        },
+        "current",
+    )
+
+    assert result["status"] == "ok"
+    assert result["reason"] == ""
 
 
 def test_failed_ratio_guard_rejects_silent_bad_sample_rate():

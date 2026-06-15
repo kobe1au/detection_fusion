@@ -1,0 +1,9 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i2_no_masked_semantic_reconstruction
+
+semantic_reconstruction:
+  enabled: false
+  weight: 0.0

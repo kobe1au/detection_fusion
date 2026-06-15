@@ -104,7 +104,7 @@ def _resume_existing(job: dict[str, Any], cfg: dict, build_fingerprint: str) -> 
             and observable_complete
             and payload_complete
         ):
-            return True, {**row, "status": "ok"}
+            return True, {**row, "status": "ok", "reason": ""}
         return False, {**row, "status": "failed", "reason": "schema or build fingerprint mismatch"}
     except Exception as exc:
         return False, {**row, "status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
@@ -390,7 +390,7 @@ def _build_one(
             }
         )
         atomic_torch_save(payload, path)
-        return {**row, "status": "ok"}
+        return {**row, "status": "ok", "reason": ""}
     except Exception as exc:
         return {**row, "status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
 

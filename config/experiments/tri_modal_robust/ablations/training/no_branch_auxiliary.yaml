@@ -1,0 +1,9 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: training_no_branch_auxiliary
+
+loss:
+  branch_aux_weight: 0.0
+  reliability_weighted_aux: false

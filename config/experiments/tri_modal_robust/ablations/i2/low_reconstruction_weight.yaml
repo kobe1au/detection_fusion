@@ -1,0 +1,8 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i2_low_reconstruction_weight
+
+semantic_reconstruction:
+  weight: 0.01

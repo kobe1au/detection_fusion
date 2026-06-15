@@ -254,12 +254,17 @@ def validate_split_partitions(cfg: dict, include_test: bool) -> None:
 
 def _checkpoint_semantic_signature(cfg: dict) -> dict[str, Any]:
     data_cfg = cfg.get("data", {}) or {}
+    fusion_cfg = copy.deepcopy(cfg.get("fusion", {}) or {})
+    # Acceptance aggregation changes rejection ranking only, not model state.
+    fusion_cfg.pop("acceptance_aggregation", None)
+    selective_cfg = cfg.get("selective_prediction", {}) or {}
     return {
         "model": copy.deepcopy(cfg.get("model", {}) or {}),
-        "fusion": copy.deepcopy(cfg.get("fusion", {}) or {}),
+        "fusion": fusion_cfg,
         "semantic_reconstruction": copy.deepcopy(cfg.get("semantic_reconstruction", {}) or {}),
         "calibration": copy.deepcopy(cfg.get("calibration", {}) or {}),
-        "selective_prediction": copy.deepcopy(cfg.get("selective_prediction", {}) or {}),
+        # Coverage changes only the validation-fitted rejection threshold.
+        "selective_prediction": {"enabled": bool(selective_cfg.get("enabled", False))},
         "data": {
             key: copy.deepcopy(data_cfg.get(key))
             for key in (
@@ -315,6 +320,7 @@ def _dataset_common_kwargs(
         "graph_semantic_source",
         "strict_split_integrity",
         "strict_partition_isolation",
+        "allow_pt_superset",
         "label_map",
     }
     unknown_data_keys = sorted(set(data_cfg) - allowed_data_keys)
@@ -342,7 +348,7 @@ def _dataset_common_kwargs(
         "num_classes": int(model_cfg.get("num_classes", 2)),
         "label_map": data_cfg.get("label_map"),
         "strict_split_integrity": bool(data_cfg.get("strict_split_integrity", True)),
-        "allow_pt_superset": False,
+        "allow_pt_superset": bool(data_cfg.get("allow_pt_superset", False)),
     }
 
 
@@ -1173,6 +1179,7 @@ def run(cfg: dict) -> dict[str, Any]:
     run_test = bool(eval_cfg.get("run_test", True))
     run_robust_test = bool(eval_cfg.get("run_robust_test", True))
     eval_only = bool(eval_cfg.get("eval_only", False))
+    refit_rejection_threshold = bool(eval_cfg.get("refit_rejection_threshold", False))
     tuning_mode = bool(train_cfg.get("tuning_mode", False))
     calibration_enabled = bool((cfg.get("calibration", {}) or {}).get("enabled", False))
     selective_enabled = bool((cfg.get("selective_prediction", {}) or {}).get("enabled", False))
@@ -1282,7 +1289,11 @@ def run(cfg: dict) -> dict[str, Any]:
         checkpoint_metric_name = str(ckpt.get("checkpoint_metric", "loaded_checkpoint"))
         calibration_summary = dict(ckpt.get("calibration") or {"enabled": False})
         rejection_threshold = ckpt.get("rejection_threshold")
-        if bool((cfg.get("selective_prediction", {}) or {}).get("enabled", False)) and rejection_threshold is None:
+        if (
+            bool((cfg.get("selective_prediction", {}) or {}).get("enabled", False))
+            and rejection_threshold is None
+            and not refit_rejection_threshold
+        ):
             raise ValueError(
                 "Selective eval-only mode requires rejection_threshold saved in the checkpoint"
             )
@@ -1378,11 +1389,11 @@ def run(cfg: dict) -> dict[str, Any]:
         dump_rows=True,
     )
     enforce_failed_ratio(val_calibration_metrics, cfg, "val_calibration")
-    if not eval_only:
+    if not eval_only or refit_rejection_threshold:
         rejection_threshold = fit_rejection_threshold(
             val_calibration_rows, cfg.get("selective_prediction", {}) or {}
         )
-        if best_path.exists():
+        if not eval_only and best_path.exists():
             ckpt = torch.load(best_path, map_location="cpu", weights_only=True)
             ckpt["model"] = model.state_dict()
             ckpt["calibration"] = calibration_summary

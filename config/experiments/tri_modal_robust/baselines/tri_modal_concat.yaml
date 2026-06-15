@@ -1,0 +1,8 @@
+defaults:
+  - ./_pure_representation_base.yaml
+
+train:
+  exp_name: baseline_tri_modal_concat
+
+model:
+  fusion_mode: tri_modal_concat

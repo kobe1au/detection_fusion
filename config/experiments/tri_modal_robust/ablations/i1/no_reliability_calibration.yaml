@@ -1,0 +1,10 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i1_no_reliability_calibration
+
+fusion:
+  reliability_calibration:
+    enabled: false
+    weight: 0.0

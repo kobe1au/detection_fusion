@@ -1,10 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import os
 import subprocess
 from pathlib import Path
-import yaml
 
 
 ROOT = Path(__file__).resolve().parent
@@ -14,181 +13,130 @@ PYTHON_BIN = os.getenv("PYTHON_BIN", "python")
 CONFIG_DIR = Path("config/experiments/tri_modal_robust")
 
 ALIASES = {
-    "api": "i1/api_only.yaml",
-    "graph": "i1/graph_only.yaml",
-    "manifest": "i1/manifest_only.yaml",
-    "api_graph": "i1/api_graph_concat.yaml",
-    "concat": "i1/tri_modal_concat.yaml",
-    "reliability": "i1/reliability_gate.yaml",
-    "fixed": "i3/fixed_gate.yaml",
-    "confidence": "i3/confidence_gate.yaml",
-    "learned_no_prior": "i3/learned_gate_no_prior.yaml",
-    "learned_with_prior": "i3/learned_gate_with_prior.yaml",
-    "learned_no_alive": "i3/learned_gate_no_alive_mask.yaml",
-    "consistency_evidence": "i2/consistency_evidence_only.yaml",
-    "conflict_evidence": "i2/conflict_evidence_only.yaml",
-    "full": "full/ours.yaml",
-    "ours": "full/ours.yaml",
     "final": "observable_reliability_discount_fusion.yaml",
+    "api": "baselines/api_only.yaml",
+    "graph": "baselines/graph_only.yaml",
+    "manifest": "baselines/manifest_only.yaml",
+    "api_graph": "baselines/api_graph_concat.yaml",
+    "concat": "baselines/tri_modal_concat.yaml",
+    "fixed": "baselines/fixed_logit_fusion.yaml",
+    "confidence": "baselines/confidence_logit_fusion.yaml",
+    "heuristic": "baselines/heuristic_reliability_logit_fusion.yaml",
+    "learned": "baselines/learned_evidence_logit_fusion.yaml",
 }
 
+BASELINES = [
+    "baselines/api_only.yaml",
+    "baselines/graph_only.yaml",
+    "baselines/manifest_only.yaml",
+    "baselines/api_graph_concat.yaml",
+    "baselines/tri_modal_concat.yaml",
+    "baselines/fixed_logit_fusion.yaml",
+    "baselines/confidence_logit_fusion.yaml",
+    "baselines/heuristic_reliability_logit_fusion.yaml",
+    "baselines/learned_evidence_logit_fusion.yaml",
+]
+
+I1_ABLATIONS = [
+    "ablations/i1/no_reliability_calibration.yaml",
+    "ablations/i1/integrity_alive_only.yaml",
+]
+
+I2_ABLATIONS = [
+    "ablations/i2/no_masked_semantic_reconstruction.yaml",
+    "ablations/i2/low_mask_probability.yaml",
+    "ablations/i2/high_mask_probability.yaml",
+    "ablations/i2/low_reconstruction_weight.yaml",
+    "ablations/i2/high_reconstruction_weight.yaml",
+]
+
+I3_ABLATIONS = [
+    "ablations/i3/no_probability_calibration.yaml",
+    "ablations/i3/no_support_discount.yaml",
+    "ablations/i3/no_conflict_discount.yaml",
+    "ablations/i3/no_confidence_proxy_discount.yaml",
+    "ablations/i3/no_hard_alive_mask.yaml",
+    "ablations/i3/no_selective_rejection.yaml",
+    "ablations/i3/raw_discount_no_posthoc_calibration.yaml",
+]
+
+TRAINING_ABLATIONS = [
+    "ablations/training/no_train_augmentation.yaml",
+    "ablations/training/no_branch_auxiliary.yaml",
+    "ablations/training/no_reliability_weighted_aux.yaml",
+]
+
+SENSITIVITY = [
+    "sensitivity/missing_relation_as_full_support.yaml",
+    "sensitivity/acceptance_product.yaml",
+    "sensitivity/coverage_80.yaml",
+    "sensitivity/coverage_95.yaml",
+]
+
+SEEDS = [
+    "seeds/seed_42.yaml",
+    "seeds/seed_2024.yaml",
+    "seeds/seed_3407.yaml",
+]
+
+FINAL = "observable_reliability_discount_fusion.yaml"
+
 GROUPS = {
-    "main": [
-        "observable_reliability_discount_fusion.yaml",
-        "full/ours.yaml",
-        "i1/api_only.yaml",
-        "i1/graph_only.yaml",
-        "i1/manifest_only.yaml",
-        "i1/api_graph_concat.yaml",
-        "i1/tri_modal_concat.yaml",
-        "i1/reliability_gate.yaml",
-        "i2/no_consistency.yaml",
-        "i2/consistency_evidence_only.yaml",
-        "i2/conflict_evidence_only.yaml",
-        "i2/evidence_only.yaml",
-        "i2/loss_only.yaml",
-        "i2/semantic_reconstruction_only.yaml",
-        "i2/evidence_plus_loss.yaml",
-        "i3/fixed_gate.yaml",
-        "i3/confidence_gate.yaml",
-        "i3/reliability_gate.yaml",
-        "i3/learned_gate_no_alive_mask.yaml",
-        "i3/learned_gate_no_prior.yaml",
-        "i3/learned_gate_with_prior.yaml",
-    ],
-    "i1": [
-        "i1/api_only.yaml",
-        "i1/graph_only.yaml",
-        "i1/manifest_only.yaml",
-        "i1/api_graph_concat.yaml",
-        "i1/tri_modal_concat.yaml",
-        "i1/reliability_gate.yaml",
-    ],
-    "i2": [
-        "i2/no_consistency.yaml",
-        "i2/consistency_evidence_only.yaml",
-        "i2/conflict_evidence_only.yaml",
-        "i2/evidence_only.yaml",
-        "i2/loss_only.yaml",
-        "i2/semantic_reconstruction_only.yaml",
-        "i2/evidence_plus_loss.yaml",
-    ],
-    "i3": [
-        "i3/fixed_gate.yaml",
-        "i3/confidence_gate.yaml",
-        "i3/reliability_gate.yaml",
-        "i3/learned_gate_no_alive_mask.yaml",
-        "i3/learned_gate_no_prior.yaml",
-        "i3/learned_gate_with_prior.yaml",
-    ],
-    "full_ablation": [
-        "full/ours.yaml",
-        "full/ours_no_aug.yaml",
-        "full/ours_no_cross_source_consistency.yaml",
-        "full/ours_no_gate_prior.yaml",
-        "full/ours_no_branch_aux.yaml",
-        "full/ours_graph_zero.yaml",
-        "full/ours_graph_full_api.yaml",
-    ],
-    "oracle_ablation": [
-        "full/ours_oracle_perturbation_evidence.yaml",
-    ],
-    "final_ablation": [
-        "observable_reliability_discount_fusion.yaml",
-        "ablations/no_reliability_weighted_aux.yaml",
-        "ablations/no_masked_semantic_reconstruction.yaml",
-        "ablations/high_masked_semantic_reconstruction.yaml",
-        "ablations/no_conflict_discount.yaml",
-        "ablations/no_hard_alive_mask.yaml",
-        "ablations/no_confidence_proxy_discount.yaml",
-        "ablations/no_discount_fusion.yaml",
-    ],
-    "seed": [
-        "final_seed/seed_42.yaml",
-        "final_seed/seed_2024.yaml",
-        "final_seed/seed_3407.yaml",
-    ],
-    "final_seed": [
-        "final_seed/seed_42.yaml",
-        "final_seed/seed_2024.yaml",
-        "final_seed/seed_3407.yaml",
-    ],
-    "legacy_seed": [
-        "seed/seed_42.yaml",
-        "seed/seed_2024.yaml",
-        "seed/seed_3407.yaml",
+    "main": [FINAL, *BASELINES],
+    "baselines": BASELINES,
+    "i1": [FINAL, *I1_ABLATIONS],
+    "i2": [FINAL, *I2_ABLATIONS],
+    "i3": [FINAL, "baselines/learned_evidence_logit_fusion.yaml", *I3_ABLATIONS],
+    "ablation": [FINAL, *I1_ABLATIONS, *I2_ABLATIONS, *I3_ABLATIONS, *TRAINING_ABLATIONS],
+    "training_ablation": [FINAL, *TRAINING_ABLATIONS],
+    "sensitivity": [SEEDS[0], *SENSITIVITY],
+    "seed": SEEDS,
+    "paper": [
+        *BASELINES,
+        *I1_ABLATIONS,
+        *I2_ABLATIONS,
+        *I3_ABLATIONS,
+        *TRAINING_ABLATIONS,
+        *SEEDS,
+        *SENSITIVITY,
     ],
 }
 
 
 def available_configs() -> dict[str, Path]:
     configs: dict[str, Path] = {}
+    stem_paths: dict[str, list[Path]] = {}
     for path in sorted(CONFIG_DIR.rglob("*.yaml")):
-        rel_parts = path.relative_to(CONFIG_DIR).parts
-        if path.name in {"base_tri_modal_robust.yaml", "optuna_base.yaml"}:
+        rel = path.relative_to(CONFIG_DIR)
+        if path.name == "base_tri_modal_robust.yaml" or path.stem.startswith("_"):
             continue
-        if "tune" in rel_parts:
-            continue
-        if "post_optuna" in rel_parts:
-            continue
-        if "oracle" in path.stem:
-            continue
-        if path.name.upper() == "README.MD":
-            continue
-        rel = path.relative_to(CONFIG_DIR).with_suffix("")
-        configs[str(rel).replace("\\", "/")] = path
-        if path.stem in configs and configs[path.stem] != path:
-            import warnings
-            warnings.warn(
-                f"Config stem collision: '{path.stem}' from '{rel}' is not reachable "
-                f"by stem lookup because the earlier entry "
-                f"'{configs[path.stem].relative_to(CONFIG_DIR)}' keeps that alias. "
-                "Use the relative config path to select the later entry."
-            )
-        configs.setdefault(path.stem, path)
+        key = rel.with_suffix("").as_posix()
+        configs[key] = path
+        stem_paths.setdefault(path.stem, []).append(path)
+    for stem, paths in stem_paths.items():
+        if len(paths) == 1:
+            configs[stem] = paths[0]
     return configs
 
 
+def _require_paths(group: str, relative_paths: list[str]) -> list[Path]:
+    paths = [CONFIG_DIR / item for item in relative_paths]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise ValueError(f"Experiment group '{group}' references missing configs: {missing}")
+    return paths
+
+
 def resolve_targets(target: str) -> list[Path]:
-    if target == "tune":
-        raise ValueError(
-            "Manual tune configs are excluded because they can mix tuning and final evaluation. "
-            "Use scripts/tune_robust_optuna.py."
-        )
     if target in GROUPS:
-        return [CONFIG_DIR / item for item in GROUPS[target]]
-    if target.startswith("post_optuna/"):
-        parts = target.split("/")
-        if len(parts) == 2:
-            groups_path = CONFIG_DIR / target / "groups.yaml"
-            selected_group = "full"
-        elif len(parts) == 3:
-            groups_path = CONFIG_DIR / "post_optuna" / parts[1] / "groups.yaml"
-            selected_group = parts[2]
-        else:
-            raise ValueError("Post-Optuna targets must be post_optuna/<tag> or post_optuna/<tag>/<group>")
-        if not groups_path.exists():
-            raise ValueError(f"Post-Optuna group file not found: {groups_path}")
-        groups = yaml.safe_load(groups_path.read_text(encoding="utf-8")) or {}
-        group_map = groups.get("groups") or {}
-        if selected_group == "all":
-            paths = [item for values in group_map.values() for item in values]
-        else:
-            if selected_group not in group_map:
-                raise ValueError(f"Unknown post-Optuna group '{selected_group}'. Known: {sorted(group_map)}")
-            paths = group_map[selected_group]
-        return [CONFIG_DIR / item for item in paths]
+        return _require_paths(target, GROUPS[target])
     if target == "all":
-        seen: set[Path] = set()
-        out: list[Path] = []
-        for path in available_configs().values():
-            resolved = path.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                out.append(path)
-        return out
+        return sorted(set(available_configs().values()))
     if target.endswith((".yaml", ".yml")):
-        return [Path(target)]
+        path = Path(target)
+        if not path.exists():
+            raise ValueError(f"Experiment config not found: {path}")
+        return [path]
     target = ALIASES.get(target, target)
     path = CONFIG_DIR / target
     if path.exists():
@@ -201,24 +149,20 @@ def resolve_targets(target: str) -> list[Path]:
 
 
 def resolve_target_specs(targets: list[str]) -> list[Path]:
-    parts: list[str] = []
-    for target in targets:
-        for part in str(target).split(","):
-            part = part.strip()
-            if part:
-                parts.append(part)
-    if not parts:
-        parts = ["final"]
-
+    parts = [
+        part.strip()
+        for target in (targets or ["final"])
+        for part in str(target).split(",")
+        if part.strip()
+    ]
     resolved: list[Path] = []
     seen: set[Path] = set()
     for part in parts:
         for path in resolve_targets(part):
             key = path.resolve()
-            if key in seen:
-                continue
-            seen.add(key)
-            resolved.append(path)
+            if key not in seen:
+                seen.add(key)
+                resolved.append(path)
     return resolved
 
 
@@ -236,23 +180,19 @@ def main() -> None:
         "target",
         nargs="*",
         default=["final"],
-        help=(
-            "Targets to run. Supports groups/aliases/YAML paths and comma lists, "
-            "e.g. 'i2,i3' or 'i2 i3'."
-        ),
+        help="Groups, aliases, YAML paths, or comma-separated targets.",
     )
-    parser.add_argument("--list", action="store_true", help="List robust experiment configs and exit.")
-    parser.add_argument("--dry-run", action="store_true", help="Print selected configs without launching training.")
+    parser.add_argument("--list", action="store_true", help="List runnable experiment configs.")
+    parser.add_argument("--dry-run", action="store_true", help="Print configs without training.")
     args = parser.parse_args()
 
     if args.list:
         seen: set[Path] = set()
         for path in sorted(available_configs().values()):
             resolved = path.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            print(path.relative_to(CONFIG_DIR).with_suffix("").as_posix() + f": {path}")
+            if resolved not in seen:
+                seen.add(resolved)
+                print(path.relative_to(CONFIG_DIR).with_suffix("").as_posix() + f": {path}")
         return
 
     targets = resolve_target_specs(args.target)
