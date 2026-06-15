@@ -43,6 +43,44 @@ def test_missing_manifest_branch_weight_is_zero():
     assert torch.equal(_run(evidence)["fusion_weight_manifest"], torch.zeros(2))
 
 
+def test_unavailable_api_graph_relation_does_not_penalize_api_discount():
+    low_support = _evidence(1)
+    low_support[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
+    low_support[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = 0.0
+    high_support = low_support.clone()
+    high_support[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = 1.0
+
+    assert torch.allclose(
+        _run(low_support)["discount_api"],
+        _run(high_support)["discount_api"],
+    )
+
+
+def test_unavailable_manifest_code_relation_does_not_penalize_manifest_discount():
+    low_support = _evidence(1)
+    low_support[:, EvidenceIndex.API_ALIVE] = 0.0
+    low_support[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
+    low_support[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = 0.0
+    high_support = low_support.clone()
+    high_support[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = 1.0
+
+    assert torch.allclose(
+        _run(low_support)["discount_manifest"],
+        _run(high_support)["discount_manifest"],
+    )
+
+
+def test_no_applicable_relation_does_not_apply_joint_support_penalty():
+    evidence = _evidence(1)
+    evidence[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
+    evidence[:, EvidenceIndex.MANIFEST_ALIVE] = 0.0
+    evidence[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = 0.0
+    evidence[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = 0.0
+
+    outputs = _run(evidence, config={"use_confidence_proxy": False})
+    assert outputs["discount_joint"].item() == outputs["total_reliability"].item()
+
+
 def test_high_manifest_conflict_reduces_manifest_discount():
     low = _evidence(1)
     high = low.clone()

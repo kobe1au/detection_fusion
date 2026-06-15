@@ -224,6 +224,11 @@ unchanged and adds three runtime/model-level mechanisms:
 - calibrated probability discount fusion with conflict applicability masks and
   validation-fitted selective rejection.
 
+The reliability calibrator uses observable parsing evidence only. Entropy/margin
+confidence proxies are applied later by discount fusion; they are not calibrator inputs.
+Masked semantic reconstruction is conditioned by observable integrity and availability,
+not by the post-hoc calibrated reliability outputs.
+
 The validation CSV is deterministically separated into disjoint `val_selection` and
 `val_calibration` subsets. Checkpoint selection and robust validation use only
 `val_selection`; after model selection, only the monotonic calibrators and branch
@@ -250,6 +255,21 @@ The main gate uses observable post-extraction integrity, support/conflict, and r
 signals. Synthetic `pert_*` values are diagnostics only. The former
 `full/ours_oracle_perturbation_evidence.yaml` entry is retained as a deprecated diagnostic
 config and no longer exposes perturbation strength to the model.
+
+Synthetic degradation augmentation remains enabled during training and robustness
+evaluation. The defensible claim is that fusion decisions never read synthetic
+perturbation labels or `pert_*` oracle metadata, not that training uses no synthetic
+degradation.
+
+Unavailable cross-modal relations do not apply support/conflict discount factors. In the
+monotonic calibrator they contribute no positive relation support
+(`missing_relation_support=0.0`), which is distinct from treating them as conflict.
+
+The final config currently consumes at most 1024 API events per sample and requires the
+observable schema, while retaining legacy PT compatibility. Increase the sequence limit
+or require PT schema 4 only after auditing the actual formal PT files; the current direct
+extractor is configured for at most 1024 events per DEX, so a blanket claim of 2048 events
+would not be justified by configuration alone.
 
 ## Observable Reliability Schema
 

@@ -45,7 +45,8 @@ class MonotonicBranchCalibrator(nn.Module):
 def build_monotonic_reliability_features(
     evidence: torch.Tensor,
     *,
-    neutral_support: float = 0.0,
+    missing_relation_support: float = 0.0,
+    neutral_support: float | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Build branch-specific features where larger always means more reliable."""
     if evidence.ndim != 2 or evidence.size(-1) < EvidenceIndex.BASE_DIM:
@@ -70,17 +71,22 @@ def build_monotonic_reliability_features(
     api_graph_applicable = api_alive & graph_alive
     manifest_code_applicable = manifest_alive & code_alive
 
-    neutral = torch.full_like(anchor_support, float(neutral_support))
+    if neutral_support is not None:
+        # Backward-compatible alias for older experiment configs/callers.
+        missing_relation_support = float(neutral_support)
+    missing_support = torch.full_like(anchor_support, float(missing_relation_support))
     # Unavailable relations contribute no positive evidence. Applicability is
     # kept as a diagnostic mask rather than treating missing counterparts as
     # either maximum support or maximum conflict.
-    anchor_good = torch.where(api_graph_applicable, anchor_support, neutral)
-    manifest_support_good = torch.where(manifest_code_applicable, manifest_support, neutral)
+    anchor_good = torch.where(api_graph_applicable, anchor_support, missing_support)
+    manifest_support_good = torch.where(
+        manifest_code_applicable, manifest_support, missing_support
+    )
     manifest_conflict_good = torch.where(
-        manifest_code_applicable, 1.0 - manifest_conflict, neutral
+        manifest_code_applicable, 1.0 - manifest_conflict, missing_support
     )
     code_conflict_good = torch.where(
-        manifest_code_applicable, 1.0 - code_conflict, neutral
+        manifest_code_applicable, 1.0 - code_conflict, missing_support
     )
 
     alive_float = torch.stack([api_alive, graph_alive, manifest_alive], dim=-1).float()
@@ -156,11 +162,18 @@ def build_monotonic_reliability_features(
 class MonotonicReliabilityCalibrator(nn.Module):
     """Four branch-specific monotonic correctness-probability estimators."""
 
-    def __init__(self, hidden_dim: int = 16, neutral_support: float = 0.0):
+    def __init__(
+        self,
+        hidden_dim: int = 16,
+        missing_relation_support: float = 0.0,
+        neutral_support: float | None = None,
+    ):
         super().__init__()
         if hidden_dim <= 0:
             raise ValueError("reliability_calibration.hidden_dim must be positive")
-        self.neutral_support = float(neutral_support)
+        if neutral_support is not None:
+            missing_relation_support = float(neutral_support)
+        self.missing_relation_support = float(missing_relation_support)
         self.branches = nn.ModuleDict(
             {
                 name: MonotonicBranchCalibrator(input_dim=5, hidden_dim=hidden_dim)
@@ -170,7 +183,7 @@ class MonotonicReliabilityCalibrator(nn.Module):
 
     def forward(self, evidence: torch.Tensor) -> dict[str, torch.Tensor]:
         features, diagnostics = build_monotonic_reliability_features(
-            evidence, neutral_support=self.neutral_support
+            evidence, missing_relation_support=self.missing_relation_support
         )
         outputs = dict(diagnostics)
         for name in BRANCH_NAMES:

@@ -43,7 +43,8 @@ fusion:
   reliability_calibration:
     enabled: true
     hidden_dim: 16
-    neutral_support: 0.0
+    # Unavailable relations provide no positive support to the calibrator.
+    missing_relation_support: 0.0
     loss: bce
     weight: 1.0
   probability_calibration:

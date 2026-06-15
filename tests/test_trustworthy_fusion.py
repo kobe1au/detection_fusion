@@ -5,7 +5,12 @@ from fusion.constants import EvidenceIndex
 from fusion.discount_fusion import DiscountProbabilityFusion
 from fusion.losses import compute_posthoc_calibration_loss
 from fusion.reliability_calibration import MonotonicReliabilityCalibrator
-from fusion.train import _selective_metrics, fit_rejection_threshold, split_validation_dataset
+from fusion.train import (
+    _selective_metrics,
+    _selective_ranking_metrics,
+    fit_rejection_threshold,
+    split_validation_dataset,
+)
 
 
 def _evidence(batch_size: int = 1) -> torch.Tensor:
@@ -177,3 +182,15 @@ def test_selective_metrics_are_undefined_when_every_sample_is_rejected():
     assert metrics["selective_acc"] is None
     assert metrics["selective_macro_f1"] is None
     assert metrics["aurc"] >= 0.0
+
+
+def test_threshold_free_selective_metrics_report_only_ranking_quality():
+    metrics = _selective_ranking_metrics(
+        labels=[0, 1],
+        preds=[0, 0],
+        acceptance_scores=[0.9, 0.1],
+    )
+
+    assert metrics["aurc"] >= 0.0
+    assert "coverage" not in metrics
+    assert "selective_risk" not in metrics

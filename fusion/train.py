@@ -761,16 +761,14 @@ def _selective_metrics(
     accepted = score >= float(threshold)
     coverage = float(accepted.mean())
     errors = (pred != y).astype(np.float64)
-    order = np.argsort(-score, kind="stable")
-    cumulative_risk = np.cumsum(errors[order]) / np.arange(1, len(errors) + 1)
     out = {
         "rejection_threshold": float(threshold),
         "coverage": coverage,
         "rejection_rate": float(1.0 - coverage),
         "num_accepted": int(accepted.sum()),
         "num_rejected": int((~accepted).sum()),
-        "aurc": float(cumulative_risk.mean()),
     }
+    out.update(_selective_ranking_metrics(labels, preds, acceptance_scores))
     if accepted.any():
         out.update(
             {
@@ -792,6 +790,28 @@ def _selective_metrics(
             }
         )
     return out
+
+
+def _selective_ranking_metrics(
+    labels: list[int],
+    preds: list[int],
+    acceptance_scores: list[float],
+) -> dict[str, float]:
+    """Report threshold-free selective-ranking quality."""
+    if not labels or len(acceptance_scores) != len(labels):
+        return {}
+    y = np.asarray(labels, dtype=np.int64)
+    pred = np.asarray(preds, dtype=np.int64)
+    score = np.nan_to_num(
+        np.asarray(acceptance_scores, dtype=np.float64),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    )
+    errors = (pred != y).astype(np.float64)
+    order = np.argsort(-score, kind="stable")
+    cumulative_risk = np.cumsum(errors[order]) / np.arange(1, len(errors) + 1)
+    return {"aurc": float(cumulative_risk.mean())}
 
 
 def fit_rejection_threshold(rows: list[dict[str, Any]], config: dict | None = None) -> float | None:
@@ -923,14 +943,16 @@ def evaluate(
     metrics["num_failed"] = int(num_failed)
     metrics["num_eval"] = int(len(labels_all))
     if len(acceptance_all) == len(labels_all):
-        metrics.update(
-            _selective_metrics(
-                labels_all,
-                preds_all,
-                acceptance_all,
-                selective_threshold if selective_threshold is not None else float("-inf"),
+        metrics.update(_selective_ranking_metrics(labels_all, preds_all, acceptance_all))
+        if selective_threshold is not None:
+            metrics.update(
+                _selective_metrics(
+                    labels_all,
+                    preds_all,
+                    acceptance_all,
+                    selective_threshold,
+                )
             )
-        )
     for key, total in diagnostic_sums.items():
         metrics[f"mean_{key}"] = total / max(diagnostic_counts.get(key, 0), 1)
     return metrics, rows

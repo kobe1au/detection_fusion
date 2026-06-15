@@ -84,7 +84,7 @@ def _available_pair_support(
 
 
 class DiscountProbabilityFusion(nn.Module):
-    """Rule-based probability-level fusion using observable reliability."""
+    """Calibrated monotonic probability discount fusion with rejection support."""
 
     def __init__(self, config: dict | None = None):
         super().__init__()
@@ -94,7 +94,12 @@ class DiscountProbabilityFusion(nn.Module):
         self.reliability_calibrator = (
             MonotonicReliabilityCalibrator(
                 hidden_dim=int(reliability_cfg.get("hidden_dim", 16)),
-                neutral_support=float(reliability_cfg.get("neutral_support", 0.0)),
+                missing_relation_support=float(
+                    reliability_cfg.get(
+                        "missing_relation_support",
+                        reliability_cfg.get("neutral_support", 0.0),
+                    )
+                ),
             )
             if bool(reliability_cfg.get("enabled", False))
             else None
@@ -202,8 +207,16 @@ class DiscountProbabilityFusion(nn.Module):
         neutral_value = float(support_cfg.get("neutral_value", 0.5))
         code_anchor_base = float(support_cfg.get("code_anchor_base", 0.5))
         manifest_support_base = float(support_cfg.get("manifest_support_base", 0.5))
-        code_anchor_factor = code_anchor_base + (1.0 - code_anchor_base) * anchor_support
-        manifest_support_factor = manifest_support_base + (1.0 - manifest_support_base) * manifest_support
+        code_anchor_factor = torch.where(
+            api_graph_applicable,
+            code_anchor_base + (1.0 - code_anchor_base) * anchor_support,
+            torch.ones_like(anchor_support),
+        )
+        manifest_support_factor = torch.where(
+            manifest_code_applicable,
+            manifest_support_base + (1.0 - manifest_support_base) * manifest_support,
+            torch.ones_like(manifest_support),
+        )
 
         conflict_min = float((cfg.get("conflict_factor", {}) or {}).get("min_value", 0.05))
         if use_conflict:
@@ -233,6 +246,12 @@ class DiscountProbabilityFusion(nn.Module):
             manifest_support,
             neutral_value,
         )
+        pair_support_applicable = api_graph_applicable | manifest_code_applicable
+        joint_support_factor = torch.where(
+            pair_support_applicable,
+            0.5 + 0.5 * pair_support,
+            torch.ones_like(pair_support),
+        )
         reliability_outputs: dict[str, torch.Tensor] = {}
         if self.reliability_calibrator is not None and self.calibration_active:
             reliability_outputs = self.reliability_calibrator(evidence)
@@ -256,7 +275,7 @@ class DiscountProbabilityFusion(nn.Module):
                 base_reliability[0] * code_anchor_factor * code_conflict_factor * confidence_factors[0],
                 base_reliability[1] * code_anchor_factor * code_conflict_factor * confidence_factors[1],
                 base_reliability[2] * manifest_support_factor * manifest_conflict_factor * confidence_factors[2],
-                base_reliability[3] * (0.5 + 0.5 * pair_support) * confidence_factors[3],
+                base_reliability[3] * joint_support_factor * confidence_factors[3],
             ],
             dim=-1,
         )
