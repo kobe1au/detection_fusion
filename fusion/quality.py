@@ -286,7 +286,7 @@ def compute_manifest_code_support_and_conflict(
     graph_counts: Any,
     manifest_counts: Any,
 ) -> tuple[float, float, float]:
-    """Return Manifest support and directional category-presence conflicts."""
+    """Return symmetric Manifest-Code support and directional conflicts."""
     def clean(value: Any) -> torch.Tensor:
         if not isinstance(value, torch.Tensor):
             return torch.empty((0,), dtype=torch.float32)
@@ -308,12 +308,12 @@ def compute_manifest_code_support_and_conflict(
     manifest_present = pad(manifest) > 0
     code_total = int(code_present.sum().item())
     manifest_total = int(manifest_present.sum().item())
+    intersection = int((manifest_present & code_present).sum().item())
+    union = int((manifest_present | code_present).sum().item())
+    support = intersection / union if union > 0 else 0.0
     if manifest_total <= 0:
-        support = 0.0
         manifest_to_code = 0.0
     else:
-        supported = int((manifest_present & code_present).sum().item())
-        support = supported / manifest_total
         manifest_to_code = int((manifest_present & ~code_present).sum().item()) / manifest_total
     code_to_manifest = (
         int((code_present & ~manifest_present).sum().item()) / code_total

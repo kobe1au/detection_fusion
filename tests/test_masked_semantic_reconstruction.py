@@ -115,6 +115,17 @@ def test_masked_reconstruction_logits_shape():
     assert outputs["recon_manifest_semantic_logits"].shape == (2, 12)
 
 
+def test_semantic_reconstruction_inputs_are_weighted_by_observable_integrity():
+    model = _model(mask_probs=(0.0, 0.0, 0.0))
+    batch = _model_batch()
+    batch.graph_integrity[0] = 0.0
+
+    _, outputs = model(batch)
+
+    assert outputs["semantic_source_weight_graph"][0].item() == 0.0
+    assert outputs["semantic_source_weight_graph"][1].item() == 1.0
+
+
 def test_masking_only_enabled_during_training():
     model = _model()
     model.train()

@@ -55,6 +55,16 @@ def test_missing_counterpart_does_not_increase_api_reliability():
     ).all()
 
 
+def test_calibrator_alive_mask_can_be_disabled_for_ablation():
+    evidence = _evidence()
+    evidence[:, EvidenceIndex.API_ALIVE] = 0.0
+    masked = MonotonicReliabilityCalibrator(hidden_dim=8, apply_alive_mask=True)
+    unmasked = MonotonicReliabilityCalibrator(hidden_dim=8, apply_alive_mask=False)
+
+    assert masked(evidence)["predicted_reliability_api"].item() == 0.0
+    assert unmasked(evidence)["predicted_reliability_api"].item() > 0.0
+
+
 def test_missing_manifest_disables_code_manifest_conflict_penalty():
     base = _evidence()
     base[:, EvidenceIndex.MANIFEST_ALIVE] = 0.0
@@ -67,6 +77,21 @@ def test_missing_manifest_disables_code_manifest_conflict_penalty():
     assert conflict_out["effective_conflict"].item() == 0.0
     assert conflict_out["discount_api"].item() == pytest.approx(base_out["discount_api"].item())
     assert conflict_out["discount_graph"].item() == pytest.approx(base_out["discount_graph"].item())
+
+
+def test_empty_manifest_code_semantic_relation_does_not_apply_explicit_discount():
+    evidence = _evidence()
+    evidence[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = 0.0
+    evidence[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 0.0
+    evidence[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 0.0
+
+    output = DiscountProbabilityFusion()(*_logits(), evidence)
+
+    assert output["manifest_code_relation_applicable"].item() == 0.0
+    assert output["effective_conflict"].item() == 0.0
+    assert output["discount_manifest"].item() == pytest.approx(
+        output["confidence_factor_manifest"].item()
+    )
 
 
 def test_posthoc_calibration_loss_updates_calibration_parameters():

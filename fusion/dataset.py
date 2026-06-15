@@ -47,6 +47,42 @@ VALID_GRAPH_SEMANTIC_SOURCES = ("alignment", "full_api", "zero")
 class FatalDatasetConfigError(RuntimeError):
     """Configuration/data schema error that must not be converted to a dummy sample."""
 
+
+def build_isolation_groups(
+    sample_sids: list[str],
+    packages: dict[str, str],
+    families: dict[str, str],
+) -> list[str]:
+    """Build connected groups so neither package nor family crosses a split."""
+    ignored_packages = {"", "nan", "none", "null"}
+    ignored_families = ignored_packages | {"benign", "goodware"}
+    parent = {sid: sid for sid in sample_sids}
+
+    def find(sid: str) -> str:
+        while parent[sid] != sid:
+            parent[sid] = parent[parent[sid]]
+            sid = parent[sid]
+        return sid
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    for values, ignored in ((packages, ignored_packages), (families, ignored_families)):
+        first_by_value: dict[str, str] = {}
+        for sid in sample_sids:
+            value = str(values.get(sid, "") or "").strip().lower()
+            if value in ignored:
+                continue
+            if value in first_by_value:
+                union(sid, first_by_value[value])
+            else:
+                first_by_value[value] = sid
+
+    return [f"isolation:{find(sid)}" for sid in sample_sids]
+
+
 def _precompute_category_maps_from_vocab(vocab_path: str | Path) -> dict | None:
     """Pre-compute Manifest semantic category maps from vocab for old-PT fallback.
 
@@ -554,18 +590,7 @@ class RobustTriModalDataset(Dataset):
             raise RuntimeError(f"No matching .pt samples found in {self.pt_dir} for {csv_path}")
         self.sample_sids = [sid for _, _, sid, _ in self.samples]
         self.sample_years = [year for _, _, _, year in self.samples]
-        self.sample_groups = [
-            (
-                f"family:{families.get(sid)}"
-                if families.get(sid) not in {"", "nan", "none", "null", "benign", "goodware"}
-                else (
-                    f"package:{groups.get(sid)}"
-                    if groups.get(sid) not in {"", "nan", "none", "null"}
-                    else f"sample:{sid}"
-                )
-            )
-            for sid in self.sample_sids
-        ]
+        self.sample_groups = build_isolation_groups(self.sample_sids, groups, families)
         self.feature_dim = self._infer_feature_dim(default_dim=515)
         logger.info("Loaded %d robust tri-modal samples from %s", len(self.samples), self.pt_dir)
 

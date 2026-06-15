@@ -65,22 +65,21 @@ def _mean_alive_integrity(
 
 
 def _available_pair_support(
-    alive_api: torch.Tensor,
-    alive_graph: torch.Tensor,
-    alive_manifest: torch.Tensor,
+    api_graph_available: torch.Tensor,
+    manifest_code_available: torch.Tensor,
     anchor_support: torch.Tensor,
     manifest_support: torch.Tensor,
-    neutral_value: float,
 ) -> torch.Tensor:
-    api_graph_available = alive_api & alive_graph
-    manifest_code_available = alive_manifest & (alive_api | alive_graph)
     pair_count = api_graph_available.to(anchor_support.dtype) + manifest_code_available.to(anchor_support.dtype)
     pair_sum = (
         anchor_support * api_graph_available.to(anchor_support.dtype)
         + manifest_support * manifest_code_available.to(anchor_support.dtype)
     )
-    neutral = torch.full_like(pair_sum, float(neutral_value))
-    return torch.where(pair_count > 0, pair_sum / pair_count.clamp_min(1.0), neutral)
+    return torch.where(
+        pair_count > 0,
+        pair_sum / pair_count.clamp_min(1.0),
+        torch.zeros_like(pair_sum),
+    )
 
 
 class DiscountProbabilityFusion(nn.Module):
@@ -100,6 +99,7 @@ class DiscountProbabilityFusion(nn.Module):
                         reliability_cfg.get("neutral_support", 0.0),
                     )
                 ),
+                apply_alive_mask=bool(reliability_cfg.get("apply_alive_mask", True)),
             )
             if bool(reliability_cfg.get("enabled", False))
             else None
@@ -201,12 +201,22 @@ class DiscountProbabilityFusion(nn.Module):
         alive_joint = alive_api | alive_graph | alive_manifest
         code_alive = alive_api | alive_graph
         api_graph_applicable = alive_api & alive_graph
-        manifest_code_applicable = alive_manifest & code_alive
+        manifest_code_relation_observed = (
+            (manifest_support > 0.0)
+            | (manifest_conflict > 0.0)
+            | (code_conflict > 0.0)
+        )
+        manifest_code_applicable = alive_manifest & code_alive & manifest_code_relation_observed
 
         support_cfg = cfg.get("support_factor", {}) or {}
-        neutral_value = float(support_cfg.get("neutral_value", 0.5))
         code_anchor_base = float(support_cfg.get("code_anchor_base", 0.5))
         manifest_support_base = float(support_cfg.get("manifest_support_base", 0.5))
+        for name, value in (
+            ("code_anchor_base", code_anchor_base),
+            ("manifest_support_base", manifest_support_base),
+        ):
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"fusion.support_factor.{name} must be within [0, 1]")
         code_anchor_factor = torch.where(
             api_graph_applicable,
             code_anchor_base + (1.0 - code_anchor_base) * anchor_support,
@@ -219,6 +229,8 @@ class DiscountProbabilityFusion(nn.Module):
         )
 
         conflict_min = float((cfg.get("conflict_factor", {}) or {}).get("min_value", 0.05))
+        if not math.isfinite(conflict_min) or not 0.0 <= conflict_min <= 1.0:
+            raise ValueError("fusion.conflict_factor.min_value must be within [0, 1]")
         if use_conflict:
             manifest_conflict_factor = torch.where(
                 manifest_code_applicable,
@@ -239,12 +251,10 @@ class DiscountProbabilityFusion(nn.Module):
             torch.stack([alive_api, alive_graph, alive_manifest], dim=-1),
         )
         pair_support = _available_pair_support(
-            alive_api,
-            alive_graph,
-            alive_manifest,
+            api_graph_applicable,
+            manifest_code_applicable,
             anchor_support,
             manifest_support,
-            neutral_value,
         )
         pair_support_applicable = api_graph_applicable | manifest_code_applicable
         joint_support_factor = torch.where(
@@ -358,8 +368,9 @@ class DiscountProbabilityFusion(nn.Module):
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             ),
-            "api_graph_conflict_applicable": api_graph_applicable.to(dtype=discounts.dtype),
+            "api_graph_support_applicable": api_graph_applicable.to(dtype=discounts.dtype),
             "manifest_code_conflict_applicable": manifest_code_applicable.to(dtype=discounts.dtype),
+            "manifest_code_relation_applicable": manifest_code_applicable.to(dtype=discounts.dtype),
         }
         outputs.update(reliability_outputs)
         for index, name in enumerate(BRANCH_NAMES):

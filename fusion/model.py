@@ -574,6 +574,9 @@ class TriModalRobustModel(nn.Module):
         api_alive: torch.Tensor,
         graph_alive: torch.Tensor,
         manifest_alive: torch.Tensor,
+        api_source_weight: torch.Tensor,
+        graph_source_weight: torch.Tensor,
+        manifest_source_weight: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         if not self.semantic_reconstruction_enabled:
             return {}
@@ -598,13 +601,21 @@ class TriModalRobustModel(nn.Module):
             mask_graph = torch.zeros(batch_size, device=device, dtype=torch.bool)
             mask_manifest = torch.zeros(batch_size, device=device, dtype=torch.bool)
 
-        def masked_input(z: torch.Tensor, alive: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        def masked_input(
+            z: torch.Tensor,
+            alive: torch.Tensor,
+            source_weight: torch.Tensor,
+            mask: torch.Tensor,
+        ) -> torch.Tensor:
             available = alive.view(batch_size, 1).bool() & ~mask.view(batch_size, 1)
-            return torch.where(available, z, torch.zeros_like(z))
+            weighted = z * source_weight.view(batch_size, 1).clamp(0.0, 1.0)
+            return torch.where(available, weighted, torch.zeros_like(z))
 
-        z_api_masked = masked_input(z_api, api_alive, mask_api)
-        z_graph_masked = masked_input(z_graph, graph_alive, mask_graph)
-        z_manifest_masked = masked_input(z_manifest, manifest_alive, mask_manifest)
+        z_api_masked = masked_input(z_api, api_alive, api_source_weight, mask_api)
+        z_graph_masked = masked_input(z_graph, graph_alive, graph_source_weight, mask_graph)
+        z_manifest_masked = masked_input(
+            z_manifest, manifest_alive, manifest_source_weight, mask_manifest
+        )
         return {
             "z_api": z_api,
             "z_graph": z_graph,
@@ -621,6 +632,9 @@ class TriModalRobustModel(nn.Module):
             "mask_api_semantic": mask_api.to(dtype=api_emb.dtype),
             "mask_graph_semantic": mask_graph.to(dtype=api_emb.dtype),
             "mask_manifest_semantic": mask_manifest.to(dtype=api_emb.dtype),
+            "semantic_source_weight_api": api_source_weight.view(-1),
+            "semantic_source_weight_graph": graph_source_weight.view(-1),
+            "semantic_source_weight_manifest": manifest_source_weight.view(-1),
         }
 
     @staticmethod
@@ -641,6 +655,27 @@ class TriModalRobustModel(nn.Module):
         if value.size(1) == 0:
             return torch.zeros((batch_size, 1), device=device, dtype=dtype)
         return value[:, :1].gt(0.0).to(dtype=dtype)
+
+    @staticmethod
+    def _observable_weight(
+        graph_data,
+        name: str,
+        legacy_quality_name: str,
+        batch_size: int,
+        device,
+        dtype,
+    ) -> torch.Tensor:
+        value = getattr(graph_data, name, None)
+        if not isinstance(value, torch.Tensor):
+            value = getattr(graph_data, legacy_quality_name, None)
+        if not isinstance(value, torch.Tensor):
+            return torch.ones((batch_size, 1), device=device, dtype=dtype)
+        value = value.to(device=device, dtype=dtype).view(batch_size, -1)
+        if value.size(1) == 0:
+            return torch.zeros((batch_size, 1), device=device, dtype=dtype)
+        return torch.nan_to_num(
+            value[:, :1].clamp(0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0
+        )
 
     def forward(
         self,
@@ -664,6 +699,15 @@ class TriModalRobustModel(nn.Module):
         )
         manifest_joint_mask = self._availability_mask(
             graph_data, "manifest_alive", "q_manifest", batch_size, device, dtype
+        )
+        api_semantic_weight = self._observable_weight(
+            graph_data, "api_integrity", "q_api", batch_size, device, dtype
+        )
+        graph_semantic_weight = self._observable_weight(
+            graph_data, "graph_integrity", "q_graph", batch_size, device, dtype
+        )
+        manifest_semantic_weight = self._observable_weight(
+            graph_data, "manifest_integrity", "q_manifest", batch_size, device, dtype
         )
         api_emb_for_joint = api_emb * api_joint_mask
         graph_emb_for_joint = graph_emb * graph_joint_mask
@@ -694,6 +738,9 @@ class TriModalRobustModel(nn.Module):
                 api_joint_mask,
                 graph_joint_mask,
                 manifest_joint_mask,
+                api_semantic_weight,
+                graph_semantic_weight,
+                manifest_semantic_weight,
             )
         )
 

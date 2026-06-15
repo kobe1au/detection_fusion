@@ -221,18 +221,20 @@ unchanged and adds three runtime/model-level mechanisms:
 
 - branch-specific monotonic reliability calibration from observable parsing evidence;
 - observable-integrity-conditioned masked security-semantic reconstruction regularization;
-- calibrated probability discount fusion with conflict applicability masks and
+- branch-temperature-calibrated probability discount fusion with relation-applicability masks and
   validation-fitted selective rejection.
 
 The reliability calibrator uses observable parsing evidence only. Entropy/margin
 confidence proxies are applied later by discount fusion; they are not calibrator inputs.
-Masked semantic reconstruction is conditioned by observable integrity and availability,
-not by the post-hoc calibrated reliability outputs.
+Masked semantic reconstruction is conditioned by observable integrity and availability:
+low-integrity source representations are attenuated before reconstruction and their
+supervision is down-weighted. It is not conditioned by the post-hoc calibrated reliability
+outputs. A reconstruction target may use either or both remaining reliable modalities.
 
 The validation CSV is deterministically separated into disjoint `val_selection` and
 `val_calibration` subsets. Checkpoint selection and robust validation use only
 `val_selection`; after model selection, only the monotonic calibrators and branch
-temperatures are fitted on `val_calibration`. Its acceptance-score quantile determines
+temperatures are fitted on the clean `val_calibration` subset. Its acceptance-score quantile determines
 the rejection threshold, which is persisted in the checkpoint. Test and robustness
 summaries report `coverage`, `selective_risk`, `selective_macro_f1`, and `aurc`.
 Because `val_calibration` is used both to fit calibration parameters and to choose the
@@ -261,15 +263,28 @@ evaluation. The defensible claim is that fusion decisions never read synthetic
 perturbation labels or `pert_*` oracle metadata, not that training uses no synthetic
 degradation.
 
-Unavailable cross-modal relations do not apply support/conflict discount factors. In the
-monotonic calibrator they contribute no positive relation support
-(`missing_relation_support=0.0`), which is distinct from treating them as conflict.
+Unavailable cross-modal relations do not apply explicit support/conflict discount
+factors. In the monotonic calibrator they contribute no positive relation evidence
+(`missing_relation_support=0.0`), so the learned reliability may still decrease because
+corroboration is absent even though no explicit conflict value or relation discount is
+applied. A Manifest-Code relation is also treated as unavailable when both sides are
+alive but neither side contains any category in the shared 12-D security-semantic space.
 
-The final config currently consumes at most 1024 API events per sample and requires the
-observable schema, while retaining legacy PT compatibility. Increase the sequence limit
-or require PT schema 4 only after auditing the actual formal PT files; the current direct
-extractor is configured for at most 1024 events per DEX, so a blanket claim of 2048 events
-would not be justified by configuration alone.
+`manifest_code_support` is the symmetric category-presence Jaccard overlap. The two
+conflict signals remain directional: Manifest categories unsupported by code and code
+categories unsupported by Manifest. Branch reliability is post-hoc calibrated, while
+support, conflict, and confidence proxies provide an additional conservative discount;
+the resulting fusion weight is therefore a discount score, not itself a calibrated
+correctness probability.
+
+The final training config and API encoder consume at most 2048 API events per sample, and
+the canonical `config/build_pts.yaml` asks the direct extractor to retain at most 2048
+events per DEX. The actual content of already-generated PTs still depends on the
+extraction config recorded in their fingerprint, and multi-DEX aggregates are truncated
+to 2048 at dataset loading. Therefore, claim a 2048-event model input limit rather than
+claiming that every sample contains 2048 events. The final config requires the observable
+schema while retaining legacy PT compatibility; require PT schema 4 only after auditing
+the actual formal PT files.
 
 ## Observable Reliability Schema
 
@@ -282,6 +297,15 @@ The current main evidence is built from `observable-v1` extraction metadata. It 
 
 `api_graph_anchor_support` is an API-to-call-graph anchor coverage signal, not an
 independent cross-modal consistency score. Main evidence never reads `pert_*`.
+Graph semantic reconstruction targets are API events explicitly anchored to graph
+methods; they are graph-context semantics, not independent graph-native labels.
+
+The final ablation names are literal: `no_conflict_discount` removes only the explicit
+conflict multiplier, while the reliability calibrator may still learn from conflict
+evidence. `no_hard_alive_mask` removes both the explicit fusion mask and the calibrator's
+output alive mask. `no_discount_fusion` switches to the legacy learned gate, disables
+post-hoc calibration/rejection, and retains the same validation holdout for checkpoint
+selection.
 
 An empty-but-successfully-parsed modality is not automatically incomplete. When
 the saved raw count is also zero, integrity remains high and the corresponding

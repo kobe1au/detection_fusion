@@ -45,13 +45,13 @@ fusion:
     hidden_dim: 16
     # Unavailable relations provide no positive support to the calibrator.
     missing_relation_support: 0.0
+    apply_alive_mask: true
     loss: bce
     weight: 1.0
   probability_calibration:
     enabled: true
     weight: 1.0
   support_factor:
-    neutral_value: 0.5
     manifest_support_base: 0.5
     code_anchor_base: 0.5
   conflict_factor:
@@ -75,7 +75,8 @@ calibration:
   lr: 0.001
   weight_decay: 0.0
   grad_clip: 5.0
-  include_robust_val: true
+  # Keep probability/reliability calibration tied to the clean held-out distribution.
+  include_robust_val: false
 
 selective_prediction:
   enabled: true

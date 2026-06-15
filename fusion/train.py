@@ -112,7 +112,9 @@ GATE_DIAGNOSTIC_KEYS = (
     "temperature_joint",
     "effective_manifest_to_code_conflict",
     "effective_code_to_manifest_conflict",
+    "api_graph_support_applicable",
     "manifest_code_conflict_applicable",
+    "manifest_code_relation_applicable",
     "total_reliability",
     "final_uncertainty_proxy",
     "effective_conflict",
@@ -969,6 +971,10 @@ def fit_posthoc_calibration(
     calibration_cfg = cfg.get("calibration", {}) or {}
     if not bool(calibration_cfg.get("enabled", False)):
         return {"enabled": False}
+    if str(getattr(model, "fusion_mode", "")) != "discount_probability":
+        raise ValueError(
+            "calibration.enabled=true requires model fusion_mode=discount_probability"
+        )
     parameters = list(model.calibration_parameters())
     if not parameters:
         raise ValueError(
@@ -1190,6 +1196,18 @@ def run(cfg: dict) -> dict[str, Any]:
     run_robust_test = bool(eval_cfg.get("run_robust_test", True))
     eval_only = bool(eval_cfg.get("eval_only", False))
     tuning_mode = bool(train_cfg.get("tuning_mode", False))
+    calibration_enabled = bool((cfg.get("calibration", {}) or {}).get("enabled", False))
+    selective_enabled = bool((cfg.get("selective_prediction", {}) or {}).get("enabled", False))
+    configured_fusion_mode = str((cfg.get("fusion", {}) or {}).get("mode", "")).lower()
+    model_fusion_mode = str((cfg.get("model", {}) or {}).get("fusion_mode", "")).lower()
+    discount_probability_mode = (
+        configured_fusion_mode == "discount_probability"
+        or (not configured_fusion_mode and model_fusion_mode == "discount_probability")
+    )
+    if (calibration_enabled or selective_enabled) and not discount_probability_mode:
+        raise ValueError(
+            "Post-hoc calibration and selective prediction require discount_probability fusion"
+        )
     gate_cfg = cfg.get("model", {}).get("gate", {}) or {}
     if bool(gate_cfg.get("use_perturbation_evidence", False)):
         raise ValueError(
@@ -1215,9 +1233,8 @@ def run(cfg: dict) -> dict[str, Any]:
 
     validate_split_partitions(cfg, include_test=run_test)
     val_ds = build_dataset(cfg, "val", is_train=False)
-    calibration_enabled = bool((cfg.get("calibration", {}) or {}).get("enabled", False))
-    selective_enabled = bool((cfg.get("selective_prediction", {}) or {}).get("enabled", False))
-    needs_validation_holdout = calibration_enabled or selective_enabled
+    holdout_enabled = bool((cfg.get("calibration", {}) or {}).get("holdout_enabled", False))
+    needs_validation_holdout = calibration_enabled or selective_enabled or holdout_enabled
     if needs_validation_holdout:
         val_selection_ds, val_calibration_ds, validation_split = split_validation_dataset(cfg, val_ds)
         selection_indices = list(validation_split["selection_indices"])

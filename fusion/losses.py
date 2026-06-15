@@ -91,6 +91,8 @@ def compute_reliability_calibration_loss(
         reliability = reliability.view(-1).float().clamp(1.0e-6, 1.0 - 1.0e-6)
         correctness = logits.detach().argmax(dim=-1).eq(labels.long()).float()
         weight = alive[name].view(-1).float()
+        if not bool((weight.sum() > 0).item()):
+            continue
         if loss_type == "brier":
             per_sample = (reliability - correctness).square()
         else:
@@ -126,6 +128,8 @@ def compute_probability_calibration_loss(
             continue
         per_sample = F.nll_loss(log_prob.float(), labels.long(), reduction="none")
         weight = alive[name].view(-1).float()
+        if not bool((weight.sum() > 0).item()):
+            continue
         denom = weight.sum().clamp_min(1.0)
         branch_loss = (per_sample * weight).sum() / denom
         losses.append(branch_loss)
@@ -147,6 +151,12 @@ def compute_posthoc_calibration_loss(
     probability_cfg = config.get("probability_calibration", {}) or {}
     reliability_weight = float(reliability_cfg.get("weight", 1.0))
     probability_weight = float(probability_cfg.get("weight", 1.0))
+    for name, value in (
+        ("reliability_calibration.weight", reliability_weight),
+        ("probability_calibration.weight", probability_weight),
+    ):
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"fusion.{name} must be finite and non-negative")
     reliability_loss, reliability_diag = compute_reliability_calibration_loss(
         outputs, labels, evidence, reliability_cfg
     )

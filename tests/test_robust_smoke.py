@@ -9,7 +9,12 @@ import yaml
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch, Data
 
-from fusion.dataset import FatalDatasetConfigError, RobustTriModalDataset, robust_collate_fn
+from fusion.dataset import (
+    FatalDatasetConfigError,
+    RobustTriModalDataset,
+    build_isolation_groups,
+    robust_collate_fn,
+)
 from fusion.gates import heuristic_reliability_gate
 from fusion.losses import compute_robust_loss
 from fusion.quality import compute_align_quality
@@ -70,6 +75,17 @@ def test_metrics_report_macro_f1_as_primary_f1():
     assert "brier" in metrics
     assert "ece_10" in metrics
     assert "mean_confidence" in metrics
+
+
+def test_internal_isolation_groups_connect_package_and_family_relations():
+    sids = ["a", "b", "c", "d"]
+    packages = {"a": "pkg-one", "b": "pkg-one", "c": "pkg-two", "d": "pkg-three"}
+    families = {"a": "fam-a", "b": "fam-b", "c": "fam-b", "d": "benign"}
+
+    groups = build_isolation_groups(sids, packages, families)
+
+    assert groups[0] == groups[1] == groups[2]
+    assert groups[3] != groups[0]
 
 
 def test_checkpoint_score_clean_and_robust_composite():
@@ -164,6 +180,20 @@ def test_tuning_mode_forbids_test_evaluation():
                     "run_robust_test": True,
                     "robust_val": {"enabled": True},
                 },
+            }
+        )
+
+
+def test_posthoc_calibration_requires_discount_probability_fusion():
+    with pytest.raises(ValueError, match="require discount_probability fusion"):
+        run_training(
+            {
+                "train": {"device": "cpu"},
+                "data": {},
+                "model": {"fusion_mode": "tri_modal_ours"},
+                "fusion": {"mode": "legacy_learned_gate"},
+                "calibration": {"enabled": True},
+                "eval": {"run_test": False, "run_robust_test": False},
             }
         )
 

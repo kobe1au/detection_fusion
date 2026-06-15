@@ -10,7 +10,7 @@ data:
   test_csv: labels/test.csv
   out_dir: results/tri_modal_robust
   max_failed_ratio: 0.0
-  max_api_events_per_sample: 1024
+  max_api_events_per_sample: 2048
   graph_semantic_source: alignment
   strict_split_integrity: true
   strict_partition_isolation: true
@@ -62,7 +62,7 @@ model:
     dropout: 0.15
     layers: 2
     heads: 4
-    max_seq_len: 1024
+    max_seq_len: 2048
 
   graph_encoder:
     type: gatv2

@@ -331,9 +331,10 @@ def test_manifest_support_and_directional_conflicts_are_separate():
     support, manifest_to_code, code_to_manifest = compute_manifest_code_support_and_conflict(
         api, graph, manifest
     )
-    assert support == pytest.approx(1.0)
+    assert support == pytest.approx(1.0 / 3.0)
     assert manifest_to_code == pytest.approx(0.0)
     assert code_to_manifest == pytest.approx(2.0 / 3.0)
+    assert support + manifest_to_code != pytest.approx(1.0)
 
 
 def test_alive_uses_raw_availability():

@@ -69,7 +69,12 @@ def build_monotonic_reliability_features(
     code_alive = api_alive | graph_alive
     joint_alive = code_alive | manifest_alive
     api_graph_applicable = api_alive & graph_alive
-    manifest_code_applicable = manifest_alive & code_alive
+    manifest_code_relation_observed = (
+        (manifest_support > 0.0)
+        | (manifest_conflict > 0.0)
+        | (code_conflict > 0.0)
+    )
+    manifest_code_applicable = manifest_alive & code_alive & manifest_code_relation_observed
 
     if neutral_support is not None:
         # Backward-compatible alias for older experiment configs/callers.
@@ -143,8 +148,9 @@ def build_monotonic_reliability_features(
         ),
     }
     diagnostics = {
-        "api_graph_conflict_applicable": api_graph_applicable.float(),
+        "api_graph_support_applicable": api_graph_applicable.float(),
         "manifest_code_conflict_applicable": manifest_code_applicable.float(),
+        "manifest_code_relation_applicable": manifest_code_applicable.float(),
         "effective_manifest_to_code_conflict": torch.where(
             manifest_code_applicable, manifest_conflict, torch.zeros_like(manifest_conflict)
         ),
@@ -167,13 +173,17 @@ class MonotonicReliabilityCalibrator(nn.Module):
         hidden_dim: int = 16,
         missing_relation_support: float = 0.0,
         neutral_support: float | None = None,
+        apply_alive_mask: bool = True,
     ):
         super().__init__()
         if hidden_dim <= 0:
             raise ValueError("reliability_calibration.hidden_dim must be positive")
         if neutral_support is not None:
             missing_relation_support = float(neutral_support)
+        if not 0.0 <= float(missing_relation_support) <= 1.0:
+            raise ValueError("reliability_calibration.missing_relation_support must be within [0, 1]")
         self.missing_relation_support = float(missing_relation_support)
+        self.apply_alive_mask = bool(apply_alive_mask)
         self.branches = nn.ModuleDict(
             {
                 name: MonotonicBranchCalibrator(input_dim=5, hidden_dim=hidden_dim)
@@ -188,7 +198,9 @@ class MonotonicReliabilityCalibrator(nn.Module):
         outputs = dict(diagnostics)
         for name in BRANCH_NAMES:
             alive = diagnostics[f"alive_{name}"]
-            reliability = self.branches[name](features[name]) * alive
+            reliability = self.branches[name](features[name])
+            if self.apply_alive_mask:
+                reliability = reliability * alive
             outputs[f"reliability_features_{name}"] = features[name]
             outputs[f"predicted_reliability_{name}"] = reliability
         return outputs
