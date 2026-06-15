@@ -6,4 +6,3 @@ train:
 
 loss:
   branch_aux_weight: 0.0
-  reliability_weighted_aux: false

@@ -1,0 +1,8 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i2_joint_only_cross_attention
+
+semantic_cross_attention:
+  attach_to_reconstruction: false

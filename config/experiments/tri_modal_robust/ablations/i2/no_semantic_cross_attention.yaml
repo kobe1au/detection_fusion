@@ -2,8 +2,7 @@ defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
 train:
-  exp_name: i2_no_masked_semantic_reconstruction
+  exp_name: i2_no_semantic_cross_attention
 
-semantic_reconstruction:
+semantic_cross_attention:
   enabled: false
-  weight: 0.0

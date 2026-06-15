@@ -1,5 +1,5 @@
 defaults:
-  - ./_pure_representation_base.yaml
+  - _pure_representation_base.yaml
 
 train:
   exp_name: baseline_api_only

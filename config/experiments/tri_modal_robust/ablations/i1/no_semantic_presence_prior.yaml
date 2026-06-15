@@ -1,0 +1,8 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i1_no_semantic_presence_prior
+
+semantic_cross_attention:
+  use_semantic_presence_prior: false

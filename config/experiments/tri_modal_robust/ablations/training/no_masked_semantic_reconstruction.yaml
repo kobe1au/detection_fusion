@@ -1,0 +1,12 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: training_no_masked_semantic_reconstruction
+
+semantic_reconstruction:
+  enabled: false
+  weight: 0.0
+
+semantic_cross_attention:
+  attach_to_reconstruction: false

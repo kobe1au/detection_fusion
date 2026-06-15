@@ -17,11 +17,7 @@ ALIASES = {
     "api": "baselines/api_only.yaml",
     "graph": "baselines/graph_only.yaml",
     "manifest": "baselines/manifest_only.yaml",
-    "api_graph": "baselines/api_graph_concat.yaml",
     "concat": "baselines/tri_modal_concat.yaml",
-    "fixed": "baselines/fixed_logit_fusion.yaml",
-    "confidence": "baselines/confidence_logit_fusion.yaml",
-    "heuristic": "baselines/heuristic_reliability_logit_fusion.yaml",
     "learned": "baselines/learned_evidence_logit_fusion.yaml",
 }
 
@@ -40,14 +36,18 @@ BASELINES = [
 I1_ABLATIONS = [
     "ablations/i1/no_reliability_calibration.yaml",
     "ablations/i1/integrity_alive_only.yaml",
+    "ablations/i1/no_semantic_presence_prior.yaml",
 ]
 
 I2_ABLATIONS = [
-    "ablations/i2/no_masked_semantic_reconstruction.yaml",
-    "ablations/i2/low_mask_probability.yaml",
-    "ablations/i2/high_mask_probability.yaml",
-    "ablations/i2/low_reconstruction_weight.yaml",
-    "ablations/i2/high_reconstruction_weight.yaml",
+    "ablations/i2/no_semantic_cross_attention.yaml",
+    "ablations/i2/plain_semantic_cross_attention.yaml",
+    "ablations/i2/no_cross_attention_reliability_bias.yaml",
+    "ablations/i2/no_cross_attention_support_bias.yaml",
+    "ablations/i2/no_cross_attention_conflict_bias.yaml",
+    "ablations/i2/no_cross_attention_relation_mask.yaml",
+    "ablations/i2/no_cross_attention_residual_tokens.yaml",
+    "ablations/i2/joint_only_cross_attention.yaml",
 ]
 
 I3_ABLATIONS = [
@@ -61,12 +61,17 @@ I3_ABLATIONS = [
 ]
 
 TRAINING_ABLATIONS = [
+    "ablations/training/no_masked_semantic_reconstruction.yaml",
     "ablations/training/no_train_augmentation.yaml",
     "ablations/training/no_branch_auxiliary.yaml",
     "ablations/training/no_reliability_weighted_aux.yaml",
 ]
 
 SENSITIVITY = [
+    "sensitivity/residual_tokens_2.yaml",
+    "sensitivity/residual_tokens_8.yaml",
+    "sensitivity/attention_heads_2.yaml",
+    "sensitivity/attention_heads_8.yaml",
     "sensitivity/missing_relation_as_full_support.yaml",
     "sensitivity/acceptance_product.yaml",
     "sensitivity/coverage_80.yaml",
@@ -87,10 +92,17 @@ GROUPS = {
     "i1": [FINAL, *I1_ABLATIONS],
     "i2": [FINAL, *I2_ABLATIONS],
     "i3": [FINAL, "baselines/learned_evidence_logit_fusion.yaml", *I3_ABLATIONS],
-    "ablation": [FINAL, *I1_ABLATIONS, *I2_ABLATIONS, *I3_ABLATIONS, *TRAINING_ABLATIONS],
+    "ablation": [
+        FINAL,
+        *I1_ABLATIONS,
+        *I2_ABLATIONS,
+        *I3_ABLATIONS,
+        *TRAINING_ABLATIONS,
+    ],
     "training_ablation": [FINAL, *TRAINING_ABLATIONS],
     "sensitivity": [SEEDS[0], *SENSITIVITY],
     "seed": SEEDS,
+    "full": SEEDS,
     "paper": [
         *BASELINES,
         *I1_ABLATIONS,
@@ -107,10 +119,10 @@ def available_configs() -> dict[str, Path]:
     configs: dict[str, Path] = {}
     stem_paths: dict[str, list[Path]] = {}
     for path in sorted(CONFIG_DIR.rglob("*.yaml")):
-        rel = path.relative_to(CONFIG_DIR)
+        relative = path.relative_to(CONFIG_DIR)
         if path.name == "base_tri_modal_robust.yaml" or path.stem.startswith("_"):
             continue
-        key = rel.with_suffix("").as_posix()
+        key = relative.with_suffix("").as_posix()
         configs[key] = path
         stem_paths.setdefault(path.stem, []).append(path)
     for stem, paths in stem_paths.items():

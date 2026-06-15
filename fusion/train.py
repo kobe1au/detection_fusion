@@ -121,6 +121,16 @@ GATE_DIAGNOSTIC_KEYS = (
     "acceptance_score",
     "calibration_active",
     "gate_uses_perturbation_evidence",
+    "semantic_cross_attention_enabled",
+    "mean_semantic_attention_entropy",
+    "mean_cross_modal_attention",
+    "semantic_residual_gate",
+    "mean_semantic_reliability_prior_api",
+    "mean_semantic_reliability_prior_graph",
+    "mean_semantic_reliability_prior_manifest",
+    "mean_semantic_attention_to_api",
+    "mean_semantic_attention_to_graph",
+    "mean_semantic_attention_to_manifest",
 )
 
 
@@ -262,6 +272,7 @@ def _checkpoint_semantic_signature(cfg: dict) -> dict[str, Any]:
         "model": copy.deepcopy(cfg.get("model", {}) or {}),
         "fusion": fusion_cfg,
         "semantic_reconstruction": copy.deepcopy(cfg.get("semantic_reconstruction", {}) or {}),
+        "semantic_cross_attention": copy.deepcopy(cfg.get("semantic_cross_attention", {}) or {}),
         "calibration": copy.deepcopy(cfg.get("calibration", {}) or {}),
         # Coverage changes only the validation-fitted rejection threshold.
         "selective_prediction": {"enabled": bool(selective_cfg.get("enabled", False))},
@@ -666,6 +677,7 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
         use_perturbation_evidence=bool(gate_cfg.get("use_perturbation_evidence", False)),
         apply_alive_mask_to_learned_gate=bool(gate_cfg.get("apply_alive_mask", True)),
         semantic_reconstruction_config=cfg.get("semantic_reconstruction", {}) or {},
+        semantic_cross_attention_config=cfg.get("semantic_cross_attention", {}) or {},
         discount_fusion_config=fusion_cfg,
     )
 

@@ -10,6 +10,22 @@ train:
 model:
   fusion_mode: discount_probability
 
+semantic_cross_attention:
+  enabled: true
+  dim: 128
+  num_heads: 4
+  num_security_tokens: 12
+  num_residual_tokens: 4
+  dropout: 0.1
+  residual_gate_init: -3.0
+  use_reliability_bias: true
+  use_support_bias: true
+  use_conflict_bias: true
+  use_relation_mask: true
+  use_semantic_presence_prior: true
+  attach_to_joint: true
+  attach_to_reconstruction: true
+
 semantic_reconstruction:
   enabled: true
   semantic_dim: 128

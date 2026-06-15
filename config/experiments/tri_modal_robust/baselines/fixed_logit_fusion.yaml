@@ -1,5 +1,5 @@
 defaults:
-  - ./_fusion_baseline_base.yaml
+  - _fusion_baseline_base.yaml
 
 train:
   exp_name: baseline_fixed_logit_fusion

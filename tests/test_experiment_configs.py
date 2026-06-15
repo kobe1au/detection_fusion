@@ -131,6 +131,49 @@ def test_enabled_masked_reconstruction_has_positive_weight():
             assert float(reconstruction.get("weight", 0.0)) > 0.0, path
 
 
+def test_full_method_enables_reliability_aware_semantic_cross_attention():
+    cfg = _resolved(ROOT / "observable_reliability_discount_fusion.yaml")
+    cross_attention = cfg["semantic_cross_attention"]
+    assert cross_attention["enabled"] is True
+    assert cross_attention["attach_to_joint"] is True
+    assert cross_attention["attach_to_reconstruction"] is True
+    assert cross_attention["use_reliability_bias"] is True
+    assert cross_attention["use_support_bias"] is True
+    assert cross_attention["use_conflict_bias"] is True
+    assert cross_attention["use_relation_mask"] is True
+    assert cross_attention["num_security_tokens"] == 12
+    assert cross_attention["num_residual_tokens"] > 0
+
+
+def test_i2_cross_attention_ablations_change_the_intended_mechanism():
+    disabled = _resolved(ROOT / "ablations/i2/no_semantic_cross_attention.yaml")
+    assert disabled["semantic_cross_attention"]["enabled"] is False
+
+    plain = _resolved(ROOT / "ablations/i2/plain_semantic_cross_attention.yaml")
+    for key in ("use_reliability_bias", "use_support_bias", "use_conflict_bias"):
+        assert plain["semantic_cross_attention"][key] is False
+
+    no_residual = _resolved(ROOT / "ablations/i2/no_cross_attention_residual_tokens.yaml")
+    assert no_residual["semantic_cross_attention"]["num_residual_tokens"] == 0
+
+    joint_only = _resolved(ROOT / "ablations/i2/joint_only_cross_attention.yaml")
+    assert joint_only["semantic_cross_attention"]["attach_to_joint"] is True
+    assert joint_only["semantic_cross_attention"]["attach_to_reconstruction"] is False
+
+
+def test_no_reconstruction_ablation_disconnects_reconstruction_path():
+    cfg = _resolved(ROOT / "ablations/training/no_masked_semantic_reconstruction.yaml")
+    assert cfg["semantic_reconstruction"]["enabled"] is False
+    assert cfg["semantic_reconstruction"]["weight"] == 0.0
+    assert cfg["semantic_cross_attention"]["attach_to_reconstruction"] is False
+
+
+def test_paper_plan_has_42_unique_runs():
+    paths = run.resolve_targets("paper")
+    assert len(paths) == 42
+    assert len({path.resolve() for path in paths}) == len(paths)
+
+
 def test_non_seed_experiments_have_unique_resolved_behavior():
     seen: dict[str, Path] = {}
     seed_paths = {path.resolve() for path in run.resolve_targets("seed")}

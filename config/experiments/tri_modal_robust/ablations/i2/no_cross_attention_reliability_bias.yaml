@@ -1,0 +1,8 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i2_no_cross_attention_reliability_bias
+
+semantic_cross_attention:
+  use_reliability_bias: false

@@ -1,0 +1,8 @@
+defaults:
+  - ../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: sensitivity_attention_heads_2
+
+semantic_cross_attention:
+  num_heads: 2

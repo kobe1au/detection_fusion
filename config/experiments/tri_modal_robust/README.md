@@ -1,29 +1,43 @@
-# Tri-modal Robust Fusion Experiment Plan
+# Reliability-Aware Tri-Modal Experiment Plan
 
-This plan is derived from the current implementation. It does not reuse the
-deleted legacy i1/i2/i3 experiment route.
+This experiment plan targets the current model with reliability-aware semantic
+Cross-Attention. It uses the existing schema-4 PT files and does not require PT
+regeneration.
 
 ## Fixed Protocol
 
-- Data: strict current schema-4 PTs and `labels/{train,val,test}.csv`.
-- CSV membership is authoritative; extra unreferenced PT files are ignored,
-  while missing/duplicate PTs still fail validation.
-- Split isolation: sample ID and package name must not overlap across splits.
-- Model input limit: at most 2048 API events per sample.
-- Checkpoint selection: robust-composite macro-F1 on `val_selection`.
-- Validation holdout: every runnable experiment uses the same deterministic
-  package-isolated 50/50 split of Val.
-- Post-hoc calibration: discount-fusion experiments with calibration enabled fit
-  reliability and/or branch temperatures on clean `val_calibration`; non-discount
-  baselines do not.
-- Test: clean test plus degradation strengths 0.1, 0.3, 0.5, 0.7, and 0.9,
-  and one run for each missing-modality scenario.
-- Synthetic degradation may be used for training and robustness evaluation, but
-  model evidence never reads `pert_*` metadata.
+- Data membership is defined by `labels/{train,val,test}.csv`.
+- All splits use strict schema-4 / observable-v1 PTs.
+- Sample ID and package name must not overlap across Train, Val, and Test.
+- At most 2048 API events are used per APK.
+- Val is deterministically split by package/sample group:
+  - `val_selection` selects the best checkpoint;
+  - `val_calibration` fits reliability, branch temperatures, and rejection threshold.
+- Checkpoint selection uses robust-composite Macro-F1 on `val_selection`.
+- Test includes clean data, five degradation strengths, and modality-missing cases.
+- Synthetic `pert_*` metadata is diagnostic-only and is never model evidence.
 
-## Experiment Groups
+## Current Full Method
 
-Run commands:
+`observable_reliability_discount_fusion.yaml` contains:
+
+1. observable evidence and monotonic branch-reliability calibration;
+2. observable-prior-constrained security-semantic Cross-Attention;
+3. calibrated probability discount fusion and selective rejection;
+4. masked semantic reconstruction using target-excluded enhanced sources;
+5. synthetic degradation training and reliability-weighted branch supervision.
+
+The Cross-Attention module:
+
+- preserves independent API, Graph, and Manifest branch logits;
+- enhances only the Joint branch;
+- uses 12 category-indexed learned security anchor tokens and 4 learned
+  residual tokens per modality;
+- injects observable reliability, support, conflict, and relation applicability;
+- blocks unavailable modalities as attention sources;
+- excludes the reconstruction target modality from enhanced reconstruction sources.
+
+## Run Groups
 
 ```bash
 python run.py final
@@ -32,28 +46,18 @@ python run.py i1
 python run.py i2
 python run.py i3
 python run.py training_ablation
-python run.py sensitivity
 python run.py seed
+python run.py sensitivity
 python run.py paper --dry-run
 ```
 
-`paper` contains 33 unique runs: all baselines, innovation/training ablations,
-sensitivity analyses, and three final-method seeds. `seeds/seed_42.yaml` is the
-final-method reference inside that group, so the root final config is not run
-twice.
+`paper` contains 42 unique runs. The final method is represented by the three
+seed configs and is not duplicated by the root final config.
 
-### Main Method
+## Baselines: 9 Runs
 
-`observable_reliability_discount_fusion.yaml` is the publication-facing method:
-
-1. observable monotonic branch-reliability calibration;
-2. observable-integrity-conditioned cross-modal masked semantic reconstruction;
-3. calibrated probability discount fusion with selective rejection.
-
-### Baselines
-
-Pure representation baselines disable final-method reconstruction, branch
-auxiliary loss, post-hoc calibration, and rejection:
+Representation baselines disable Cross-Attention, semantic reconstruction,
+branch auxiliary supervision, calibration, and rejection:
 
 - API only;
 - Graph only;
@@ -61,99 +65,125 @@ auxiliary loss, post-hoc calibration, and rejection:
 - API + Graph concatenation;
 - tri-modal concatenation.
 
-Fusion baselines retain the final method's representation training and replace
-only the final fusion/calibration/rejection stage:
+Fusion baselines retain the full representation-training path, including
+Cross-Attention, but replace probability discount fusion:
 
 - fixed equal-weight logit fusion;
 - confidence-weighted logit fusion;
 - heuristic observable-reliability logit fusion;
 - learned observable-evidence logit fusion.
 
-All baselines use the same `val_selection` subset as the final method.
+## Innovation I1: Observable Reliability Priors
 
-### Innovation I1
+Question: do observable relation evidence, branch calibration, and semantic
+presence priors improve reliability estimation and downstream robustness?
 
-Observable monotonic reliability calibration:
+- `no_reliability_calibration`: use raw observable integrity as base fusion reliability;
+- `integrity_alive_only`: remove relation support/conflict evidence from both
+  the evidence path and explicit final discounts;
+- `no_semantic_presence_prior`: use modality-level priors for all security
+  tokens instead of presence-modulated token priors.
 
-- `no_reliability_calibration`: retain branch-temperature calibration but use
-  raw observable integrity as base reliability;
-- `integrity_alive_only`: remove cross-source support/conflict evidence and
-  explicit relation discounts, retaining integrity, availability, and confidence;
+Report branch reliability Brier/ECE, correctness separation, fusion weights, and
+robust classification metrics.
 
-### Innovation I2
+The token-level value is an observable presence-modulated prior, not a
+post-hoc calibrated per-category correctness probability.
 
-Cross-modal masked security-semantic reconstruction:
+## Innovation I2: Reliability-Aware Semantic Cross-Attention
 
-- remove the reconstruction mechanism;
-- mask-probability sensitivity at 0.05 and 0.30;
-- reconstruction-weight sensitivity at 0.01 and 0.05.
+Question: does observable-prior-constrained semantic interaction outperform the
+old independent-joint path and ordinary Cross-Attention?
 
-Masks are sampled only during training. A selected target modality is
-reconstructed from the other available, integrity-weighted modalities.
+- `no_semantic_cross_attention`: restore the previous concatenation Joint branch;
+- `plain_semantic_cross_attention`: retain relation masking but remove
+  reliability/support/conflict attention biases;
+- `no_cross_attention_reliability_bias`;
+- `no_cross_attention_support_bias`;
+- `no_cross_attention_conflict_bias`;
+- `no_cross_attention_relation_mask`: unavailable sources remain blocked;
+- `no_cross_attention_residual_tokens`;
+- `joint_only_cross_attention`: do not attach target-excluded enhanced sources
+  to semantic reconstruction.
 
-### Innovation I3
+Report Joint-branch Macro-F1, final Macro-F1, missing-modality robustness,
+attention-to-modality means, attention entropy, and residual-gate value.
 
-Calibrated probability discount fusion and rejection:
+## Innovation I3: Calibrated Discount Fusion And Rejection
 
-- remove branch-temperature calibration;
-- remove explicit support discount;
-- remove explicit conflict discount;
-- remove entropy-margin confidence discount;
-- remove hard alive masking;
-- remove thresholded rejection;
-- remove all post-hoc calibration while retaining raw probability discount;
-- compare against learned observable-evidence logit fusion.
+Question: which final decision components improve calibration and selective risk?
 
-`no_support_discount` and `no_conflict_discount` remove only explicit
-multipliers; the monotonic reliability calibrator can still use the
-corresponding observable evidence.
+- `no_probability_calibration`;
+- `no_support_discount`;
+- `no_conflict_discount`;
+- `no_confidence_proxy_discount`;
+- `no_hard_alive_mask`;
+- `no_selective_rejection`;
+- `raw_discount_no_posthoc_calibration`;
+- comparison with `learned_evidence_logit_fusion`.
 
-### Training And Sensitivity
+`no_support_discount` and `no_conflict_discount` remove explicit final-discount
+multipliers only. Cross-Attention and the branch-reliability calibrator may still
+consume the corresponding observable evidence.
 
-- remove synthetic training degradation;
+## Training Ablations: 4 Runs
+
+- remove masked semantic reconstruction;
+- remove synthetic degradation training;
 - remove branch auxiliary supervision;
-- replace integrity-weighted branch auxiliary supervision with ordinary branch
-  auxiliary supervision;
-- treat unavailable relations as full positive support;
-- use product instead of minimum acceptance aggregation;
-- target selective coverage of 0.80 and 0.95.
+- replace reliability-weighted branch supervision with ordinary branch supervision.
 
-The acceptance-aggregation and coverage sensitivities are eval-only runs that
-reuse the calibrated `seed_42` checkpoint and refit only the rejection threshold
-on `val_calibration`. Run `python run.py seed` before `python run.py sensitivity`;
-the `paper` group already enforces this order.
+## Full Method: 3 Seeds
 
-### Multi-seed
+- seed 42;
+- seed 2024;
+- seed 3407.
 
-The final method is repeated with seeds 42, 2024, and 3407. The validation
-holdout split remains fixed with `calibration.split_seed=42`.
+Report mean and standard deviation. The validation holdout remains fixed with
+`calibration.split_seed=42`.
+
+## Sensitivity: 8 Runs
+
+Train new models for:
+
+- 2 and 8 residual tokens, compared with the default 4;
+- 2 and 8 attention heads, compared with the default 4;
+- unavailable relation treated as full support in the post-hoc calibrator.
+
+Reuse the calibrated seed-42 checkpoint and refit only the rejection threshold for:
+
+- product acceptance aggregation;
+- target coverage 0.80;
+- target coverage 0.95.
+
+Run `python run.py seed` before decision-only sensitivity experiments. The
+`paper` group already enforces the required order.
 
 ## Reporting
 
-Primary classification metrics:
+Classification and robustness:
 
-- macro-F1, accuracy, ROC-AUC, AP;
-- clean and every robustness scenario;
-- mean and standard deviation over the three final seeds.
+- Macro-F1, accuracy, ROC-AUC, AP;
+- clean and every synthetic degradation/missing scenario;
+- per-branch and final predictions.
 
-Calibration and selective metrics:
+Calibration and selective prediction:
 
-- Brier score, ECE-10, confidence-accuracy gap;
-- coverage, selective risk, selective macro-F1, and AURC.
+- Brier, ECE-10, confidence-accuracy gap;
+- coverage, selective risk, selective Macro-F1, AURC.
 
-Do not describe entropy/margin as calibrated uncertainty. It is a confidence
-proxy. Do not describe support/conflict-only ablations as removing those signals
-from the reliability calibrator unless the config explicitly disables relation
-evidence.
+Cross-Attention analysis:
 
-Before training, validate observable-signal distributions and degradation trends:
+- mean semantic reliability prior per modality;
+- mean attention received by each source modality;
+- mean cross-modal attention and attention entropy;
+- behavior under missing modalities and high Manifest-Code conflict.
 
-```bash
-python scripts/diagnose_observable_signals.py --pt-dir D:/pts_robust/test --csv labels/test.csv --out-dir results/signal_diagnostics --split test --fail-on-check-error
-```
+## Required External Validation
 
-Publication gaps not represented by runnable YAMLs yet:
+The runnable YAMLs still do not prove real-world robustness. Publication
+experiments should additionally include:
 
-- external published malware-detection baselines;
-- paired real Obfuscapk evaluation. `config/extract_obfuscapk.yaml` is aligned
-  with the current PT protocol, but the paired APK/PT/CSV data is not present.
+- paired original/Obfuscapk APK evaluation;
+- naturally packed or partially unparseable APK evaluation;
+- external published malware-detection baselines.

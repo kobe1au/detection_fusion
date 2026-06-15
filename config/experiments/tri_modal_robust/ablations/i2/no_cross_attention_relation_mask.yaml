@@ -1,0 +1,8 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: i2_no_cross_attention_relation_mask
+
+semantic_cross_attention:
+  use_relation_mask: false

@@ -1,8 +1,8 @@
 defaults:
   - ../observable_reliability_discount_fusion.yaml
 
-model:
-  fusion_mode: tri_modal_ours
+semantic_cross_attention:
+  enabled: false
 
 semantic_reconstruction:
   enabled: false
