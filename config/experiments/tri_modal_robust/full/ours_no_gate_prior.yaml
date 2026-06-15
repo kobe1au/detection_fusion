@@ -1,0 +1,8 @@
+defaults:
+  - ./ours.yaml
+
+train:
+  exp_name: full_ours_no_gate_prior
+
+loss:
+  gate_prior_weight: 0.0

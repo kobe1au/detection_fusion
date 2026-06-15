@@ -1,0 +1,9 @@
+defaults:
+  - ../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: no_conflict_discount
+
+fusion:
+  use_conflict_discount: false
+

@@ -1,0 +1,7 @@
+defaults:
+  - ../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: observable_reliability_discount_fusion_seed_42
+  seed: 42
+  deterministic: true

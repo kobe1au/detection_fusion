@@ -1,0 +1,8 @@
+defaults:
+  - ./ours.yaml
+
+train:
+  exp_name: full_ours_graph_zero
+
+data:
+  graph_semantic_source: zero

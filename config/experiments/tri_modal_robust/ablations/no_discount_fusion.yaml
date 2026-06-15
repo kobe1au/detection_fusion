@@ -1,0 +1,12 @@
+defaults:
+  - ../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: no_discount_fusion
+
+model:
+  fusion_mode: tri_modal_ours
+
+fusion:
+  mode: legacy_learned_gate
+

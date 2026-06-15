@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python -m py_compile \"fusion\\\\mm_dataset.py\" \"fusion\\\\train.py\" \"fusion\\\\complementarity.py\")",
+      "PowerShell(py -3 -m py_compile \"fusion\\\\mm_dataset.py\" \"fusion\\\\train.py\" \"fusion\\\\complementarity.py\")",
+      "WebSearch",
+      "WebFetch(domain:scholar.google.com)",
+      "PowerShell(New-Item -ItemType Directory -Force -Path \"d:\\\\code\\\\detection\\\\config\\\\final\")",
+      "Bash(python -m pytest tests/test_robust_smoke.py -x -q)",
+      "Bash(where python *)",
+      "Bash(ls /c/Python*/python.exe /c/Users/lau/AppData/Local/Programs/Python/*/python.exe)",
+      "Read(//c/ProgramData/Anaconda3/**)",
+      "Bash(conda info *)",
+      "Bash(/d/software/env/miniconda3/python.exe -m pytest tests/test_robust_smoke.py -x -q)",
+      "Read(//d/software/env/miniconda3/envs//**)",
+      "Bash(/d/software/env/miniconda3/Scripts/conda.exe env *)",
+      "Bash(/d/software/env/miniconda3/envs/malware/python.exe -m pytest tests/test_robust_smoke.py -x -q)",
+      "Bash(/d/software/env/miniconda3/envs/malware/python.exe -m pytest tests/test_robust_smoke.py -q --basetemp=D:/code/detection/.pytest_tmp -p no:cacheprovider)",
+      "Bash(/d/software/env/miniconda3/envs/malware/python.exe -m pytest tests/test_robust_smoke.py --basetemp=D:/code/detection/.pytest_tmp -p no:cacheprovider -v)",
+      "Bash(git -C \"D:/code/detection\" status)",
+      "Bash(git -C \"D:/code/detection\" diff HEAD -- fusion/robust/perturbations.py)"
+    ]
+  }
+}

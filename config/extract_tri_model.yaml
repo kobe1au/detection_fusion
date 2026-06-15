@@ -1,0 +1,64 @@
+data:
+  # Splits may live on different drives. These paths are the canonical APK sources.
+  split_dirs:
+    train: "E:/resource/train"
+    val: "C:/val"
+    test: "D:/resource/test"
+  # Metadata outputs, manifest jsonl files, index CSV, and default .pt root.
+  out_root: "C:/pts_tri"
+  # Final .pt outputs are also split across drives to avoid filling C:.
+  out_dirs:
+    train: "E:/pts_tri/train"
+    val: "C:/pts_tri/val"
+    test: "D:/pts_tri/test"
+  splits: ["train", "val", "test"]
+
+hyperparameters:
+  # Keep consistent with extract/extract_graph_api.py graph feature definition.
+  vocab_size: 256
+
+graph:
+  sensitive_hops: 1
+  # Keep Graph node features structural. Subgraph selection still uses
+  # sensitive API seeds, so Graph is contextual rather than API-independent.
+  use_behavior_hints: false
+  max_methods_per_dex: 4096
+  fallback_max_methods: 512
+  fallback_policy: api_rich
+
+api:
+  num_hash_buckets: 8192
+  max_events_per_dex: 1024
+  max_events_per_method: 32
+  event_scope: all_methods
+  framework_only: true
+  include_descriptor: false
+
+manifest:
+  # Built from train split only when rebuild_vocab=true or the file does not exist.
+  vocab_path: "C:/pts_tri/manifest_vocab.yaml"
+  rebuild_vocab: true
+  allow_empty_vocab: false
+  manifest_dim: 256
+  max_permissions: 128
+  max_intents: 64
+  max_features: 32
+  save_manifest_jsonl: true
+  # Empty means out_root/_manifest_jsonl.
+  manifest_jsonl_dir: ""
+
+storage:
+  keep_method_names: false
+  keep_api_tokens: false
+
+execution:
+  workers: 4
+  # rebuild_vocab=true is intentionally incompatible with resume=true.
+  resume: false
+  # Legacy PTs without a build fingerprint are rejected during resume by
+  # default, preventing silent mixtures of extraction schemas.
+  allow_legacy_resume: false
+  # Failed APKs are recorded in the index/failed list. Filter CSVs after generation.
+  fail_on_error: false
+  # Empty means out_root/failed_tri_modal_direct.json.
+  failed_json: ""

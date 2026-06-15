@@ -1,0 +1,7 @@
+defaults:
+  - ../full/ours.yaml
+
+train:
+  exp_name: seed_3407_full_ours
+  seed: 3407
+  deterministic: true

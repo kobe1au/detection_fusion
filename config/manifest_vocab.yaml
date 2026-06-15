@@ -1,0 +1,16 @@
+categories:
+  - network
+  - sms
+  - location
+  - contacts
+  - storage
+  - telephony
+  - camera_media
+  - receiver
+  - component_exposure
+  - dynamic_loading
+  - crypto
+  - system_settings
+permission_vocab: []
+intent_vocab: []
+feature_vocab: []

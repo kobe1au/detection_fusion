@@ -1,0 +1,7 @@
+defaults:
+  - ../full/ours.yaml
+
+train:
+  exp_name: seed_2024_full_ours
+  seed: 2024
+  deterministic: true

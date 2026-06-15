@@ -1,0 +1,123 @@
+# configs/build_pts_observable_v1.yaml
+
+data:
+  # 要处理哪些 split
+  splits:
+    - train
+    - val
+    - test
+
+  # 每个目录里直接放 .apk 文件
+  split_dirs:
+    train: E:/train
+    val: E:/val
+    test: E:/test
+
+  # 新 PT 输出根目录
+  # 最终会输出：
+  # /root/autodl-tmp/pts_observable_v1/train/*.pt
+  # /root/autodl-tmp/pts_observable_v1/val/*.pt
+  # /root/autodl-tmp/pts_observable_v1/test/*.pt
+  out_root: D:/pts_robust
+
+
+hyperparameters:
+  # 图节点局部 CFG 特征的 hashing 维度
+  # 代码中 graph feature 基础维度与 vocab_size 有关
+  vocab_size: 256
+
+
+graph:
+  # 围绕敏感方法向外扩展几跳
+  sensitive_hops: 1
+
+  # 每个 dex 最多保留多少个方法节点
+  max_methods_per_dex: 4096
+
+  # 如果没有敏感 seed，用 fallback 策略保留多少方法
+  fallback_max_methods: 512
+
+  # 可选：api_rich / all_capped / empty_dex
+  # 推荐 api_rich：没有敏感 seed 时，优先保留 API 行为更丰富的方法
+  fallback_policy: api_rich
+
+  # 是否给 graph node 加轻量 API 行为提示
+  # commit2 以后建议 true，因为它能帮助 graph branch 获得行为上下文
+  use_behavior_hints: true
+
+
+api:
+  # API token hash bucket 数
+  num_hash_buckets: 8192
+
+  # 每个 dex 最多保留多少 API event
+  # 1024 比较省显存，但容易截断；正式实验可以考虑 2048 或 4096
+  max_events_per_dex: 2048
+
+  # 每个 method 最多保留多少 API event
+  max_events_per_method: 32
+
+  # all_methods：API 序列来自全部方法
+  # graph_methods：只来自进入 graph 子图的方法
+  # 推荐 all_methods，避免 API 分支过度依赖 graph 子图
+  event_scope: all_methods
+
+  # 是否只保留 framework API
+  framework_only: true
+
+  # token 里是否包含 descriptor
+  # false 更稳，hash 碰撞/稀疏程度低一些
+  include_descriptor: false
+
+
+manifest:
+  # Manifest 词表保存路径
+  vocab_path: D:/pts_robust/manifest_vocab.yaml
+
+  # 第一次正式重新生成 PT 时用 true
+  # 它会只从 train split 构建 vocab，避免 val/test 泄漏
+  rebuild_vocab: false
+
+  # 正式实验必须 false
+  allow_empty_vocab: false
+
+  # Manifest 向量维度
+  # 默认 128 permissions + 64 intents + 32 features + 12 categories + 11 stats = 247
+  # 所以 256 刚好够。
+  # 如果你增大 max_permissions / max_intents / max_features，要同步增大 manifest_dim。
+  manifest_dim: 256
+
+  max_permissions: 128
+  max_intents: 64
+  max_features: 32
+
+  # 保存每个 split 的 Manifest jsonl，便于检查
+  save_manifest_jsonl: true
+  manifest_jsonl_dir: D:/pts_robust/_manifest_jsonl
+
+
+storage:
+  # 正式大规模生成建议 false，节省空间
+  keep_method_names: false
+  keep_api_tokens: false
+
+
+execution:
+  # 第一次正式生成建议 false，避免复用旧 PT
+  resume: true
+
+  # 正式实验必须 false，避免旧 schema PT 混进来
+  allow_legacy_resume: false
+
+  # split 目录为空时是否允许继续
+  allow_empty_splits: false
+
+  # 有失败 APK 时最终直接报错
+  fail_on_error: false
+
+  # 并行进程数
+  # 先用 4 或 8，太大可能被内存/IO/androguard 拖慢
+  workers: 8
+
+  # 失败记录输出
+  failed_json: D:/pts_robust/failed_tri_modal_direct.json

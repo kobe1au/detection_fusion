@@ -1,0 +1,49 @@
+data:
+  # APK root should contain train/val/test subdirectories.
+  apk_root: "D:/src"
+  out_root: "C:/pts"
+  splits: ["train"]
+
+hyperparameters:
+  # Keep consistent with the current graph feature definition:
+  # call_x = 256 mean opcode hist + 256 max opcode hist + 3 CFG stats
+  # Optional +4 API-derived behavior hints are disabled in the canonical setup.
+  vocab_size: 256
+
+graph:
+  # Keep the graph centered around methods that call sensitive framework APIs.
+  sensitive_hops: 1
+  # Keep Graph node features structural; subgraph selection remains API-seeded.
+  use_behavior_hints: false
+  # Safety cap for very large DEX files.
+  max_methods_per_dex: 4096
+  # If no sensitive seed exists, keep API-rich methods rather than dropping the DEX.
+  fallback_max_methods: 512
+  # api_rich keeps API-rich methods and records fallback_used in metadata.
+  # all_capped keeps the first fallback_max_methods methods.
+  # empty_dex writes an empty DEX placeholder when no sensitive seed exists.
+  fallback_policy: api_rich
+
+api:
+  # Stable hashing avoids building a train/test-leaking API vocabulary.
+  num_hash_buckets: 8192
+  # Keep API sequence compact; increase to 2048 if memory is stable.
+  max_events_per_dex: 1024
+  max_events_per_method: 32
+  # all_methods keeps the global API behavior sequence even when graph keeps
+  # only a sensitive subgraph. graph_methods is stricter but loses behavior.
+  event_scope: all_methods
+  # Keep framework/library behavior calls, not app-internal method names.
+  framework_only: true
+  # false is more robust across Android versions and reduces hash sparsity.
+  include_descriptor: false
+
+storage:
+  keep_method_names: false
+  # Set true only for debugging/interpreting extracted API tokens.
+  keep_api_tokens: false
+
+execution:
+  workers: 8
+  # Keep false when regenerating a dataset or write to a fresh out_root.
+  resume: false

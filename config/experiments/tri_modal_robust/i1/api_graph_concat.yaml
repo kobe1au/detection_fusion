@@ -1,0 +1,20 @@
+defaults:
+  - ../base_tri_modal_robust.yaml
+
+train:
+  exp_name: i1_api_graph_concat
+
+model:
+  fusion_mode: api_graph_concat
+  gate:
+    use_consistency_evidence: false
+    use_conflict_evidence: false
+
+loss:
+  branch_aux_weight: 0.0
+  semantic_reconstruction_weight: 0.0
+  cross_source_consistency_weight: 0.0
+  gate_prior_weight: 0.0
+
+robust:
+  train_aug: false

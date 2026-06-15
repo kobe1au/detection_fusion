@@ -1,0 +1,55 @@
+class ArchitectureConstants:
+    HEAD_HIDDEN_DIMS = [256, 128]
+    HEAD_DROPOUT_RATES = [0.3, 0.2]
+    HEAD_DROPOUT = 0.2
+
+    GATE_HIDDEN_DIM = 128
+    GATE_INIT_BIAS = 0.0
+    GATE_JOINT_INIT_BIAS = 0.5
+
+    MODALITY_ALIVE_THRESHOLD = 0.01
+
+
+class QualityConstants:
+    API_COUNT_NORM = 128.0
+    API_DIVERSITY_SCALE = 2.0
+    API_COUNT_WEIGHT = 0.35
+    API_DIVERSITY_WEIGHT = 0.25
+    API_COVERAGE_WEIGHT = 0.25
+    API_TYPE_WEIGHT = 0.15
+
+    GRAPH_NODE_NORM = 32.0
+    GRAPH_NODE_WEIGHT = 0.35
+    GRAPH_EDGE_WEIGHT = 0.35
+    GRAPH_FEATURE_WEIGHT = 0.30
+
+    ALIGN_NODE_COVER_WEIGHT = 0.5
+    ALIGN_API_COVER_WEIGHT = 0.5
+
+class GateConstants:
+    NUM_BRANCHES = 4
+    UNIFORM_BRANCH_WEIGHT = 0.25
+    EPS = 1e-8
+
+
+class EvidenceIndex:
+    API_INTEGRITY = 0
+    GRAPH_INTEGRITY = 1
+    MANIFEST_INTEGRITY = 2
+    CODE_INTEGRITY = 3
+    API_GRAPH_ANCHOR_SUPPORT = 4
+    MANIFEST_CODE_SUPPORT = 5
+    MANIFEST_TO_CODE_CONFLICT = 6
+    CODE_TO_MANIFEST_CONFLICT = 7
+    API_ALIVE = 8
+    GRAPH_ALIVE = 9
+    MANIFEST_ALIVE = 10
+
+    BASE_DIM = 11
+
+    # Compatibility aliases for old gate/loss code. They point only to
+    # observable integrity/support fields and never to synthetic pert_*.
+    R_API = API_INTEGRITY
+    R_GRAPH = GRAPH_INTEGRITY
+    R_MANIFEST = MANIFEST_INTEGRITY
+    Q_ALIGN = API_GRAPH_ANCHOR_SUPPORT

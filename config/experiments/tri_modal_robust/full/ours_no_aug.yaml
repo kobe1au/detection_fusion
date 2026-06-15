@@ -1,0 +1,8 @@
+defaults:
+  - ./ours.yaml
+
+train:
+  exp_name: full_ours_no_aug
+
+robust:
+  train_aug: false

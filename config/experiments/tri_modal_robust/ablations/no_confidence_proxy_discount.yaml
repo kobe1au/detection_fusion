@@ -1,0 +1,9 @@
+defaults:
+  - ../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: no_confidence_proxy_discount
+
+fusion:
+  use_confidence_proxy: false
+
