@@ -48,6 +48,14 @@ DEFAULT_ROBUST_VAL_SCENARIOS = (
 )
 
 
+BRANCH_EVAL_LOGIT_KEYS = {
+    "api": "api_logits_aux",
+    "graph": "graph_logits_aux",
+    "manifest": "manifest_logits_aux",
+    "joint": "joint_logits_aux",
+}
+
+
 class EmptyExtraEvalSetError(RuntimeError):
     """Raised when an optional external eval set has no usable samples."""
 
@@ -742,6 +750,104 @@ def _metrics(labels: list[int], probs: list[float], preds: list[int]) -> dict[st
     return out
 
 
+def _calibration_ece(
+    scores: np.ndarray,
+    correctness: np.ndarray,
+    bins: int = 10,
+) -> float:
+    if scores.size == 0:
+        return 0.0
+    ece = 0.0
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        if hi >= 1.0:
+            mask = (scores >= lo) & (scores <= hi)
+        else:
+            mask = (scores >= lo) & (scores < hi)
+        if not np.any(mask):
+            continue
+        ece += float(mask.mean()) * abs(
+            float(scores[mask].mean()) - float(correctness[mask].mean())
+        )
+    return float(ece)
+
+
+def _branch_prediction_row(
+    extra: dict[str, Any],
+    labels: torch.Tensor,
+    index: int,
+) -> dict[str, float | int]:
+    row: dict[str, float | int] = {}
+    label = int(labels[index].detach().cpu().item())
+    for branch, key in BRANCH_EVAL_LOGIT_KEYS.items():
+        branch_logits = extra.get(key)
+        if not isinstance(branch_logits, torch.Tensor):
+            continue
+        if branch_logits.ndim != 2 or branch_logits.size(0) <= index or branch_logits.size(1) < 2:
+            continue
+        logits_i = branch_logits.float()[index]
+        prob_i = torch.softmax(logits_i, dim=-1)
+        pred_i = int(logits_i.argmax(dim=-1).detach().cpu().item())
+        row[f"{branch}_prob"] = float(prob_i[1].detach().cpu().item())
+        row[f"{branch}_pred"] = pred_i
+        row[f"{branch}_correct"] = int(pred_i == label)
+        row[f"{branch}_confidence"] = float(prob_i.max().detach().cpu().item())
+    return row
+
+
+def _finite_row_float(row: dict[str, Any], key: str) -> float | None:
+    try:
+        value = float(row[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, float | int]:
+    """Compare calibrated branch reliability against branch correctness."""
+    out: dict[str, float | int] = {}
+    for branch in BRANCH_EVAL_LOGIT_KEYS:
+        reliability_values: list[float] = []
+        correctness_values: list[float] = []
+        for row in rows:
+            reliability = _finite_row_float(row, f"predicted_reliability_{branch}")
+            correctness = _finite_row_float(row, f"{branch}_correct")
+            if reliability is None or correctness is None:
+                continue
+            reliability_values.append(min(1.0, max(0.0, reliability)))
+            correctness_values.append(1.0 if correctness >= 0.5 else 0.0)
+        count = len(reliability_values)
+        out[f"{branch}_reliability_count"] = count
+        if count == 0:
+            continue
+        reliability_arr = np.asarray(reliability_values, dtype=np.float64)
+        correctness_arr = np.asarray(correctness_values, dtype=np.float64)
+        out[f"{branch}_reliability_brier"] = float(
+            np.mean((reliability_arr - correctness_arr) ** 2)
+        )
+        out[f"{branch}_reliability_ece_10"] = _calibration_ece(
+            reliability_arr,
+            correctness_arr,
+            bins=10,
+        )
+        out[f"{branch}_reliability_mean"] = float(reliability_arr.mean())
+        out[f"{branch}_branch_accuracy"] = float(correctness_arr.mean())
+        out[f"{branch}_reliability_accuracy_gap"] = float(
+            reliability_arr.mean() - correctness_arr.mean()
+        )
+        if len(set(correctness_values)) > 1:
+            out[f"{branch}_reliability_auc"] = float(
+                roc_auc_score(correctness_arr, reliability_arr)
+            )
+            out[f"{branch}_reliability_ap"] = float(
+                average_precision_score(correctness_arr, reliability_arr)
+            )
+        else:
+            out[f"{branch}_reliability_auc"] = 0.0
+            out[f"{branch}_reliability_ap"] = 0.0
+    return out
+
+
 def _selective_metrics(
     labels: list[int],
     preds: list[int],
@@ -911,6 +1017,7 @@ def evaluate(
                     "correct": int(pred[i].detach().cpu().item() == labels[i].detach().cpu().item()),
                     "year": int(batch.get("years")[i].detach().cpu().item()) if batch.get("years") is not None else 0,
                 }
+                row.update(_branch_prediction_row(extra, labels, i))
                 if isinstance(acceptance, torch.Tensor) and acceptance.numel() > i:
                     acceptance_i = float(acceptance.view(-1)[i].detach().cpu().item())
                     row["acceptance_score"] = acceptance_i
@@ -955,6 +1062,8 @@ def evaluate(
             )
     for key, total in diagnostic_sums.items():
         metrics[f"mean_{key}"] = total / max(diagnostic_counts.get(key, 0), 1)
+    if rows:
+        metrics.update(compute_branch_reliability_metrics(rows))
     return metrics, rows
 
 

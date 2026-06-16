@@ -6,8 +6,10 @@ from fusion.discount_fusion import DiscountProbabilityFusion
 from fusion.losses import compute_posthoc_calibration_loss
 from fusion.reliability_calibration import MonotonicReliabilityCalibrator
 from fusion.train import (
+    _branch_prediction_row,
     _selective_metrics,
     _selective_ranking_metrics,
+    compute_branch_reliability_metrics,
     fit_rejection_threshold,
     split_validation_dataset,
 )
@@ -219,3 +221,45 @@ def test_threshold_free_selective_metrics_report_only_ranking_quality():
     assert metrics["aurc"] >= 0.0
     assert "coverage" not in metrics
     assert "selective_risk" not in metrics
+
+
+def test_branch_prediction_row_records_per_branch_correctness():
+    extra = {
+        "api_logits_aux": torch.tensor([[-2.0, 2.0], [3.0, -3.0]]),
+        "graph_logits_aux": torch.tensor([[3.0, -3.0], [-2.0, 2.0]]),
+        "manifest_logits_aux": torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+        "joint_logits_aux": torch.tensor([[-1.0, 1.0], [1.0, -1.0]]),
+    }
+    labels = torch.tensor([1, 0])
+
+    first = _branch_prediction_row(extra, labels, 0)
+    second = _branch_prediction_row(extra, labels, 1)
+
+    assert first["api_pred"] == 1
+    assert first["api_correct"] == 1
+    assert first["graph_pred"] == 0
+    assert first["graph_correct"] == 0
+    assert first["api_prob"] > 0.9
+    assert first["api_confidence"] > 0.9
+    assert second["joint_pred"] == 0
+    assert second["joint_correct"] == 1
+
+
+def test_branch_reliability_metrics_compare_reliability_to_branch_correctness():
+    rows = [
+        {"api_correct": 1, "predicted_reliability_api": 0.9},
+        {"api_correct": 1, "predicted_reliability_api": 0.8},
+        {"api_correct": 0, "predicted_reliability_api": 0.2},
+        {"api_correct": 0, "predicted_reliability_api": 0.1},
+        {"graph_correct": 1, "predicted_reliability_graph": 0.4},
+    ]
+
+    metrics = compute_branch_reliability_metrics(rows)
+
+    assert metrics["api_reliability_count"] == 4
+    assert metrics["api_reliability_auc"] == pytest.approx(1.0)
+    assert metrics["api_reliability_brier"] == pytest.approx(0.025)
+    assert metrics["api_branch_accuracy"] == pytest.approx(0.5)
+    assert metrics["api_reliability_mean"] == pytest.approx(0.5)
+    assert metrics["graph_reliability_count"] == 1
+    assert metrics["graph_reliability_auc"] == 0.0
