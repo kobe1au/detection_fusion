@@ -152,9 +152,13 @@ def _finite_binary(values: pd.Series) -> np.ndarray:
 def _safe_auc(correctness: np.ndarray, scores: np.ndarray) -> float:
     return (
         float(roc_auc_score(correctness, scores))
-        if len(set(correctness.tolist())) > 1
-        else 0.0
+        if _auc_defined(correctness)
+        else float("nan")
     )
+
+
+def _auc_defined(correctness: np.ndarray) -> bool:
+    return len(set(correctness.tolist())) > 1
 
 
 def _safe_ap(correctness: np.ndarray, scores: np.ndarray) -> float:
@@ -182,6 +186,7 @@ def reliability_table(frame: pd.DataFrame) -> pd.DataFrame:
                 continue
             scores = data[reliability_key].astype(float).clip(0.0, 1.0).to_numpy()
             correctness = _finite_binary(data[correct_key])
+            auc_defined = _auc_defined(correctness)
             records.append(
                 {
                     **base,
@@ -192,6 +197,7 @@ def reliability_table(frame: pd.DataFrame) -> pd.DataFrame:
                     "reliability_accuracy_gap": float(scores.mean() - correctness.mean()),
                     "brier": float(np.mean((scores - correctness) ** 2)),
                     "ece_10": _ece(scores, correctness, bins=10),
+                    "auc_defined": int(auc_defined),
                     "auc": _safe_auc(correctness, scores),
                     "ap": _safe_ap(correctness, scores),
                 }
@@ -267,7 +273,23 @@ def _tercile_labels(values: pd.Series) -> pd.Series:
     return labels
 
 
-def evidence_bin_effects_table(frame: pd.DataFrame) -> pd.DataFrame:
+def _assign_evidence_bins(
+    frame: pd.DataFrame,
+    evidence: str,
+    group_columns: list[str],
+    bin_scope: str,
+) -> pd.Series:
+    if bin_scope not in {"global", "group"}:
+        raise ValueError("bin_scope must be 'global' or 'group'")
+    if bin_scope == "global" or not group_columns:
+        return _tercile_labels(frame[evidence])
+    labels = pd.Series(index=frame.index, dtype="object")
+    for _, group_frame in frame.groupby(group_columns, dropna=False):
+        labels.loc[group_frame.index] = _tercile_labels(group_frame[evidence])
+    return labels
+
+
+def evidence_bin_effects_table(frame: pd.DataFrame, bin_scope: str = "global") -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     frame = _with_derived_evidence(frame)
     group_columns = ["experiment", "seed", "diagnostic_file", "split"]
@@ -276,7 +298,12 @@ def evidence_bin_effects_table(frame: pd.DataFrame) -> pd.DataFrame:
         if evidence not in frame.columns:
             continue
         working = frame.copy()
-        working["evidence_bin"] = _tercile_labels(working[evidence])
+        working["evidence_bin"] = _assign_evidence_bins(
+            working,
+            evidence,
+            available_groups,
+            bin_scope,
+        )
         working = working.dropna(subset=["evidence_bin"])
         if working.empty:
             continue
@@ -438,6 +465,15 @@ def main() -> None:
     parser.add_argument("--seed", nargs="*", default=None)
     parser.add_argument("--split", nargs="*", default=None)
     parser.add_argument("--diagnostic-file", nargs="*", default=None)
+    parser.add_argument(
+        "--bin-scope",
+        choices=("global", "group"),
+        default="global",
+        help=(
+            "Use one evidence-binning threshold globally after filtering, or "
+            "separate thresholds inside each experiment/seed/split group."
+        ),
+    )
     parser.add_argument("--fail-if-empty", action="store_true")
     args = parser.parse_args()
 
@@ -470,7 +506,10 @@ def main() -> None:
         raise RuntimeError("No diagnostics remained after filtering.")
     _write_csv(reliability_table(frame), Path(args.out_dir) / "i1_reliability_calibration.csv")
     _write_csv(evidence_group_table(frame), Path(args.out_dir) / "i1_evidence_groups.csv")
-    _write_csv(evidence_bin_effects_table(frame), Path(args.out_dir) / "i1_evidence_bin_effects.csv")
+    _write_csv(
+        evidence_bin_effects_table(frame, bin_scope=args.bin_scope),
+        Path(args.out_dir) / "i1_evidence_bin_effects.csv",
+    )
     write_reliability_diagrams(frame, Path(args.figures_dir))
 
 

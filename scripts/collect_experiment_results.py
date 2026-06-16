@@ -51,6 +51,46 @@ SELECTIVE_KEYS = (
 
 AGGREGATE_GROUP_COLUMNS = ("method", "section", "scenario")
 
+DEFAULT_AGGREGATE_METRICS = {
+    "acc",
+    "f1",
+    "macro_f1",
+    "recall",
+    "auc",
+    "ap",
+    "brier",
+    "ece_10",
+    "confidence_accuracy_gap",
+    "coverage",
+    "selective_risk",
+    "selective_acc",
+    "selective_macro_f1",
+    "aurc",
+    "acceptance_score_mean",
+    "acceptance_score_p10",
+    "acceptance_score_p50",
+    "acceptance_score_p90",
+    "mean_semantic_attention_entropy",
+    "mean_cross_modal_attention",
+    "semantic_residual_gate",
+    "mean_semantic_reliability_prior_api",
+    "mean_semantic_reliability_prior_graph",
+    "mean_semantic_reliability_prior_manifest",
+    "mean_semantic_attention_to_api",
+    "mean_semantic_attention_to_graph",
+    "mean_semantic_attention_to_manifest",
+}
+
+BRANCH_AGGREGATE_SUFFIXES = (
+    "_reliability_brier",
+    "_reliability_ece_10",
+    "_reliability_auc",
+    "_reliability_ap",
+    "_reliability_mean",
+    "_branch_accuracy",
+    "_reliability_accuracy_gap",
+)
+
 NON_METRIC_COLUMNS = {
     "experiment",
     "method",
@@ -211,9 +251,19 @@ def _write_csv(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=False)
 
 
-def aggregate_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
+def _aggregate_metric_allowed(column: str, allowlist: set[str]) -> bool:
+    if column in allowlist:
+        return True
+    return any(column.endswith(suffix) for suffix in BRANCH_AGGREGATE_SUFFIXES)
+
+
+def aggregate_metrics(
+    metrics: pd.DataFrame,
+    metric_allowlist: set[str] | None = None,
+) -> pd.DataFrame:
     if metrics.empty:
         return pd.DataFrame()
+    allowlist = set(metric_allowlist or DEFAULT_AGGREGATE_METRICS)
     frame = metrics.copy()
     if "method" not in frame.columns and "experiment" in frame.columns:
         frame["method"] = frame["experiment"].map(_method_name)
@@ -223,6 +273,8 @@ def aggregate_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
     numeric_columns: list[str] = []
     for column in frame.columns:
         if column in NON_METRIC_COLUMNS:
+            continue
+        if not _aggregate_metric_allowed(column, allowlist):
             continue
         numeric = pd.to_numeric(frame[column], errors="coerce")
         if numeric.notna().any():
@@ -264,12 +316,24 @@ def main() -> None:
     )
     parser.add_argument("--results-root", default="results/tri_modal_robust")
     parser.add_argument("--out-dir", default="tables")
+    parser.add_argument(
+        "--aggregate-metrics",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional explicit metric allowlist for aggregate_*.csv. "
+            "Raw main_results.csv is unaffected."
+        ),
+    )
     args = parser.parse_args()
 
     results_root = Path(args.results_root)
     out_dir = Path(args.out_dir)
     metrics = collect_metric_rows(results_root)
-    aggregate = aggregate_metrics(metrics)
+    aggregate = aggregate_metrics(
+        metrics,
+        metric_allowlist=set(args.aggregate_metrics) if args.aggregate_metrics else None,
+    )
     _write_csv(metrics, out_dir / "main_results.csv")
     _write_csv(aggregate, out_dir / "aggregate_main_results.csv")
     _write_csv(_filter_methods(aggregate, ("i1_",)), out_dir / "aggregate_i1_ablation.csv")
