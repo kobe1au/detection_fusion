@@ -908,6 +908,12 @@ class TriModalRobustModel(nn.Module):
                 joint_emb = self.cross_attention_joint_projection(
                     cross_attention_outputs["enhanced_joint"]
                 )
+                joint_alive_mask = (
+                    api_joint_mask.bool()
+                    | graph_joint_mask.bool()
+                    | manifest_joint_mask.bool()
+                ).to(dtype=joint_emb.dtype)
+                joint_emb = joint_emb * joint_alive_mask
             if self.attach_cross_attention_to_reconstruction:
                 semantic_source_embeddings_by_target = {}
                 modality_names = ("api", "graph", "manifest")

@@ -150,6 +150,53 @@ def test_all_unavailable_modalities_produce_zero_joint_and_diagnostics():
         assert torch.equal(output[f"mean_semantic_attention_to_{name}"], torch.zeros(4))
 
 
+def test_model_masks_cross_joint_projection_when_all_modalities_unavailable():
+    model = TriModalRobustModel(
+        in_feat_dim=8,
+        fusion_mode="discount_probability",
+        api_num_hash_buckets=32,
+        api_type_vocab_size=16,
+        api_emb_dim=16,
+        api_hidden_dim=32,
+        api_layers=1,
+        api_heads=4,
+        api_max_seq_len=16,
+        graph_emb_dim=16,
+        graph_hidden=16,
+        graph_heads=4,
+        graph_layers=1,
+        max_nodes_gnn=32,
+        manifest_in_dim=16,
+        manifest_emb_dim=16,
+        manifest_hidden_dim=32,
+        joint_emb_dim=32,
+        semantic_cross_attention_config={
+            "enabled": True,
+            "dim": 16,
+            "num_heads": 4,
+            "num_security_tokens": 12,
+            "num_residual_tokens": 4,
+            "dropout": 0.0,
+            "attach_to_joint": True,
+            "attach_to_reconstruction": False,
+        },
+    )
+    batch = _model_batch()
+    for name in (
+        "api_alive",
+        "graph_alive",
+        "manifest_alive",
+        "api_integrity",
+        "graph_integrity",
+        "manifest_integrity",
+    ):
+        setattr(batch, name, torch.zeros(2, 1))
+
+    _, output = model(batch, return_features=True)
+
+    assert torch.equal(output["joint_emb"], torch.zeros(2, 32))
+
+
 def test_high_manifest_code_conflict_reduces_cross_modal_attention():
     module = _module()
     embeddings = _embeddings()
