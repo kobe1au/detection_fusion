@@ -29,6 +29,20 @@ EVIDENCE_FIELDS = (
     "graph_manifest_relation_applicable",
 )
 
+EVIDENCE_BIN_SPECS = {
+    "api_integrity": ("api",),
+    "graph_integrity": ("graph",),
+    "manifest_integrity": ("manifest",),
+    "code_integrity": ("api", "graph", "joint"),
+    "api_graph_anchor_support": ("api", "graph", "joint"),
+    "manifest_code_support": ("manifest", "joint"),
+    "manifest_to_code_conflict": ("manifest", "joint"),
+    "code_to_manifest_conflict": ("api", "graph", "joint"),
+    "max_manifest_code_conflict": ("api", "graph", "manifest", "joint"),
+}
+
+FILTER_COLUMNS = ("experiment", "seed", "split", "diagnostic_file")
+
 
 def _run_identity(path: Path, results_root: Path | None) -> dict[str, str]:
     if results_root is not None:
@@ -80,6 +94,36 @@ def _to_numeric(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
         if column in out.columns:
             out[column] = pd.to_numeric(out[column], errors="coerce")
     return out
+
+
+def _parse_filter(values: list[str] | None) -> set[str]:
+    return {str(value) for value in values or [] if str(value).strip()}
+
+
+def _apply_filters(
+    frame: pd.DataFrame,
+    *,
+    experiments: set[str],
+    seeds: set[str],
+    splits: set[str],
+    diagnostic_files: set[str],
+) -> pd.DataFrame:
+    filtered = frame
+    filters = {
+        "experiment": experiments,
+        "seed": seeds,
+        "split": splits,
+        "diagnostic_file": diagnostic_files,
+    }
+    for column, accepted in filters.items():
+        if accepted and column in filtered.columns:
+            filtered = filtered[filtered[column].astype(str).isin(accepted)]
+    return filtered.copy()
+
+
+def _safe_path_part(value: Any) -> str:
+    text = str(value or "unknown")
+    return "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in text)
 
 
 def _ece(scores: np.ndarray, correctness: np.ndarray, bins: int = 10) -> float:
@@ -193,6 +237,91 @@ def evidence_group_table(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame.from_records(records)
 
 
+def _with_derived_evidence(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    conflict_columns = [
+        column
+        for column in ("manifest_to_code_conflict", "code_to_manifest_conflict")
+        if column in out.columns
+    ]
+    if conflict_columns:
+        out["max_manifest_code_conflict"] = out[conflict_columns].max(axis=1)
+    return out
+
+
+def _tercile_labels(values: pd.Series) -> pd.Series:
+    labels = pd.Series(index=values.index, dtype="object")
+    valid = pd.to_numeric(values, errors="coerce").dropna()
+    if valid.empty:
+        return labels
+    if valid.nunique(dropna=True) <= 1:
+        labels.loc[valid.index] = "all"
+        return labels
+    q = min(3, len(valid))
+    label_values = ["low", "mid", "high"] if q == 3 else ["low", "high"]
+    try:
+        ranked = valid.rank(method="first")
+        labels.loc[valid.index] = pd.qcut(ranked, q=q, labels=label_values).astype(str)
+    except ValueError:
+        labels.loc[valid.index] = "all"
+    return labels
+
+
+def evidence_bin_effects_table(frame: pd.DataFrame) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    frame = _with_derived_evidence(frame)
+    group_columns = ["experiment", "seed", "diagnostic_file", "split"]
+    available_groups = [column for column in group_columns if column in frame.columns]
+    for evidence, branches in EVIDENCE_BIN_SPECS.items():
+        if evidence not in frame.columns:
+            continue
+        working = frame.copy()
+        working["evidence_bin"] = _tercile_labels(working[evidence])
+        working = working.dropna(subset=["evidence_bin"])
+        if working.empty:
+            continue
+        for group, group_frame in working.groupby([*available_groups, "evidence_bin"], dropna=False):
+            group_values = group if isinstance(group, tuple) else (group,)
+            base = dict(zip([*available_groups, "evidence_bin"], group_values))
+            evidence_values = pd.to_numeric(group_frame[evidence], errors="coerce").dropna()
+            if evidence_values.empty:
+                continue
+            for branch in branches:
+                correct_key = f"{branch}_correct"
+                reliability_key = f"predicted_reliability_{branch}"
+                if correct_key not in group_frame.columns and reliability_key not in group_frame.columns:
+                    continue
+                branch_record: dict[str, Any] = {
+                    **base,
+                    "evidence": evidence,
+                    "branch": branch,
+                    "count": int(len(group_frame)),
+                    "evidence_mean": float(evidence_values.mean()),
+                    "evidence_min": float(evidence_values.min()),
+                    "evidence_max": float(evidence_values.max()),
+                }
+                if correct_key in group_frame.columns:
+                    correctness = pd.to_numeric(group_frame[correct_key], errors="coerce").dropna()
+                    if not correctness.empty:
+                        branch_record["branch_accuracy"] = float((correctness >= 0.5).mean())
+                if reliability_key in group_frame.columns:
+                    reliability = pd.to_numeric(group_frame[reliability_key], errors="coerce").dropna()
+                    if not reliability.empty:
+                        branch_record["predicted_reliability_mean"] = float(
+                            reliability.clip(0.0, 1.0).mean()
+                        )
+                if (
+                    "branch_accuracy" in branch_record
+                    and "predicted_reliability_mean" in branch_record
+                ):
+                    branch_record["reliability_accuracy_gap"] = float(
+                        branch_record["predicted_reliability_mean"]
+                        - branch_record["branch_accuracy"]
+                    )
+                records.append(branch_record)
+    return pd.DataFrame.from_records(records)
+
+
 def _diagram_points(scores: np.ndarray, correctness: np.ndarray, bins: int = 10) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     edges = np.linspace(0.0, 1.0, bins + 1)
@@ -216,12 +345,15 @@ def _diagram_points(scores: np.ndarray, correctness: np.ndarray, bins: int = 10)
     return pd.DataFrame.from_records(rows)
 
 
-def write_reliability_diagrams(frame: pd.DataFrame, out_dir: Path) -> None:
+def _write_reliability_diagrams_for_frame(
+    frame: pd.DataFrame,
+    out_dir: Path,
+    title_prefix: str = "",
+) -> None:
     try:
         import matplotlib.pyplot as plt
     except Exception:
         return
-    out_dir.mkdir(parents=True, exist_ok=True)
     for branch in BRANCHES:
         reliability_key = f"predicted_reliability_{branch}"
         correct_key = f"{branch}_correct"
@@ -235,6 +367,7 @@ def write_reliability_diagrams(frame: pd.DataFrame, out_dir: Path) -> None:
         points = _diagram_points(scores, correctness, bins=10)
         if points.empty:
             continue
+        out_dir.mkdir(parents=True, exist_ok=True)
         points.to_csv(out_dir / f"reliability_diagram_{branch}.csv", index=False)
         fig, ax = plt.subplots(figsize=(4.0, 4.0))
         ax.plot([0.0, 1.0], [0.0, 1.0], color="black", linestyle="--", linewidth=1.0)
@@ -248,11 +381,44 @@ def write_reliability_diagrams(frame: pd.DataFrame, out_dir: Path) -> None:
         ax.set_ylim(0.0, 1.0)
         ax.set_xlabel("Predicted branch reliability")
         ax.set_ylabel("Empirical branch accuracy")
-        ax.set_title(f"{branch.capitalize()} reliability")
+        title = f"{branch.capitalize()} reliability"
+        if title_prefix:
+            title = f"{title_prefix} {title}"
+        ax.set_title(title)
         ax.grid(True, alpha=0.25)
         fig.tight_layout()
         fig.savefig(out_dir / f"reliability_diagram_{branch}.png", dpi=200)
         plt.close(fig)
+
+
+def write_reliability_diagrams(frame: pd.DataFrame, out_dir: Path) -> None:
+    group_columns = [
+        column
+        for column in ("experiment", "seed", "split", "diagnostic_file")
+        if column in frame.columns
+    ]
+    if not group_columns:
+        _write_reliability_diagrams_for_frame(frame, out_dir)
+        return
+    for group, group_frame in frame.groupby(group_columns, dropna=False):
+        group_values = group if isinstance(group, tuple) else (group,)
+        group_map = dict(zip(group_columns, group_values))
+        group_dir = out_dir
+        for column in group_columns:
+            if column == "diagnostic_file":
+                group_dir = group_dir / _safe_path_part(Path(str(group_map[column])).stem)
+            else:
+                group_dir = group_dir / _safe_path_part(group_map[column])
+        title_parts = [
+            str(group_map[column])
+            for column in ("experiment", "seed", "split")
+            if column in group_map
+        ]
+        _write_reliability_diagrams_for_frame(
+            group_frame,
+            group_dir,
+            title_prefix=" ".join(title_parts),
+        )
 
 
 def _write_csv(frame: pd.DataFrame, path: Path) -> None:
@@ -268,6 +434,10 @@ def main() -> None:
     parser.add_argument("--diagnostics", nargs="*", default=None)
     parser.add_argument("--out-dir", default="tables")
     parser.add_argument("--figures-dir", default="figures")
+    parser.add_argument("--experiment", nargs="*", default=None)
+    parser.add_argument("--seed", nargs="*", default=None)
+    parser.add_argument("--split", nargs="*", default=None)
+    parser.add_argument("--diagnostic-file", nargs="*", default=None)
     parser.add_argument("--fail-if-empty", action="store_true")
     args = parser.parse_args()
 
@@ -280,6 +450,7 @@ def main() -> None:
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_reliability_calibration.csv", index=False)
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_evidence_groups.csv", index=False)
+        pd.DataFrame().to_csv(Path(args.out_dir) / "i1_evidence_bin_effects.csv", index=False)
         return
 
     numeric_columns = [
@@ -288,8 +459,18 @@ def main() -> None:
         *[f"{branch}_correct" for branch in BRANCHES],
     ]
     frame = _to_numeric(frame, [column for column in numeric_columns if column in frame.columns])
+    frame = _apply_filters(
+        frame,
+        experiments=_parse_filter(args.experiment),
+        seeds=_parse_filter(args.seed),
+        splits=_parse_filter(args.split),
+        diagnostic_files=_parse_filter(args.diagnostic_file),
+    )
+    if frame.empty and args.fail_if_empty:
+        raise RuntimeError("No diagnostics remained after filtering.")
     _write_csv(reliability_table(frame), Path(args.out_dir) / "i1_reliability_calibration.csv")
     _write_csv(evidence_group_table(frame), Path(args.out_dir) / "i1_evidence_groups.csv")
+    _write_csv(evidence_bin_effects_table(frame), Path(args.out_dir) / "i1_evidence_bin_effects.csv")
     write_reliability_diagrams(frame, Path(args.figures_dir))
 
 

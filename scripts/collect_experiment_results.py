@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,21 @@ SELECTIVE_KEYS = (
     "brier",
 )
 
+AGGREGATE_GROUP_COLUMNS = ("method", "section", "scenario")
+
+NON_METRIC_COLUMNS = {
+    "experiment",
+    "method",
+    "seed",
+    "run_dir",
+    "summary_path",
+    "section",
+    "scenario",
+    "pt_dir",
+    "csv",
+    "perturb_type",
+}
+
 
 def _safe_load_yaml(path: Path) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as handle:
@@ -75,10 +91,18 @@ def _run_identity(summary_path: Path, results_root: Path) -> dict[str, str]:
     seed = parts[-1] if parts else ""
     return {
         "experiment": experiment,
+        "method": _method_name(experiment),
         "seed": seed,
         "run_dir": str(summary_path.parent),
         "summary_path": str(summary_path),
     }
+
+
+def _method_name(experiment: str) -> str:
+    match = re.fullmatch(r"(.+)_seed_\d+", str(experiment))
+    if match:
+        return match.group(1)
+    return str(experiment)
 
 
 def _scalar_metrics(metrics: Any) -> dict[str, Any]:
@@ -187,6 +211,53 @@ def _write_csv(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=False)
 
 
+def aggregate_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
+    if metrics.empty:
+        return pd.DataFrame()
+    frame = metrics.copy()
+    if "method" not in frame.columns and "experiment" in frame.columns:
+        frame["method"] = frame["experiment"].map(_method_name)
+    group_columns = [column for column in AGGREGATE_GROUP_COLUMNS if column in frame.columns]
+    if not group_columns:
+        return pd.DataFrame()
+    numeric_columns: list[str] = []
+    for column in frame.columns:
+        if column in NON_METRIC_COLUMNS:
+            continue
+        numeric = pd.to_numeric(frame[column], errors="coerce")
+        if numeric.notna().any():
+            frame[column] = numeric
+            numeric_columns.append(column)
+    records: list[dict[str, Any]] = []
+    for group, group_frame in frame.groupby(group_columns, dropna=False):
+        group_values = group if isinstance(group, tuple) else (group,)
+        base = dict(zip(group_columns, group_values))
+        for metric in numeric_columns:
+            values = group_frame[metric].dropna()
+            if values.empty:
+                continue
+            records.append(
+                {
+                    **base,
+                    "metric": metric,
+                    "mean": float(values.mean()),
+                    "std": float(values.std(ddof=1)) if len(values) > 1 else 0.0,
+                    "count": int(values.size),
+                }
+            )
+    return pd.DataFrame.from_records(records)
+
+
+def _filter_methods(aggregate: pd.DataFrame, prefixes: tuple[str, ...], extras: tuple[str, ...] = ()) -> pd.DataFrame:
+    if aggregate.empty or "method" not in aggregate.columns:
+        return pd.DataFrame()
+    methods = aggregate["method"].astype(str)
+    mask = methods.isin({"observable_reliability_discount_fusion", "final", *extras})
+    for prefix in prefixes:
+        mask |= methods.str.startswith(prefix)
+    return aggregate[mask].copy()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Collect robust tri-modal experiment summaries into paper tables."
@@ -198,7 +269,15 @@ def main() -> None:
     results_root = Path(args.results_root)
     out_dir = Path(args.out_dir)
     metrics = collect_metric_rows(results_root)
+    aggregate = aggregate_metrics(metrics)
     _write_csv(metrics, out_dir / "main_results.csv")
+    _write_csv(aggregate, out_dir / "aggregate_main_results.csv")
+    _write_csv(_filter_methods(aggregate, ("i1_",)), out_dir / "aggregate_i1_ablation.csv")
+    _write_csv(_filter_methods(aggregate, ("i2_",)), out_dir / "aggregate_i2_ablation.csv")
+    _write_csv(
+        _filter_methods(aggregate, ("i3_",), extras=("learned_evidence_logit_fusion",)),
+        out_dir / "aggregate_i3_ablation.csv",
+    )
     _write_csv(_branch_reliability_rows(metrics), out_dir / "i1_reliability_calibration_summary.csv")
     _write_csv(_selected_columns(metrics, ATTENTION_KEYS), out_dir / "i2_attention_ablation.csv")
     _write_csv(_selected_columns(metrics, SELECTIVE_KEYS), out_dir / "i3_selective_results.csv")
