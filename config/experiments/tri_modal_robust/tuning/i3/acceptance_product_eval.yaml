@@ -1,0 +1,8 @@
+defaults:
+  - _decision_eval_base.yaml
+
+fusion:
+  acceptance_aggregation: product
+
+eval:
+  output_name: tuning_i3_acceptance_product_eval

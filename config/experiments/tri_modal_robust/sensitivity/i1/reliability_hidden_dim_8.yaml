@@ -1,0 +1,9 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: sensitivity_i1_reliability_hidden_dim_8
+
+fusion:
+  reliability_calibration:
+    hidden_dim: 8

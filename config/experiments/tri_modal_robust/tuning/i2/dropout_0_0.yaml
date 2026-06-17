@@ -1,0 +1,8 @@
+defaults:
+  - ../_tuning_train_base.yaml
+
+train:
+  exp_name: tuning_i2_dropout_0_0
+
+semantic_cross_attention:
+  dropout: 0.0

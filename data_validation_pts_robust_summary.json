@@ -1,0 +1,340 @@
+{
+  "config": "config\\experiments\\tri_modal_robust\\observable_reliability_discount_fusion.yaml",
+  "required_pt_schema_version": 4,
+  "required_observable_schema_version": "observable-v1",
+  "split_partition_validation": {
+    "ok": true
+  },
+  "splits": {
+    "train": {
+      "dataset_build_ok": true,
+      "num_samples": 10126,
+      "num_failed_items": 0,
+      "dummy_examples": [],
+      "label_counts": {
+        "0": 5142,
+        "1": 4984
+      },
+      "year_counts": {
+        "2018": 1690,
+        "2019": 1661,
+        "2020": 1718,
+        "2021": 1678,
+        "2022": 1365,
+        "2023": 1024,
+        "2024": 990
+      },
+      "schema_versions": {
+        "observable-v1": 10126
+      },
+      "observable_signal_minmax": {
+        "api_integrity": [
+          0.21860146522521973,
+          1.0
+        ],
+        "graph_integrity": [
+          0.25,
+          1.0
+        ],
+        "manifest_integrity": [
+          0.800000011920929,
+          1.0
+        ],
+        "code_integrity": [
+          0.23490485548973083,
+          0.993730366230011
+        ],
+        "api_graph_anchor_support": [
+          0.0,
+          1.0
+        ],
+        "manifest_code_support": [
+          0.0,
+          1.0
+        ],
+        "manifest_to_code_conflict": [
+          0.0,
+          1.0
+        ],
+        "code_to_manifest_conflict": [
+          0.0,
+          1.0
+        ],
+        "api_alive": [
+          0.0,
+          1.0
+        ],
+        "graph_alive": [
+          1.0,
+          1.0
+        ],
+        "manifest_alive": [
+          0.0,
+          1.0
+        ]
+      },
+      "observable_nonfinite_counts": {},
+      "shape_issues": {},
+      "alive_counts": {
+        "api0_graph1_manifest1": 1,
+        "api1_graph1_manifest0": 1,
+        "api1_graph1_manifest1": 10124
+      },
+      "collate_smoke_ok": true,
+      "collate_num_valid": 4,
+      "collate_num_failed": 0,
+      "loader_smoke_ok": true,
+      "loader_num_valid": 32,
+      "loader_num_failed": 0,
+      "elapsed_sec": 403.152,
+      "feature_dim": 515,
+      "sample_sid_examples": [
+        "0005e35076402af3e3885353678dc124a54fc8166e64d6f8d576361be234bf1d",
+        "0009c0561158e9f28582dd2c62c7b1ee9789e3333707c49c11cffcc3513de406",
+        "0016913e62a2799a14ec9e2d67fb539de5305fb3d1855817befaabe49de9bdb3"
+      ],
+      "collate_shapes": {
+        "graph_x": [
+          28725,
+          515
+        ],
+        "api_ids": 6965,
+        "manifest_x": [
+          4,
+          256
+        ],
+        "api_semantic_category_counts": [
+          4,
+          12
+        ],
+        "graph_semantic_category_counts": [
+          4,
+          12
+        ],
+        "manifest_category_counts": [
+          4,
+          12
+        ]
+      }
+    },
+    "val": {
+      "dataset_build_ok": true,
+      "num_samples": 1499,
+      "num_failed_items": 0,
+      "dummy_examples": [],
+      "label_counts": {
+        "0": 750,
+        "1": 749
+      },
+      "year_counts": {
+        "2018": 250,
+        "2019": 249,
+        "2020": 250,
+        "2021": 250,
+        "2022": 200,
+        "2023": 150,
+        "2024": 150
+      },
+      "schema_versions": {
+        "observable-v1": 1499
+      },
+      "observable_signal_minmax": {
+        "api_integrity": [
+          0.3077066242694855,
+          0.987500011920929
+        ],
+        "graph_integrity": [
+          0.9408450722694397,
+          1.0
+        ],
+        "manifest_integrity": [
+          0.8909090757369995,
+          1.0
+        ],
+        "code_integrity": [
+          0.5547130703926086,
+          0.993730366230011
+        ],
+        "api_graph_anchor_support": [
+          0.0015435998793691397,
+          1.0
+        ],
+        "manifest_code_support": [
+          0.0,
+          0.9166666865348816
+        ],
+        "manifest_to_code_conflict": [
+          0.0,
+          1.0
+        ],
+        "code_to_manifest_conflict": [
+          0.0,
+          1.0
+        ],
+        "api_alive": [
+          1.0,
+          1.0
+        ],
+        "graph_alive": [
+          1.0,
+          1.0
+        ],
+        "manifest_alive": [
+          1.0,
+          1.0
+        ]
+      },
+      "observable_nonfinite_counts": {},
+      "shape_issues": {},
+      "alive_counts": {
+        "api1_graph1_manifest1": 1499
+      },
+      "collate_smoke_ok": true,
+      "collate_num_valid": 4,
+      "collate_num_failed": 0,
+      "loader_smoke_ok": true,
+      "loader_num_valid": 64,
+      "loader_num_failed": 0,
+      "elapsed_sec": 37.871,
+      "feature_dim": 515,
+      "sample_sid_examples": [
+        "0024bfc367926f6a20a6c9d060795a3423aece6df6a52ec77548ab4a59029c06",
+        "008bcc7ff65e7abcc406f32595b5640bf9412ddf2d51e1689d8e071a80df0402",
+        "00bc6f96dfb6ab4b3b88497f0b59b7cf6e8c292879813b30b1ae402694a5896a"
+      ],
+      "collate_shapes": {
+        "graph_x": [
+          4019,
+          515
+        ],
+        "api_ids": 4544,
+        "manifest_x": [
+          4,
+          256
+        ],
+        "api_semantic_category_counts": [
+          4,
+          12
+        ],
+        "graph_semantic_category_counts": [
+          4,
+          12
+        ],
+        "manifest_category_counts": [
+          4,
+          12
+        ]
+      }
+    },
+    "test": {
+      "dataset_build_ok": true,
+      "num_samples": 2979,
+      "num_failed_items": 0,
+      "dummy_examples": [],
+      "label_counts": {
+        "0": 1500,
+        "1": 1479
+      },
+      "year_counts": {
+        "2018": 498,
+        "2019": 489,
+        "2020": 500,
+        "2021": 498,
+        "2022": 400,
+        "2023": 300,
+        "2024": 294
+      },
+      "schema_versions": {
+        "observable-v1": 2979
+      },
+      "observable_signal_minmax": {
+        "api_integrity": [
+          0.22415447235107422,
+          0.987500011920929
+        ],
+        "graph_integrity": [
+          0.25,
+          1.0
+        ],
+        "manifest_integrity": [
+          0.8573093414306641,
+          1.0
+        ],
+        "code_integrity": [
+          0.23672477900981903,
+          0.993730366230011
+        ],
+        "api_graph_anchor_support": [
+          0.01098703220486641,
+          1.0
+        ],
+        "manifest_code_support": [
+          0.0,
+          0.9166666865348816
+        ],
+        "manifest_to_code_conflict": [
+          0.0,
+          1.0
+        ],
+        "code_to_manifest_conflict": [
+          0.0,
+          1.0
+        ],
+        "api_alive": [
+          1.0,
+          1.0
+        ],
+        "graph_alive": [
+          1.0,
+          1.0
+        ],
+        "manifest_alive": [
+          0.0,
+          1.0
+        ]
+      },
+      "observable_nonfinite_counts": {},
+      "shape_issues": {},
+      "alive_counts": {
+        "api1_graph1_manifest0": 1,
+        "api1_graph1_manifest1": 2978
+      },
+      "collate_smoke_ok": true,
+      "collate_num_valid": 4,
+      "collate_num_failed": 0,
+      "loader_smoke_ok": true,
+      "loader_num_valid": 64,
+      "loader_num_failed": 0,
+      "elapsed_sec": 77.679,
+      "feature_dim": 515,
+      "sample_sid_examples": [
+        "0017dfd58a2afc9080400378569a5267b561184fb6be77b8c99a5ee6461ea9da",
+        "0019f9847c708ea11ebe24a40bd476055c8cce3291164a3a91f68df3deaf0d57",
+        "001a31e031088c74a1ca010ca86e508adbaf20607048cec8364a87747bb2322b"
+      ],
+      "collate_shapes": {
+        "graph_x": [
+          5097,
+          515
+        ],
+        "api_ids": 6301,
+        "manifest_x": [
+          4,
+          256
+        ],
+        "api_semantic_category_counts": [
+          4,
+          12
+        ],
+        "graph_semantic_category_counts": [
+          4,
+          12
+        ],
+        "manifest_category_counts": [
+          4,
+          12
+        ]
+      }
+    }
+  }
+}

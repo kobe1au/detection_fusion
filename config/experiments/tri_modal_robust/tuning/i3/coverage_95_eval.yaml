@@ -1,0 +1,8 @@
+defaults:
+  - _decision_eval_base.yaml
+
+selective_prediction:
+  target_coverage: 0.95
+
+eval:
+  output_name: tuning_i3_coverage_95_eval

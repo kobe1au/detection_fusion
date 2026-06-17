@@ -642,6 +642,13 @@ def checkpoint_score(
     return weighted_sum / weight_sum, "robust_composite"
 
 
+def checkpoint_requires_robust_validation(cfg: dict) -> bool:
+    metric_name = str(
+        cfg.get("train", {}).get("checkpoint_metric", "clean_macro_f1")
+    ).strip().lower()
+    return metric_name == "robust_composite"
+
+
 def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
     model_cfg = cfg.get("model", {})
     api_cfg = model_cfg.get("api_encoder", {})
@@ -1116,12 +1123,12 @@ def fit_posthoc_calibration(
                     optimizer.zero_grad(set_to_none=True)
                     with get_amp_context(device, use_amp):
                         _logits, extra = model(graph, return_features=False)
-                        loss, _parts = compute_posthoc_calibration_loss(
-                            extra,
-                            labels,
-                            extra.get("gate_evidence"),
-                            cfg.get("fusion", {}) or {},
-                        )
+                    loss, _parts = compute_posthoc_calibration_loss(
+                        extra,
+                        labels,
+                        extra.get("gate_evidence"),
+                        cfg.get("fusion", {}) or {},
+                    )
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(
                         parameters, float(calibration_cfg.get("grad_clip", 5.0))
@@ -1446,12 +1453,17 @@ def run(cfg: dict) -> dict[str, Any]:
         best_path = out_dir / "best_tri_modal_robust.pt"
         patience = int(train_cfg.get("patience", 10))
         stale = 0
+        run_epoch_robust_val = checkpoint_requires_robust_validation(cfg)
 
         for epoch in range(1, int(train_cfg.get("epochs", 1)) + 1):
             train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg, epoch)
             val_metrics, _ = evaluate(model, val_loader, device, use_amp, "val", dump_rows=False)
             enforce_failed_ratio(val_metrics, cfg, "val")
-            val_robust_metrics = evaluate_robust_validation(model, robust_val_loaders, device, use_amp, cfg)
+            val_robust_metrics = (
+                evaluate_robust_validation(model, robust_val_loaders, device, use_amp, cfg)
+                if run_epoch_robust_val
+                else {}
+            )
             score, checkpoint_metric_name = checkpoint_score(
                 cfg,
                 val_metrics,

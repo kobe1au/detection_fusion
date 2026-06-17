@@ -134,6 +134,31 @@ def test_posthoc_calibration_loss_updates_calibration_parameters():
     assert all(parameter.grad is not None for parameter in fusion.calibration_parameters())
 
 
+def test_posthoc_reliability_loss_is_safe_under_autocast():
+    reliability = torch.tensor([0.8, 0.2], dtype=torch.float32, requires_grad=True)
+    outputs = {
+        "predicted_reliability_api": reliability,
+        "api_logits_aux": torch.tensor([[3.0, -3.0], [3.0, -3.0]], dtype=torch.float32),
+    }
+    evidence = _evidence(2)
+
+    with torch.amp.autocast(device_type="cpu", enabled=True):
+        loss, parts = compute_posthoc_calibration_loss(
+            outputs,
+            torch.tensor([0, 1]),
+            evidence,
+            {
+                "reliability_calibration": {"weight": 1.0},
+                "probability_calibration": {"weight": 0.0},
+            },
+        )
+
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert parts["reliability_calibration_loss"] > 0.0
+    assert reliability.grad is not None
+
+
 def test_calibration_parameters_are_inactive_during_main_training():
     fusion = DiscountProbabilityFusion(
         {

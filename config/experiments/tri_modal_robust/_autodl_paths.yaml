@@ -1,0 +1,4 @@
+data:
+  train_pt_dir: /root/autodl-tmp/pts/train
+  val_pt_dir: /pts/val
+  test_pt_dir: /pts/test

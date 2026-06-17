@@ -96,7 +96,10 @@ def compute_reliability_calibration_loss(
         if loss_type == "brier":
             per_sample = (reliability - correctness).square()
         else:
-            per_sample = F.binary_cross_entropy(reliability, correctness, reduction="none")
+            per_sample = -(
+                correctness * reliability.log()
+                + (1.0 - correctness) * torch.log1p(-reliability)
+            )
         denom = weight.sum().clamp_min(1.0)
         branch_loss = (per_sample * weight).sum() / denom
         losses.append(branch_loss)

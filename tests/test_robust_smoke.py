@@ -25,6 +25,7 @@ from fusion.train import (
     _metrics,
     _normalize_robust_val_scenarios,
     checkpoint_score,
+    checkpoint_requires_robust_validation,
     enforce_failed_ratio,
     load_config_path,
     run as run_training,
@@ -123,6 +124,18 @@ def test_checkpoint_score_clean_and_robust_composite():
     )
     assert robust_name == "robust_composite"
     assert robust_score == pytest.approx((0.4 * 0.9 + 0.4 * 0.8 + 0.2 * 0.7) / 1.0)
+
+
+def test_epoch_robust_validation_is_only_required_for_robust_checkpoint_metric():
+    assert checkpoint_requires_robust_validation(
+        {"train": {"checkpoint_metric": "robust_composite"}}
+    )
+    assert not checkpoint_requires_robust_validation(
+        {
+            "train": {"checkpoint_metric": "clean_macro_f1"},
+            "eval": {"robust_val": {"enabled": True}},
+        }
+    )
 
 
 def test_checkpoint_score_robust_composite_requires_robust_loaders():

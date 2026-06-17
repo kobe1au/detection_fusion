@@ -1,0 +1,9 @@
+defaults:
+  - ../_tuning_train_base.yaml
+
+train:
+  exp_name: tuning_i1_missing_relation_support_1_0
+
+fusion:
+  reliability_calibration:
+    missing_relation_support: 1.0

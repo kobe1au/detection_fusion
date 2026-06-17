@@ -164,9 +164,13 @@ def _auc_defined(correctness: np.ndarray) -> bool:
 def _safe_ap(correctness: np.ndarray, scores: np.ndarray) -> float:
     return (
         float(average_precision_score(correctness, scores))
-        if len(set(correctness.tolist())) > 1
-        else 0.0
+        if _ap_defined(correctness)
+        else float("nan")
     )
+
+
+def _ap_defined(correctness: np.ndarray) -> bool:
+    return len(set(correctness.tolist())) > 1
 
 
 def reliability_table(frame: pd.DataFrame) -> pd.DataFrame:
@@ -187,6 +191,7 @@ def reliability_table(frame: pd.DataFrame) -> pd.DataFrame:
             scores = data[reliability_key].astype(float).clip(0.0, 1.0).to_numpy()
             correctness = _finite_binary(data[correct_key])
             auc_defined = _auc_defined(correctness)
+            ap_defined = _ap_defined(correctness)
             records.append(
                 {
                     **base,
@@ -199,6 +204,7 @@ def reliability_table(frame: pd.DataFrame) -> pd.DataFrame:
                     "ece_10": _ece(scores, correctness, bins=10),
                     "auc_defined": int(auc_defined),
                     "auc": _safe_auc(correctness, scores),
+                    "ap_defined": int(ap_defined),
                     "ap": _safe_ap(correctness, scores),
                 }
             )

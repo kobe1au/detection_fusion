@@ -66,6 +66,29 @@ def test_runner_groups_and_aliases_reference_existing_configs():
         assert run.resolve_targets(name)
 
 
+def test_tuning_groups_are_validation_only():
+    for group in ("tuning_i1", "tuning_i2", "tuning_i3", "tuning"):
+        for path in run.resolve_targets(group):
+            cfg = _resolved(path)
+            eval_cfg = cfg.get("eval", {}) or {}
+            assert eval_cfg.get("run_test") is False, path
+            assert eval_cfg.get("run_robust_test") is False, path
+            if eval_cfg.get("eval_only", False):
+                assert "tuning_full_candidate/42/best_tri_modal_robust.pt" in eval_cfg[
+                    "checkpoint_path"
+                ], path
+                assert eval_cfg.get("refit_rejection_threshold") is True, path
+            else:
+                assert cfg["train"].get("tuning_mode") is True, path
+
+
+def test_paper_plan_excludes_tuning_configs():
+    tuning_paths = {path.resolve() for path in run.resolve_targets("tuning")}
+    for group in ("paper", "paper_main", "paper_appendix", "paper_all"):
+        paper_paths = {path.resolve() for path in run.resolve_targets(group)}
+        assert not (tuning_paths & paper_paths)
+
+
 def test_runner_groups_do_not_repeat_equivalent_runs():
     for name in run.GROUPS:
         seen: dict[str, Path] = {}
@@ -78,9 +101,9 @@ def test_runner_groups_do_not_repeat_equivalent_runs():
 def test_decision_only_sensitivities_reuse_seed_42_checkpoint_safely():
     seed_cfg = _resolved(ROOT / "seeds/seed_42.yaml")
     for relative in (
-        "sensitivity/acceptance_product.yaml",
-        "sensitivity/coverage_80.yaml",
-        "sensitivity/coverage_95.yaml",
+        "sensitivity/i3/acceptance_product.yaml",
+        "sensitivity/i3/coverage_80.yaml",
+        "sensitivity/i3/coverage_95.yaml",
     ):
         cfg = _resolved(ROOT / relative)
         assert cfg["eval"]["eval_only"] is True
@@ -156,9 +179,56 @@ def test_i2_cross_attention_ablations_change_the_intended_mechanism():
     no_residual = _resolved(ROOT / "ablations/i2/no_cross_attention_residual_tokens.yaml")
     assert no_residual["semantic_cross_attention"]["num_residual_tokens"] == 0
 
+    no_presence = _resolved(ROOT / "ablations/i2/no_semantic_presence_prior.yaml")
+    assert no_presence["semantic_cross_attention"]["use_semantic_presence_prior"] is False
+
     joint_only = _resolved(ROOT / "ablations/i2/joint_only_cross_attention.yaml")
     assert joint_only["semantic_cross_attention"]["attach_to_joint"] is True
     assert joint_only["semantic_cross_attention"]["attach_to_reconstruction"] is False
+
+
+def test_i1_observable_reliability_ablations_change_the_intended_mechanism():
+    no_calibration = _resolved(ROOT / "ablations/i1/no_reliability_calibration.yaml")
+    assert no_calibration["fusion"]["reliability_calibration"]["enabled"] is False
+
+    integrity_only = _resolved(ROOT / "ablations/i1/integrity_alive_only.yaml")
+    assert integrity_only["model"]["gate"]["use_consistency_evidence"] is False
+    assert integrity_only["model"]["gate"]["use_conflict_evidence"] is False
+    assert integrity_only["fusion"]["use_support_discount"] is False
+    assert integrity_only["fusion"]["use_conflict_discount"] is False
+    assert integrity_only["semantic_cross_attention"]["use_support_bias"] is False
+    assert integrity_only["semantic_cross_attention"]["use_conflict_bias"] is False
+
+    no_support = _resolved(ROOT / "ablations/i1/no_support_evidence.yaml")
+    assert no_support["model"]["gate"]["use_consistency_evidence"] is False
+    assert no_support["fusion"]["use_support_discount"] is False
+    assert no_support["semantic_cross_attention"]["use_support_bias"] is False
+
+    no_conflict = _resolved(ROOT / "ablations/i1/no_conflict_evidence.yaml")
+    assert no_conflict["model"]["gate"]["use_conflict_evidence"] is False
+    assert no_conflict["fusion"]["use_conflict_discount"] is False
+    assert no_conflict["semantic_cross_attention"]["use_conflict_bias"] is False
+
+    no_alive = _resolved(ROOT / "ablations/i1/no_alive_applicability_mask.yaml")
+    assert no_alive["model"]["gate"]["apply_alive_mask"] is False
+    assert no_alive["fusion"]["use_hard_alive_mask"] is False
+    assert no_alive["fusion"]["reliability_calibration"]["apply_alive_mask"] is False
+    assert no_alive["semantic_cross_attention"]["use_relation_mask"] is False
+
+
+def test_i3_main_ablations_use_compact_mechanism_splits():
+    no_prob = _resolved(ROOT / "ablations/i3/no_probability_calibration.yaml")
+    assert no_prob["fusion"]["probability_calibration"]["enabled"] is False
+
+    no_support_conflict = _resolved(ROOT / "ablations/i3/no_support_conflict_discount.yaml")
+    assert no_support_conflict["fusion"]["use_support_discount"] is False
+    assert no_support_conflict["fusion"]["use_conflict_discount"] is False
+
+    no_confidence = _resolved(ROOT / "ablations/i3/no_confidence_proxy_discount.yaml")
+    assert no_confidence["fusion"]["use_confidence_proxy"] is False
+
+    no_rejection = _resolved(ROOT / "ablations/i3/no_selective_rejection.yaml")
+    assert no_rejection["selective_prediction"]["enabled"] is False
 
 
 def test_no_reconstruction_ablation_disconnects_reconstruction_path():
@@ -168,10 +238,58 @@ def test_no_reconstruction_ablation_disconnects_reconstruction_path():
     assert cfg["semantic_cross_attention"]["attach_to_reconstruction"] is False
 
 
-def test_paper_plan_has_42_unique_runs():
-    paths = run.resolve_targets("paper")
-    assert len(paths) == 42
+def test_paper_plan_has_expected_unique_runs():
+    paths = run.resolve_targets("paper_all")
+    expected = [
+        *run.BASELINES,
+        *run.I1_ABLATIONS,
+        *run.I1_APPENDIX_ABLATIONS,
+        *run.I2_ABLATIONS,
+        *run.I2_APPENDIX_ABLATIONS,
+        *run.I3_ABLATIONS,
+        *run.I3_APPENDIX_ABLATIONS,
+        *run.TRAINING_ABLATIONS,
+        *run.TRAINING_APPENDIX_ABLATIONS,
+        *run.SEEDS,
+        *run.SENSITIVITY,
+    ]
+    assert len(paths) == len(expected)
     assert len({path.resolve() for path in paths}) == len(paths)
+
+
+def test_main_paper_plan_is_compact_and_excludes_sensitivity():
+    paths = run.resolve_targets("paper")
+    expected = [
+        *run.BASELINES,
+        *run.I1_ABLATIONS,
+        *run.I2_ABLATIONS,
+        *run.I3_ABLATIONS,
+        *run.TRAINING_ABLATIONS,
+        *run.SEEDS,
+    ]
+    assert len(paths) == len(expected)
+    assert len({path.resolve() for path in paths}) == len(paths)
+    sensitivity_paths = {
+        (run.CONFIG_DIR / relative).resolve() for relative in run.SENSITIVITY
+    }
+    assert not ({path.resolve() for path in paths} & sensitivity_paths)
+
+
+def test_paper_appendix_runs_seed_checkpoint_before_sensitivity():
+    paths = run.resolve_targets("paper_appendix")
+    seed_42 = (run.CONFIG_DIR / run.SEEDS[0]).resolve()
+    resolved_paths = [path.resolve() for path in paths]
+    sensitivity_paths = {
+        (run.CONFIG_DIR / relative).resolve() for relative in run.SENSITIVITY
+    }
+    first_sensitivity = min(
+        index
+        for index, path in enumerate(resolved_paths)
+        if path in sensitivity_paths
+    )
+
+    assert seed_42 in resolved_paths
+    assert resolved_paths.index(seed_42) < first_sensitivity
 
 
 def test_non_seed_experiments_have_unique_resolved_behavior():

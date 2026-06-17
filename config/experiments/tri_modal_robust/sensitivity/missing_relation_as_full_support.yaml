@@ -1,9 +1,0 @@
-defaults:
-  - ../observable_reliability_discount_fusion.yaml
-
-train:
-  exp_name: sensitivity_missing_relation_as_full_support
-
-fusion:
-  reliability_calibration:
-    missing_relation_support: 1.0

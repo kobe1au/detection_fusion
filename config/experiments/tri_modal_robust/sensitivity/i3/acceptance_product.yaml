@@ -1,8 +1,5 @@
 defaults:
-  - ../observable_reliability_discount_fusion.yaml
-
-train:
-  exp_name: sensitivity_acceptance_product
+  - ../../observable_reliability_discount_fusion.yaml
 
 fusion:
   acceptance_aggregation: product
@@ -10,5 +7,5 @@ fusion:
 eval:
   eval_only: true
   checkpoint_path: results/tri_modal_robust/final_seed_42/42/best_tri_modal_robust.pt
-  output_name: sensitivity_acceptance_product
+  output_name: sensitivity_i3_acceptance_product
   refit_rejection_threshold: true

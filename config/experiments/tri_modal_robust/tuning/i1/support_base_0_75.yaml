@@ -1,0 +1,10 @@
+defaults:
+  - ../_tuning_train_base.yaml
+
+train:
+  exp_name: tuning_i1_support_base_0_75
+
+fusion:
+  support_factor:
+    manifest_support_base: 0.75
+    code_anchor_base: 0.75

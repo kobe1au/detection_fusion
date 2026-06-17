@@ -1,0 +1,8 @@
+defaults:
+  - ../_tuning_train_base.yaml
+
+train:
+  exp_name: tuning_i2_attention_heads_8
+
+semantic_cross_attention:
+  num_heads: 8

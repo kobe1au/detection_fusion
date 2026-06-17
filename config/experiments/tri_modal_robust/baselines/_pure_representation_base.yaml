@@ -27,3 +27,7 @@ calibration:
 
 selective_prediction:
   enabled: false
+
+eval:
+  robust_val:
+    enabled: false

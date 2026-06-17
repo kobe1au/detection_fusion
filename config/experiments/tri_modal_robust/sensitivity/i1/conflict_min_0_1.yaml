@@ -1,0 +1,9 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+train:
+  exp_name: sensitivity_i1_conflict_min_0_1
+
+fusion:
+  conflict_factor:
+    min_value: 0.1

@@ -1,0 +1,9 @@
+defaults:
+  - ../_tuning_train_base.yaml
+
+train:
+  exp_name: tuning_i1_reliability_hidden_dim_32
+
+fusion:
+  reliability_calibration:
+    hidden_dim: 32

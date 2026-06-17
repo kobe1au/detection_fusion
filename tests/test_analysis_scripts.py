@@ -36,7 +36,7 @@ def test_evidence_bin_effects_report_branch_accuracy_by_tercile():
     assert api_rows.loc["high", "predicted_reliability_mean"] == pytest.approx(0.8)
 
 
-def test_reliability_table_marks_auc_undefined_for_single_class_correctness():
+def test_reliability_table_marks_auc_and_ap_undefined_for_single_class_correctness():
     frame = pd.DataFrame(
         {
             "experiment": ["final_seed_42", "final_seed_42"],
@@ -53,6 +53,8 @@ def test_reliability_table_marks_auc_undefined_for_single_class_correctness():
 
     assert row["auc_defined"] == 0
     assert np.isnan(row["auc"])
+    assert row["ap_defined"] == 0
+    assert np.isnan(row["ap"])
 
 
 def test_aggregate_metrics_groups_seed_runs_by_method(tmp_path):

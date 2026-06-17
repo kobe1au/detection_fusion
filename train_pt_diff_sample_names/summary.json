@@ -1,0 +1,23 @@
+﻿{
+    "sample_names_txt":  "D:\\code\\detection_fusion\\sample_names.txt",
+    "local_train_dir":  "D:\\pts_robust\\train",
+    "output_dir":  "D:\\code\\detection_fusion\\train_pt_diff_sample_names",
+    "sample_names_raw_lines":  10200,
+    "sample_names_unique":  10200,
+    "sample_names_duplicate_lines":  0,
+    "local_train_pt_files":  10334,
+    "local_train_unique":  10334,
+    "local_train_duplicate_stems":  0,
+    "common":  10200,
+    "local_train_only_missing_from_sample_names":  134,
+    "sample_names_only_missing_from_local_train":  0,
+    "copied_local_train_only_pts":  134,
+    "copied_local_train_only_total_bytes":  469568321,
+    "copied_local_train_only_total_gib":  0.4373,
+    "files":  {
+                  "local_train_only_list":  "D:\\code\\detection_fusion\\train_pt_diff_sample_names\\local_train_only_missing_from_sample_names.txt",
+                  "sample_names_only_list":  "D:\\code\\detection_fusion\\train_pt_diff_sample_names\\sample_names_only_missing_from_local_train.txt",
+                  "common_list":  "D:\\code\\detection_fusion\\train_pt_diff_sample_names\\common.txt",
+                  "local_train_only_pts_dir":  "D:\\code\\detection_fusion\\train_pt_diff_sample_names\\local_train_only_pts"
+              }
+}
