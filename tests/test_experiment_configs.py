@@ -82,6 +82,38 @@ def test_tuning_groups_are_validation_only():
                 assert cfg["train"].get("tuning_mode") is True, path
 
 
+def test_section_groups_do_not_rerun_full_method():
+    final_path = (run.CONFIG_DIR / run.FINAL).resolve()
+    section_groups = (
+        "module",
+        "i1",
+        "i1_appendix",
+        "i1_full",
+        "i2",
+        "i2_appendix",
+        "i2_full",
+        "i3",
+        "i3_appendix",
+        "i3_full",
+        "component",
+        "training_ablation",
+        "training_ablation_appendix",
+        "training_ablation_full",
+        "sensitivity",
+        "external",
+    )
+    for group in section_groups:
+        paths = {path.resolve() for path in run.resolve_targets(group)}
+        assert final_path not in paths, group
+
+
+def test_per_module_tuning_groups_do_not_rerun_tuning_base():
+    tuning_base = (run.CONFIG_DIR / run.TUNING_FULL).resolve()
+    for group in ("tuning_i1", "tuning_i2", "tuning_i3"):
+        paths = {path.resolve() for path in run.resolve_targets(group)}
+        assert tuning_base not in paths, group
+
+
 def test_paper_plan_excludes_tuning_configs():
     tuning_paths = {path.resolve() for path in run.resolve_targets("tuning")}
     for group in ("paper", "paper_main", "paper_appendix", "paper_all"):
@@ -112,6 +144,19 @@ def test_decision_only_sensitivities_reuse_seed_42_checkpoint_safely():
         validate_eval_checkpoint_config(cfg, seed_cfg)
 
 
+def test_external_obfuscapk_eval_configs_reuse_seed_42_checkpoint_safely():
+    seed_cfg = _resolved(ROOT / "seeds/seed_42.yaml")
+    for relative in run.EXTERNAL_EVAL:
+        cfg = _resolved(ROOT / relative)
+        assert cfg["eval"]["eval_only"] is True
+        assert cfg["eval"]["run_test"] is False
+        assert cfg["eval"]["run_robust_test"] is False
+        assert cfg["eval"]["refit_rejection_threshold"] is True
+        assert "final_seed_42/42/best_tri_modal_robust.pt" in cfg["eval"]["checkpoint_path"]
+        assert cfg["eval"].get("extra_sets"), relative
+        validate_eval_checkpoint_config(cfg, seed_cfg)
+
+
 def test_runnable_configs_share_validation_selection_protocol():
     for path in run.resolve_targets("all"):
         cfg = _resolved(path)
@@ -134,6 +179,28 @@ def test_non_discount_baselines_do_not_enable_calibration_or_rejection():
         assert cfg["calibration"]["enabled"] is False
         assert cfg["calibration"]["holdout_enabled"] is True
         assert cfg["selective_prediction"]["enabled"] is False
+
+
+def test_module_ablations_match_paper_claims():
+    no_i1 = _resolved(ROOT / "ablations/modules/no_i1_observable_reliability.yaml")
+    assert no_i1["fusion"]["reliability_calibration"]["enabled"] is False
+    assert no_i1["fusion"]["use_support_discount"] is False
+    assert no_i1["fusion"]["use_conflict_discount"] is False
+    assert no_i1["fusion"]["use_hard_alive_mask"] is False
+    assert no_i1["semantic_cross_attention"]["use_reliability_bias"] is False
+    assert no_i1["semantic_cross_attention"]["use_support_bias"] is False
+    assert no_i1["semantic_cross_attention"]["use_conflict_bias"] is False
+
+    no_i2 = _resolved(ROOT / "ablations/modules/no_i2_semantic_interaction.yaml")
+    assert no_i2["semantic_cross_attention"]["enabled"] is False
+    assert no_i2["semantic_cross_attention"]["attach_to_joint"] is False
+    assert no_i2["semantic_cross_attention"]["attach_to_reconstruction"] is False
+
+    no_i3 = _resolved(ROOT / "baselines/learned_evidence_logit_fusion.yaml")
+    assert no_i3["model"]["fusion_mode"] == "tri_modal_ours"
+    assert no_i3["fusion"]["mode"] == "legacy_learned_gate"
+    assert no_i3["calibration"]["enabled"] is False
+    assert no_i3["selective_prediction"]["enabled"] is False
 
 
 def test_calibration_configs_have_trainable_posthoc_parameters():
@@ -242,6 +309,7 @@ def test_paper_plan_has_expected_unique_runs():
     paths = run.resolve_targets("paper_all")
     expected = [
         *run.BASELINES,
+        *run.MODULE_ABLATIONS,
         *run.I1_ABLATIONS,
         *run.I1_APPENDIX_ABLATIONS,
         *run.I2_ABLATIONS,
@@ -252,6 +320,7 @@ def test_paper_plan_has_expected_unique_runs():
         *run.TRAINING_APPENDIX_ABLATIONS,
         *run.SEEDS,
         *run.SENSITIVITY,
+        *run.EXTERNAL_EVAL,
     ]
     assert len(paths) == len(expected)
     assert len({path.resolve() for path in paths}) == len(paths)
@@ -261,9 +330,7 @@ def test_main_paper_plan_is_compact_and_excludes_sensitivity():
     paths = run.resolve_targets("paper")
     expected = [
         *run.BASELINES,
-        *run.I1_ABLATIONS,
-        *run.I2_ABLATIONS,
-        *run.I3_ABLATIONS,
+        *run.MODULE_ABLATIONS,
         *run.TRAINING_ABLATIONS,
         *run.SEEDS,
     ]
@@ -275,8 +342,31 @@ def test_main_paper_plan_is_compact_and_excludes_sensitivity():
     assert not ({path.resolve() for path in paths} & sensitivity_paths)
 
 
-def test_paper_appendix_runs_seed_checkpoint_before_sensitivity():
-    paths = run.resolve_targets("paper_appendix")
+def test_standalone_sensitivity_group_runs_seed_checkpoint_before_sensitivity():
+    paths = run.resolve_targets("sensitivity_with_seed")
+    seed_42 = (run.CONFIG_DIR / run.SEEDS[0]).resolve()
+    resolved_paths = [path.resolve() for path in paths]
+    sensitivity_paths = {
+        (run.CONFIG_DIR / relative).resolve() for relative in run.SENSITIVITY
+    }
+    first_sensitivity = min(
+        index
+        for index, path in enumerate(resolved_paths)
+        if path in sensitivity_paths
+    )
+
+    assert seed_42 in resolved_paths
+    assert resolved_paths.index(seed_42) < first_sensitivity
+
+
+def test_default_appendix_group_does_not_rerun_seed_checkpoint():
+    seed_42 = (run.CONFIG_DIR / run.SEEDS[0]).resolve()
+    paths = {path.resolve() for path in run.resolve_targets("paper_appendix")}
+    assert seed_42 not in paths
+
+
+def test_standalone_appendix_group_runs_seed_checkpoint_before_sensitivity():
+    paths = run.resolve_targets("paper_appendix_with_seed")
     seed_42 = (run.CONFIG_DIR / run.SEEDS[0]).resolve()
     resolved_paths = [path.resolve() for path in paths]
     sensitivity_paths = {

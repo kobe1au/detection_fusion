@@ -1,6 +1,9 @@
 defaults:
   - ../_tuning_train_base.yaml
 
+method:
+  name: tuning_i1_conflict_min_0_1
+
 train:
   exp_name: tuning_i1_conflict_min_0_1
 

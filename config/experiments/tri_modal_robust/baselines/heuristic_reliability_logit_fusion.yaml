@@ -1,6 +1,9 @@
 defaults:
   - _fusion_baseline_base.yaml
 
+method:
+  name: baseline_heuristic_reliability_logit_fusion
+
 train:
   exp_name: baseline_heuristic_reliability_logit_fusion
 

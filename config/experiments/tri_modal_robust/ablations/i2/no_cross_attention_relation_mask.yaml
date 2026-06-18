@@ -1,6 +1,9 @@
 defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
+method:
+  name: i2_no_cross_attention_relation_mask
+
 train:
   exp_name: i2_no_cross_attention_relation_mask
 

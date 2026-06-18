@@ -2,11 +2,12 @@ defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
 method:
-  name: i2_joint_only_cross_attention
+  name: module_no_i2_semantic_interaction
 
 train:
-  exp_name: i2_joint_only_cross_attention
+  exp_name: module_no_i2_semantic_interaction
 
 semantic_cross_attention:
-  attach_to_joint: true
+  enabled: false
+  attach_to_joint: false
   attach_to_reconstruction: false

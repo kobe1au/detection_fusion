@@ -1,6 +1,9 @@
 defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
+method:
+  name: training_no_reliability_weighted_aux
+
 train:
   exp_name: training_no_reliability_weighted_aux
 

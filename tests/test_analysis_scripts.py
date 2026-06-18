@@ -6,6 +6,7 @@ import pytest
 
 from scripts.analyze_reliability_evidence import (
     evidence_bin_effects_table,
+    natural_degradation_subset_table,
     reliability_table,
 )
 from scripts.collect_experiment_results import aggregate_metrics, collect_metric_rows
@@ -55,6 +56,29 @@ def test_reliability_table_marks_auc_and_ap_undefined_for_single_class_correctne
     assert np.isnan(row["auc"])
     assert row["ap_defined"] == 0
     assert np.isnan(row["ap"])
+
+
+def test_natural_degradation_subset_table_reports_low_integrity_final_metrics():
+    frame = pd.DataFrame(
+        {
+            "experiment": ["final_seed_42"] * 6,
+            "seed": ["42"] * 6,
+            "diagnostic_file": ["gate_diagnostics.csv"] * 6,
+            "split": ["test_clean"] * 6,
+            "api_integrity": [0.05, 0.10, 0.20, 0.70, 0.80, 0.90],
+            "label": [0, 1, 1, 0, 1, 0],
+            "prob_malware": [0.20, 0.80, 0.40, 0.10, 0.90, 0.30],
+            "pred": [0, 1, 0, 0, 1, 0],
+        }
+    )
+
+    table = natural_degradation_subset_table(frame, quantile=1.0 / 3.0, min_count=1)
+    row = table[table["subset"] == "api_low_integrity"].iloc[0]
+
+    assert row["count"] == 2
+    assert 0.10 < row["threshold"] < 0.20
+    assert row["acc"] == pytest.approx(1.0)
+    assert row["macro_f1"] == pytest.approx(1.0)
 
 
 def test_aggregate_metrics_groups_seed_runs_by_method(tmp_path):

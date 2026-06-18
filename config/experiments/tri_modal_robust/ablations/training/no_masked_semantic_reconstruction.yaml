@@ -1,6 +1,9 @@
 defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
+method:
+  name: training_no_masked_semantic_reconstruction
+
 train:
   exp_name: training_no_masked_semantic_reconstruction
 

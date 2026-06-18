@@ -1,6 +1,9 @@
 defaults:
   - ../_tuning_train_base.yaml
 
+method:
+  name: tuning_i2_dropout_0_0
+
 train:
   exp_name: tuning_i2_dropout_0_0
 

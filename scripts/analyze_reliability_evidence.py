@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
 
 
 BRANCHES = ("api", "graph", "manifest", "joint")
@@ -39,6 +39,24 @@ EVIDENCE_BIN_SPECS = {
     "manifest_to_code_conflict": ("manifest", "joint"),
     "code_to_manifest_conflict": ("api", "graph", "joint"),
     "max_manifest_code_conflict": ("api", "graph", "manifest", "joint"),
+}
+
+NATURAL_SUBSET_SPECS = {
+    "api_low_integrity": ("api_integrity", "low"),
+    "graph_low_integrity": ("graph_integrity", "low"),
+    "manifest_low_integrity": ("manifest_integrity", "low"),
+    "code_low_integrity": ("code_integrity", "low"),
+    "api_graph_low_support": ("api_graph_anchor_support", "low"),
+    "manifest_code_low_support": ("manifest_code_support", "low"),
+    "manifest_to_code_high_conflict": ("manifest_to_code_conflict", "high"),
+    "code_to_manifest_high_conflict": ("code_to_manifest_conflict", "high"),
+    "max_manifest_code_high_conflict": ("max_manifest_code_conflict", "high"),
+}
+
+NATURAL_MISSING_SPECS = {
+    "api_naturally_missing": "api_alive",
+    "graph_naturally_missing": "graph_alive",
+    "manifest_naturally_missing": "manifest_alive",
 }
 
 FILTER_COLUMNS = ("experiment", "seed", "split", "diagnostic_file")
@@ -355,6 +373,131 @@ def evidence_bin_effects_table(frame: pd.DataFrame, bin_scope: str = "global") -
     return pd.DataFrame.from_records(records)
 
 
+def _classification_metrics_for_frame(frame: pd.DataFrame) -> dict[str, Any]:
+    required = {"label", "prob_malware", "pred"}
+    if frame.empty or not required.issubset(frame.columns):
+        return {}
+    data = frame[list(required)].copy()
+    for column in required:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.dropna()
+    if data.empty:
+        return {}
+    valid_index = data.index
+    labels_arr = data["label"].astype(int).to_numpy()
+    probs_arr = data["prob_malware"].clip(0.0, 1.0).to_numpy(dtype=float)
+    preds_arr = data["pred"].astype(int).to_numpy()
+    confidence = np.maximum(probs_arr, 1.0 - probs_arr)
+    correctness = (preds_arr == labels_arr).astype(float)
+    auc_defined = _auc_defined(labels_arr.astype(float))
+    ap_defined = _ap_defined(labels_arr.astype(float))
+    out: dict[str, Any] = {
+        "count": int(labels_arr.size),
+        "positive_rate": float(labels_arr.mean()) if labels_arr.size else float("nan"),
+        "acc": float(accuracy_score(labels_arr, preds_arr)),
+        "macro_f1": float(f1_score(labels_arr, preds_arr, average="macro", zero_division=0)),
+        "brier": float(np.mean((probs_arr - labels_arr.astype(float)) ** 2)),
+        "ece_10": _ece(confidence, correctness, bins=10),
+        "mean_confidence": float(confidence.mean()),
+        "confidence_accuracy_gap": float(confidence.mean() - correctness.mean()),
+        "auc_defined": int(auc_defined),
+        "auc": _safe_auc(labels_arr.astype(float), probs_arr),
+        "ap_defined": int(ap_defined),
+        "ap": _safe_ap(labels_arr.astype(float), probs_arr),
+    }
+    if "acceptance_score" in frame.columns:
+        acceptance = pd.to_numeric(frame.loc[valid_index, "acceptance_score"], errors="coerce")
+        if acceptance.notna().any():
+            out["acceptance_score_mean"] = float(acceptance.dropna().mean())
+    if "rejected" in frame.columns:
+        rejected = pd.to_numeric(frame.loc[valid_index, "rejected"], errors="coerce")
+        if rejected.notna().any():
+            out["rejection_rate"] = float((rejected.dropna() >= 0.5).mean())
+    return out
+
+
+def natural_degradation_subset_table(
+    frame: pd.DataFrame,
+    quantile: float = 1.0 / 3.0,
+    min_count: int = 10,
+) -> pd.DataFrame:
+    """Evaluate clean, naturally low-quality evidence subsets without perturbing samples."""
+    if not (0.0 < quantile < 0.5):
+        raise ValueError("quantile must be in (0, 0.5)")
+    records: list[dict[str, Any]] = []
+    frame = _with_derived_evidence(frame)
+    group_columns = ["experiment", "seed", "diagnostic_file", "split"]
+    available_groups = [column for column in group_columns if column in frame.columns]
+    numeric_columns = [
+        *{spec[0] for spec in NATURAL_SUBSET_SPECS.values()},
+        *NATURAL_MISSING_SPECS.values(),
+        "label",
+        "prob_malware",
+        "pred",
+        "acceptance_score",
+        "rejected",
+    ]
+    numeric = _to_numeric(frame, [column for column in numeric_columns if column in frame.columns])
+    for group, group_frame in numeric.groupby(available_groups, dropna=False):
+        group_values = group if isinstance(group, tuple) else (group,)
+        base = dict(zip(available_groups, group_values))
+
+        for subset_name, (evidence, direction) in NATURAL_SUBSET_SPECS.items():
+            if evidence not in group_frame.columns:
+                continue
+            values = pd.to_numeric(group_frame[evidence], errors="coerce")
+            valid = values.dropna()
+            if valid.empty:
+                continue
+            threshold = float(valid.quantile(quantile if direction == "low" else 1.0 - quantile))
+            mask = values <= threshold if direction == "low" else values >= threshold
+            subset = group_frame[mask.fillna(False)]
+            if len(subset) < min_count:
+                continue
+            metrics = _classification_metrics_for_frame(subset)
+            if not metrics:
+                continue
+            records.append(
+                {
+                    **base,
+                    "subset": subset_name,
+                    "subset_type": "natural_evidence_quantile",
+                    "evidence": evidence,
+                    "direction": direction,
+                    "quantile": float(quantile),
+                    "threshold": threshold,
+                    "evidence_mean": float(values[mask].mean()),
+                    **metrics,
+                }
+            )
+
+        for subset_name, alive_column in NATURAL_MISSING_SPECS.items():
+            if alive_column not in group_frame.columns:
+                continue
+            values = pd.to_numeric(group_frame[alive_column], errors="coerce")
+            mask = values < 0.5
+            subset = group_frame[mask.fillna(False)]
+            if len(subset) < min_count:
+                continue
+            metrics = _classification_metrics_for_frame(subset)
+            if not metrics:
+                continue
+            records.append(
+                {
+                    **base,
+                    "subset": subset_name,
+                    "subset_type": "natural_missing_modality",
+                    "evidence": alive_column,
+                    "direction": "missing",
+                    "quantile": float("nan"),
+                    "threshold": 0.5,
+                    "evidence_mean": float(values[mask].mean()),
+                    **metrics,
+                }
+            )
+    return pd.DataFrame.from_records(records)
+
+
 def _diagram_points(scores: np.ndarray, correctness: np.ndarray, bins: int = 10) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     edges = np.linspace(0.0, 1.0, bins + 1)
@@ -480,6 +623,18 @@ def main() -> None:
             "separate thresholds inside each experiment/seed/split group."
         ),
     )
+    parser.add_argument(
+        "--natural-subset-quantile",
+        type=float,
+        default=1.0 / 3.0,
+        help="Bottom/top quantile used for natural degradation subset cuts.",
+    )
+    parser.add_argument(
+        "--natural-subset-min-count",
+        type=int,
+        default=10,
+        help="Minimum samples required before writing a natural subset row.",
+    )
     parser.add_argument("--fail-if-empty", action="store_true")
     args = parser.parse_args()
 
@@ -493,6 +648,7 @@ def main() -> None:
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_reliability_calibration.csv", index=False)
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_evidence_groups.csv", index=False)
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_evidence_bin_effects.csv", index=False)
+        pd.DataFrame().to_csv(Path(args.out_dir) / "natural_degradation_subsets.csv", index=False)
         return
 
     numeric_columns = [
@@ -515,6 +671,14 @@ def main() -> None:
     _write_csv(
         evidence_bin_effects_table(frame, bin_scope=args.bin_scope),
         Path(args.out_dir) / "i1_evidence_bin_effects.csv",
+    )
+    _write_csv(
+        natural_degradation_subset_table(
+            frame,
+            quantile=float(args.natural_subset_quantile),
+            min_count=int(args.natural_subset_min_count),
+        ),
+        Path(args.out_dir) / "natural_degradation_subsets.csv",
     )
     write_reliability_diagrams(frame, Path(args.figures_dir))
 

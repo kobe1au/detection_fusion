@@ -2,8 +2,14 @@ defaults:
   - ../observable_reliability_discount_fusion.yaml
 
 train:
+  exp_name: tuning_base
   tuning_mode: true
+  epochs: 35
+  patience: 5
+  checkpoint_metric: robust_composite
 
 eval:
   run_test: false
   run_robust_test: false
+  robust_val:
+    enabled: true

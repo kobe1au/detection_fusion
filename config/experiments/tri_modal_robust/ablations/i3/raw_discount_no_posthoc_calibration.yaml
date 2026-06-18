@@ -1,8 +1,15 @@
 defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
+method:
+  name: i3_raw_discount_no_posthoc_calibration
+
 train:
   exp_name: i3_raw_discount_no_posthoc_calibration
+
+calibration:
+  enabled: false
+  holdout_enabled: true
 
 fusion:
   reliability_calibration:
@@ -11,7 +18,3 @@ fusion:
   probability_calibration:
     enabled: false
     weight: 0.0
-
-calibration:
-  enabled: false
-  holdout_enabled: true

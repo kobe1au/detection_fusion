@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
 
-PYTHON_BIN = os.getenv("PYTHON_BIN", "python")
+PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
 CONFIG_DIR = Path("config/experiments/tri_modal_robust")
 
 ALIASES = {
@@ -30,6 +31,16 @@ BASELINES = [
     "baselines/fixed_logit_fusion.yaml",
     "baselines/confidence_logit_fusion.yaml",
     "baselines/heuristic_reliability_logit_fusion.yaml",
+    "baselines/learned_evidence_logit_fusion.yaml",
+]
+
+MODULE_ABLATIONS = [
+    "ablations/modules/no_i1_observable_reliability.yaml",
+    "ablations/modules/no_i2_semantic_interaction.yaml",
+]
+
+MODULE_ABLATIONS_WITH_I3 = [
+    *MODULE_ABLATIONS,
     "baselines/learned_evidence_logit_fusion.yaml",
 ]
 
@@ -76,7 +87,6 @@ I3_APPENDIX_ABLATIONS = [
 TUNING_FULL = "tuning/full_candidate.yaml"
 
 TUNING_I1 = [
-    TUNING_FULL,
     "tuning/i1/reliability_hidden_dim_8.yaml",
     "tuning/i1/reliability_hidden_dim_32.yaml",
     "tuning/i1/missing_relation_support_0_5.yaml",
@@ -88,7 +98,6 @@ TUNING_I1 = [
 ]
 
 TUNING_I2 = [
-    TUNING_FULL,
     "tuning/i2/residual_tokens_2.yaml",
     "tuning/i2/residual_tokens_8.yaml",
     "tuning/i2/attention_heads_2.yaml",
@@ -98,7 +107,6 @@ TUNING_I2 = [
 ]
 
 TUNING_I3 = [
-    TUNING_FULL,
     "tuning/i3/acceptance_product_eval.yaml",
     "tuning/i3/coverage_80_eval.yaml",
     "tuning/i3/coverage_95_eval.yaml",
@@ -106,9 +114,9 @@ TUNING_I3 = [
 
 TUNING = [
     TUNING_FULL,
-    *[item for item in TUNING_I1 if item != TUNING_FULL],
-    *[item for item in TUNING_I2 if item != TUNING_FULL],
-    *[item for item in TUNING_I3 if item != TUNING_FULL],
+    *TUNING_I1,
+    *TUNING_I2,
+    *TUNING_I3,
 ]
 
 TRAINING_ABLATIONS = [
@@ -139,6 +147,13 @@ SENSITIVITY = [
     "sensitivity/i3/coverage_95.yaml",
 ]
 
+EXTERNAL_EVAL = [
+    "external/obfuscapk_rename_eval.yaml",
+    "external/obfuscapk_code_eval.yaml",
+    "external/obfuscapk_encryption_eval.yaml",
+    "external/obfuscapk_combined_eval.yaml",
+]
+
 SEEDS = [
     "seeds/seed_42.yaml",
     "seeds/seed_2024.yaml",
@@ -150,40 +165,44 @@ FINAL = "observable_reliability_discount_fusion.yaml"
 GROUPS = {
     "main": [FINAL, *BASELINES],
     "baselines": BASELINES,
+    "module": MODULE_ABLATIONS_WITH_I3,
+    "tuning_base": [TUNING_FULL],
     "tuning_i1": TUNING_I1,
     "tuning_i2": TUNING_I2,
     "tuning_i3": TUNING_I3,
     "tuning": TUNING,
-    "i1": [FINAL, *I1_ABLATIONS],
-    "i1_appendix": [FINAL, *I1_APPENDIX_ABLATIONS],
-    "i1_full": [FINAL, *I1_ABLATIONS, *I1_APPENDIX_ABLATIONS],
-    "i2": [FINAL, *I2_ABLATIONS],
-    "i2_appendix": [FINAL, *I2_APPENDIX_ABLATIONS],
-    "i2_full": [FINAL, *I2_ABLATIONS, *I2_APPENDIX_ABLATIONS],
-    "i3": [FINAL, "baselines/learned_evidence_logit_fusion.yaml", *I3_ABLATIONS],
-    "i3_appendix": [FINAL, *I3_APPENDIX_ABLATIONS],
+    "i1": I1_ABLATIONS,
+    "i1_appendix": I1_APPENDIX_ABLATIONS,
+    "i1_full": [*I1_ABLATIONS, *I1_APPENDIX_ABLATIONS],
+    "i2": I2_ABLATIONS,
+    "i2_appendix": I2_APPENDIX_ABLATIONS,
+    "i2_full": [*I2_ABLATIONS, *I2_APPENDIX_ABLATIONS],
+    "i3": ["baselines/learned_evidence_logit_fusion.yaml", *I3_ABLATIONS],
+    "i3_appendix": I3_APPENDIX_ABLATIONS,
     "i3_full": [
-        FINAL,
         "baselines/learned_evidence_logit_fusion.yaml",
         *I3_ABLATIONS,
         *I3_APPENDIX_ABLATIONS,
     ],
     "ablation": [
-        FINAL,
-        *I1_ABLATIONS,
-        *I2_ABLATIONS,
-        *I3_ABLATIONS,
+        *MODULE_ABLATIONS_WITH_I3,
         *TRAINING_ABLATIONS,
     ],
+    "component": [
+        *I1_ABLATIONS,
+        *I1_APPENDIX_ABLATIONS,
+        *I2_ABLATIONS,
+        *I2_APPENDIX_ABLATIONS,
+        *I3_ABLATIONS,
+        *I3_APPENDIX_ABLATIONS,
+    ],
     "ablation_appendix": [
-        FINAL,
         *I1_APPENDIX_ABLATIONS,
         *I2_APPENDIX_ABLATIONS,
         *I3_APPENDIX_ABLATIONS,
         *TRAINING_APPENDIX_ABLATIONS,
     ],
     "ablation_full": [
-        FINAL,
         *I1_ABLATIONS,
         *I1_APPENDIX_ABLATIONS,
         *I2_ABLATIONS,
@@ -193,29 +212,36 @@ GROUPS = {
         *TRAINING_ABLATIONS,
         *TRAINING_APPENDIX_ABLATIONS,
     ],
-    "training_ablation": [FINAL, *TRAINING_ABLATIONS],
-    "training_ablation_appendix": [FINAL, *TRAINING_APPENDIX_ABLATIONS],
-    "training_ablation_full": [FINAL, *TRAINING_ABLATIONS, *TRAINING_APPENDIX_ABLATIONS],
-    "sensitivity": [SEEDS[0], *SENSITIVITY],
+    "training_ablation": TRAINING_ABLATIONS,
+    "training_ablation_appendix": TRAINING_APPENDIX_ABLATIONS,
+    "training_ablation_full": [*TRAINING_ABLATIONS, *TRAINING_APPENDIX_ABLATIONS],
+    "external": EXTERNAL_EVAL,
+    "obfuscapk": EXTERNAL_EVAL,
+    "sensitivity": SENSITIVITY,
+    "sensitivity_with_seed": [SEEDS[0], *SENSITIVITY],
     "seed": SEEDS,
     "full": SEEDS,
     "paper": [
         *BASELINES,
-        *I1_ABLATIONS,
-        *I2_ABLATIONS,
-        *I3_ABLATIONS,
+        *MODULE_ABLATIONS,
         *TRAINING_ABLATIONS,
         *SEEDS,
     ],
     "paper_main": [
         *BASELINES,
-        *I1_ABLATIONS,
-        *I2_ABLATIONS,
-        *I3_ABLATIONS,
+        *MODULE_ABLATIONS,
         *TRAINING_ABLATIONS,
         *SEEDS,
     ],
     "paper_appendix": [
+        *I1_APPENDIX_ABLATIONS,
+        *I2_APPENDIX_ABLATIONS,
+        *I3_APPENDIX_ABLATIONS,
+        *TRAINING_APPENDIX_ABLATIONS,
+        *SENSITIVITY,
+    ],
+    "paper_external": EXTERNAL_EVAL,
+    "paper_appendix_with_seed": [
         SEEDS[0],
         *I1_APPENDIX_ABLATIONS,
         *I2_APPENDIX_ABLATIONS,
@@ -225,6 +251,7 @@ GROUPS = {
     ],
     "paper_all": [
         *BASELINES,
+        *MODULE_ABLATIONS,
         *I1_ABLATIONS,
         *I1_APPENDIX_ABLATIONS,
         *I2_ABLATIONS,
@@ -235,6 +262,7 @@ GROUPS = {
         *TRAINING_APPENDIX_ABLATIONS,
         *SEEDS,
         *SENSITIVITY,
+        *EXTERNAL_EVAL,
     ],
 }
 

@@ -1,6 +1,9 @@
 defaults:
   - _pure_representation_base.yaml
 
+method:
+  name: baseline_graph_only
+
 train:
   exp_name: baseline_graph_only
 

@@ -1,6 +1,9 @@
 defaults:
   - _pure_representation_base.yaml
 
+method:
+  name: baseline_tri_modal_concat
+
 train:
   exp_name: baseline_tri_modal_concat
 

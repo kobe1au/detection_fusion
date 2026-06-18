@@ -1,6 +1,9 @@
 defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
+method:
+  name: i1_no_support_evidence
+
 train:
   exp_name: i1_no_support_evidence
 

@@ -1,74 +1,60 @@
 # Tri-Modal Robust Experiment Plan
 
-The layout follows current reproducibility practice: hyperparameters are chosen
-on validation data, test data is reserved for frozen final models, mechanism
-ablations are separated from numeric sensitivity analyses, and final results are
-reported across multiple seeds.
+This directory supports the paper structure:
 
-## Files
+1. overall performance against internal baselines;
+2. module-level ablation for I1/I2/I3;
+3. static parsing degradation robustness;
+4. mechanism analysis;
+5. optional comparison with reproduced prior detectors.
 
-- `base_tri_modal_robust.yaml`: fixed protocol and the default full method.
-- `observable_reliability_discount_fusion.yaml`: the named full-method entry.
-- `_autodl_paths.yaml`: optional path overlay for the AutoDL server.
-- `tuning/`: validation-only hyperparameter selection.
-- `ablations/`: frozen full method with one mechanism removed.
-- `sensitivity/`: final/appendix hyperparameter sensitivity.
-- `seeds/`: final multi-seed runs.
+## Main Paper
 
-## Recommended Order
+- `python run.py main`: full method plus internal baselines for Section 4.2.
+- `python run.py module`: `w/o I1`, `w/o I2`, and `w/o I3` for Section 4.3.
+- `python run.py full`: final three-seed full method.
+- `python run.py paper_main`: compact main-paper runnable set.
 
-1. `python run.py tuning_i1`: choose reliability-module hyperparameters on
-   validation only.
-2. Freeze the selected I1 values in `base_tri_modal_robust.yaml`.
-3. `python run.py tuning_i2`: choose semantic-interaction hyperparameters on
-   validation only.
-4. Freeze the selected I2 values.
-5. `python run.py tuning_i3`: choose decision/rejection settings on validation
-   only.
-6. Freeze the final full method.
-7. Run compact main-paper experiments:
-   - `python run.py main`
-   - `python run.py i1`
-   - `python run.py i2`
-   - `python run.py i3`
-   - `python run.py training_ablation`
-   - `python run.py full`
-8. Run appendix experiments only when needed:
-   - `python run.py ablation_appendix`
-   - `python run.py sensitivity`
+`module`, `i1`, `i2`, `i3`, `component`, and `paper_appendix` do not rerun the
+full method. Compare their rows against results from `main`, `full`, or
+`paper_main`.
 
-Use AutoDL paths with:
+## Robustness
+
+- Controlled degradation is produced by `eval.perturb_tests` in the base config.
+- Natural degradation subsets are produced after training:
 
 ```bash
-python run.py tuning_i1 --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
+python scripts/analyze_reliability_evidence.py \
+  --results-root results/tri_modal_robust \
+  --out-dir tables/natural_degradation \
+  --figures-dir figures/natural_degradation \
+  --split test_clean \
+  --diagnostic-file gate_diagnostics.csv \
+  --bin-scope group \
+  --natural-subset-quantile 0.333 \
+  --natural-subset-min-count 30
 ```
 
-## Interpretation
+- Obfuscapk eval-only configs live under `external/`. They assume obfuscated PTs
+  were built separately and reuse the trained full-method checkpoint.
 
-- `tuning_*` experiments are not paper ablations. They justify selected values.
-- `i1`, `i2`, and `i3` are compact mechanism-level ablations for the main paper.
-- `i1_appendix`, `i2_appendix`, `i3_appendix`, and `ablation_appendix` keep
-  fine-grained component splits for supplementary material.
-- `sensitivity` reports whether conclusions are stable under nearby numeric
-  hyperparameter changes and belongs in appendix/supplementary material.
-- `paper` and `paper_main` exclude tuning and sensitivity runs. They are the
-  recommended main-paper runnable set.
-- `paper_appendix` contains fine-grained ablations and sensitivity experiments;
-  it first runs `seed_42` so decision-only sensitivity configs have a checkpoint.
-- `paper_all` contains both main-paper and appendix experiments.
+## Appendix
 
-## Main-Paper Ablation Scope
+- `python run.py component`: fine-grained component ablations.
+- `python run.py tuning_base`: validation-only default candidate.
+- `python run.py tuning_i1`, `python run.py tuning_i2`, `python run.py tuning_i3`:
+  validation-only variants for each module.
+- `python run.py sensitivity`: appendix sensitivity runs.
+- `python run.py paper_appendix`: component ablations plus sensitivity, assuming
+  the seed-42 full checkpoint already exists.
+- `python run.py paper_appendix_with_seed`: standalone appendix run that first
+  trains the required seed-42 full checkpoint.
 
-To match common recent ML paper style, the main text uses a compact set of
-mechanism ablations:
+## AutoDL
 
-- I1: reliability calibration, full observable evidence versus
-  integrity/alive-only evidence, and alive/applicability masking.
-- I2: semantic Cross-Attention, reliability-aware biases, relation masking, and
-  residual tokens.
-- I3: probability calibration, support/conflict discounting, confidence proxy,
-  and selective rejection.
-- Training: masked semantic reconstruction and synthetic degradation training.
+Use the path overlay as the last config:
 
-Fine-grained splits such as support-only versus conflict-only and individual
-attention-bias removals are preserved as appendix experiments.
+```bash
+python run.py paper_main --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
+```

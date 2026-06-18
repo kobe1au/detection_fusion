@@ -1,6 +1,9 @@
 defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
+method:
+  name: i3_no_hard_alive_mask
+
 train:
   exp_name: i3_no_hard_alive_mask
 

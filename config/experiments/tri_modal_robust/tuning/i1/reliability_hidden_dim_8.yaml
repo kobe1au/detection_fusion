@@ -1,6 +1,9 @@
 defaults:
   - ../_tuning_train_base.yaml
 
+method:
+  name: tuning_i1_reliability_hidden_dim_8
+
 train:
   exp_name: tuning_i1_reliability_hidden_dim_8
 

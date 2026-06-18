@@ -1,6 +1,9 @@
 defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
+method:
+  name: i1_no_alive_applicability_mask
+
 train:
   exp_name: i1_no_alive_applicability_mask
 
