@@ -8,6 +8,10 @@ train:
   exp_name: observable_reliability_discount_fusion
   checkpoint_metric: clean_macro_f1
 
+# Frozen from the completed I2 tuning sweep.
+semantic_cross_attention:
+  dropout: 0.0
+
 eval:
   robust_val:
     enabled: false

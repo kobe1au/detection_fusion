@@ -25,6 +25,7 @@ OBSOLETE_CONFIGS = {
     "tuning/i1/best_i1_candidate_1.yaml",
     "tuning/i1/best_i1_candidate_2.yaml",
     "tuning/i1/best_i1_candidate_3.yaml",
+    "tuning/i2/dropout_0_0.yaml",
     "tuning/tuning_final_candidate.yaml",
 }
 
@@ -121,7 +122,6 @@ TUNING_I2 = [
     "tuning/i2/residual_tokens_8.yaml",
     "tuning/i2/attention_heads_2.yaml",
     "tuning/i2/attention_heads_8.yaml",
-    "tuning/i2/dropout_0_0.yaml",
     "tuning/i2/dropout_0_2.yaml",
 ]
 

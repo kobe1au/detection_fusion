@@ -712,8 +712,10 @@ def _metrics(labels: list[int], probs: list[float], preds: list[int]) -> dict[st
             "recall": 0.0,
             "macro_recall": 0.0,
             "recall_pos": 0.0,
-            "auc": 0.0,
-            "ap": 0.0,
+            "auc_defined": 0,
+            "auc": float("nan"),
+            "ap_defined": 0,
+            "ap": float("nan"),
             "brier": 0.0,
             "ece_10": 0.0,
             "mean_confidence": 0.0,
@@ -752,11 +754,15 @@ def _metrics(labels: list[int], probs: list[float], preds: list[int]) -> dict[st
         "confidence_accuracy_gap": float(confidence.mean() - correct.mean()),
     }
     if len(set(labels)) > 1:
+        out["auc_defined"] = 1
         out["auc"] = float(roc_auc_score(labels, probs))
+        out["ap_defined"] = 1
         out["ap"] = float(average_precision_score(labels, probs))
     else:
-        out["auc"] = 0.0
-        out["ap"] = 0.0
+        out["auc_defined"] = 0
+        out["auc"] = float("nan")
+        out["ap_defined"] = 0
+        out["ap"] = float("nan")
     return out
 
 

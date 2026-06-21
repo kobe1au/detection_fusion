@@ -72,6 +72,8 @@ def test_metrics_report_macro_f1_as_primary_f1():
     metrics = _metrics(labels, probs, preds)
 
     assert metrics["acc"] == pytest.approx(0.5)
+    assert metrics["auc_defined"] == 1
+    assert metrics["ap_defined"] == 1
     assert metrics["f1_pos"] == pytest.approx(2.0 / 3.0)
     assert metrics["macro_f1"] == pytest.approx(1.0 / 3.0)
     assert metrics["f1"] == pytest.approx(metrics["macro_f1"])
@@ -80,6 +82,15 @@ def test_metrics_report_macro_f1_as_primary_f1():
     assert "brier" in metrics
     assert "ece_10" in metrics
     assert "mean_confidence" in metrics
+
+
+def test_metrics_mark_auc_and_ap_undefined_for_single_class():
+    metrics = _metrics([1, 1], [0.8, 0.9], [1, 1])
+
+    assert metrics["auc_defined"] == 0
+    assert metrics["auc"] != metrics["auc"]
+    assert metrics["ap_defined"] == 0
+    assert metrics["ap"] != metrics["ap"]
 
 
 def test_internal_isolation_groups_use_package_or_sample_id():
@@ -950,6 +961,9 @@ def _perturbation_sample():
 def test_api_missing_sets_q_align_zero():
     data = apply_api_missing(_perturbation_sample())
     assert data["q_api"] == 0.0
+    assert data["api_alive"] == 0.0
+    assert data["api_integrity"] == 0.0
+    assert data["code_integrity"] == 0.0
     assert data["pert_api"] == 1.0
     assert data["q_align"] == 0.0
     assert data["graph_semantic_category_counts"].sum().item() == 12.0
@@ -990,6 +1004,9 @@ def test_sensitive_api_dropout_is_noop_when_no_sensitive_events_exist():
 def test_graph_missing_sets_q_align_zero():
     data = apply_graph_missing(_perturbation_sample())
     assert data["q_graph"] == 0.0
+    assert data["graph_alive"] == 0.0
+    assert data["graph_integrity"] == 0.0
+    assert data["code_integrity"] == 0.0
     assert data["pert_graph"] == 1.0
     assert data["q_align"] == 0.0
 
@@ -1210,6 +1227,8 @@ def test_manifest_missing_zeroes_manifest_counts_and_q_manifest():
     data = apply_manifest_missing(_perturbation_sample())
     assert data["manifest_category_counts"].sum().item() == 0.0
     assert data["q_manifest"] == 0.0
+    assert data["manifest_alive"] == 0.0
+    assert data["manifest_integrity"] == 0.0
     assert data["pert_manifest"] == 1.0
 
 

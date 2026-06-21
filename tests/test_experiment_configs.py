@@ -282,6 +282,7 @@ def test_full_method_enables_reliability_aware_semantic_cross_attention():
     assert cross_attention["use_relation_mask"] is True
     assert cross_attention["num_security_tokens"] == 12
     assert cross_attention["num_residual_tokens"] > 0
+    assert cross_attention["dropout"] == 0.0
     assert cross_attention["residual_gate_init"] == 0.0
     assert cross_attention["joint_residual_gate_init"] < 0.0
     assert cfg["fusion"]["reliability_calibration"]["missing_relation_support"] == 0.0
