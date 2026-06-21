@@ -22,6 +22,7 @@ from fusion.manifest_features import DEFAULT_CATEGORIES, load_manifest_vocab, ve
 from fusion.model import ApiSequenceEncoder, TriModalRobustModel
 from fusion.train import (
     _dataset_common_kwargs,
+    _json_compatible,
     _metrics,
     _normalize_robust_val_scenarios,
     checkpoint_score,
@@ -91,6 +92,17 @@ def test_metrics_mark_auc_and_ap_undefined_for_single_class():
     assert metrics["auc"] != metrics["auc"]
     assert metrics["ap_defined"] == 0
     assert metrics["ap"] != metrics["ap"]
+
+
+def test_metric_serialization_converts_nonfinite_values_to_null():
+    cleaned = _json_compatible(
+        {"nan": float("nan"), "nested": [float("inf"), 1.0]}
+    )
+
+    assert cleaned == {"nan": None, "nested": [None, 1.0]}
+    dumped = yaml.safe_dump(cleaned)
+    assert ".nan" not in dumped.lower()
+    assert ".inf" not in dumped.lower()
 
 
 def test_internal_isolation_groups_use_package_or_sample_id():

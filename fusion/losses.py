@@ -248,16 +248,19 @@ def compute_masked_semantic_reconstruction_loss(
         "manifest": ("api", "graph"),
     }
     losses: dict[str, torch.Tensor] = {}
+    active_targets: dict[str, torch.Tensor] = {}
     diagnostics: dict[str, torch.Tensor] = {}
     for target_name in ("api", "graph", "manifest"):
         logits = outputs.get(f"recon_{target_name}_semantic_logits")
         if not isinstance(logits, torch.Tensor):
             losses[target_name] = zero
+            active_targets[target_name] = zero.detach()
             diagnostics[f"valid_recon_{target_name}_rate"] = zero.detach()
             continue
         target = _batch_semantic_target(batch, target_names[target_name], logits)
         if target is None:
             losses[target_name] = logits.sum() * 0.0
+            active_targets[target_name] = zero.detach()
             diagnostics[f"valid_recon_{target_name}_rate"] = zero.detach()
             continue
 
@@ -275,16 +278,22 @@ def compute_masked_semantic_reconstruction_loss(
         )
         sample_weight = valid.to(ref.dtype) * integrity[target_name] * input_weight
         losses[target_name] = _weighted_bce(logits, target, sample_weight)
+        active_targets[target_name] = (sample_weight.sum() > 0).to(dtype=ref.dtype)
         diagnostics[f"valid_recon_{target_name}_rate"] = valid.float().mean().detach()
         diagnostics[f"mask_rate_{target_name}"] = masks[target_name].float().mean().detach()
 
-    total = losses["api"] + losses["graph"] + losses["manifest"]
+    loss_values = torch.stack([losses[name] for name in ("api", "graph", "manifest")])
+    active = torch.stack(
+        [active_targets[name] for name in ("api", "graph", "manifest")]
+    )
+    total = (loss_values * active).sum() / active.sum().clamp_min(1.0)
     diagnostics.update(
         {
             "loss_recon_api": losses["api"].detach(),
             "loss_recon_graph": losses["graph"].detach(),
             "loss_recon_manifest": losses["manifest"].detach(),
             "loss_recon_total": total.detach(),
+            "active_recon_target_count": active.sum().detach(),
         }
     )
     return total, diagnostics

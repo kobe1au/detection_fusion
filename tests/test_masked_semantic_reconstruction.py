@@ -142,10 +142,33 @@ def test_masking_only_enabled_during_training():
 
 
 def test_masked_reconstruction_loss_finite():
-    outputs, batch, config = _loss_inputs()
-    loss, _ = compute_masked_semantic_reconstruction_loss(outputs, batch, _evidence(), config)
+    outputs, batch, config = _loss_inputs(3)
+    outputs["mask_api_semantic"] = torch.tensor([1.0, 0.0, 0.0])
+    outputs["mask_graph_semantic"] = torch.tensor([0.0, 1.0, 0.0])
+    outputs["mask_manifest_semantic"] = torch.tensor([0.0, 0.0, 1.0])
+    loss, diagnostics = compute_masked_semantic_reconstruction_loss(
+        outputs, batch, _evidence(3), config
+    )
     loss.backward()
     assert torch.isfinite(loss)
+    expected = torch.stack(
+        [diagnostics[f"loss_recon_{name}"] for name in ("api", "graph", "manifest")]
+    ).mean()
+    assert torch.allclose(loss.detach(), expected)
+    assert diagnostics["active_recon_target_count"].item() == 3.0
+
+
+def test_masked_reconstruction_averages_only_active_targets():
+    outputs, batch, config = _loss_inputs(1)
+    outputs["mask_graph_semantic"] = torch.zeros(1)
+    outputs["mask_manifest_semantic"] = torch.zeros(1)
+
+    loss, diagnostics = compute_masked_semantic_reconstruction_loss(
+        outputs, batch, _evidence(1), config
+    )
+
+    assert torch.allclose(loss.detach(), diagnostics["loss_recon_api"])
+    assert diagnostics["active_recon_target_count"].item() == 1.0
 
 
 def test_masked_reconstruction_skips_low_integrity_target():

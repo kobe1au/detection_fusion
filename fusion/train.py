@@ -1746,7 +1746,7 @@ def run(cfg: dict) -> dict[str, Any]:
         "extra_eval": extra_results,
     }
     with open(out_dir / "summary.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(summary, f, sort_keys=False)
+        yaml.safe_dump(_json_compatible(summary), f, sort_keys=False)
     logger.info("finished: %s", out_dir)
     return summary
 
