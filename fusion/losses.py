@@ -51,7 +51,8 @@ def _weighted_bce(
 ) -> torch.Tensor:
     per_sample = F.binary_cross_entropy_with_logits(logits, target, reduction="none").mean(dim=-1)
     denom = sample_weight.sum()
-    return (per_sample * sample_weight).sum() / denom.clamp_min(1e-8) if bool((denom > 0).item()) else logits.sum() * 0.0
+    weighted = (per_sample * sample_weight).sum() / denom.clamp_min(1e-8)
+    return weighted * (denom > 0).to(dtype=weighted.dtype)
 
 
 def _branch_alive_masks(evidence: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -302,7 +303,8 @@ def _weighted_cross_entropy(
         label_smoothing=label_smoothing,
     )
     denom = sample_weight.sum()
-    return (per_sample * sample_weight).sum() / denom.clamp_min(1e-8) if bool((denom > 0).item()) else logits.sum() * 0.0
+    weighted = (per_sample * sample_weight).sum() / denom.clamp_min(1e-8)
+    return weighted * (denom > 0).to(dtype=weighted.dtype)
 
 
 def compute_reliability_weighted_aux_loss(
@@ -341,6 +343,7 @@ def compute_reliability_weighted_aux_loss(
         "joint": joint_alive.to(ref.dtype) * (min_weight + (1.0 - min_weight) * mean_alive_integrity),
     }
     losses = []
+    active_flags = []
     diagnostics: dict[str, torch.Tensor] = {}
     for key in BRANCH_AUX_KEYS:
         branch = BRANCH_AUX_NAMES[key]
@@ -349,7 +352,16 @@ def compute_reliability_weighted_aux_loss(
         diagnostics[f"aux_weight_{branch}"] = weight
         if isinstance(logits, torch.Tensor) and logits.shape == ref.shape:
             losses.append(_weighted_cross_entropy(logits, labels, weight, label_smoothing))
-    total = torch.stack(losses).sum() if losses else ref.sum() * 0.0
+            active_flags.append((weight.sum() > 0).to(dtype=ref.dtype))
+    if losses:
+        loss_values = torch.stack(losses)
+        active = torch.stack(active_flags)
+        total = (loss_values * active).sum() / active.sum().clamp_min(1.0)
+        active_branch_count = active.sum().detach()
+    else:
+        total = ref.sum() * 0.0
+        active_branch_count = ref.new_zeros(())
+    diagnostics["aux_active_branch_count"] = active_branch_count
     diagnostics["reliability_weighted_aux_loss"] = total.detach()
     return total, diagnostics
 

@@ -19,6 +19,17 @@ This directory supports the paper structure:
 full method. Compare their rows against results from `main`, `full`, or
 `paper_main`.
 
+## Multi-Seed Protocol
+
+`paper_main` runs the full method at three seeds, but internal baselines and
+ablations at seed 42. For publication-level mean and standard deviation, repeat
+the paper baselines and key ablations with the two seed-only overlays:
+
+```bash
+python run.py paper_baselines module training_ablation --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml config/experiments/tri_modal_robust/_seed_2024_overlay.yaml
+python run.py paper_baselines module training_ablation --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml config/experiments/tri_modal_robust/_seed_3407_overlay.yaml
+```
+
 ## Robustness
 
 - Controlled degradation is produced by `eval.perturb_tests` in the base config.
@@ -58,3 +69,12 @@ Use the path overlay as the last config:
 ```bash
 python run.py paper_main --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 ```
+
+
+## Prior Detector Reproductions
+
+The repository does not currently contain audited Drebin, MaMaDroid, MalDozer,
+MsDroid, or DeepCatra reproductions. Internal representation/fusion baselines must
+not be described as reproduced prior methods. Obfuscapk PT directories require a
+CSV containing exactly the successfully transformed sample IDs; replace Windows
+template paths before AutoDL evaluation.

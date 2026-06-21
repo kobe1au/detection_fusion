@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from fusion.constants import EvidenceIndex
 from fusion.losses import compute_reliability_weighted_aux_loss
@@ -43,4 +44,19 @@ def test_reliability_weighted_aux_loss_detaches_reliability():
     )
     loss.backward()
     assert evidence.grad is None
+
+
+def test_reliability_weighted_aux_loss_averages_active_branches():
+    outputs = _outputs(2)
+    labels = torch.tensor([0, 1])
+
+    loss, diagnostics = compute_reliability_weighted_aux_loss(
+        outputs, labels, _evidence(2), {"min_aux_weight": 0.2}
+    )
+
+    expected = torch.stack(
+        [F.cross_entropy(logits, labels) for logits in outputs.values()]
+    ).mean()
+    assert torch.allclose(loss, expected)
+    assert diagnostics["aux_active_branch_count"].item() == 4.0
 

@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 
 import run
+import pytest
 import yaml
 from fusion.train import (
     _dataset_common_kwargs,
     build_model,
+    load_config,
     load_config_path,
     validate_eval_checkpoint_config,
 )
@@ -163,7 +165,11 @@ def test_per_module_tuning_groups_do_not_rerun_tuning_base():
 
 
 def test_paper_plan_excludes_tuning_configs():
-    tuning_paths = {path.resolve() for path in run.resolve_targets("tuning")}
+    tuning_paths = {
+        path.resolve()
+        for group in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_i3")
+        for path in run.resolve_targets(group)
+    }
     for group in ("paper", "paper_main", "paper_appendix", "paper_all"):
         paper_paths = {path.resolve() for path in run.resolve_targets(group)}
         assert not (tuning_paths & paper_paths)
@@ -400,6 +406,8 @@ def test_main_paper_plan_is_compact_and_excludes_sensitivity():
 
 def test_tuning_must_be_run_in_explicit_stages():
     assert "tuning" not in run.GROUPS
+    with pytest.raises(ValueError, match="Unknown robust experiment target"):
+        run.resolve_targets("tuning")
     assert "tuning_final" not in run.GROUPS
     for required in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_i3"):
         assert required in run.GROUPS
@@ -486,3 +494,14 @@ def test_obsolete_configs_are_hidden_from_runnable_catalog():
     available = {path.resolve() for path in run.available_configs().values()}
     for relative in run.OBSOLETE_CONFIGS:
         assert (run.CONFIG_DIR / relative).resolve() not in available
+
+
+def test_seed_overlays_change_only_the_training_seed():
+    base_path = ROOT / "baselines/api_only.yaml"
+    base = _resolved(base_path)
+    for seed in (2024, 3407):
+        overlay = ROOT / f"_seed_{seed}_overlay.yaml"
+        resolved = load_config([str(base_path), str(overlay)])
+        expected = copy.deepcopy(base)
+        expected["train"]["seed"] = seed
+        assert resolved == expected

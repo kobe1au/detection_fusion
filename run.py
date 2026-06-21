@@ -176,6 +176,7 @@ FINAL = "observable_reliability_discount_fusion.yaml"
 GROUPS = {
     "main": [FINAL, *BASELINES],
     "baselines": BASELINES,
+    "paper_baselines": PAPER_BASELINES,
     "module": MODULE_ABLATIONS,
     "tuning_base": [TUNING_FULL],
     "tuning_i1": TUNING_I1,
@@ -313,7 +314,7 @@ def available_configs() -> dict[str, Path]:
 
 def _require_paths(group: str, relative_paths: list[str]) -> list[Path]:
     paths = [CONFIG_DIR / item for item in relative_paths]
-    missing = [str(path) for path in paths if not path.exists()]
+    missing = [str(path) for path in paths if not path.is_file()]
     if missing:
         raise ValueError(f"Experiment group '{group}' references missing configs: {missing}")
     return paths
@@ -326,12 +327,12 @@ def resolve_targets(target: str) -> list[Path]:
         return sorted(set(available_configs().values()))
     if target.endswith((".yaml", ".yml")):
         path = Path(target)
-        if not path.exists():
+        if not path.is_file():
             raise ValueError(f"Experiment config not found: {path}")
         return [path]
     target = ALIASES.get(target, target)
     path = CONFIG_DIR / target
-    if path.exists():
+    if path.is_file():
         return [path]
     configs = available_configs()
     if target in configs:
@@ -404,7 +405,7 @@ def main() -> None:
 
     targets = resolve_target_specs(args.target)
     extra_configs = [Path(path) for path in args.extra_config]
-    missing_extra = [str(path) for path in extra_configs if not path.exists()]
+    missing_extra = [str(path) for path in extra_configs if not path.is_file()]
     if missing_extra:
         raise ValueError(f"Extra config overlay not found: {missing_extra}")
     if args.dry_run:
