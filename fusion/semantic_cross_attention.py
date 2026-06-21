@@ -61,7 +61,6 @@ def build_semantic_reliability_priors(
     api_integrity = _column(evidence, EvidenceIndex.API_INTEGRITY)
     graph_integrity = _column(evidence, EvidenceIndex.GRAPH_INTEGRITY)
     manifest_integrity = _column(evidence, EvidenceIndex.MANIFEST_INTEGRITY)
-    code_integrity = _column(evidence, EvidenceIndex.CODE_INTEGRITY)
     anchor_support = _column(evidence, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT)
     manifest_support = _column(evidence, EvidenceIndex.MANIFEST_CODE_SUPPORT)
     manifest_conflict = _column(evidence, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT)

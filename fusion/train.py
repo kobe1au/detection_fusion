@@ -1328,10 +1328,28 @@ def _extra_eval_paths(cfg: dict, item: dict[str, Any]) -> tuple[str, str]:
     return resolve(root, pt_value), resolve(root, csv_value)
 
 
+def _json_compatible(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, (float, np.floating)):
+        return float(value) if math.isfinite(float(value)) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    return value
+
+
 def _write_metrics_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        json.dump(
+            _json_compatible(payload),
+            f,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
 
 
 def run(cfg: dict) -> dict[str, Any]:

@@ -1,3 +1,4 @@
+import json
 import math
 
 import pytest
@@ -12,6 +13,7 @@ from fusion.train import (
     _branch_prediction_row,
     _selective_metrics,
     _selective_ranking_metrics,
+    _write_metrics_json,
     compute_branch_reliability_metrics,
     fit_posthoc_calibration,
     fit_rejection_threshold,
@@ -68,6 +70,24 @@ def test_intrinsic_calibrator_ignores_pairwise_relation_values():
             favorable_out[f"predicted_reliability_{name}"],
             unfavorable_out[f"predicted_reliability_{name}"],
         )
+
+
+def test_intrinsic_single_modality_features_use_self_integrity_once():
+    calibrator = MonotonicReliabilityCalibrator(
+        hidden_dim=8,
+        use_relation_evidence=False,
+    )
+    evidence = _evidence()
+    integrity = {"api": 0.2, "graph": 0.4, "manifest": 0.6}
+    evidence[:, EvidenceIndex.API_INTEGRITY] = integrity["api"]
+    evidence[:, EvidenceIndex.GRAPH_INTEGRITY] = integrity["graph"]
+    evidence[:, EvidenceIndex.MANIFEST_INTEGRITY] = integrity["manifest"]
+    evidence[:, EvidenceIndex.CODE_INTEGRITY] = 0.9
+
+    outputs = calibrator(evidence)
+    for name, value in integrity.items():
+        expected = torch.tensor([[value, 0.0, 0.0, 0.0, 0.0]])
+        assert torch.allclose(outputs[f"reliability_features_{name}"], expected)
 
 
 def test_intrinsic_api_reliability_is_neutral_to_missing_graph():
@@ -442,3 +462,16 @@ def test_branch_reliability_metrics_compare_reliability_to_branch_correctness():
     assert metrics["graph_reliability_ap_defined"] == 0
     assert math.isnan(metrics["graph_reliability_auc"])
     assert math.isnan(metrics["graph_reliability_ap"])
+
+
+def test_metrics_json_replaces_nonfinite_values_with_null(tmp_path):
+    path = tmp_path / "metrics.json"
+    _write_metrics_json(
+        path,
+        {"auc": float("nan"), "nested": [float("inf"), 1.0]},
+    )
+
+    raw = path.read_text(encoding="utf-8")
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
+    assert json.loads(raw) == {"auc": None, "nested": [None, 1.0]}

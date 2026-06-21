@@ -97,19 +97,15 @@ def build_monotonic_reliability_features(
         manifest_conflict_good = no_relation_evidence
         code_conflict_good = no_relation_evidence
 
-    # A single-modality branch must not inherit degradation from another
-    # modality that merely remains alive. Pair quality is represented by the
-    # explicit support/conflict features below, while code_integrity is kept
+    # Single-modality reliability uses intrinsic quality exactly once. The
+    # reserved context slot stays neutral; pair quality is represented only by
+    # the explicit support/conflict features, while code_integrity is reserved
     # for the joint branch.
-    api_code_context = api_integrity
-    graph_code_context = graph_integrity
+    zero_context = torch.zeros_like(api_integrity)
     effective_code_integrity = torch.where(
         api_alive & graph_alive,
         code_integrity,
         torch.where(api_alive, api_integrity, torch.where(graph_alive, graph_integrity, torch.zeros_like(code_integrity))),
-    )
-    intrinsic_manifest_code_context = (
-        code_integrity if use_relation_evidence else torch.zeros_like(code_integrity)
     )
 
     alive_float = torch.stack([api_alive, graph_alive, manifest_alive], dim=-1).float()
@@ -127,7 +123,7 @@ def build_monotonic_reliability_features(
         "api": torch.stack(
             [
                 api_integrity,
-                api_code_context,
+                zero_context,
                 anchor_good,
                 manifest_support_good,
                 code_conflict_good,
@@ -137,7 +133,7 @@ def build_monotonic_reliability_features(
         "graph": torch.stack(
             [
                 graph_integrity,
-                graph_code_context,
+                zero_context,
                 anchor_good,
                 manifest_support_good,
                 code_conflict_good,
@@ -147,7 +143,7 @@ def build_monotonic_reliability_features(
         "manifest": torch.stack(
             [
                 manifest_integrity,
-                intrinsic_manifest_code_context,
+                zero_context,
                 manifest_support_good,
                 manifest_conflict_good,
                 anchor_good,
