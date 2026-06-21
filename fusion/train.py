@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import copy
@@ -829,6 +829,8 @@ def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, 
         count = len(reliability_values)
         out[f"{branch}_reliability_count"] = count
         if count == 0:
+            out[f"{branch}_reliability_auc_defined"] = 0
+            out[f"{branch}_reliability_ap_defined"] = 0
             continue
         reliability_arr = np.asarray(reliability_values, dtype=np.float64)
         correctness_arr = np.asarray(correctness_values, dtype=np.float64)
@@ -846,6 +848,8 @@ def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, 
             reliability_arr.mean() - correctness_arr.mean()
         )
         if len(set(correctness_values)) > 1:
+            out[f"{branch}_reliability_auc_defined"] = 1
+            out[f"{branch}_reliability_ap_defined"] = 1
             out[f"{branch}_reliability_auc"] = float(
                 roc_auc_score(correctness_arr, reliability_arr)
             )
@@ -853,8 +857,10 @@ def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, 
                 average_precision_score(correctness_arr, reliability_arr)
             )
         else:
-            out[f"{branch}_reliability_auc"] = 0.0
-            out[f"{branch}_reliability_ap"] = 0.0
+            out[f"{branch}_reliability_auc_defined"] = 0
+            out[f"{branch}_reliability_ap_defined"] = 0
+            out[f"{branch}_reliability_auc"] = float("nan")
+            out[f"{branch}_reliability_ap"] = float("nan")
     return out
 
 

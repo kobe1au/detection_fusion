@@ -97,8 +97,12 @@ def build_monotonic_reliability_features(
         manifest_conflict_good = no_relation_evidence
         code_conflict_good = no_relation_evidence
 
-    api_code_context = torch.where(graph_alive, code_integrity, api_integrity)
-    graph_code_context = torch.where(api_alive, code_integrity, graph_integrity)
+    # A single-modality branch must not inherit degradation from another
+    # modality that merely remains alive. Pair quality is represented by the
+    # explicit support/conflict features below, while code_integrity is kept
+    # for the joint branch.
+    api_code_context = api_integrity
+    graph_code_context = graph_integrity
     effective_code_integrity = torch.where(
         api_alive & graph_alive,
         code_integrity,

@@ -725,9 +725,11 @@ class TriModalRobustModel(nn.Module):
             z: torch.Tensor,
             alive: torch.Tensor,
             mask: torch.Tensor,
+            weight: torch.Tensor,
         ) -> torch.Tensor:
             available = alive.view(batch_size, 1).bool() & ~mask.view(batch_size, 1)
-            return torch.where(available, z, torch.zeros_like(z))
+            weighted = z * weight.view(batch_size, 1).clamp(0.0, 1.0)
+            return torch.where(available, weighted, torch.zeros_like(z))
 
         alive = {"api": api_alive, "graph": graph_alive, "manifest": manifest_alive}
         source_weight = {
@@ -742,6 +744,7 @@ class TriModalRobustModel(nn.Module):
                 source_z(target_name, source_name),
                 alive[source_name],
                 masks[source_name],
+                source_weight[source_name],
             )
 
         return {

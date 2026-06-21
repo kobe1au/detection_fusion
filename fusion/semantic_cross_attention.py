@@ -85,24 +85,11 @@ def build_semantic_reliability_priors(
     manifest_code_applicable = api_manifest_applicable | graph_manifest_applicable
 
     zero = torch.zeros_like(anchor_support)
-    # Modality priors describe source quality only. A missing code counterpart
-    # must not reduce the surviving branch through geometric-mean code quality.
-    api_code_context = torch.where(graph_alive, code_integrity, api_integrity)
-    graph_code_context = torch.where(api_alive, code_integrity, graph_integrity)
-    r_api = api_alive.to(evidence.dtype) * torch.stack(
-        [
-            api_integrity,
-            api_code_context,
-        ],
-        dim=-1,
-    ).mean(dim=-1)
-    r_graph = graph_alive.to(evidence.dtype) * torch.stack(
-        [
-            graph_integrity,
-            graph_code_context,
-        ],
-        dim=-1,
-    ).mean(dim=-1)
+    # Modality priors describe intrinsic source quality. Cross-modal support
+    # and conflict are applied separately as relation priors, so an alive but
+    # degraded counterpart cannot suppress a healthy source here.
+    r_api = api_alive.to(evidence.dtype) * api_integrity
+    r_graph = graph_alive.to(evidence.dtype) * graph_integrity
     r_manifest = manifest_alive.to(evidence.dtype) * manifest_integrity
     modality_reliability = torch.stack(
         [r_api, r_graph, r_manifest], dim=1

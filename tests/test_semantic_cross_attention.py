@@ -64,6 +64,21 @@ def test_missing_graph_does_not_reduce_surviving_api_prior():
     assert torch.allclose(complete_prior[:, 0], missing_prior[:, 0])
 
 
+def test_degraded_alive_graph_does_not_reduce_surviving_api_prior():
+    complete = _evidence()
+    degraded_graph = complete.clone()
+    degraded_graph[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.01
+    degraded_graph[:, EvidenceIndex.CODE_INTEGRITY] = 0.1
+
+    module = _module()
+    embeddings = _embeddings()
+    complete_prior = module(*embeddings, complete)["semantic_reliability_prior"]
+    degraded_prior = module(*embeddings, degraded_graph)["semantic_reliability_prior"]
+
+    assert torch.allclose(complete_prior[:, 0], degraded_prior[:, 0])
+    assert torch.all(degraded_prior[:, 1] < complete_prior[:, 1])
+
+
 def test_unavailable_graph_never_propagates_as_attention_source():
     evidence = _evidence()
     evidence[:, EvidenceIndex.GRAPH_ALIVE] = 0.0

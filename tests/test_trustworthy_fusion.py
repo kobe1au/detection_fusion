@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 import torch.nn as nn
@@ -83,6 +85,27 @@ def test_intrinsic_api_reliability_is_neutral_to_missing_graph():
         calibrator(complete)["predicted_reliability_api"],
         calibrator(missing_graph)["predicted_reliability_api"],
     )
+
+
+def test_intrinsic_api_reliability_is_neutral_to_degraded_alive_graph():
+    calibrator = MonotonicReliabilityCalibrator(
+        hidden_dim=8,
+        use_relation_evidence=False,
+    )
+    complete = _evidence()
+    degraded_graph = complete.clone()
+    degraded_graph[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.01
+    degraded_graph[:, EvidenceIndex.CODE_INTEGRITY] = 0.1
+
+    complete_out = calibrator(complete)
+    degraded_out = calibrator(degraded_graph)
+    assert torch.allclose(
+        complete_out["predicted_reliability_api"],
+        degraded_out["predicted_reliability_api"],
+    )
+    assert degraded_out["predicted_reliability_graph"].item() < complete_out[
+        "predicted_reliability_graph"
+    ].item()
 
 
 def test_missing_counterpart_does_not_increase_api_reliability():
@@ -408,9 +431,14 @@ def test_branch_reliability_metrics_compare_reliability_to_branch_correctness():
     metrics = compute_branch_reliability_metrics(rows)
 
     assert metrics["api_reliability_count"] == 4
+    assert metrics["api_reliability_auc_defined"] == 1
+    assert metrics["api_reliability_ap_defined"] == 1
     assert metrics["api_reliability_auc"] == pytest.approx(1.0)
     assert metrics["api_reliability_brier"] == pytest.approx(0.025)
     assert metrics["api_branch_accuracy"] == pytest.approx(0.5)
     assert metrics["api_reliability_mean"] == pytest.approx(0.5)
     assert metrics["graph_reliability_count"] == 1
-    assert metrics["graph_reliability_auc"] == 0.0
+    assert metrics["graph_reliability_auc_defined"] == 0
+    assert metrics["graph_reliability_ap_defined"] == 0
+    assert math.isnan(metrics["graph_reliability_auc"])
+    assert math.isnan(metrics["graph_reliability_ap"])
