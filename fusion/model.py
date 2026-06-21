@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import warnings
 
 import torch
@@ -555,7 +556,7 @@ class TriModalRobustModel(nn.Module):
                 ),
                 dropout=float(self.semantic_cross_attention_config.get("dropout", 0.1)),
                 residual_gate_init=float(
-                    self.semantic_cross_attention_config.get("residual_gate_init", -3.0)
+                    self.semantic_cross_attention_config.get("residual_gate_init", 0.0)
                 ),
                 use_reliability_bias=bool(
                     self.semantic_cross_attention_config.get("use_reliability_bias", True)
@@ -579,6 +580,18 @@ class TriModalRobustModel(nn.Module):
                 nn.Identity()
                 if cross_dim == joint_emb_dim
                 else nn.Linear(cross_dim, joint_emb_dim)
+            )
+            joint_residual_gate_init = float(
+                self.semantic_cross_attention_config.get(
+                    "joint_residual_gate_init", -3.0
+                )
+            )
+            if not math.isfinite(joint_residual_gate_init):
+                raise ValueError(
+                    "semantic_cross_attention.joint_residual_gate_init must be finite"
+                )
+            self.cross_attention_joint_gate = nn.Parameter(
+                torch.tensor(joint_residual_gate_init)
             )
             self.cross_attention_reconstruction_projections = nn.ModuleDict(
                 {
@@ -711,12 +724,10 @@ class TriModalRobustModel(nn.Module):
         def masked_input(
             z: torch.Tensor,
             alive: torch.Tensor,
-            source_weight: torch.Tensor,
             mask: torch.Tensor,
         ) -> torch.Tensor:
             available = alive.view(batch_size, 1).bool() & ~mask.view(batch_size, 1)
-            weighted = z * source_weight.view(batch_size, 1).clamp(0.0, 1.0)
-            return torch.where(available, weighted, torch.zeros_like(z))
+            return torch.where(available, z, torch.zeros_like(z))
 
         alive = {"api": api_alive, "graph": graph_alive, "manifest": manifest_alive}
         source_weight = {
@@ -730,7 +741,6 @@ class TriModalRobustModel(nn.Module):
             return masked_input(
                 source_z(target_name, source_name),
                 alive[source_name],
-                source_weight[source_name],
                 masks[source_name],
             )
 
@@ -905,15 +915,20 @@ class TriModalRobustModel(nn.Module):
                 ),
             )
             if self.attach_cross_attention_to_joint:
-                joint_emb = self.cross_attention_joint_projection(
+                cross_attention_joint_emb = self.cross_attention_joint_projection(
                     cross_attention_outputs["enhanced_joint"]
                 )
+                joint_gate = torch.sigmoid(self.cross_attention_joint_gate)
+                joint_emb = base_joint_emb + joint_gate * cross_attention_joint_emb
                 joint_alive_mask = (
                     api_joint_mask.bool()
                     | graph_joint_mask.bool()
                     | manifest_joint_mask.bool()
                 ).to(dtype=joint_emb.dtype)
                 joint_emb = joint_emb * joint_alive_mask
+                cross_attention_outputs["semantic_joint_residual_gate"] = (
+                    joint_gate.view(1).expand(batch_size)
+                )
             if self.attach_cross_attention_to_reconstruction:
                 semantic_source_embeddings_by_target = {}
                 modality_names = ("api", "graph", "manifest")

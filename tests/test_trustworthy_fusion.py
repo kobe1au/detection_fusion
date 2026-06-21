@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn as nn
 
 from fusion.constants import EvidenceIndex
 from fusion.discount_fusion import DiscountProbabilityFusion
@@ -10,6 +11,7 @@ from fusion.train import (
     _selective_metrics,
     _selective_ranking_metrics,
     compute_branch_reliability_metrics,
+    fit_posthoc_calibration,
     fit_rejection_threshold,
     split_validation_dataset,
 )
@@ -43,6 +45,44 @@ def test_monotonic_calibrator_respects_integrity_and_conflict_directions():
         calibrator(conflict)["predicted_reliability_api"]
         <= calibrator(high)["predicted_reliability_api"]
     ).all()
+
+
+def test_intrinsic_calibrator_ignores_pairwise_relation_values():
+    calibrator = MonotonicReliabilityCalibrator(
+        hidden_dim=8,
+        use_relation_evidence=False,
+    )
+    favorable = _evidence()
+    unfavorable = favorable.clone()
+    unfavorable[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = 0.1
+    unfavorable[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = 0.1
+    unfavorable[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 0.9
+    unfavorable[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 0.9
+
+    favorable_out = calibrator(favorable)
+    unfavorable_out = calibrator(unfavorable)
+    for name in ("api", "graph", "manifest", "joint"):
+        assert torch.allclose(
+            favorable_out[f"predicted_reliability_{name}"],
+            unfavorable_out[f"predicted_reliability_{name}"],
+        )
+
+
+def test_intrinsic_api_reliability_is_neutral_to_missing_graph():
+    calibrator = MonotonicReliabilityCalibrator(
+        hidden_dim=8,
+        use_relation_evidence=False,
+    )
+    complete = _evidence()
+    missing_graph = complete.clone()
+    missing_graph[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
+    missing_graph[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.0
+    missing_graph[:, EvidenceIndex.CODE_INTEGRITY] = 0.0
+
+    assert torch.allclose(
+        calibrator(complete)["predicted_reliability_api"],
+        calibrator(missing_graph)["predicted_reliability_api"],
+    )
 
 
 def test_missing_counterpart_does_not_increase_api_reliability():
@@ -157,6 +197,92 @@ def test_posthoc_reliability_loss_is_safe_under_autocast():
     assert torch.isfinite(loss)
     assert parts["reliability_calibration_loss"] > 0.0
     assert reliability.grad is not None
+
+
+class _CalibrationGraph:
+    def __init__(self, evidence: torch.Tensor):
+        self.evidence = evidence
+
+    def to(self, device, non_blocking=True):
+        self.evidence = self.evidence.to(device)
+        return self
+
+
+class _PosthocCalibrationModel(nn.Module):
+    fusion_mode = "discount_probability"
+
+    def __init__(self):
+        super().__init__()
+        self.discount_fusion = DiscountProbabilityFusion(
+            {
+                "use_confidence_proxy": True,
+                "reliability_calibration": {
+                    "enabled": True,
+                    "hidden_dim": 8,
+                    "use_relation_evidence": False,
+                },
+                "probability_calibration": {"enabled": True},
+            }
+        )
+
+    def calibration_parameters(self):
+        return self.discount_fusion.calibration_parameters()
+
+    def set_calibration_active(self, enabled: bool):
+        self.discount_fusion.set_calibration_active(enabled)
+
+    def forward(self, graph, return_features=False):
+        batch_size = graph.evidence.size(0)
+        branch_logits = tuple(
+            graph.evidence.new_tensor([[2.0, -2.0], [-2.0, 2.0]])[:batch_size]
+            for _ in range(4)
+        )
+        outputs = self.discount_fusion(*branch_logits, graph.evidence)
+        for name, logits in zip(
+            ("api", "graph", "manifest", "joint"),
+            branch_logits,
+        ):
+            outputs[f"{name}_logits_aux"] = logits
+        outputs["gate_evidence"] = graph.evidence
+        return outputs["final_logits"], outputs
+
+
+def test_posthoc_calibration_restores_best_epoch_and_stops_early():
+    evidence = _evidence(2)
+    loader = [
+        {
+            "graph_batch": _CalibrationGraph(evidence),
+            "labels": torch.tensor([0, 1]),
+            "sids": ["a", "b"],
+            "quality": {},
+            "num_failed": 0,
+        }
+    ]
+    model = _PosthocCalibrationModel()
+    summary = fit_posthoc_calibration(
+        model,
+        [loader],
+        torch.device("cpu"),
+        False,
+        {
+            "calibration": {
+                "enabled": True,
+                "epochs": 5,
+                "patience": 1,
+                "min_delta": 1.0e6,
+                "lr": 1.0e-3,
+            },
+            "fusion": {
+                "reliability_calibration": {"weight": 1.0},
+                "probability_calibration": {"weight": 1.0},
+            },
+        },
+    )
+
+    assert summary["best_epoch"] == 1
+    assert summary["epochs_ran"] == 2
+    assert summary["stopped_early"] is True
+    assert summary["final_loss"] == summary["losses"][0]
 
 
 def test_calibration_parameters_are_inactive_during_main_training():

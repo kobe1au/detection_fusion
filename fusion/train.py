@@ -135,6 +135,9 @@ GATE_DIAGNOSTIC_KEYS = (
     "mean_semantic_attention_entropy",
     "mean_cross_modal_attention",
     "semantic_residual_gate",
+    "semantic_joint_residual_gate",
+    "explicit_relation_factors_active",
+    "joint_conflict_factor",
     "mean_semantic_reliability_prior_api",
     "mean_semantic_reliability_prior_graph",
     "mean_semantic_reliability_prior_manifest",
@@ -1094,9 +1097,15 @@ def fit_posthoc_calibration(
         raise ValueError(
             "calibration.enabled=true requires fusion reliability/probability calibration modules"
         )
-    epochs = int(calibration_cfg.get("epochs", 5))
+    epochs = int(calibration_cfg.get("epochs", 20))
+    patience = int(calibration_cfg.get("patience", 4))
+    min_delta = float(calibration_cfg.get("min_delta", 1.0e-5))
     if epochs <= 0:
         raise ValueError("calibration.epochs must be positive")
+    if patience < 0:
+        raise ValueError("calibration.patience must be non-negative")
+    if not math.isfinite(min_delta) or min_delta < 0.0:
+        raise ValueError("calibration.min_delta must be finite and non-negative")
     optimizer = torch.optim.Adam(
         parameters,
         lr=float(calibration_cfg.get("lr", 1.0e-3)),
@@ -1110,6 +1119,11 @@ def fit_posthoc_calibration(
 
     epoch_losses: list[float] = []
     total_steps = 0
+    best_loss = float("inf")
+    best_epoch = 0
+    best_parameters: list[torch.Tensor] | None = None
+    stale_epochs = 0
+    stopped_early = False
     try:
         model.eval()
         for epoch in range(1, epochs + 1):
@@ -1140,6 +1154,16 @@ def fit_posthoc_calibration(
             epoch_loss = total / max(steps, 1)
             epoch_losses.append(epoch_loss)
             logger.info("posthoc_calibration epoch=%s loss=%.6f", epoch, epoch_loss)
+            if steps > 0 and epoch_loss < best_loss - min_delta:
+                best_loss = epoch_loss
+                best_epoch = epoch
+                best_parameters = [param.detach().clone() for param in parameters]
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+                if patience > 0 and stale_epochs >= patience:
+                    stopped_early = True
+                    break
     finally:
         for param in model.parameters():
             param.requires_grad_(previous_requires_grad[id(param)])
@@ -1149,6 +1173,11 @@ def fit_posthoc_calibration(
             "Post-hoc calibration received no valid batches; refusing to use unfitted "
             "reliability and temperature parameters"
         )
+    if best_parameters is None:
+        raise RuntimeError("Post-hoc calibration did not produce a valid optimization state")
+    with torch.no_grad():
+        for parameter, best_value in zip(parameters, best_parameters):
+            parameter.copy_(best_value)
     temperatures = {}
     for name in ("api", "graph", "manifest", "joint"):
         if model.discount_fusion.temperature_parameters is not None:
@@ -1160,8 +1189,11 @@ def fit_posthoc_calibration(
     return {
         "enabled": True,
         "epochs": epochs,
+        "epochs_ran": len(epoch_losses),
+        "best_epoch": best_epoch,
+        "stopped_early": stopped_early,
         "losses": epoch_losses,
-        "final_loss": epoch_losses[-1] if epoch_losses else 0.0,
+        "final_loss": best_loss,
         "temperatures": temperatures,
     }
 

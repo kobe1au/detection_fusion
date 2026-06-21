@@ -1,0 +1,20 @@
+defaults:
+  - ../_tuning_train_base.yaml
+
+method:
+  name: best_i1_candidate_1
+
+train:
+  exp_name: best_i1_candidate_1
+
+fusion:
+  reliability_calibration:
+    hidden_dim: 16
+    missing_relation_support: 1.0
+
+  support_factor:
+    manifest_support_base: 0.5
+    code_anchor_base: 0.5
+
+  conflict_factor:
+    min_value: 0.2

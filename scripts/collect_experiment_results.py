@@ -339,7 +339,11 @@ def main() -> None:
     _write_csv(_filter_methods(aggregate, ("i1_",)), out_dir / "aggregate_i1_ablation.csv")
     _write_csv(_filter_methods(aggregate, ("i2_",)), out_dir / "aggregate_i2_ablation.csv")
     _write_csv(
-        _filter_methods(aggregate, ("i3_",), extras=("learned_evidence_logit_fusion",)),
+        _filter_methods(
+            aggregate,
+            ("i3_",),
+            extras=("module_no_i3_discount_rejection",),
+        ),
         out_dir / "aggregate_i3_ablation.csv",
     )
     _write_csv(_branch_reliability_rows(metrics), out_dir / "i1_reliability_calibration_summary.csv")

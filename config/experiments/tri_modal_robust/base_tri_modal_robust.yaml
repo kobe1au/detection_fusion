@@ -90,7 +90,8 @@ semantic_cross_attention:
   num_security_tokens: 12
   num_residual_tokens: 4
   dropout: 0.1
-  residual_gate_init: -3.0
+  residual_gate_init: 0.0
+  joint_residual_gate_init: -3.0
   use_reliability_bias: true
   use_support_bias: true
   use_conflict_bias: true
@@ -132,7 +133,9 @@ fusion:
   reliability_calibration:
     enabled: true
     hidden_dim: 16
+    # An unavailable relation contributes no additional positive support.
     missing_relation_support: 0.0
+    use_relation_evidence: false
     apply_alive_mask: true
     loss: bce
     weight: 1.0
@@ -163,7 +166,9 @@ calibration:
   enabled: true
   validation_fraction: 0.5
   split_seed: 42
-  epochs: 5
+  epochs: 20
+  patience: 4
+  min_delta: 0.00001
   lr: 0.001
   weight_decay: 0.0
   grad_clip: 5.0

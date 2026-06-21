@@ -49,6 +49,21 @@ def test_semantic_cross_attention_does_not_require_semantic_presence_or_pt_field
     assert torch.isfinite(output["semantic_attention"]).all()
 
 
+def test_missing_graph_does_not_reduce_surviving_api_prior():
+    complete = _evidence()
+    missing_graph = complete.clone()
+    missing_graph[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
+    missing_graph[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.0
+    missing_graph[:, EvidenceIndex.CODE_INTEGRITY] = 0.0
+
+    module = _module()
+    embeddings = _embeddings()
+    complete_prior = module(*embeddings, complete)["semantic_reliability_prior"]
+    missing_prior = module(*embeddings, missing_graph)["semantic_reliability_prior"]
+
+    assert torch.allclose(complete_prior[:, 0], missing_prior[:, 0])
+
+
 def test_unavailable_graph_never_propagates_as_attention_source():
     evidence = _evidence()
     evidence[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
@@ -99,6 +114,25 @@ def test_semantic_presence_modulates_security_tokens_but_not_residual_tokens():
     prior = output["semantic_reliability_prior"]
     assert torch.all(prior[:, 0, 0] < prior[:, 0, 1])
     assert torch.allclose(prior[:, 0, 12:], prior[:, 0, 12:13].expand(-1, 4))
+
+
+def test_pairwise_evidence_does_not_change_modality_reliability_prior():
+    observed = _evidence()
+    unobserved = observed.clone()
+    unobserved[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = 0.0
+    unobserved[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = 0.0
+    high_conflict = observed.clone()
+    high_conflict[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 1.0
+    high_conflict[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 1.0
+
+    module = _module()
+    embeddings = _embeddings()
+    observed_prior = module(*embeddings, observed)["semantic_reliability_prior"]
+    unobserved_prior = module(*embeddings, unobserved)["semantic_reliability_prior"]
+    conflict_prior = module(*embeddings, high_conflict)["semantic_reliability_prior"]
+
+    assert torch.allclose(observed_prior, unobserved_prior)
+    assert torch.allclose(observed_prior, conflict_prior)
 
 
 def test_attention_diagnostics_average_only_alive_target_queries():
@@ -335,6 +369,23 @@ def test_model_enabled_enhances_joint_and_reconstruction_sources():
     assert output["enhanced_joint"].shape == (2, 16)
     assert output["recon_api_semantic_logits"].shape == (2, 12)
     assert torch.equal(output["semantic_cross_attention_enabled"], torch.ones(2))
+
+
+def test_cross_attention_joint_path_is_a_small_gated_residual():
+    model = _model(True).eval()
+    with torch.no_grad():
+        _, output = model(_model_batch(), return_features=True)
+
+    gate = torch.sigmoid(model.cross_attention_joint_gate)
+    cross_joint = model.cross_attention_joint_projection(output["enhanced_joint"])
+    expected = output["base_joint_emb"] + gate * cross_joint
+
+    assert gate.item() < 0.1
+    assert torch.allclose(output["joint_emb"], expected, atol=1.0e-6, rtol=1.0e-6)
+    assert torch.allclose(
+        output["semantic_joint_residual_gate"],
+        gate.view(1).expand(2),
+    )
 
 
 def test_cross_attention_changes_joint_without_changing_single_modality_branches():

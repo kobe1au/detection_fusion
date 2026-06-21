@@ -115,15 +115,20 @@ def test_masked_reconstruction_logits_shape():
     assert outputs["recon_manifest_semantic_logits"].shape == (2, 12)
 
 
-def test_semantic_reconstruction_inputs_are_weighted_by_observable_integrity():
-    model = _model(mask_probs=(0.0, 0.0, 0.0))
+def test_semantic_reconstruction_tracks_integrity_without_scaling_input_amplitude():
+    model = _model(mask_probs=(0.0, 0.0, 0.0)).eval()
     batch = _model_batch()
-    batch.graph_integrity[0] = 0.0
-
-    _, outputs = model(batch)
+    with torch.no_grad():
+        _, baseline = model(batch)
+        batch.graph_integrity[0] = 0.0
+        _, outputs = model(batch)
 
     assert outputs["semantic_source_weight_graph"][0].item() == 0.0
     assert outputs["semantic_source_weight_graph"][1].item() == 1.0
+    assert torch.allclose(
+        baseline["recon_api_semantic_logits"][0],
+        outputs["recon_api_semantic_logits"][0],
+    )
 
 
 def test_masking_only_enabled_during_training():

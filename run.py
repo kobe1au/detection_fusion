@@ -13,6 +13,21 @@ os.chdir(ROOT)
 PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
 CONFIG_DIR = Path("config/experiments/tri_modal_robust")
 
+# Historical configs retained for provenance but hidden from runnable targets
+# because their overridden field is disabled by the current formal method or
+# their behavior is identical to a canonical config.
+OBSOLETE_CONFIGS = {
+    "ablations/i2/no_semantic_cross_attention.yaml",
+    "tuning/i1/missing_relation_support_0_5.yaml",
+    "tuning/i1/missing_relation_support_1_0.yaml",
+    "sensitivity/i1/missing_relation_support_0_5.yaml",
+    "sensitivity/i1/missing_relation_support_1_0.yaml",
+    "tuning/i1/best_i1_candidate_1.yaml",
+    "tuning/i1/best_i1_candidate_2.yaml",
+    "tuning/i1/best_i1_candidate_3.yaml",
+    "tuning/tuning_final_candidate.yaml",
+}
+
 ALIASES = {
     "final": "observable_reliability_discount_fusion.yaml",
     "api": "baselines/api_only.yaml",
@@ -20,7 +35,10 @@ ALIASES = {
     "manifest": "baselines/manifest_only.yaml",
     "concat": "baselines/tri_modal_concat.yaml",
     "learned": "baselines/learned_evidence_logit_fusion.yaml",
+    "no_i3": "ablations/modules/no_i3_discount_rejection.yaml",
 }
+
+LEARNED_EVIDENCE_LOGIT_FUSION = "baselines/learned_evidence_logit_fusion.yaml"
 
 BASELINES = [
     "baselines/api_only.yaml",
@@ -31,17 +49,17 @@ BASELINES = [
     "baselines/fixed_logit_fusion.yaml",
     "baselines/confidence_logit_fusion.yaml",
     "baselines/heuristic_reliability_logit_fusion.yaml",
-    "baselines/learned_evidence_logit_fusion.yaml",
+    LEARNED_EVIDENCE_LOGIT_FUSION,
+]
+
+PAPER_BASELINES = [
+    item for item in BASELINES if item != LEARNED_EVIDENCE_LOGIT_FUSION
 ]
 
 MODULE_ABLATIONS = [
     "ablations/modules/no_i1_observable_reliability.yaml",
     "ablations/modules/no_i2_semantic_interaction.yaml",
-]
-
-MODULE_ABLATIONS_WITH_I3 = [
-    *MODULE_ABLATIONS,
-    "baselines/learned_evidence_logit_fusion.yaml",
+    "ablations/modules/no_i3_discount_rejection.yaml",
 ]
 
 I1_ABLATIONS = [
@@ -56,7 +74,6 @@ I1_APPENDIX_ABLATIONS = [
 ]
 
 I2_ABLATIONS = [
-    "ablations/i2/no_semantic_cross_attention.yaml",
     "ablations/i2/plain_semantic_cross_attention.yaml",
     "ablations/i2/no_cross_attention_relation_mask.yaml",
     "ablations/i2/no_cross_attention_residual_tokens.yaml",
@@ -89,11 +106,13 @@ TUNING_FULL = "tuning/full_candidate.yaml"
 TUNING_I1 = [
     "tuning/i1/reliability_hidden_dim_8.yaml",
     "tuning/i1/reliability_hidden_dim_32.yaml",
-    "tuning/i1/missing_relation_support_0_5.yaml",
-    "tuning/i1/missing_relation_support_1_0.yaml",
     "tuning/i1/support_base_0_25.yaml",
     "tuning/i1/support_base_0_75.yaml",
     "tuning/i1/conflict_min_0_1.yaml",
+    "tuning/i1/conflict_min_0_2.yaml",
+]
+
+BEST_I1_CANDIDATES = [
     "tuning/i1/conflict_min_0_2.yaml",
 ]
 
@@ -112,12 +131,6 @@ TUNING_I3 = [
     "tuning/i3/coverage_95_eval.yaml",
 ]
 
-TUNING = [
-    TUNING_FULL,
-    *TUNING_I1,
-    *TUNING_I2,
-    *TUNING_I3,
-]
 
 TRAINING_ABLATIONS = [
     "ablations/training/no_masked_semantic_reconstruction.yaml",
@@ -132,8 +145,6 @@ TRAINING_APPENDIX_ABLATIONS = [
 SENSITIVITY = [
     "sensitivity/i1/reliability_hidden_dim_8.yaml",
     "sensitivity/i1/reliability_hidden_dim_32.yaml",
-    "sensitivity/i1/missing_relation_support_0_5.yaml",
-    "sensitivity/i1/missing_relation_support_1_0.yaml",
     "sensitivity/i1/support_base_0_25.yaml",
     "sensitivity/i1/support_base_0_75.yaml",
     "sensitivity/i1/conflict_min_0_1.yaml",
@@ -165,27 +176,32 @@ FINAL = "observable_reliability_discount_fusion.yaml"
 GROUPS = {
     "main": [FINAL, *BASELINES],
     "baselines": BASELINES,
-    "module": MODULE_ABLATIONS_WITH_I3,
+    "module": MODULE_ABLATIONS,
     "tuning_base": [TUNING_FULL],
     "tuning_i1": TUNING_I1,
+    "best_i1_c": BEST_I1_CANDIDATES,
+    "BEST_I1_C": BEST_I1_CANDIDATES,
     "tuning_i2": TUNING_I2,
     "tuning_i3": TUNING_I3,
-    "tuning": TUNING,
     "i1": I1_ABLATIONS,
     "i1_appendix": I1_APPENDIX_ABLATIONS,
     "i1_full": [*I1_ABLATIONS, *I1_APPENDIX_ABLATIONS],
-    "i2": I2_ABLATIONS,
+    "i2": ["ablations/modules/no_i2_semantic_interaction.yaml", *I2_ABLATIONS],
     "i2_appendix": I2_APPENDIX_ABLATIONS,
-    "i2_full": [*I2_ABLATIONS, *I2_APPENDIX_ABLATIONS],
-    "i3": ["baselines/learned_evidence_logit_fusion.yaml", *I3_ABLATIONS],
+    "i2_full": [
+        "ablations/modules/no_i2_semantic_interaction.yaml",
+        *I2_ABLATIONS,
+        *I2_APPENDIX_ABLATIONS,
+    ],
+    "i3": ["ablations/modules/no_i3_discount_rejection.yaml", *I3_ABLATIONS],
     "i3_appendix": I3_APPENDIX_ABLATIONS,
     "i3_full": [
-        "baselines/learned_evidence_logit_fusion.yaml",
+        "ablations/modules/no_i3_discount_rejection.yaml",
         *I3_ABLATIONS,
         *I3_APPENDIX_ABLATIONS,
     ],
     "ablation": [
-        *MODULE_ABLATIONS_WITH_I3,
+        *MODULE_ABLATIONS,
         *TRAINING_ABLATIONS,
     ],
     "component": [
@@ -195,6 +211,16 @@ GROUPS = {
         *I2_APPENDIX_ABLATIONS,
         *I3_ABLATIONS,
         *I3_APPENDIX_ABLATIONS,
+    ],
+    "mechanism": [
+        *I1_ABLATIONS,
+        *I2_ABLATIONS,
+        *I3_ABLATIONS,
+    ],
+    "paper_mechanism": [
+        *I1_ABLATIONS,
+        *I2_ABLATIONS,
+        *I3_ABLATIONS,
     ],
     "ablation_appendix": [
         *I1_APPENDIX_ABLATIONS,
@@ -222,13 +248,13 @@ GROUPS = {
     "seed": SEEDS,
     "full": SEEDS,
     "paper": [
-        *BASELINES,
+        *PAPER_BASELINES,
         *MODULE_ABLATIONS,
         *TRAINING_ABLATIONS,
         *SEEDS,
     ],
     "paper_main": [
-        *BASELINES,
+        *PAPER_BASELINES,
         *MODULE_ABLATIONS,
         *TRAINING_ABLATIONS,
         *SEEDS,
@@ -250,7 +276,7 @@ GROUPS = {
         *SENSITIVITY,
     ],
     "paper_all": [
-        *BASELINES,
+        *PAPER_BASELINES,
         *MODULE_ABLATIONS,
         *I1_ABLATIONS,
         *I1_APPENDIX_ABLATIONS,
@@ -273,6 +299,8 @@ def available_configs() -> dict[str, Path]:
     for path in sorted(CONFIG_DIR.rglob("*.yaml")):
         relative = path.relative_to(CONFIG_DIR)
         if path.name == "base_tri_modal_robust.yaml" or path.stem.startswith("_"):
+            continue
+        if relative.as_posix() in OBSOLETE_CONFIGS:
             continue
         key = relative.with_suffix("").as_posix()
         configs[key] = path

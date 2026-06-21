@@ -1,6 +1,9 @@
 defaults:
   - ../observable_reliability_discount_fusion.yaml
 
+train:
+  checkpoint_metric: clean_macro_f1
+
 semantic_cross_attention:
   enabled: false
   attach_to_joint: false

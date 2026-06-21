@@ -23,8 +23,10 @@ def _resolved(path: Path) -> dict:
 
 def _semantic_key(cfg: dict) -> str:
     normalized = copy.deepcopy(cfg)
+    normalized.pop("method", None)
     normalized.get("train", {}).pop("exp_name", None)
     normalized.get("train", {}).pop("seed", None)
+    normalized.get("eval", {}).pop("output_name", None)
     return json.dumps(normalized, sort_keys=True, default=str)
 
 
@@ -67,7 +69,7 @@ def test_runner_groups_and_aliases_reference_existing_configs():
 
 
 def test_tuning_groups_are_validation_only():
-    for group in ("tuning_i1", "tuning_i2", "tuning_i3", "tuning"):
+    for group in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_i3"):
         for path in run.resolve_targets(group):
             cfg = _resolved(path)
             eval_cfg = cfg.get("eval", {}) or {}
@@ -81,6 +83,52 @@ def test_tuning_groups_are_validation_only():
             else:
                 assert cfg["train"].get("tuning_mode") is True, path
 
+
+def test_formal_training_configs_use_clean_validation_selection():
+    for path in run.resolve_targets("all"):
+        relative = path.relative_to(run.CONFIG_DIR).as_posix()
+        cfg = _resolved(path)
+        eval_cfg = cfg.get("eval", {}) or {}
+        if relative.startswith("tuning/") or eval_cfg.get("eval_only", False):
+            continue
+        assert cfg["train"]["checkpoint_metric"] == "clean_macro_f1", path
+        assert eval_cfg["robust_val"]["enabled"] is False, path
+
+
+def test_tuning_training_configs_use_robust_validation_selection():
+    for group in ("tuning_base", "tuning_i1", "tuning_i2"):
+        for path in run.resolve_targets(group):
+            cfg = _resolved(path)
+            assert cfg["train"]["checkpoint_metric"] == "robust_composite", path
+            assert cfg["eval"]["robust_val"]["enabled"] is True, path
+
+
+def test_baselines_share_full_training_augmentation():
+    full = _resolved(ROOT / "observable_reliability_discount_fusion.yaml")
+    expected = full["robust"]
+    for relative in run.BASELINES:
+        cfg = _resolved(ROOT / relative)
+        assert cfg["robust"]["train_aug"] is True, relative
+        assert cfg["robust"]["perturb_prob"] == expected["perturb_prob"], relative
+        assert cfg["robust"]["perturb_strengths"] == expected["perturb_strengths"], relative
+
+
+def test_decision_eval_configs_have_unique_output_names():
+    paths = [
+        *run.resolve_targets("tuning_i3"),
+        *run.resolve_targets("sensitivity"),
+        *run.resolve_targets("external"),
+    ]
+    output_names: dict[str, Path] = {}
+    for path in paths:
+        cfg = _resolved(path)
+        eval_cfg = cfg.get("eval", {}) or {}
+        if not eval_cfg.get("eval_only", False):
+            continue
+        output_name = str(eval_cfg.get("output_name", "")).strip()
+        assert output_name, path
+        assert output_name not in output_names, f"{path} duplicates {output_names.get(output_name)}"
+        output_names[output_name] = path
 
 def test_section_groups_do_not_rerun_full_method():
     final_path = (run.CONFIG_DIR / run.FINAL).resolve()
@@ -196,7 +244,8 @@ def test_module_ablations_match_paper_claims():
     assert no_i2["semantic_cross_attention"]["attach_to_joint"] is False
     assert no_i2["semantic_cross_attention"]["attach_to_reconstruction"] is False
 
-    no_i3 = _resolved(ROOT / "baselines/learned_evidence_logit_fusion.yaml")
+    no_i3 = _resolved(ROOT / "ablations/modules/no_i3_discount_rejection.yaml")
+    assert no_i3["method"]["name"] == "module_no_i3_discount_rejection"
     assert no_i3["model"]["fusion_mode"] == "tri_modal_ours"
     assert no_i3["fusion"]["mode"] == "legacy_learned_gate"
     assert no_i3["calibration"]["enabled"] is False
@@ -233,6 +282,12 @@ def test_full_method_enables_reliability_aware_semantic_cross_attention():
     assert cross_attention["use_relation_mask"] is True
     assert cross_attention["num_security_tokens"] == 12
     assert cross_attention["num_residual_tokens"] > 0
+    assert cross_attention["residual_gate_init"] == 0.0
+    assert cross_attention["joint_residual_gate_init"] < 0.0
+    assert cfg["fusion"]["reliability_calibration"]["missing_relation_support"] == 0.0
+    assert cfg["fusion"]["reliability_calibration"]["use_relation_evidence"] is False
+    assert cfg["calibration"]["epochs"] >= 10
+    assert cfg["calibration"]["patience"] > 0
 
 
 def test_i2_cross_attention_ablations_change_the_intended_mechanism():
@@ -308,7 +363,7 @@ def test_no_reconstruction_ablation_disconnects_reconstruction_path():
 def test_paper_plan_has_expected_unique_runs():
     paths = run.resolve_targets("paper_all")
     expected = [
-        *run.BASELINES,
+        *run.PAPER_BASELINES,
         *run.MODULE_ABLATIONS,
         *run.I1_ABLATIONS,
         *run.I1_APPENDIX_ABLATIONS,
@@ -329,7 +384,7 @@ def test_paper_plan_has_expected_unique_runs():
 def test_main_paper_plan_is_compact_and_excludes_sensitivity():
     paths = run.resolve_targets("paper")
     expected = [
-        *run.BASELINES,
+        *run.PAPER_BASELINES,
         *run.MODULE_ABLATIONS,
         *run.TRAINING_ABLATIONS,
         *run.SEEDS,
@@ -340,6 +395,32 @@ def test_main_paper_plan_is_compact_and_excludes_sensitivity():
         (run.CONFIG_DIR / relative).resolve() for relative in run.SENSITIVITY
     }
     assert not ({path.resolve() for path in paths} & sensitivity_paths)
+
+
+def test_tuning_must_be_run_in_explicit_stages():
+    assert "tuning" not in run.GROUPS
+    assert "tuning_final" not in run.GROUPS
+    for required in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_i3"):
+        assert required in run.GROUPS
+
+
+def test_paper_mechanism_group_contains_only_main_component_ablations():
+    paths = run.resolve_targets("paper_mechanism")
+    expected = [
+        *run.I1_ABLATIONS,
+        *run.I2_ABLATIONS,
+        *run.I3_ABLATIONS,
+    ]
+    assert paths == [run.CONFIG_DIR / relative for relative in expected]
+    appendix_paths = {
+        (run.CONFIG_DIR / relative).resolve()
+        for relative in (
+            *run.I1_APPENDIX_ABLATIONS,
+            *run.I2_APPENDIX_ABLATIONS,
+            *run.I3_APPENDIX_ABLATIONS,
+        )
+    }
+    assert not ({path.resolve() for path in paths} & appendix_paths)
 
 
 def test_standalone_sensitivity_group_runs_seed_checkpoint_before_sensitivity():
@@ -385,9 +466,22 @@ def test_standalone_appendix_group_runs_seed_checkpoint_before_sensitivity():
 def test_non_seed_experiments_have_unique_resolved_behavior():
     seen: dict[str, Path] = {}
     seed_paths = {path.resolve() for path in run.resolve_targets("seed")}
+    allowed_duplicate = {
+        (run.CONFIG_DIR / "baselines/learned_evidence_logit_fusion.yaml").resolve(),
+        (run.CONFIG_DIR / "ablations/modules/no_i3_discount_rejection.yaml").resolve(),
+    }
     for path in run.resolve_targets("all"):
         if path.resolve() in seed_paths:
             continue
         key = _semantic_key(_resolved(path))
-        assert key not in seen, f"{path} duplicates {seen.get(key)}"
-        seen[key] = path
+        previous = seen.get(key)
+        if previous is not None:
+            assert {path.resolve(), previous.resolve()} == allowed_duplicate
+        else:
+            seen[key] = path
+
+
+def test_obsolete_configs_are_hidden_from_runnable_catalog():
+    available = {path.resolve() for path in run.available_configs().values()}
+    for relative in run.OBSOLETE_CONFIGS:
+        assert (run.CONFIG_DIR / relative).resolve() not in available

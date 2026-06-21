@@ -46,6 +46,7 @@ def build_monotonic_reliability_features(
     evidence: torch.Tensor,
     *,
     missing_relation_support: float = 0.0,
+    use_relation_evidence: bool = True,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Build branch-specific features where larger always means more reliable."""
     if evidence.ndim != 2 or evidence.size(-1) < EvidenceIndex.BASE_DIM:
@@ -89,6 +90,23 @@ def build_monotonic_reliability_features(
     code_conflict_good = torch.where(
         manifest_code_applicable, 1.0 - code_conflict, missing_support
     )
+    if not use_relation_evidence:
+        no_relation_evidence = torch.zeros_like(anchor_support)
+        anchor_good = no_relation_evidence
+        manifest_support_good = no_relation_evidence
+        manifest_conflict_good = no_relation_evidence
+        code_conflict_good = no_relation_evidence
+
+    api_code_context = torch.where(graph_alive, code_integrity, api_integrity)
+    graph_code_context = torch.where(api_alive, code_integrity, graph_integrity)
+    effective_code_integrity = torch.where(
+        api_alive & graph_alive,
+        code_integrity,
+        torch.where(api_alive, api_integrity, torch.where(graph_alive, graph_integrity, torch.zeros_like(code_integrity))),
+    )
+    intrinsic_manifest_code_context = (
+        code_integrity if use_relation_evidence else torch.zeros_like(code_integrity)
+    )
 
     alive_float = torch.stack([api_alive, graph_alive, manifest_alive], dim=-1).float()
     integrities = torch.stack(
@@ -105,7 +123,7 @@ def build_monotonic_reliability_features(
         "api": torch.stack(
             [
                 api_integrity,
-                code_integrity,
+                api_code_context,
                 anchor_good,
                 manifest_support_good,
                 code_conflict_good,
@@ -115,7 +133,7 @@ def build_monotonic_reliability_features(
         "graph": torch.stack(
             [
                 graph_integrity,
-                code_integrity,
+                graph_code_context,
                 anchor_good,
                 manifest_support_good,
                 code_conflict_good,
@@ -125,7 +143,7 @@ def build_monotonic_reliability_features(
         "manifest": torch.stack(
             [
                 manifest_integrity,
-                code_integrity,
+                intrinsic_manifest_code_context,
                 manifest_support_good,
                 manifest_conflict_good,
                 anchor_good,
@@ -135,7 +153,7 @@ def build_monotonic_reliability_features(
         "joint": torch.stack(
             [
                 mean_alive_integrity,
-                code_integrity,
+                effective_code_integrity,
                 pair_values.mean(dim=-1),
                 conflict_good,
                 alive_fraction,
@@ -168,6 +186,7 @@ class MonotonicReliabilityCalibrator(nn.Module):
         self,
         hidden_dim: int = 16,
         missing_relation_support: float = 0.0,
+        use_relation_evidence: bool = True,
         apply_alive_mask: bool = True,
     ):
         super().__init__()
@@ -176,6 +195,7 @@ class MonotonicReliabilityCalibrator(nn.Module):
         if not 0.0 <= float(missing_relation_support) <= 1.0:
             raise ValueError("reliability_calibration.missing_relation_support must be within [0, 1]")
         self.missing_relation_support = float(missing_relation_support)
+        self.use_relation_evidence = bool(use_relation_evidence)
         self.apply_alive_mask = bool(apply_alive_mask)
         self.branches = nn.ModuleDict(
             {
@@ -186,7 +206,9 @@ class MonotonicReliabilityCalibrator(nn.Module):
 
     def forward(self, evidence: torch.Tensor) -> dict[str, torch.Tensor]:
         features, diagnostics = build_monotonic_reliability_features(
-            evidence, missing_relation_support=self.missing_relation_support
+            evidence,
+            missing_relation_support=self.missing_relation_support,
+            use_relation_evidence=self.use_relation_evidence,
         )
         outputs = dict(diagnostics)
         for name in BRANCH_NAMES:

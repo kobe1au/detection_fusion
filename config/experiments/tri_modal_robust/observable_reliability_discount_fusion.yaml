@@ -6,3 +6,8 @@ method:
 
 train:
   exp_name: observable_reliability_discount_fusion
+  checkpoint_metric: clean_macro_f1
+
+eval:
+  robust_val:
+    enabled: false

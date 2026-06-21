@@ -85,45 +85,25 @@ def build_semantic_reliability_priors(
     manifest_code_applicable = api_manifest_applicable | graph_manifest_applicable
 
     zero = torch.zeros_like(anchor_support)
-    anchor_good = torch.where(api_graph_applicable, anchor_support, zero)
-    manifest_support_good = torch.where(
-        manifest_code_applicable, manifest_support, zero
-    )
-    manifest_conflict_good = torch.where(
-        manifest_code_applicable, 1.0 - manifest_conflict, zero
-    )
-    code_conflict_good = torch.where(
-        manifest_code_applicable, 1.0 - code_conflict, zero
-    )
-
+    # Modality priors describe source quality only. A missing code counterpart
+    # must not reduce the surviving branch through geometric-mean code quality.
+    api_code_context = torch.where(graph_alive, code_integrity, api_integrity)
+    graph_code_context = torch.where(api_alive, code_integrity, graph_integrity)
     r_api = api_alive.to(evidence.dtype) * torch.stack(
         [
             api_integrity,
-            code_integrity,
-            anchor_good,
-            manifest_support_good,
-            code_conflict_good,
+            api_code_context,
         ],
         dim=-1,
     ).mean(dim=-1)
     r_graph = graph_alive.to(evidence.dtype) * torch.stack(
         [
             graph_integrity,
-            code_integrity,
-            anchor_good,
-            manifest_support_good,
-            code_conflict_good,
+            graph_code_context,
         ],
         dim=-1,
     ).mean(dim=-1)
-    r_manifest = manifest_alive.to(evidence.dtype) * torch.stack(
-        [
-            manifest_integrity,
-            manifest_support_good,
-            manifest_conflict_good,
-        ],
-        dim=-1,
-    ).mean(dim=-1)
+    r_manifest = manifest_alive.to(evidence.dtype) * manifest_integrity
     modality_reliability = torch.stack(
         [r_api, r_graph, r_manifest], dim=1
     ).clamp(0.0, 1.0)
@@ -206,7 +186,7 @@ class ReliabilityAwareSemanticCrossAttention(nn.Module):
         num_security_tokens: int = 12,
         num_residual_tokens: int = 4,
         dropout: float = 0.1,
-        residual_gate_init: float = -3.0,
+        residual_gate_init: float = 0.0,
         use_reliability_bias: bool = True,
         use_support_bias: bool = True,
         use_conflict_bias: bool = True,

@@ -94,6 +94,7 @@ class DiscountProbabilityFusion(nn.Module):
             MonotonicReliabilityCalibrator(
                 hidden_dim=int(reliability_cfg.get("hidden_dim", 16)),
                 missing_relation_support=float(reliability_cfg.get("missing_relation_support", 0.0)),
+                use_relation_evidence=bool(reliability_cfg.get("use_relation_evidence", False)),
                 apply_alive_mask=bool(reliability_cfg.get("apply_alive_mask", True)),
             )
             if bool(reliability_cfg.get("enabled", False))
@@ -213,6 +214,12 @@ class DiscountProbabilityFusion(nn.Module):
         ):
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"fusion.support_factor.{name} must be within [0, 1]")
+        calibrated_reliability_active = (
+            self.reliability_calibrator is not None and self.calibration_active
+        )
+        # Relation evidence is applied exactly once through these explicit
+        # factors. The formal calibrator uses intrinsic observable quality only.
+        apply_explicit_relation_factors = use_support or use_conflict
         if use_support:
             code_anchor_factor = torch.where(
                 api_graph_applicable,
@@ -245,6 +252,10 @@ class DiscountProbabilityFusion(nn.Module):
         else:
             manifest_conflict_factor = torch.ones_like(manifest_conflict)
             code_conflict_factor = torch.ones_like(code_conflict)
+        joint_conflict_factor = torch.minimum(
+            manifest_conflict_factor,
+            code_conflict_factor,
+        )
 
         mean_alive_integrity = _mean_alive_integrity(
             torch.stack([api_integrity, graph_integrity, manifest_integrity], dim=-1),
@@ -267,7 +278,7 @@ class DiscountProbabilityFusion(nn.Module):
             else torch.ones_like(pair_support)
         )
         reliability_outputs: dict[str, torch.Tensor] = {}
-        if self.reliability_calibrator is not None and self.calibration_active:
+        if calibrated_reliability_active:
             reliability_outputs = self.reliability_calibrator(evidence)
             base_reliability = [
                 reliability_outputs[f"predicted_reliability_{name}"]
@@ -279,6 +290,9 @@ class DiscountProbabilityFusion(nn.Module):
                 evidence,
                 missing_relation_support=float(
                     reliability_cfg.get("missing_relation_support", 0.0)
+                ),
+                use_relation_evidence=bool(
+                    reliability_cfg.get("use_relation_evidence", False)
                 ),
             )
             reliability_outputs.update(feature_diagnostics)
@@ -295,7 +309,7 @@ class DiscountProbabilityFusion(nn.Module):
                 base_reliability[0] * code_anchor_factor * code_conflict_factor * confidence_factors[0],
                 base_reliability[1] * code_anchor_factor * code_conflict_factor * confidence_factors[1],
                 base_reliability[2] * manifest_support_factor * manifest_conflict_factor * confidence_factors[2],
-                base_reliability[3] * joint_support_factor * confidence_factors[3],
+                base_reliability[3] * joint_support_factor * joint_conflict_factor * confidence_factors[3],
             ],
             dim=-1,
         )
@@ -378,6 +392,13 @@ class DiscountProbabilityFusion(nn.Module):
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             ),
+            "explicit_relation_factors_active": torch.full(
+                (final_logits.size(0),),
+                float(apply_explicit_relation_factors),
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
+            "joint_conflict_factor": joint_conflict_factor,
             "api_graph_support_applicable": api_graph_applicable.to(dtype=discounts.dtype),
             "manifest_code_conflict_applicable": manifest_code_applicable.to(dtype=discounts.dtype),
             "manifest_code_relation_applicable": manifest_code_applicable.to(dtype=discounts.dtype),

@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 
 from fusion.constants import EvidenceIndex
 from fusion.discount_fusion import DiscountProbabilityFusion
@@ -93,6 +94,7 @@ def test_inactive_calibrator_fallback_features_use_configured_missing_support():
             "reliability_calibration": {
                 "enabled": True,
                 "missing_relation_support": 0.75,
+                "use_relation_evidence": True,
             }
         },
     )
@@ -108,6 +110,60 @@ def test_high_manifest_conflict_reduces_manifest_discount():
     high = low.clone()
     high[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 1.0
     assert _run(high)["discount_manifest"].item() < _run(low)["discount_manifest"].item()
+
+
+class _ConstantReliabilityCalibrator(nn.Module):
+    def forward(self, evidence: torch.Tensor) -> dict[str, torch.Tensor]:
+        value = torch.full(
+            (evidence.size(0),),
+            0.8,
+            dtype=evidence.dtype,
+            device=evidence.device,
+        )
+        return {
+            f"predicted_reliability_{name}": value
+            for name in ("api", "graph", "manifest", "joint")
+        }
+
+
+def test_calibrated_reliability_uses_explicit_relation_factors_once():
+    fusion = DiscountProbabilityFusion(
+        {
+            "use_confidence_proxy": False,
+            "use_support_discount": True,
+            "use_conflict_discount": True,
+            "reliability_calibration": {"enabled": True},
+        }
+    )
+    fusion.reliability_calibrator = _ConstantReliabilityCalibrator()
+    fusion.set_calibration_active(True)
+
+    favorable = _evidence(1)
+    unfavorable = favorable.clone()
+    unfavorable[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = 0.1
+    unfavorable[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = 0.1
+    unfavorable[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 0.9
+    unfavorable[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 0.9
+
+    favorable_out = fusion(*_logits(1), favorable)
+    unfavorable_out = fusion(*_logits(1), unfavorable)
+
+    assert torch.all(favorable_out["discounts"] > unfavorable_out["discounts"])
+    assert favorable_out["explicit_relation_factors_active"].item() == 1.0
+    assert unfavorable_out["explicit_relation_factors_active"].item() == 1.0
+
+
+def test_high_manifest_conflict_reduces_joint_discount():
+    low = _evidence(1)
+    high = low.clone()
+    high[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 0.9
+    high[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 0.9
+
+    low_out = _run(low, config={"use_confidence_proxy": False})
+    high_out = _run(high, config={"use_confidence_proxy": False})
+
+    assert high_out["discount_joint"].item() < low_out["discount_joint"].item()
+    assert high_out["joint_conflict_factor"].item() < 1.0
 
 
 def test_support_discount_can_be_disabled():
