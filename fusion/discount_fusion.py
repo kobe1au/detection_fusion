@@ -88,6 +88,8 @@ class DiscountProbabilityFusion(nn.Module):
     def __init__(self, config: dict | None = None):
         super().__init__()
         self.config = dict(config or {})
+        if not bool(self.config.get("force_fp32_decision", True)):
+            raise ValueError("fusion.force_fp32_decision=false is unsupported")
         self.register_buffer("_calibration_active", torch.tensor(False, dtype=torch.bool))
         reliability_cfg = self.config.get("reliability_calibration", {}) or {}
         self.reliability_calibrator = (
@@ -148,6 +150,27 @@ class DiscountProbabilityFusion(nn.Module):
         evidence: torch.Tensor,
         config: dict | None = None,
     ) -> dict[str, torch.Tensor]:
+        # Encoders can remain under AMP, but calibration, probability discounting,
+        # and rejection scores need FP32 to avoid quantized temperatures/thresholds.
+        with torch.autocast(device_type=api_logits.device.type, enabled=False):
+            return self._forward_fp32(
+                api_logits.float(),
+                graph_logits.float(),
+                manifest_logits.float(),
+                joint_logits.float(),
+                evidence.float(),
+                config,
+            )
+
+    def _forward_fp32(
+        self,
+        api_logits: torch.Tensor,
+        graph_logits: torch.Tensor,
+        manifest_logits: torch.Tensor,
+        joint_logits: torch.Tensor,
+        evidence: torch.Tensor,
+        config: dict | None = None,
+    ) -> dict[str, torch.Tensor]:
         cfg = dict(self.config)
         cfg.update(config or {})
         if evidence.ndim != 2 or evidence.size(-1) < EvidenceIndex.BASE_DIM:
@@ -163,6 +186,7 @@ class DiscountProbabilityFusion(nn.Module):
         detach_discount = bool(cfg.get("detach_discount", True))
         use_hard_alive = bool(cfg.get("use_hard_alive_mask", True))
         use_confidence = bool(cfg.get("use_confidence_proxy", True))
+        use_reliability = bool(cfg.get("use_reliability_discount", True))
         use_conflict = bool(cfg.get("use_conflict_discount", True))
         use_support = bool(cfg.get("use_support_discount", True))
 
@@ -304,6 +328,10 @@ class DiscountProbabilityFusion(nn.Module):
                 manifest_integrity,
                 mean_alive_integrity,
             ]
+        if not use_reliability:
+            base_reliability = [
+                torch.ones_like(api_integrity) for _ in BRANCH_NAMES
+            ]
         raw_discounts = torch.stack(
             [
                 base_reliability[0] * code_anchor_factor * code_conflict_factor * confidence_factors[0],
@@ -346,13 +374,21 @@ class DiscountProbabilityFusion(nn.Module):
         final_proxy = compute_branch_confidence_proxy(final_logits, temperature=1.0, eps=eps)
         reliability_matrix = torch.stack(base_reliability, dim=-1)
         total_reliability = (fusion_weights * reliability_matrix).sum(dim=-1).clamp(0.0, 1.0)
-        effective_conflict = torch.maximum(
-            torch.where(
-                manifest_code_applicable, manifest_conflict, torch.zeros_like(manifest_conflict)
-            ),
-            torch.where(
-                manifest_code_applicable, code_conflict, torch.zeros_like(code_conflict)
-            ),
+        effective_conflict = (
+            torch.maximum(
+                torch.where(
+                    manifest_code_applicable,
+                    manifest_conflict,
+                    torch.zeros_like(manifest_conflict),
+                ),
+                torch.where(
+                    manifest_code_applicable,
+                    code_conflict,
+                    torch.zeros_like(code_conflict),
+                ),
+            )
+            if use_conflict
+            else torch.zeros_like(manifest_conflict)
         )
         acceptance_components = torch.stack(
             [

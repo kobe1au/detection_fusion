@@ -200,11 +200,14 @@ def compute_masked_semantic_reconstruction_loss(
         raise ValueError("masked semantic reconstruction requires observable evidence")
 
     detach = bool(config.get("detach_reliability", True))
+    use_integrity_conditioning = bool(config.get("use_integrity_conditioning", True))
     integrity = {
         "api": _evidence_column(evidence, EvidenceIndex.API_INTEGRITY, detach),
         "graph": _evidence_column(evidence, EvidenceIndex.GRAPH_INTEGRITY, detach),
         "manifest": _evidence_column(evidence, EvidenceIndex.MANIFEST_INTEGRITY, detach),
     }
+    if not use_integrity_conditioning:
+        integrity = {name: torch.ones_like(value) for name, value in integrity.items()}
     use_calibrated_reliability = bool(config.get("use_calibrated_reliability", False))
     if use_calibrated_reliability and not all(
         isinstance(outputs.get(f"predicted_reliability_{name}"), torch.Tensor)
@@ -222,6 +225,10 @@ def compute_masked_semantic_reconstruction_loss(
             source_reliability[name] = calibrated.detach() if detach else calibrated
         else:
             source_reliability[name] = integrity[name]
+    if not use_integrity_conditioning:
+        source_reliability = {
+            name: torch.ones_like(value) for name, value in source_reliability.items()
+        }
     alive = {
         "api": _evidence_column(evidence, EvidenceIndex.API_ALIVE, True).bool(),
         "graph": _evidence_column(evidence, EvidenceIndex.GRAPH_ALIVE, True).bool(),

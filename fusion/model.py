@@ -146,8 +146,8 @@ def _fusion_discount_probability(model, batch_size, device, dtype, tensors, extr
         tensors["api_emb"],
         tensors["graph_emb"],
         tensors["manifest_emb"],
-        use_consistency_evidence=model.use_consistency_evidence,
-        use_conflict_evidence=model.use_conflict_evidence,
+        use_consistency_evidence=True,
+        use_conflict_evidence=True,
         use_perturbation_evidence=False,
     )
     extra.update(diagnostics)
@@ -737,6 +737,12 @@ class TriModalRobustModel(nn.Module):
             "graph": graph_source_weight,
             "manifest": manifest_source_weight,
         }
+        if not bool(
+            self.semantic_reconstruction_config.get("use_integrity_conditioning", True)
+        ):
+            source_weight = {
+                name: torch.ones_like(weight) for name, weight in source_weight.items()
+            }
         masks = {"api": mask_api, "graph": mask_graph, "manifest": mask_manifest}
 
         def reconstruction_input(target_name: str, source_name: str) -> torch.Tensor:
@@ -781,9 +787,9 @@ class TriModalRobustModel(nn.Module):
             "mask_api_semantic": mask_api.to(dtype=api_emb.dtype),
             "mask_graph_semantic": mask_graph.to(dtype=api_emb.dtype),
             "mask_manifest_semantic": mask_manifest.to(dtype=api_emb.dtype),
-            "semantic_source_weight_api": api_source_weight.view(-1),
-            "semantic_source_weight_graph": graph_source_weight.view(-1),
-            "semantic_source_weight_manifest": manifest_source_weight.view(-1),
+            "semantic_source_weight_api": source_weight["api"].view(-1),
+            "semantic_source_weight_graph": source_weight["graph"].view(-1),
+            "semantic_source_weight_manifest": source_weight["manifest"].view(-1),
         }
 
     @staticmethod
@@ -904,8 +910,8 @@ class TriModalRobustModel(nn.Module):
                 api_emb,
                 graph_emb,
                 manifest_emb,
-                use_consistency_evidence=self.use_consistency_evidence,
-                use_conflict_evidence=self.use_conflict_evidence,
+                use_consistency_evidence=True,
+                use_conflict_evidence=True,
                 use_perturbation_evidence=False,
             )
             cross_attention_outputs = self.semantic_cross_attention(

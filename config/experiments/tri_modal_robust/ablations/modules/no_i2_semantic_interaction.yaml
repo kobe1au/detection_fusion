@@ -11,3 +11,7 @@ semantic_cross_attention:
   enabled: false
   attach_to_joint: false
   attach_to_reconstruction: false
+
+semantic_reconstruction:
+  enabled: false
+  weight: 0.0

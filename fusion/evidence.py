@@ -203,9 +203,31 @@ def build_evidence(
 
     api_manifest_consistency = cosine_counts(api_counts, manifest_counts)
     graph_manifest_consistency = cosine_counts(graph_counts, manifest_counts)
+    graph_encoder_coverage = scalar_attr(
+        graph_data, "graph_encoder_coverage", batch_size, device, dtype, 1.0
+    )
+    graph_truncated = scalar_attr(
+        graph_data,
+        "graph_truncated_by_encoder_budget",
+        batch_size,
+        device,
+        dtype,
+        0.0,
+    )
+    graph_integrity_before_budget = scalar_attr(
+        graph_data,
+        "graph_integrity_before_encoder_budget",
+        batch_size,
+        device,
+        dtype,
+        0.0,
+    )
     diagnostics = {
         "api_integrity": api_integrity.detach().view(batch_size),
         "graph_integrity": graph_integrity.detach().view(batch_size),
+        "graph_encoder_coverage": graph_encoder_coverage.detach().view(batch_size),
+        "graph_truncated_by_encoder_budget": graph_truncated.detach().view(batch_size),
+        "graph_integrity_before_encoder_budget": graph_integrity_before_budget.detach().view(batch_size),
         "manifest_integrity": manifest_integrity.detach().view(batch_size),
         "code_integrity": code_integrity.detach().view(batch_size),
         "api_graph_anchor_support": anchor_support.detach().view(batch_size),

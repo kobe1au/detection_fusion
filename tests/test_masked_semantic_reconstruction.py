@@ -71,7 +71,7 @@ def _model_batch() -> Batch:
     return batch
 
 
-def _model(mask_probs=(1.0, 1.0, 1.0)) -> TriModalRobustModel:
+def _model(mask_probs=(1.0, 1.0, 1.0), use_integrity_conditioning=True) -> TriModalRobustModel:
     return TriModalRobustModel(
         in_feat_dim=8,
         fusion_mode="discount_probability",
@@ -97,6 +97,7 @@ def _model(mask_probs=(1.0, 1.0, 1.0)) -> TriModalRobustModel:
             "mask_prob_api": mask_probs[0],
             "mask_prob_graph": mask_probs[1],
             "mask_prob_manifest": mask_probs[2],
+            "use_integrity_conditioning": use_integrity_conditioning,
         },
     )
 
@@ -130,6 +131,37 @@ def test_semantic_reconstruction_scales_each_source_by_its_integrity():
         outputs["recon_api_semantic_logits"][0],
     )
 
+
+
+def test_semantic_reconstruction_can_disable_integrity_conditioning():
+    model = _model(
+        mask_probs=(0.0, 0.0, 0.0), use_integrity_conditioning=False
+    ).eval()
+    batch = _model_batch()
+    batch.graph_integrity[0] = 0.0
+
+    with torch.no_grad():
+        _, outputs = model(batch)
+
+    assert outputs["semantic_source_weight_graph"].tolist() == [1.0, 1.0]
+
+
+def test_reconstruction_loss_can_disable_integrity_conditioning():
+    outputs, batch, config = _loss_inputs(1)
+    outputs["mask_graph_semantic"] = torch.zeros(1)
+    outputs["mask_manifest_semantic"] = torch.zeros(1)
+    evidence = _evidence(1)
+    evidence[:, EvidenceIndex.API_INTEGRITY] = 0.0
+    evidence[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.0
+    evidence[:, EvidenceIndex.MANIFEST_INTEGRITY] = 0.0
+    config["use_integrity_conditioning"] = False
+
+    loss, diagnostics = compute_masked_semantic_reconstruction_loss(
+        outputs, batch, evidence, config
+    )
+
+    assert torch.isfinite(loss)
+    assert diagnostics["valid_recon_api_rate"].item() == 1.0
 
 def test_masking_only_enabled_during_training():
     model = _model()

@@ -27,6 +27,12 @@ OBSOLETE_CONFIGS = {
     "tuning/i1/best_i1_candidate_3.yaml",
     "tuning/i2/dropout_0_0.yaml",
     "tuning/tuning_final_candidate.yaml",
+    "tuning/i3/acceptance_product_eval.yaml",
+    "sensitivity/i3/acceptance_product.yaml",
+    # Historical confirmations retained for provenance. They resolve to the
+    # current frozen objective and would otherwise duplicate canonical runs.
+    "tuning/objective/branch_aux_weight_0_20.yaml",
+    "tuning/objective/tuning_objective_combined_0.2_0.02.yaml",
 }
 
 ALIASES = {
@@ -54,7 +60,11 @@ BASELINES = [
 ]
 
 PAPER_BASELINES = [
-    item for item in BASELINES if item != LEARNED_EVIDENCE_LOGIT_FUSION
+    "baselines/api_only.yaml",
+    "baselines/graph_only.yaml",
+    "baselines/manifest_only.yaml",
+    "baselines/tri_modal_concat.yaml",
+    "baselines/fixed_logit_fusion.yaml",
 ]
 
 MODULE_ABLATIONS = [
@@ -126,11 +136,35 @@ TUNING_I2 = [
 ]
 
 TUNING_I3 = [
-    "tuning/i3/acceptance_product_eval.yaml",
+    "tuning/i3/acceptance_min_eval.yaml",
     "tuning/i3/coverage_80_eval.yaml",
     "tuning/i3/coverage_95_eval.yaml",
 ]
 
+
+TUNING_OBJECTIVE = [
+    TUNING_FULL,
+    "tuning/objective/branch_aux_weight_0_02.yaml",
+    "tuning/objective/branch_aux_weight_0_10.yaml",
+    "tuning/objective/branch_aux_weight_0_15.yaml",
+    "tuning/objective/branch_aux_weight_0_25.yaml",
+    "tuning/objective/semantic_reconstruction_weight_0_01.yaml",
+    "tuning/objective/semantic_reconstruction_weight_0_04.yaml",
+    "tuning/objective/semantic_reconstruction_weight_0_05.yaml",
+    "tuning/objective/semantic_reconstruction_weight_0_06.yaml",
+]
+
+# Compact confirmation after graph-budget, FP32-decision, and stratified-split
+# semantics changed. Historical broad sweeps remain provenance only.
+REFREEZE = [
+    TUNING_FULL,
+    "tuning/objective/branch_aux_weight_0_15.yaml",
+    "tuning/objective/branch_aux_weight_0_25.yaml",
+    "tuning/objective/semantic_reconstruction_weight_0_01.yaml",
+    "tuning/objective/tuning_objective_combined_0.2_0.03.yaml",
+    "tuning/i1/conflict_min_0_1.yaml",
+    "tuning/i2/dropout_0_2.yaml",
+]
 
 TRAINING_ABLATIONS = [
     "ablations/training/no_masked_semantic_reconstruction.yaml",
@@ -153,7 +187,7 @@ SENSITIVITY = [
     "sensitivity/i2/residual_tokens_8.yaml",
     "sensitivity/i2/attention_heads_2.yaml",
     "sensitivity/i2/attention_heads_8.yaml",
-    "sensitivity/i3/acceptance_product.yaml",
+    "sensitivity/i3/acceptance_min.yaml",
     "sensitivity/i3/coverage_80.yaml",
     "sensitivity/i3/coverage_95.yaml",
 ]
@@ -184,6 +218,8 @@ GROUPS = {
     "BEST_I1_C": BEST_I1_CANDIDATES,
     "tuning_i2": TUNING_I2,
     "tuning_i3": TUNING_I3,
+    "tuning_objective": TUNING_OBJECTIVE,
+    "refreeze": REFREEZE,
     "i1": I1_ABLATIONS,
     "i1_appendix": I1_APPENDIX_ABLATIONS,
     "i1_full": [*I1_ABLATIONS, *I1_APPENDIX_ABLATIONS],
@@ -299,6 +335,8 @@ def available_configs() -> dict[str, Path]:
     stem_paths: dict[str, list[Path]] = {}
     for path in sorted(CONFIG_DIR.rglob("*.yaml")):
         relative = path.relative_to(CONFIG_DIR)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
         if path.name == "base_tri_modal_robust.yaml" or path.stem.startswith("_"):
             continue
         if relative.as_posix() in OBSOLETE_CONFIGS:

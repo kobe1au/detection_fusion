@@ -16,6 +16,6 @@ eval:
   extra_sets:
     - name: obfuscapk_encryption
       split_name: obfuscapk_encryption
-      pt_dir: D:/pts_obfuscapk/encryption/test
-      csv: labels/test.csv
-      skip_if_empty: true
+      pt_dir: ../../pts_obfuscapk/encryption/test
+      csv: labels/obfuscapk_encryption_test.csv
+      skip_if_empty: false

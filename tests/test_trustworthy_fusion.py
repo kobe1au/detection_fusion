@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from fusion.constants import EvidenceIndex
+from fusion.dataset import apply_graph_encoder_budget
 from fusion.discount_fusion import DiscountProbabilityFusion
 from fusion.losses import compute_posthoc_calibration_loss
 from fusion.reliability_calibration import MonotonicReliabilityCalibrator
@@ -328,6 +329,32 @@ def test_posthoc_calibration_restores_best_epoch_and_stops_early():
     assert summary["final_loss"] == summary["losses"][0]
 
 
+
+def test_reliability_and_conflict_switches_remove_their_decision_signals():
+    fusion = DiscountProbabilityFusion(
+        {
+            "use_reliability_discount": False,
+            "use_support_discount": False,
+            "use_conflict_discount": False,
+            "use_confidence_proxy": False,
+            "use_hard_alive_mask": False,
+            "reliability_calibration": {"enabled": False},
+            "probability_calibration": {"enabled": False},
+        }
+    )
+    evidence = _evidence(2)
+    evidence[0, EvidenceIndex.API_INTEGRITY] = 0.0
+    evidence[0, EvidenceIndex.GRAPH_INTEGRITY] = 0.1
+    evidence[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 1.0
+    evidence[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 1.0
+
+    outputs = fusion(*_logits(batch_size=2), evidence)
+
+    assert torch.allclose(
+        outputs["fusion_weights"], torch.full((2, 4), 0.25)
+    )
+    assert torch.equal(outputs["effective_conflict"], torch.zeros(2))
+
 def test_calibration_parameters_are_inactive_during_main_training():
     fusion = DiscountProbabilityFusion(
         {
@@ -349,6 +376,7 @@ def test_validation_split_is_deterministic_and_group_isolated():
     class Dataset:
         sample_sids = ["a", "b", "c", "d", "e"]
         sample_groups = ["same", "same", "g2", "g3", "g4"]
+        sample_labels = [0, 0, 1, 0, 1]
 
         def __len__(self):
             return len(self.sample_sids)
@@ -366,6 +394,89 @@ def test_validation_split_is_deterministic_and_group_isolated():
     calibration_groups = {Dataset.sample_groups[index] for index in calibration_a.indices}
     assert selection_groups.isdisjoint(calibration_groups)
 
+
+
+def test_validation_split_is_label_stratified_for_singleton_groups():
+    class Dataset:
+        sample_sids = [f"s{index}" for index in range(20)]
+        sample_groups = [f"g{index}" for index in range(20)]
+        sample_labels = [0] * 10 + [1] * 10
+
+        def __len__(self):
+            return len(self.sample_sids)
+
+        def __getitem__(self, index):
+            return index
+
+    cfg = {"train": {"seed": 42}, "calibration": {"validation_fraction": 0.5}}
+    selection, calibration, meta = split_validation_dataset(cfg, Dataset())
+
+    assert len(selection) == 10
+    assert len(calibration) == 10
+    assert meta["selection_label_counts"] == {0: 5, 1: 5}
+    assert meta["calibration_label_counts"] == {0: 5, 1: 5}
+
+
+def test_discount_probability_fusion_uses_fp32_for_half_inputs():
+    fusion = DiscountProbabilityFusion(
+        {
+            "reliability_calibration": {"enabled": False},
+            "probability_calibration": {"enabled": False},
+        }
+    )
+    logits = tuple(value.half() for value in _logits(batch_size=2))
+    outputs = fusion(*logits, _evidence(batch_size=2).half())
+
+    assert outputs["final_logits"].dtype == torch.float32
+    assert outputs["acceptance_score"].dtype == torch.float32
+    assert outputs["fusion_weights"].dtype == torch.float32
+
+
+def test_graph_encoder_budget_refreshes_alignment_and_effective_integrity():
+    api_types = torch.tensor([1, 2], dtype=torch.long)
+    data = {
+        "x": torch.ones((5, 3)),
+        "edge_index": torch.tensor([[0, 1, 3, 4], [1, 2, 4, 3]], dtype=torch.long),
+        "sensitive_mask": torch.zeros(5, dtype=torch.uint8),
+        "real_node_mask": torch.ones(5, dtype=torch.bool),
+        "mask": torch.empty((5, 0)),
+        "method_api_edge_index": torch.tensor([[0, 4], [0, 1]], dtype=torch.long),
+        "api_ids": torch.tensor([10, 11], dtype=torch.long),
+        "api_type_ids": api_types,
+        "api_method_index": torch.tensor([0, 4], dtype=torch.long),
+        "api_in_graph_mask": torch.ones(2),
+        "api_semantic_category_counts": torch.ones(12),
+        "graph_semantic_category_counts": torch.ones(12),
+        "manifest_category_counts": torch.ones(12),
+        "api_integrity": 1.0,
+        "graph_integrity": 1.0,
+        "q_graph": 1.0,
+        "api_parse_ok": True,
+        "dex_parse_ok": True,
+        "graph_parse_ok": True,
+        "manifest_parse_ok": True,
+        "api_event_count_raw": 2,
+        "api_event_count_kept": 2,
+        "api_known_type_count": 2,
+        "api_unknown_type_count": 0,
+        "graph_edge_count_reference": 4,
+        "manifest_permission_ids": torch.tensor([1]),
+        "manifest_intent_ids": torch.tensor([1]),
+        "manifest_stats": torch.ones(11),
+    }
+
+    out = apply_graph_encoder_budget(data, 3, "alignment")
+
+    assert out["x"].size(0) == 3
+    assert out["graph_encoder_coverage"] == pytest.approx(0.6)
+    assert out["graph_truncated_by_encoder_budget"] == 1.0
+    assert out["method_api_edge_index"].tolist() == [[0], [0]]
+    assert out["api_method_index"].tolist() == [0, -1]
+    assert out["api_in_graph_mask"].tolist() == [1.0, 0.0]
+    assert out["graph_integrity"] < out["graph_integrity_before_encoder_budget"]
+    assert out["code_integrity"] == pytest.approx(
+        math.sqrt(out["api_integrity"] * out["graph_integrity"])
+    )
 
 def test_selective_metrics_and_validation_threshold():
     rows = [

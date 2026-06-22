@@ -43,6 +43,118 @@ logger = logging.getLogger(__name__)
 
 VALID_GRAPH_SEMANTIC_SOURCES = ("alignment", "full_api", "zero")
 
+
+def apply_graph_encoder_budget(
+    data: dict[str, Any],
+    max_nodes: int | None,
+    graph_semantic_source: str,
+) -> dict[str, Any]:
+    """Apply the model's per-sample graph budget before evidence is refreshed."""
+    x = data.get("x")
+    if not isinstance(x, torch.Tensor) or x.ndim != 2:
+        return data
+    storage_nodes = int(x.size(0))
+    raw_integrity = float(data.get("graph_integrity", data.get("q_graph", 0.0)))
+    if max_nodes is None or max_nodes <= 0 or storage_nodes <= max_nodes:
+        data["graph_encoder_coverage"] = 1.0
+        data["graph_truncated_by_encoder_budget"] = 0.0
+        data["graph_integrity_before_encoder_budget"] = raw_integrity
+        return data
+
+    keep = torch.arange(max_nodes, dtype=torch.long)
+    mapping = torch.full((storage_nodes,), -1, dtype=torch.long)
+    mapping[keep] = torch.arange(max_nodes, dtype=torch.long)
+    data["x"] = x[keep]
+    for key in ("sensitive_mask", "real_node_mask", "mask"):
+        value = data.get(key)
+        if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.size(0) == storage_nodes:
+            data[key] = value[keep]
+
+    edge = data.get("edge_index")
+    if isinstance(edge, torch.Tensor) and edge.ndim == 2 and edge.size(0) == 2:
+        edge = edge.long()
+        valid = (
+            (edge[0] >= 0)
+            & (edge[0] < storage_nodes)
+            & (edge[1] >= 0)
+            & (edge[1] < storage_nodes)
+        )
+        edge = edge[:, valid]
+        src = mapping[edge[0]]
+        dst = mapping[edge[1]]
+        retained = (src >= 0) & (dst >= 0)
+        data["edge_index"] = torch.stack([src[retained], dst[retained]], dim=0)
+
+    method_edge = data.get("method_api_edge_index")
+    if isinstance(method_edge, torch.Tensor) and method_edge.ndim == 2 and method_edge.size(0) == 2:
+        method_edge = method_edge.long()
+        valid = (method_edge[0] >= 0) & (method_edge[0] < storage_nodes)
+        method_edge = method_edge[:, valid]
+        retained_src = mapping[method_edge[0]]
+        retained = retained_src >= 0
+        data["method_api_edge_index"] = torch.stack(
+            [retained_src[retained], method_edge[1, retained]], dim=0
+        )
+
+    api_method_index = data.get("api_method_index")
+    if isinstance(api_method_index, torch.Tensor):
+        api_method_index = api_method_index.long().view(-1)
+        valid = (api_method_index >= 0) & (api_method_index < storage_nodes)
+        mapped = torch.full_like(api_method_index, -1)
+        mapped[valid] = mapping[api_method_index[valid]]
+        data["api_method_index"] = mapped
+
+    api_ids = data.get("api_ids")
+    num_api = int(api_ids.numel()) if isinstance(api_ids, torch.Tensor) else 0
+    api_in_graph = torch.zeros((num_api,), dtype=torch.float32)
+    retained_method_edge = data.get("method_api_edge_index")
+    if (
+        isinstance(retained_method_edge, torch.Tensor)
+        and retained_method_edge.ndim == 2
+        and retained_method_edge.size(0) == 2
+        and retained_method_edge.numel() > 0
+    ):
+        dst = retained_method_edge[1].long()
+        dst = dst[(dst >= 0) & (dst < num_api)]
+        if dst.numel() > 0:
+            api_in_graph[dst.unique()] = 1.0
+    data["api_in_graph_mask"] = api_in_graph
+
+    api_types = data.get("api_type_ids")
+    if graph_semantic_source == "alignment":
+        data["graph_semantic_category_counts"] = graph_semantic_counts_from_method_api_edges(
+            api_types, data.get("method_api_edge_index")
+        )
+    elif graph_semantic_source == "full_api":
+        data["graph_semantic_category_counts"] = data["api_semantic_category_counts"].clone()
+    else:
+        data["graph_semantic_category_counts"] = torch.zeros(
+            (SEMANTIC_CATEGORY_DIM,), dtype=torch.float32
+        )
+    data["graph_category_counts"] = data["graph_semantic_category_counts"]
+
+    real_mask = data.get("real_node_mask")
+    data["real_num_nodes"] = (
+        int(real_mask.bool().sum().item())
+        if isinstance(real_mask, torch.Tensor)
+        else int(data["x"].size(0))
+    )
+    data["graph_encoder_coverage"] = float(max_nodes / storage_nodes)
+    data["graph_truncated_by_encoder_budget"] = 1.0
+    data["graph_integrity_before_encoder_budget"] = raw_integrity
+    refresh_observable_signals(data)
+    effective_graph_integrity = max(
+        0.0,
+        min(1.0, float(data["graph_integrity"]) * data["graph_encoder_coverage"]),
+    )
+    data["graph_integrity"] = effective_graph_integrity
+    data["code_integrity"] = math.sqrt(
+        max(0.0, float(data["api_integrity"]) * effective_graph_integrity)
+    )
+    data["q_graph"] = effective_graph_integrity
+    data["r_graph"] = effective_graph_integrity
+    return data
+
 class FatalDatasetConfigError(RuntimeError):
     """Configuration/data schema error that must not be converted to a dummy sample."""
 
@@ -232,6 +344,7 @@ class RobustTriModalDataset(Dataset):
         eval_perturb_type: str | None = None,
         eval_perturb_strength: float = 0.0,
         max_api_events_per_sample: int | None = None,
+        max_graph_nodes_per_sample: int | None = None,
         manifest_dim: int = 256,
         manifest_category_dim: int = 12,
         manifest_stats_dim: int = 11,
@@ -268,6 +381,13 @@ class RobustTriModalDataset(Dataset):
         self.max_api_events_per_sample = (
             int(max_api_events_per_sample) if max_api_events_per_sample is not None else None
         )
+        self.max_graph_nodes_per_sample = (
+            int(max_graph_nodes_per_sample)
+            if max_graph_nodes_per_sample is not None
+            else None
+        )
+        if self.max_graph_nodes_per_sample is not None and self.max_graph_nodes_per_sample <= 0:
+            raise ValueError("max_graph_nodes_per_sample must be positive")
         self.manifest_dim = int(manifest_dim)
         if int(manifest_category_dim) != SEMANTIC_CATEGORY_DIM:
             raise ValueError(
@@ -394,6 +514,7 @@ class RobustTriModalDataset(Dataset):
         if not self.samples:
             raise RuntimeError(f"No matching .pt samples found in {self.pt_dir} for {csv_path}")
         self.sample_sids = [sid for _, _, sid, _ in self.samples]
+        self.sample_labels = [label for _, label, _, _ in self.samples]
         self.sample_years = [year for _, _, _, year in self.samples]
         self.sample_groups = build_package_isolation_groups(self.sample_sids, groups)
         self.feature_dim = self._infer_feature_dim(default_dim=515)
@@ -808,6 +929,22 @@ class RobustTriModalDataset(Dataset):
         obj.graph_semantic_category_counts = data["graph_semantic_category_counts"].float()
         obj.api_category_counts = obj.api_semantic_category_counts
         obj.graph_category_counts = obj.graph_semantic_category_counts
+        obj.graph_encoder_coverage = torch.tensor(
+            [scalar_float(data.get("graph_encoder_coverage"), 1.0)], dtype=torch.float32
+        )
+        obj.graph_truncated_by_encoder_budget = torch.tensor(
+            [scalar_float(data.get("graph_truncated_by_encoder_budget"), 0.0)],
+            dtype=torch.float32,
+        )
+        obj.graph_integrity_before_encoder_budget = torch.tensor(
+            [
+                scalar_float(
+                    data.get("graph_integrity_before_encoder_budget"),
+                    data.get("graph_integrity", 0.0),
+                )
+            ],
+            dtype=torch.float32,
+        )
         obj.manifest_x = data["manifest_x"].float().view(1, -1)
         obj.manifest_permission_ids = data["manifest_permission_ids"].long().view(-1)
         obj.manifest_intent_ids = data["manifest_intent_ids"].long().view(-1)
@@ -855,6 +992,11 @@ class RobustTriModalDataset(Dataset):
                 seed = _stable_seed(sid, self.eval_perturb_type)
                 with _temporary_random_seed(seed):
                     data = apply_perturbation(data, self.eval_perturb_type, self.eval_perturb_strength)
+            data = apply_graph_encoder_budget(
+                data,
+                self.max_graph_nodes_per_sample,
+                self.graph_semantic_source,
+            )
             return self._to_data_object(data, label, sid, year)
         except FatalDatasetConfigError:
             raise

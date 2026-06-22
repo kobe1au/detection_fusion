@@ -63,6 +63,9 @@ class EmptyExtraEvalSetError(RuntimeError):
 GATE_DIAGNOSTIC_KEYS = (
     "api_integrity",
     "graph_integrity",
+    "graph_encoder_coverage",
+    "graph_truncated_by_encoder_budget",
+    "graph_integrity_before_encoder_budget",
     "manifest_integrity",
     "code_integrity",
     "api_graph_anchor_support",
@@ -156,10 +159,17 @@ def set_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-def configure_determinism(enabled: bool) -> None:
+def configure_determinism(enabled: bool, strict: bool = False) -> None:
     torch.backends.cudnn.benchmark = not enabled
     torch.backends.cudnn.deterministic = enabled
-    torch.use_deterministic_algorithms(enabled, warn_only=True)
+    if enabled and strict and torch.cuda.is_available():
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
+    torch.use_deterministic_algorithms(enabled, warn_only=not strict)
 
 
 def select_device(value: str) -> torch.device:
@@ -367,6 +377,11 @@ def _dataset_common_kwargs(
         "manifest_intent_dim": int(manifest_cfg.get("intent_dim", 64)),
         "manifest_feature_dim": int(manifest_cfg.get("feature_dim", 32)),
         "max_api_events_per_sample": data_cfg.get("max_api_events_per_sample"),
+        "max_graph_nodes_per_sample": (
+            int(model_cfg.get("max_nodes_gnn", 12288))
+            if bool(model_cfg.get("graph_encoder", {}).get("account_for_encoder_budget", True))
+            else None
+        ),
         "drop_graph_behavior_hints": bool(model_cfg.get("graph_encoder", {}).get("drop_extracted_behavior_hints", False)),
         "graph_semantic_source": str(data_cfg.get("graph_semantic_source", "alignment")),
         "num_classes": int(model_cfg.get("num_classes", 2)),
@@ -443,7 +458,11 @@ def build_loader(cfg: dict, dataset, is_train: bool):
 
 
 def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[str, Any]]:
-    """Deterministically separate checkpoint selection from calibration."""
+    """Deterministically separate checkpoint selection from calibration.
+
+    Package/sample groups remain intact while a deterministic greedy assignment
+    keeps both halves close to the full validation label distribution.
+    """
     calibration_cfg = cfg.get("calibration", {}) or {}
     fraction = float(calibration_cfg.get("validation_fraction", 0.5))
     if not 0.0 < fraction < 1.0:
@@ -458,6 +477,17 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
     groups = list(getattr(dataset, "sample_groups", []))
     if len(groups) != size:
         groups = list(sids)
+    labels = list(getattr(dataset, "sample_labels", []))
+    if len(labels) != size:
+        samples = list(getattr(dataset, "samples", []))
+        if len(samples) == size:
+            labels = [int(sample[1]) for sample in samples]
+        else:
+            raise ValueError(
+                "Validation dataset must expose sample_labels for stratified calibration split"
+            )
+    labels = [int(label) for label in labels]
+
     group_to_indices: dict[str, list[int]] = {}
     for index, group in enumerate(groups):
         group_to_indices.setdefault(str(group), []).append(index)
@@ -465,25 +495,77 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
         raise ValueError(
             "Validation dataset needs at least two package/sample groups for leakage-free calibration split"
         )
+
+    label_values = sorted(set(labels))
+    total_label_counts = {
+        label: sum(int(value == label) for value in labels) for label in label_values
+    }
+    target_label_counts = {
+        label: float(total_label_counts[label]) * fraction for label in label_values
+    }
+    target_calibration_size = min(size - 1, max(1, int(round(size * fraction))))
     ranked_groups = sorted(
         group_to_indices,
         key=lambda group: hashlib.sha256(f"{seed}:{group}".encode("utf-8")).hexdigest(),
     )
-    target_calibration_size = min(size - 1, max(1, int(round(size * fraction))))
+    rank = {group: index for index, group in enumerate(ranked_groups)}
+    group_label_counts: dict[str, dict[int, int]] = {}
+    for group, indices in group_to_indices.items():
+        group_label_counts[group] = {
+            label: sum(int(labels[index] == label) for index in indices)
+            for label in label_values
+        }
+
+    def split_error(candidate_size: int, candidate_counts: dict[int, int]) -> float:
+        size_error = abs(candidate_size - target_calibration_size) / max(size, 1)
+        label_error = sum(
+            abs(candidate_counts[label] - target_label_counts[label])
+            / max(total_label_counts[label], 1)
+            for label in label_values
+        )
+        return size_error + label_error
+
+    remaining = set(ranked_groups)
     calibration_groups: list[str] = []
     calibration_indices: list[int] = []
-    for group in ranked_groups:
-        indices = group_to_indices[group]
-        if calibration_indices and len(calibration_indices) >= target_calibration_size:
+    calibration_label_counts = {label: 0 for label in label_values}
+    while remaining:
+        current_size = len(calibration_indices)
+        current_error = split_error(current_size, calibration_label_counts)
+        candidates = []
+        for group in remaining:
+            indices = group_to_indices[group]
+            new_size = current_size + len(indices)
+            if new_size >= size:
+                continue
+            new_counts = {
+                label: calibration_label_counts[label]
+                + group_label_counts[group][label]
+                for label in label_values
+            }
+            candidates.append(
+                (split_error(new_size, new_counts), rank[group], group, new_counts)
+            )
+        if not candidates:
             break
-        if len(calibration_indices) + len(indices) >= size:
-            continue
-        calibration_groups.append(group)
-        calibration_indices.extend(indices)
+        best_error, _, best_group, best_counts = min(candidates)
+        if current_size >= target_calibration_size and best_error >= current_error:
+            break
+        calibration_groups.append(best_group)
+        calibration_indices.extend(group_to_indices[best_group])
+        calibration_label_counts = best_counts
+        remaining.remove(best_group)
+
     calibration_indices = sorted(calibration_indices)
+    if not calibration_indices or len(calibration_indices) >= size:
+        raise ValueError("Unable to build non-empty stratified validation subsets")
     calibration_set = set(calibration_indices)
     selection_indices = [index for index in range(size) if index not in calibration_set]
     selection_groups = sorted(set(groups[index] for index in selection_indices))
+    selection_label_counts = {
+        label: sum(int(labels[index] == label) for index in selection_indices)
+        for label in label_values
+    }
     return (
         Subset(dataset, selection_indices),
         Subset(dataset, calibration_indices),
@@ -494,6 +576,8 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
             "num_calibration": len(calibration_indices),
             "num_selection_groups": len(selection_groups),
             "num_calibration_groups": len(calibration_groups),
+            "selection_label_counts": selection_label_counts,
+            "calibration_label_counts": calibration_label_counts,
             "selection_indices": selection_indices,
             "calibration_indices": calibration_indices,
         },
@@ -1365,7 +1449,10 @@ def run(cfg: dict) -> dict[str, Any]:
     eval_cfg = cfg.get("eval", {})
     seed = int(train_cfg.get("seed", 42))
     set_seed(seed)
-    configure_determinism(bool(train_cfg.get("deterministic", False)))
+    configure_determinism(
+        bool(train_cfg.get("deterministic", False)),
+        strict=bool(train_cfg.get("strict_deterministic", False)),
+    )
     device = select_device(str(train_cfg.get("device", "auto")))
     use_amp = bool(train_cfg.get("use_amp", True))
     run_test = bool(eval_cfg.get("run_test", True))
@@ -1400,8 +1487,19 @@ def run(cfg: dict) -> dict[str, Any]:
             raise ValueError("train.tuning_mode=true forbids eval.extra_sets")
         if not bool((eval_cfg.get("robust_val", {}) or {}).get("enabled", False)):
             raise ValueError("train.tuning_mode=true requires eval.robust_val.enabled=true")
-        if str(train_cfg.get("checkpoint_metric", "")).strip().lower() != "robust_composite":
-            raise ValueError("train.tuning_mode=true requires train.checkpoint_metric=robust_composite")
+        tuning_checkpoint_metric = str(
+            train_cfg.get("checkpoint_metric", "clean_macro_f1")
+        ).strip().lower()
+        if tuning_checkpoint_metric not in {
+            "clean",
+            "clean_macro_f1",
+            "macro_f1",
+            "val_macro_f1",
+            "robust_composite",
+        }:
+            raise ValueError(
+                "train.tuning_mode=true requires a supported clean or robust checkpoint metric"
+            )
     if eval_only:
         if tuning_mode:
             raise ValueError("eval.eval_only=true is incompatible with train.tuning_mode=true")
@@ -1727,6 +1825,16 @@ def run(cfg: dict) -> dict[str, Any]:
     write_gate_dump(out_dir / "gate_diagnostics_extra_eval.csv", extra_rows)
     if extra_results:
         _write_metrics_json(out_dir / "metrics_extra_eval.json", extra_results)
+    tuning_robust_composite_score = None
+    if tuning_mode:
+        robust_score_cfg = copy.deepcopy(cfg)
+        robust_score_cfg.setdefault("train", {})["checkpoint_metric"] = "robust_composite"
+        tuning_robust_composite_score, _ = checkpoint_score(
+            robust_score_cfg,
+            val_metrics,
+            val_robust_results,
+            robust_val_loaders,
+        )
     summary = {
         "eval_only": eval_only,
         "checkpoint_path": str(best_path),
@@ -1734,6 +1842,7 @@ def run(cfg: dict) -> dict[str, Any]:
         "best_val_f1": best_val_f1,
         "best_val_macro_f1": best_val_f1,
         "checkpoint_metric": checkpoint_metric_name,
+        "tuning_robust_composite_score": tuning_robust_composite_score,
         "calibration": calibration_summary,
         "rejection_threshold": rejection_threshold,
         "val": val_metrics,

@@ -16,6 +16,6 @@ eval:
   extra_sets:
     - name: obfuscapk_rename
       split_name: obfuscapk_rename
-      pt_dir: D:/pts_obfuscapk/rename/test
-      csv: labels/test.csv
-      skip_if_empty: true
+      pt_dir: ../../pts_obfuscapk/rename/test
+      csv: labels/obfuscapk_rename_test.csv
+      skip_if_empty: false

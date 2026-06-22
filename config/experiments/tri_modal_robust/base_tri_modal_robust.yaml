@@ -21,6 +21,7 @@ train:
   seed: 42
   tuning_mode: false
   deterministic: true
+  strict_deterministic: false
   device: auto
   epochs: 60
   patience: 8
@@ -39,7 +40,7 @@ train:
   grad_clip: 1.0
   grad_accum_steps: 1
   label_smoothing: 0.0
-  checkpoint_metric: robust_composite
+  checkpoint_metric: clean_macro_f1
 
 model:
   num_classes: 2
@@ -64,6 +65,7 @@ model:
     layers: 2
     use_behavior_hint: false
     drop_extracted_behavior_hints: true
+    account_for_encoder_budget: true
   manifest_encoder:
     enabled: true
     in_dim: 256
@@ -89,7 +91,7 @@ semantic_cross_attention:
   num_heads: 4
   num_security_tokens: 12
   num_residual_tokens: 4
-  dropout: 0.1
+  dropout: 0.0
   residual_gate_init: 0.0
   joint_residual_gate_init: -3.0
   use_reliability_bias: true
@@ -112,16 +114,19 @@ semantic_reconstruction:
   min_input_integrity: 0.2
   detach_reliability: true
   use_calibrated_reliability: false
+  use_integrity_conditioning: true
 
 fusion:
   mode: discount_probability
   detach_discount: true
   detach_confidence_proxy: true
   use_confidence_proxy: true
+  use_reliability_discount: true
   use_support_discount: true
   use_conflict_discount: true
   use_hard_alive_mask: true
-  acceptance_aggregation: min
+  acceptance_aggregation: product
+  force_fp32_decision: true
   min_discount: 1.0e-6
   fallback: uniform
   confidence_proxy:
@@ -149,7 +154,7 @@ fusion:
     min_value: 0.05
 
 loss:
-  branch_aux_weight: 0.05
+  branch_aux_weight: 0.20
   reliability_weighted_aux: true
   min_aux_weight: 0.2
   detach_reliability_for_aux: true
@@ -166,6 +171,7 @@ calibration:
   enabled: true
   validation_fraction: 0.5
   split_seed: 42
+  stratified_group_split: true
   epochs: 20
   patience: 4
   min_delta: 0.00001

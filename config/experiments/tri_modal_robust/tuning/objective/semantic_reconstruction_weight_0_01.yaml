@@ -1,0 +1,11 @@
+defaults:
+  - ../_tuning_train_base.yaml
+
+method:
+  name: tuning_objective_semantic_reconstruction_weight_0_01
+
+train:
+  exp_name: tuning_objective_semantic_reconstruction_weight_0_01
+
+semantic_reconstruction:
+  weight: 0.01

@@ -71,16 +71,19 @@ def test_runner_groups_and_aliases_reference_existing_configs():
 
 
 def test_tuning_groups_are_validation_only():
-    for group in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_i3"):
+    for group in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_i3", "tuning_objective"):
         for path in run.resolve_targets(group):
             cfg = _resolved(path)
             eval_cfg = cfg.get("eval", {}) or {}
             assert eval_cfg.get("run_test") is False, path
             assert eval_cfg.get("run_robust_test") is False, path
             if eval_cfg.get("eval_only", False):
-                assert "tuning_full_candidate/42/best_tri_modal_robust.pt" in eval_cfg[
-                    "checkpoint_path"
-                ], path
+                expected = (
+                    "tuning_full_candidate/42/best_tri_modal_robust.pt"
+                    if group == "tuning_i3"
+                    else "final_seed_42/42/best_tri_modal_robust.pt"
+                )
+                assert expected in eval_cfg["checkpoint_path"], path
                 assert eval_cfg.get("refit_rejection_threshold") is True, path
             else:
                 assert cfg["train"].get("tuning_mode") is True, path
@@ -97,11 +100,11 @@ def test_formal_training_configs_use_clean_validation_selection():
         assert eval_cfg["robust_val"]["enabled"] is False, path
 
 
-def test_tuning_training_configs_use_robust_validation_selection():
-    for group in ("tuning_base", "tuning_i1", "tuning_i2"):
+def test_tuning_training_configs_use_clean_checkpoint_then_final_robust_validation():
+    for group in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_objective"):
         for path in run.resolve_targets(group):
             cfg = _resolved(path)
-            assert cfg["train"]["checkpoint_metric"] == "robust_composite", path
+            assert cfg["train"]["checkpoint_metric"] == "clean_macro_f1", path
             assert cfg["eval"]["robust_val"]["enabled"] is True, path
 
 
@@ -167,7 +170,7 @@ def test_per_module_tuning_groups_do_not_rerun_tuning_base():
 def test_paper_plan_excludes_tuning_configs():
     tuning_paths = {
         path.resolve()
-        for group in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_i3")
+        for group in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_i3", "tuning_objective")
         for path in run.resolve_targets(group)
     }
     for group in ("paper", "paper_main", "paper_appendix", "paper_all"):
@@ -184,10 +187,20 @@ def test_runner_groups_do_not_repeat_equivalent_runs():
             seen[key] = path
 
 
+
+def test_tuning_i3_reuses_refreeze_full_candidate_checkpoint():
+    candidate_cfg = _resolved(ROOT / "tuning/full_candidate.yaml")
+    for path in run.resolve_targets("tuning_i3"):
+        cfg = _resolved(path)
+        assert cfg["eval"]["eval_only"] is True
+        assert cfg["eval"]["refit_rejection_threshold"] is True
+        assert "tuning_full_candidate/42/best_tri_modal_robust.pt" in cfg["eval"]["checkpoint_path"]
+        validate_eval_checkpoint_config(cfg, candidate_cfg)
+
 def test_decision_only_sensitivities_reuse_seed_42_checkpoint_safely():
     seed_cfg = _resolved(ROOT / "seeds/seed_42.yaml")
     for relative in (
-        "sensitivity/i3/acceptance_product.yaml",
+        "sensitivity/i3/acceptance_min.yaml",
         "sensitivity/i3/coverage_80.yaml",
         "sensitivity/i3/coverage_95.yaml",
     ):
@@ -208,6 +221,10 @@ def test_external_obfuscapk_eval_configs_reuse_seed_42_checkpoint_safely():
         assert cfg["eval"]["refit_rejection_threshold"] is True
         assert "final_seed_42/42/best_tri_modal_robust.pt" in cfg["eval"]["checkpoint_path"]
         assert cfg["eval"].get("extra_sets"), relative
+        extra = cfg["eval"]["extra_sets"][0]
+        assert extra["skip_if_empty"] is False
+        assert extra["pt_dir"].startswith("../../pts_obfuscapk/")
+        assert extra["csv"].startswith("labels/obfuscapk_")
         validate_eval_checkpoint_config(cfg, seed_cfg)
 
 
@@ -215,14 +232,29 @@ def test_runnable_configs_share_validation_selection_protocol():
     for path in run.resolve_targets("all"):
         cfg = _resolved(path)
         calibration = cfg.get("calibration", {}) or {}
+        assert cfg["train"]["strict_deterministic"] is False, path
         assert calibration.get("validation_fraction") == 0.5, path
         assert calibration.get("split_seed") == 42, path
+        assert calibration.get("stratified_group_split") is True, path
+        assert cfg["model"]["graph_encoder"]["account_for_encoder_budget"] is True, path
+        assert cfg["fusion"]["force_fp32_decision"] is True, path
         assert (
             calibration.get("enabled")
             or calibration.get("holdout_enabled")
             or (cfg.get("selective_prediction", {}) or {}).get("enabled")
         ), path
 
+
+
+def test_pre_fix_checkpoint_config_is_rejected():
+    current = _resolved(ROOT / "seeds/seed_42.yaml")
+    old = yaml.safe_load(yaml.safe_dump(current))
+    old["model"]["graph_encoder"].pop("account_for_encoder_budget")
+    old["fusion"].pop("force_fp32_decision")
+    old["calibration"].pop("stratified_group_split")
+
+    with pytest.raises(ValueError, match="model/data semantics"):
+        validate_eval_checkpoint_config(current, old)
 
 def test_non_discount_baselines_do_not_enable_calibration_or_rejection():
     for relative in run.BASELINES:
@@ -238,17 +270,23 @@ def test_non_discount_baselines_do_not_enable_calibration_or_rejection():
 def test_module_ablations_match_paper_claims():
     no_i1 = _resolved(ROOT / "ablations/modules/no_i1_observable_reliability.yaml")
     assert no_i1["fusion"]["reliability_calibration"]["enabled"] is False
+    assert no_i1["fusion"]["use_reliability_discount"] is False
     assert no_i1["fusion"]["use_support_discount"] is False
     assert no_i1["fusion"]["use_conflict_discount"] is False
     assert no_i1["fusion"]["use_hard_alive_mask"] is False
     assert no_i1["semantic_cross_attention"]["use_reliability_bias"] is False
     assert no_i1["semantic_cross_attention"]["use_support_bias"] is False
     assert no_i1["semantic_cross_attention"]["use_conflict_bias"] is False
+    assert no_i1["semantic_cross_attention"]["use_relation_mask"] is False
+    assert no_i1["semantic_reconstruction"]["use_integrity_conditioning"] is False
+    assert no_i1["loss"]["reliability_weighted_aux"] is False
 
     no_i2 = _resolved(ROOT / "ablations/modules/no_i2_semantic_interaction.yaml")
     assert no_i2["semantic_cross_attention"]["enabled"] is False
     assert no_i2["semantic_cross_attention"]["attach_to_joint"] is False
     assert no_i2["semantic_cross_attention"]["attach_to_reconstruction"] is False
+    assert no_i2["semantic_reconstruction"]["enabled"] is False
+    assert no_i2["semantic_reconstruction"]["weight"] == 0.0
 
     no_i3 = _resolved(ROOT / "ablations/modules/no_i3_discount_rejection.yaml")
     assert no_i3["method"]["name"] == "module_no_i3_discount_rejection"
@@ -409,8 +447,57 @@ def test_tuning_must_be_run_in_explicit_stages():
     with pytest.raises(ValueError, match="Unknown robust experiment target"):
         run.resolve_targets("tuning")
     assert "tuning_final" not in run.GROUPS
-    for required in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_i3"):
+    for required in ("tuning_base", "tuning_i1", "tuning_i2", "tuning_i3", "tuning_objective"):
         assert required in run.GROUPS
+
+
+def test_objective_tuning_changes_one_weight_at_a_time():
+    paths = run.resolve_targets("tuning_objective")
+    assert paths[0] == run.CONFIG_DIR / run.TUNING_FULL
+    baseline = _resolved(paths[0])
+    expected = {
+        "branch_aux_weight_0_02.yaml": ("loss", "branch_aux_weight", 0.02),
+        "branch_aux_weight_0_10.yaml": ("loss", "branch_aux_weight", 0.10),
+        "branch_aux_weight_0_15.yaml": ("loss", "branch_aux_weight", 0.15),
+        "branch_aux_weight_0_25.yaml": ("loss", "branch_aux_weight", 0.25),
+        "semantic_reconstruction_weight_0_01.yaml": (
+            "semantic_reconstruction", "weight", 0.01
+        ),
+        "semantic_reconstruction_weight_0_04.yaml": (
+            "semantic_reconstruction", "weight", 0.04
+        ),
+        "semantic_reconstruction_weight_0_05.yaml": (
+            "semantic_reconstruction", "weight", 0.05
+        ),
+        "semantic_reconstruction_weight_0_06.yaml": (
+            "semantic_reconstruction", "weight", 0.06
+        ),
+    }
+    for path in paths[1:]:
+        cfg = _resolved(path)
+        section, key, value = expected[path.name]
+        assert cfg[section][key] == value
+        normalized = copy.deepcopy(cfg)
+        normalized[section][key] = baseline[section][key]
+        normalized["method"] = baseline["method"]
+        normalized["train"]["exp_name"] = baseline["train"]["exp_name"]
+        assert normalized == baseline
+
+
+def test_combined_objective_config_names_match_weights():
+    for reconstruction_weight in (0.02, 0.03):
+        suffix = f"0.2_{reconstruction_weight:.2f}"
+        path = (
+            ROOT
+            / "tuning"
+            / "objective"
+            / f"tuning_objective_combined_{suffix}.yaml"
+        )
+        cfg = _resolved(path)
+        assert cfg["method"]["name"] == f"tuning_objective_combined_{suffix}"
+        assert cfg["train"]["exp_name"] == f"tuning_objective_combined_{suffix}"
+        assert cfg["loss"]["branch_aux_weight"] == 0.20
+        assert cfg["semantic_reconstruction"]["weight"] == reconstruction_weight
 
 
 def test_paper_mechanism_group_contains_only_main_component_ablations():

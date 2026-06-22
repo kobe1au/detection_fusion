@@ -16,6 +16,6 @@ eval:
   extra_sets:
     - name: obfuscapk_combined
       split_name: obfuscapk_combined
-      pt_dir: D:/pts_obfuscapk/combined/test
-      csv: labels/test.csv
-      skip_if_empty: true
+      pt_dir: ../../pts_obfuscapk/combined/test
+      csv: labels/obfuscapk_combined_test.csv
+      skip_if_empty: false

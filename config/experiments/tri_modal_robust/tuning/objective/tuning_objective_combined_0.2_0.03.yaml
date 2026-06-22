@@ -1,0 +1,13 @@
+defaults:
+  - ../_tuning_train_base.yaml
+
+method:
+  name: tuning_objective_combined_0.2_0.03
+
+train:
+  exp_name: tuning_objective_combined_0.2_0.03
+
+loss:
+  branch_aux_weight: 0.20
+semantic_reconstruction:
+  weight: 0.03
