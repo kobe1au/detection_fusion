@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import copy
 import json
@@ -93,6 +93,7 @@ def test_lean_full_method_excludes_semantic_interaction_modules():
     assert cfg["fusion"]["mode"] == "discount_probability"
     assert cfg["fusion"]["reliability_calibration"]["enabled"] is True
     assert cfg["fusion"]["probability_calibration"]["enabled"] is True
+    assert cfg["loss"]["reliability_weighted_aux"] is True
     assert cfg["selective_prediction"]["enabled"] is True
     assert cfg["selective_prediction"]["target_coverage"] == 0.95
 
@@ -104,12 +105,12 @@ def test_module_ablations_match_lean_paper_claims():
     assert no_i1["fusion"]["use_support_discount"] is True
     assert no_i1["fusion"]["use_conflict_discount"] is True
 
-    no_i2 = _resolved(ROOT / "ablations/modules/no_i2_discount_fusion.yaml")
-    assert no_i2["fusion"]["use_support_discount"] is False
-    assert no_i2["fusion"]["use_conflict_discount"] is False
-    assert no_i2["fusion"]["use_confidence_proxy"] is False
-    assert no_i2["fusion"]["use_hard_alive_mask"] is False
-    assert no_i2["fusion"]["use_reliability_discount"] is True
+    reliability_only = _resolved(ROOT / "ablations/modules/reliability_only_discount_fusion.yaml")
+    assert reliability_only["fusion"]["use_support_discount"] is False
+    assert reliability_only["fusion"]["use_conflict_discount"] is False
+    assert reliability_only["fusion"]["use_confidence_proxy"] is False
+    assert reliability_only["fusion"]["use_hard_alive_mask"] is False
+    assert reliability_only["fusion"]["use_reliability_discount"] is True
 
     no_i3 = _resolved(ROOT / "ablations/modules/no_i3_selective_rejection.yaml")
     assert no_i3["selective_prediction"]["enabled"] is False

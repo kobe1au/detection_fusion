@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import os
@@ -23,7 +23,7 @@ ALIASES = {
     "concat": "baselines/tri_modal_concat.yaml",
     "late": "baselines/fixed_logit_fusion.yaml",
     "no_i1": "ablations/modules/no_i1_observable_reliability.yaml",
-    "no_i2": "ablations/modules/no_i2_discount_fusion.yaml",
+    "rel_only_discount": "ablations/modules/reliability_only_discount_fusion.yaml",
     "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
 }
 
@@ -38,7 +38,7 @@ BASELINES = [
 
 MODULE_ABLATIONS = [
     "ablations/modules/no_i1_observable_reliability.yaml",
-    "ablations/modules/no_i2_discount_fusion.yaml",
+    "ablations/modules/reliability_only_discount_fusion.yaml",
     "ablations/modules/no_i3_selective_rejection.yaml",
 ]
 

@@ -1,4 +1,4 @@
-# Lean tri-modal robust experiment plan
+﻿# Lean tri-modal robust experiment plan
 
 The formal method is intentionally compact:
 
@@ -21,3 +21,5 @@ python run.py mechanism
 python run.py sensitivity
 python run.py external
 ```
+
+The module ablation named `module_reliability_only_discount_fusion` keeps the I1 reliability estimate and probability-level fusion, but removes the relation/support, conflict, confidence-proxy, and hard-alive discount factors. Describe it as a reliability-only discount ablation rather than a complete removal of probability discount fusion.

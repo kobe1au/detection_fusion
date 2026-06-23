@@ -1,4 +1,4 @@
-log_level: INFO
+﻿log_level: INFO
 
 data:
   root: ""
@@ -44,6 +44,7 @@ fusion:
 
 loss:
   branch_aux_weight: 0.25
+  reliability_weighted_aux: true
 
 selective_prediction:
   enabled: true

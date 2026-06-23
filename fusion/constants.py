@@ -1,4 +1,4 @@
-class ArchitectureConstants:
+﻿class ArchitectureConstants:
     HEAD_HIDDEN_DIMS = [256, 128]
     HEAD_DROPOUT_RATES = [0.3, 0.2]
     HEAD_DROPOUT = 0.2
@@ -181,7 +181,7 @@ class TriModalConfigDefaults:
         },
         "loss": {
             "branch_aux_weight": 0.25,
-            "reliability_weighted_aux": False,
+            "reliability_weighted_aux": True,
             "min_aux_weight": 0.2,
             "detach_reliability_for_aux": True,
             "reliability_calibration_weight": 0.0,
