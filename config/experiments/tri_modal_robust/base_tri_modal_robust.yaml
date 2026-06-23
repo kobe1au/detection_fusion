@@ -9,225 +9,49 @@ data:
   val_csv: labels/val.csv
   test_csv: labels/test.csv
   out_dir: results/tri_modal_robust
-  max_failed_ratio: 0.0
-  max_api_events_per_sample: 2048
-  graph_semantic_source: alignment
-  strict_split_integrity: true
-  strict_partition_isolation: true
-  allow_pt_superset: true
 
 train:
   exp_name: base_tri_modal_robust
   seed: 42
-  tuning_mode: false
-  deterministic: true
-  strict_deterministic: false
-  device: auto
   epochs: 60
   patience: 8
-  min_delta: 0.0001
   batch_size: 48
   eval_batch_size: 64
   num_workers: 8
   eval_num_workers: 4
-  pin_memory: false
-  allow_pyg_pin_memory: false
-  persistent_workers: true
-  use_amp: true
   lr: 0.0003
-  eta_min: 0.000001
-  weight_decay: 0.01
-  grad_clip: 1.0
-  grad_accum_steps: 1
-  label_smoothing: 0.0
-  checkpoint_metric: clean_macro_f1
 
-model:
-  num_classes: 2
-  fusion_mode: discount_probability
-  joint_emb_dim: 128
-  max_nodes_gnn: 12288
-  api_encoder:
-    type: transformer
-    num_hash_buckets: 8192
-    type_vocab_size: 16
-    emb_dim: 128
-    hidden_dim: 256
-    dropout: 0.15
-    layers: 2
-    heads: 4
-    max_seq_len: 2048
-  graph_encoder:
-    type: gatv2
-    emb_dim: 128
-    hidden: 128
-    heads: 4
-    layers: 2
-    use_behavior_hint: false
-    drop_extracted_behavior_hints: true
-    account_for_encoder_budget: true
-  manifest_encoder:
-    enabled: true
-    in_dim: 256
-    emb_dim: 128
-    hidden_dim: 256
-    dropout: 0.1
-    category_dim: 12
-    stats_dim: 11
-    permission_dim: 128
-    intent_dim: 64
-    feature_dim: 32
-  gate:
-    hidden_dim: 128
-    detach: true
-    use_consistency_evidence: true
-    use_conflict_evidence: true
-    use_perturbation_evidence: false
-    apply_alive_mask: true
-
-semantic_cross_attention:
-  enabled: true
-  dim: 128
-  num_heads: 4
-  num_security_tokens: 12
-  num_residual_tokens: 4
-  dropout: 0.0
-  residual_gate_init: 0.0
-  joint_residual_gate_init: -3.0
-  use_reliability_bias: true
-  use_support_bias: true
-  use_conflict_bias: true
-  use_relation_mask: true
-  use_semantic_presence_prior: true
-  attach_to_joint: true
-  attach_to_reconstruction: true
-
-semantic_reconstruction:
-  enabled: true
-  semantic_dim: 128
-  mask_prob_api: 0.15
-  mask_prob_graph: 0.15
-  mask_prob_manifest: 0.15
-  loss: bce
-  weight: 0.02
-  min_target_integrity: 0.2
-  min_input_integrity: 0.2
-  detach_reliability: true
-  use_calibrated_reliability: false
-  use_integrity_conditioning: true
-
+# I1: observable reliability estimation.
 fusion:
-  mode: discount_probability
-  detach_discount: true
-  detach_confidence_proxy: true
-  use_confidence_proxy: true
   use_reliability_discount: true
-  use_support_discount: true
-  use_conflict_discount: true
-  use_hard_alive_mask: true
-  acceptance_aggregation: product
-  force_fp32_decision: true
-  min_discount: 1.0e-6
-  fallback: uniform
-  confidence_proxy:
-    type: entropy_margin
-    temperature_api: 1.0
-    temperature_graph: 1.0
-    temperature_manifest: 1.0
-    temperature_joint: 1.0
   reliability_calibration:
     enabled: true
     hidden_dim: 16
-    # An unavailable relation contributes no additional positive support.
-    missing_relation_support: 0.0
-    use_relation_evidence: false
-    apply_alive_mask: true
-    loss: bce
-    weight: 1.0
-  probability_calibration:
-    enabled: true
-    weight: 1.0
+
+  # I2: probability-level discount fusion.
+  use_support_discount: true
+  use_conflict_discount: true
+  use_confidence_proxy: true
+  use_hard_alive_mask: true
   support_factor:
     manifest_support_base: 0.5
     code_anchor_base: 0.5
   conflict_factor:
     min_value: 0.05
 
-loss:
-  branch_aux_weight: 0.20
-  reliability_weighted_aux: true
-  min_aux_weight: 0.2
-  detach_reliability_for_aux: true
-  reliability_calibration_weight: 0.0
-  probability_calibration_weight: 0.0
-  semantic_reconstruction_weight: 0.0
-  cross_source_consistency_weight: 0.0
-  gate_prior_weight: 0.0
-  cross_source_min_reliability: 0.0
-  cross_source_min_consistency: 0.0
-  semantic_active_only: false
+  # I3: selective decision score aggregation.
+  acceptance_aggregation: product
 
-calibration:
-  enabled: true
-  validation_fraction: 0.5
-  split_seed: 42
-  stratified_group_split: true
-  epochs: 20
-  patience: 4
-  min_delta: 0.00001
-  lr: 0.001
-  weight_decay: 0.0
-  grad_clip: 5.0
-  include_robust_val: false
+loss:
+  branch_aux_weight: 0.25
 
 selective_prediction:
   enabled: true
-  target_coverage: 0.9
+  target_coverage: 0.95
 
 robust:
   train_aug: true
-  perturb_prob: 0.5
-  perturb_strengths: [0.1, 0.3, 0.5]
 
 eval:
   run_test: true
   run_robust_test: true
-  robust_val:
-    enabled: true
-    clean_weight: 0.4
-    scenarios:
-      - name: api_graph_degraded_s0.5
-        perturb_type: api_graph_degraded
-        strength: 0.5
-        weight: 0.25
-      - name: manifest_degraded_s0.5
-        perturb_type: manifest_degraded
-        strength: 0.5
-        weight: 0.15
-      - name: all_degraded_s0.5
-        perturb_type: all_degraded
-        strength: 0.5
-        weight: 0.1
-      - name: api_missing
-        perturb_type: api_missing
-        strength: 1.0
-        weight: 0.0333333333
-      - name: graph_missing
-        perturb_type: graph_missing
-        strength: 1.0
-        weight: 0.0333333333
-      - name: manifest_missing
-        perturb_type: manifest_missing
-        strength: 1.0
-        weight: 0.0333333334
-  perturb_strengths: [0.1, 0.3, 0.5, 0.7, 0.9]
-  perturb_tests:
-    - clean
-    - api_degraded
-    - graph_degraded
-    - api_graph_degraded
-    - manifest_degraded
-    - all_degraded
-    - api_missing
-    - graph_missing
-    - manifest_missing

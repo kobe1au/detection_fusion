@@ -2,10 +2,10 @@ defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
 method:
-  name: i3_no_confidence_proxy_discount
+  name: mechanism_no_confidence_proxy_discount
 
 train:
-  exp_name: i3_no_confidence_proxy_discount
+  exp_name: mechanism_no_confidence_proxy_discount
 
 fusion:
   use_confidence_proxy: false

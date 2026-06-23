@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 
 from fusion.constants import EvidenceIndex
-from fusion.gates import heuristic_reliability_gate
 
 
 BRANCH_AUX_KEYS = (
@@ -27,32 +26,6 @@ BRANCH_NAMES = ("api", "graph", "manifest", "joint")
 def _evidence_column(evidence: torch.Tensor, index: int, detach: bool = False) -> torch.Tensor:
     value = evidence[:, index].clamp(0.0, 1.0)
     return value.detach() if detach else value
-
-
-def _batch_semantic_target(
-    batch,
-    name: str,
-    ref: torch.Tensor,
-) -> torch.Tensor | None:
-    value = getattr(batch, name, None)
-    if not isinstance(value, torch.Tensor):
-        return None
-    value = value.to(device=ref.device, dtype=ref.dtype)
-    value = value.view(1, -1).expand(ref.size(0), -1) if value.ndim == 1 else value.view(ref.size(0), -1)
-    if value.size(1) != ref.size(1):
-        return None
-    return (value > 0).to(dtype=ref.dtype)
-
-
-def _weighted_bce(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    sample_weight: torch.Tensor,
-) -> torch.Tensor:
-    per_sample = F.binary_cross_entropy_with_logits(logits, target, reduction="none").mean(dim=-1)
-    denom = sample_weight.sum()
-    weighted = (per_sample * sample_weight).sum() / denom.clamp_min(1e-8)
-    return weighted * (denom > 0).to(dtype=weighted.dtype)
 
 
 def _branch_alive_masks(evidence: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -180,132 +153,6 @@ def compute_posthoc_calibration_loss(
     return total, diagnostics
 
 
-def compute_masked_semantic_reconstruction_loss(
-    outputs: dict,
-    batch,
-    evidence: torch.Tensor,
-    config: dict | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Reconstruct masked 12-D semantic targets from other available modalities."""
-    config = config or {}
-    ref = outputs.get("recon_api_semantic_logits")
-    if not isinstance(ref, torch.Tensor):
-        raise ValueError("outputs is missing recon_api_semantic_logits")
-    zero = ref.sum() * 0.0
-    if not bool(config.get("enabled", False)):
-        return zero, {"loss_recon_total": zero}
-    if str(config.get("loss", "bce")).lower() != "bce":
-        raise ValueError("semantic_reconstruction.loss currently supports only 'bce'")
-    if not isinstance(evidence, torch.Tensor) or evidence.ndim != 2 or evidence.size(-1) < EvidenceIndex.BASE_DIM:
-        raise ValueError("masked semantic reconstruction requires observable evidence")
-
-    detach = bool(config.get("detach_reliability", True))
-    use_integrity_conditioning = bool(config.get("use_integrity_conditioning", True))
-    integrity = {
-        "api": _evidence_column(evidence, EvidenceIndex.API_INTEGRITY, detach),
-        "graph": _evidence_column(evidence, EvidenceIndex.GRAPH_INTEGRITY, detach),
-        "manifest": _evidence_column(evidence, EvidenceIndex.MANIFEST_INTEGRITY, detach),
-    }
-    if not use_integrity_conditioning:
-        integrity = {name: torch.ones_like(value) for name, value in integrity.items()}
-    use_calibrated_reliability = bool(config.get("use_calibrated_reliability", False))
-    if use_calibrated_reliability and not all(
-        isinstance(outputs.get(f"predicted_reliability_{name}"), torch.Tensor)
-        for name in ("api", "graph", "manifest")
-    ):
-        raise ValueError(
-            "semantic_reconstruction.use_calibrated_reliability=true requires an "
-            "already-fitted and active reliability calibrator"
-        )
-    source_reliability = {}
-    for name in ("api", "graph", "manifest"):
-        calibrated = outputs.get(f"predicted_reliability_{name}")
-        if use_calibrated_reliability and isinstance(calibrated, torch.Tensor):
-            calibrated = calibrated.view(-1).to(device=ref.device, dtype=ref.dtype)
-            source_reliability[name] = calibrated.detach() if detach else calibrated
-        else:
-            source_reliability[name] = integrity[name]
-    if not use_integrity_conditioning:
-        source_reliability = {
-            name: torch.ones_like(value) for name, value in source_reliability.items()
-        }
-    alive = {
-        "api": _evidence_column(evidence, EvidenceIndex.API_ALIVE, True).bool(),
-        "graph": _evidence_column(evidence, EvidenceIndex.GRAPH_ALIVE, True).bool(),
-        "manifest": _evidence_column(evidence, EvidenceIndex.MANIFEST_ALIVE, True).bool(),
-    }
-    masks = {
-        name: outputs.get(f"mask_{name}_semantic", ref.new_zeros(ref.size(0))).view(-1).bool()
-        for name in ("api", "graph", "manifest")
-    }
-    min_target = float(config.get("min_target_integrity", 0.2))
-    min_input = float(config.get("min_input_integrity", 0.2))
-    for name, value in (("min_target_integrity", min_target), ("min_input_integrity", min_input)):
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"semantic_reconstruction.{name} must be within [0, 1]")
-
-    target_names = {
-        "api": "api_semantic_category_counts",
-        "graph": "graph_semantic_category_counts",
-        "manifest": "manifest_category_counts",
-    }
-    source_names = {
-        "api": ("graph", "manifest"),
-        "graph": ("api", "manifest"),
-        "manifest": ("api", "graph"),
-    }
-    losses: dict[str, torch.Tensor] = {}
-    active_targets: dict[str, torch.Tensor] = {}
-    diagnostics: dict[str, torch.Tensor] = {}
-    for target_name in ("api", "graph", "manifest"):
-        logits = outputs.get(f"recon_{target_name}_semantic_logits")
-        if not isinstance(logits, torch.Tensor):
-            losses[target_name] = zero
-            active_targets[target_name] = zero.detach()
-            diagnostics[f"valid_recon_{target_name}_rate"] = zero.detach()
-            continue
-        target = _batch_semantic_target(batch, target_names[target_name], logits)
-        if target is None:
-            losses[target_name] = logits.sum() * 0.0
-            active_targets[target_name] = zero.detach()
-            diagnostics[f"valid_recon_{target_name}_rate"] = zero.detach()
-            continue
-
-        source_a, source_b = source_names[target_name]
-        source_a_available = alive[source_a] & ~masks[source_a]
-        source_b_available = alive[source_b] & ~masks[source_b]
-        source_a_weight = source_reliability[source_a] * source_a_available.to(ref.dtype)
-        source_b_weight = source_reliability[source_b] * source_b_available.to(ref.dtype)
-        input_weight = torch.maximum(source_a_weight, source_b_weight)
-        valid = (
-            masks[target_name]
-            & alive[target_name]
-            & (integrity[target_name] >= min_target)
-            & (input_weight >= min_input)
-        )
-        sample_weight = valid.to(ref.dtype) * integrity[target_name] * input_weight
-        losses[target_name] = _weighted_bce(logits, target, sample_weight)
-        active_targets[target_name] = (sample_weight.sum() > 0).to(dtype=ref.dtype)
-        diagnostics[f"valid_recon_{target_name}_rate"] = valid.float().mean().detach()
-        diagnostics[f"mask_rate_{target_name}"] = masks[target_name].float().mean().detach()
-
-    loss_values = torch.stack([losses[name] for name in ("api", "graph", "manifest")])
-    active = torch.stack(
-        [active_targets[name] for name in ("api", "graph", "manifest")]
-    )
-    total = (loss_values * active).sum() / active.sum().clamp_min(1.0)
-    diagnostics.update(
-        {
-            "loss_recon_api": losses["api"].detach(),
-            "loss_recon_graph": losses["graph"].detach(),
-            "loss_recon_manifest": losses["manifest"].detach(),
-            "loss_recon_total": total.detach(),
-            "active_recon_target_count": active.sum().detach(),
-        }
-    )
-    return total, diagnostics
-
-
 def _weighted_cross_entropy(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -382,205 +229,43 @@ def compute_reliability_weighted_aux_loss(
     return total, diagnostics
 
 
-def _matrix(extra: dict, key: str, ref: torch.Tensor) -> torch.Tensor | None:
-    value = extra.get(key)
-    if not isinstance(value, torch.Tensor):
-        return None
-    out = value.to(device=ref.device, dtype=ref.dtype)
-    if out.ndim == 1:
-        out = out.view(1, -1).expand(ref.size(0), -1)
-    else:
-        out = out.view(ref.size(0), -1)
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def _reliability(extra: dict, key: str, ref: torch.Tensor, default: float) -> torch.Tensor:
-    value = extra.get(key)
-    if not isinstance(value, torch.Tensor):
-        return torch.full((ref.size(0),), float(default), device=ref.device, dtype=ref.dtype)
-    out = value.to(device=ref.device, dtype=ref.dtype).view(ref.size(0), -1)[:, 0]
-    return torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-
-
-def _weighted_cosine_direction_loss(
-    pred_logits: torch.Tensor | None,
-    target_counts: torch.Tensor | None,
-    weights: torch.Tensor,
-    active_only: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if pred_logits is None or target_counts is None:
-        zero = weights.new_tensor(0.0)
-        return zero, zero
-    pred = F.softplus(pred_logits.float())
-    target = target_counts.float().clamp_min(0.0)
-    if pred.size(1) != target.size(1):
-        zero = weights.new_tensor(0.0)
-        return zero, zero
-    if active_only:
-        active = target > 0
-        pred = pred * active.to(dtype=pred.dtype)
-        target = target * active.to(dtype=target.dtype)
-    valid = (target.abs().sum(dim=-1) > 0) & (weights > 0)
-    if not valid.any():
-        zero = weights.new_tensor(0.0)
-        return zero, zero
-    sim = F.cosine_similarity(pred[valid], target[valid], dim=-1).clamp(-1.0, 1.0)
-    loss = 1.0 - sim
-    w = weights[valid].float()
-    return (loss * w).sum() / w.sum().clamp_min(1e-8), w.sum()
-
-
-def _pair_weight(
-    base_weight: torch.Tensor,
-    consistency: torch.Tensor | None,
-    min_reliability: float,
-    min_consistency: float,
-) -> torch.Tensor:
-    weight = base_weight
-    if min_reliability > 0.0:
-        weight = torch.where(weight >= min_reliability, weight, torch.zeros_like(weight))
-    if consistency is not None and min_consistency > 0.0:
-        weight = torch.where(consistency >= min_consistency, weight, torch.zeros_like(weight))
-    return weight
-
-
-def _semantic_losses(
-    extra: dict,
-    ref_logits: torch.Tensor,
-    loss_cfg: dict | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    loss_cfg = loss_cfg or {}
-    api_pred = _matrix(extra, "api_semantic_logits", ref_logits)
-    graph_pred = _matrix(extra, "graph_semantic_logits", ref_logits)
-    manifest_pred = _matrix(extra, "manifest_semantic_logits", ref_logits)
-    api_counts = _matrix(extra, "api_semantic_category_counts", ref_logits)
-    graph_counts = _matrix(extra, "graph_semantic_category_counts", ref_logits)
-    manifest_counts = _matrix(extra, "manifest_category_counts", ref_logits)
-
-    r_api = _reliability(extra, "r_api", ref_logits, 1.0)
-    r_graph = _reliability(extra, "r_graph", ref_logits, 1.0)
-    r_manifest = _reliability(extra, "r_manifest", ref_logits, 0.0)
-    api_manifest = _reliability(extra, "api_manifest_consistency", ref_logits, 0.0)
-    graph_manifest = _reliability(extra, "graph_manifest_consistency", ref_logits, 0.0)
-    min_reliability = float(loss_cfg.get("cross_source_min_reliability", 0.0))
-    min_consistency = float(loss_cfg.get("cross_source_min_consistency", 0.0))
-    active_only = bool(loss_cfg.get("semantic_active_only", False))
-
-    reconstruction_terms: list[torch.Tensor] = []
-    cross_source_terms: list[torch.Tensor] = []
-    for pred, target, weight, consistency in (
-        (api_pred, api_counts, r_api, None),
-        (graph_pred, graph_counts, r_graph, None),
-        (manifest_pred, manifest_counts, r_manifest, None),
-    ):
-        filtered_weight = _pair_weight(weight, None, min_reliability, 0.0)
-        term, used_weight = _weighted_cosine_direction_loss(pred, target, filtered_weight, active_only=active_only)
-        if float(used_weight.detach().item()) > 0.0:
-            reconstruction_terms.append(term)
-
-    for pred, target, weight, consistency in (
-        (api_pred, manifest_counts, r_api * r_manifest, api_manifest),
-        (graph_pred, manifest_counts, r_graph * r_manifest, graph_manifest),
-        (manifest_pred, api_counts, r_manifest * r_api, api_manifest),
-        (manifest_pred, graph_counts, r_manifest * r_graph, graph_manifest),
-    ):
-        filtered_weight = _pair_weight(weight, consistency, min_reliability, min_consistency)
-        term, used_weight = _weighted_cosine_direction_loss(pred, target, filtered_weight, active_only=active_only)
-        if float(used_weight.detach().item()) > 0.0:
-            cross_source_terms.append(term)
-
-    reconstruction = (
-        torch.stack(reconstruction_terms).mean().to(dtype=ref_logits.dtype)
-        if reconstruction_terms
-        else ref_logits.new_tensor(0.0)
-    )
-    cross_source = (
-        torch.stack(cross_source_terms).mean().to(dtype=ref_logits.dtype)
-        if cross_source_terms
-        else ref_logits.new_tensor(0.0)
-    )
-    return reconstruction, cross_source
-
-
-def _gate_prior_target(extra: dict, ref_logits: torch.Tensor) -> torch.Tensor:
-    """Return a heuristic gate-prior target for the learned gate.
-
-    Prefer ``extra["gate_evidence"]`` (already built during the forward pass)
-    over reconstructing the evidence tensor from scratch.  Fall back to the
-    explicit rebuild only when the cached tensor is missing (e.g. standalone
-    loss tests).
-    """
-    dtype = ref_logits.dtype
-    cached = extra.get("gate_evidence")
-    if isinstance(cached, torch.Tensor):
-        evidence = cached[..., : EvidenceIndex.BASE_DIM].to(device=ref_logits.device, dtype=dtype)
-    else:
-        batch_size = ref_logits.size(0)
-        device = ref_logits.device
-        evidence = torch.zeros((batch_size, EvidenceIndex.BASE_DIM), device=device, dtype=dtype)
-        evidence[:, EvidenceIndex.R_API] = _reliability(extra, "r_api", ref_logits, 1.0)
-        evidence[:, EvidenceIndex.R_GRAPH] = _reliability(extra, "r_graph", ref_logits, 1.0)
-        evidence[:, EvidenceIndex.R_MANIFEST] = _reliability(extra, "r_manifest", ref_logits, 0.0)
-        evidence[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = _reliability(extra, "api_graph_anchor_support", ref_logits, 0.0)
-        evidence[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = _reliability(extra, "manifest_code_support", ref_logits, 0.0)
-        evidence[:, EvidenceIndex.API_ALIVE] = _reliability(extra, "api_alive", ref_logits, 1.0)
-        evidence[:, EvidenceIndex.GRAPH_ALIVE] = _reliability(extra, "graph_alive", ref_logits, 1.0)
-        evidence[:, EvidenceIndex.MANIFEST_ALIVE] = _reliability(extra, "manifest_alive", ref_logits, 0.0)
-    return heuristic_reliability_gate(evidence).to(dtype=dtype).detach()
-
-
-def _gate_prior_loss(extra: dict, ref_logits: torch.Tensor) -> torch.Tensor:
-    if not bool(extra.get("gate_prior_enabled", False)):
-        return ref_logits.new_tensor(0.0)
-    gate_weights = extra.get("gate_weights_train")
-    if not isinstance(gate_weights, torch.Tensor):
-        return ref_logits.new_tensor(0.0)
-    gate_weights = gate_weights.to(device=ref_logits.device, dtype=ref_logits.dtype)
-    if gate_weights.ndim != 2 or gate_weights.size(0) != ref_logits.size(0) or gate_weights.size(1) != 4:
-        return ref_logits.new_tensor(0.0)
-    target = _gate_prior_target(extra, ref_logits).to(device=ref_logits.device, dtype=ref_logits.dtype)
-    return F.kl_div(
-        gate_weights.clamp_min(1e-8).log(),
-        target,
-        reduction="batchmean",
-    ).to(dtype=ref_logits.dtype)
-
-
 def compute_robust_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     extra: dict | None = None,
     loss_cfg: dict | None = None,
     *,
-    batch=None,
     evidence: torch.Tensor | None = None,
-    semantic_reconstruction_cfg: dict | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Robust objective with independently attributable auxiliary terms."""
     extra = extra or {}
     loss_cfg = loss_cfg or {}
     label_smoothing = float(loss_cfg.get("label_smoothing", 0.0))
     branch_aux_weight = float(loss_cfg.get("branch_aux_weight", 0.05))
-    semantic_reconstruction_weight = float(loss_cfg.get("semantic_reconstruction_weight", 0.0))
-    cross_source_consistency_weight = float(loss_cfg.get("cross_source_consistency_weight", 0.0))
-    gate_prior_weight = float(loss_cfg.get("gate_prior_weight", 0.0))
     reliability_calibration_weight = float(loss_cfg.get("reliability_calibration_weight", 0.0))
     probability_calibration_weight = float(loss_cfg.get("probability_calibration_weight", 0.0))
     named_weights = {
         "branch_aux_weight": branch_aux_weight,
-        "semantic_reconstruction_weight": semantic_reconstruction_weight,
-        "cross_source_consistency_weight": cross_source_consistency_weight,
-        "gate_prior_weight": gate_prior_weight,
         "reliability_calibration_weight": reliability_calibration_weight,
         "probability_calibration_weight": probability_calibration_weight,
     }
     for name, value in named_weights.items():
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"{name} must be finite and non-negative, got {value}")
-    for name in ("cross_source_min_reliability", "cross_source_min_consistency"):
-        value = float(loss_cfg.get(name, 0.0))
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"{name} must be within [0, 1], got {value}")
+    legacy_weights = {
+        name: float(loss_cfg.get(name, 0.0))
+        for name in (
+            "semantic_reconstruction_weight",
+            "cross_source_consistency_weight",
+            "gate_prior_weight",
+        )
+    }
+    nonzero_legacy = {name: value for name, value in legacy_weights.items() if value != 0.0}
+    if nonzero_legacy:
+        raise ValueError(
+            "Semantic reconstruction/cross-source/gate-prior losses were removed from "
+            f"the formal lean pipeline; non-zero legacy weights are unsupported: {nonzero_legacy}"
+        )
 
     final_is_log_probability = extra.get("final_is_log_probability", False)
     if isinstance(final_is_log_probability, torch.Tensor):
@@ -623,35 +308,6 @@ def compute_robust_loss(
         if branch_weight_sum > 0.0:
             branch_loss = branch_loss / branch_loss.new_tensor(branch_weight_sum)
 
-    if semantic_reconstruction_weight > 0.0 or cross_source_consistency_weight > 0.0:
-        semantic_reconstruction, cross_source_consistency = _semantic_losses(extra, logits, loss_cfg)
-    else:
-        semantic_reconstruction = logits.new_tensor(0.0)
-        cross_source_consistency = logits.new_tensor(0.0)
-    gate_prior = (
-        _gate_prior_loss(extra, logits)
-        if gate_prior_weight > 0.0
-        else logits.new_tensor(0.0)
-    )
-    masked_reconstruction = logits.new_tensor(0.0)
-    masked_diagnostics: dict[str, torch.Tensor] = {}
-    semantic_reconstruction_cfg = semantic_reconstruction_cfg or {}
-    masked_reconstruction_weight = float(semantic_reconstruction_cfg.get("weight", 0.0))
-    if not math.isfinite(masked_reconstruction_weight) or masked_reconstruction_weight < 0.0:
-        raise ValueError(
-            "semantic_reconstruction.weight must be finite and non-negative, "
-            f"got {masked_reconstruction_weight}"
-        )
-    if bool(semantic_reconstruction_cfg.get("enabled", False)) and masked_reconstruction_weight > 0.0:
-        if batch is None or not isinstance(evidence, torch.Tensor):
-            raise ValueError("enabled masked semantic reconstruction requires batch and observable evidence")
-        masked_reconstruction, masked_diagnostics = compute_masked_semantic_reconstruction_loss(
-            extra,
-            batch,
-            evidence,
-            semantic_reconstruction_cfg,
-        )
-
     reliability_calibration = logits.new_tensor(0.0)
     probability_calibration = logits.new_tensor(0.0)
     calibration_diagnostics: dict[str, torch.Tensor] = {}
@@ -678,10 +334,6 @@ def compute_robust_loss(
     total = (
         ce
         + branch_aux_weight * branch_loss
-        + masked_reconstruction_weight * masked_reconstruction
-        + semantic_reconstruction_weight * semantic_reconstruction
-        + cross_source_consistency_weight * cross_source_consistency
-        + gate_prior_weight * gate_prior
         + reliability_calibration_weight * reliability_calibration
         + probability_calibration_weight * probability_calibration
     )
@@ -690,22 +342,12 @@ def compute_robust_loss(
         "ce": float(ce.detach().item()),
         "branch_aux": float(branch_loss.detach().item()),
         "branch_aux_weight": branch_aux_weight,
-        "semantic_reconstruction": float(semantic_reconstruction.detach().item()),
-        "semantic_reconstruction_weight": semantic_reconstruction_weight,
-        "cross_source_consistency": float(cross_source_consistency.detach().item()),
-        "cross_source_consistency_weight": cross_source_consistency_weight,
-        "cross_source_min_reliability": float(loss_cfg.get("cross_source_min_reliability", 0.0)),
-        "cross_source_min_consistency": float(loss_cfg.get("cross_source_min_consistency", 0.0)),
-        "gate_prior": float(gate_prior.detach().item()),
-        "gate_prior_weight": gate_prior_weight,
-        "masked_semantic_reconstruction": float(masked_reconstruction.detach().item()),
-        "masked_semantic_reconstruction_weight": masked_reconstruction_weight,
         "reliability_calibration": float(reliability_calibration.detach().item()),
         "reliability_calibration_weight": reliability_calibration_weight,
         "probability_calibration": float(probability_calibration.detach().item()),
         "probability_calibration_weight": probability_calibration_weight,
     }
-    for source in (aux_diagnostics, masked_diagnostics, calibration_diagnostics):
+    for source in (aux_diagnostics, calibration_diagnostics):
         for key, value in source.items():
             if isinstance(value, torch.Tensor) and value.numel() == 1:
                 parts[key] = float(value.detach().item())

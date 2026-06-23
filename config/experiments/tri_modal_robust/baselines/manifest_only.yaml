@@ -1,5 +1,5 @@
 defaults:
-  - _pure_representation_base.yaml
+  - _base.yaml
 
 method:
   name: baseline_manifest_only

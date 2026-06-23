@@ -1,21 +1,19 @@
 defaults:
-  - ../observable_reliability_discount_fusion.yaml
+  - ../seeds/seed_42.yaml
 
 method:
-  name: external_obfuscapk_encryption_eval
+  name: obfuscapk_encryption_eval
 
 eval:
   eval_only: true
-  checkpoint_path: results/tri_modal_robust/final_seed_42/42/best_tri_modal_robust.pt
-  output_name: external_obfuscapk_encryption_eval
+  output_name: obfuscapk_encryption_eval
+  checkpoint_path: results/tri_modal_robust_new/final_seed_42/42/best_tri_modal_robust.pt
   refit_rejection_threshold: true
   run_test: false
   run_robust_test: false
-  robust_val:
-    enabled: false
   extra_sets:
     - name: obfuscapk_encryption
-      split_name: obfuscapk_encryption
-      pt_dir: ../../pts_obfuscapk/encryption/test
-      csv: labels/obfuscapk_encryption_test.csv
-      skip_if_empty: false
+      pt_dir: ../../pts_obfuscapk/encryption
+      csv: labels/obfuscapk_encryption.csv
+      allow_pt_superset: true
+      skip_if_empty: true

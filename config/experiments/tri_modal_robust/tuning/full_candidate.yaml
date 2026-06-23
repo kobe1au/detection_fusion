@@ -1,8 +1,0 @@
-defaults:
-  - _tuning_train_base.yaml
-
-method:
-  name: tuning_full_candidate
-
-train:
-  exp_name: tuning_full_candidate

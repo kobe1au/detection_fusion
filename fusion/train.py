@@ -34,6 +34,7 @@ from fusion.dataset import (
 from fusion.model import TriModalRobustModel
 from fusion.perturbations import EVAL_PERTURB_TYPES
 from fusion.utils import build_grad_scaler, get_amp_context
+from fusion.constants import TriModalConfigDefaults
 
 
 logger = logging.getLogger("tri_modal_robust")
@@ -134,19 +135,8 @@ GATE_DIAGNOSTIC_KEYS = (
     "acceptance_score",
     "calibration_active",
     "gate_uses_perturbation_evidence",
-    "semantic_cross_attention_enabled",
-    "mean_semantic_attention_entropy",
-    "mean_cross_modal_attention",
-    "semantic_residual_gate",
-    "semantic_joint_residual_gate",
     "explicit_relation_factors_active",
     "joint_conflict_factor",
-    "mean_semantic_reliability_prior_api",
-    "mean_semantic_reliability_prior_graph",
-    "mean_semantic_reliability_prior_manifest",
-    "mean_semantic_attention_to_api",
-    "mean_semantic_attention_to_graph",
-    "mean_semantic_attention_to_manifest",
 )
 
 
@@ -191,6 +181,22 @@ def deep_update(base: dict, override: dict) -> dict:
     return out
 
 
+def _should_apply_tri_modal_defaults(path: Path, cfg: dict) -> bool:
+    if path.name.startswith("_"):
+        return False
+    try:
+        normalized = path.resolve().as_posix()
+    except OSError:
+        normalized = path.as_posix()
+    return "config/experiments/tri_modal_robust" in normalized and bool(cfg)
+
+
+def _apply_tri_modal_defaults(path: Path, cfg: dict) -> dict:
+    if not _should_apply_tri_modal_defaults(path, cfg):
+        return cfg
+    return deep_update(TriModalConfigDefaults.CONFIG, cfg)
+
+
 def load_yaml(path: str | Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
@@ -213,7 +219,7 @@ def load_config_path(path: str | Path, seen: set[Path] | None = None) -> dict:
         if not item_path.is_absolute():
             item_path = path.parent / item_path
         cfg = deep_update(cfg, load_config_path(item_path, seen))
-    return deep_update(cfg, raw)
+    return _apply_tri_modal_defaults(path, deep_update(cfg, raw))
 
 
 def load_config(paths: list[str]) -> dict:
@@ -294,8 +300,6 @@ def _checkpoint_semantic_signature(cfg: dict) -> dict[str, Any]:
     return {
         "model": copy.deepcopy(cfg.get("model", {}) or {}),
         "fusion": fusion_cfg,
-        "semantic_reconstruction": copy.deepcopy(cfg.get("semantic_reconstruction", {}) or {}),
-        "semantic_cross_attention": copy.deepcopy(cfg.get("semantic_cross_attention", {}) or {}),
         "calibration": copy.deepcopy(cfg.get("calibration", {}) or {}),
         # Coverage changes only the validation-fitted rejection threshold.
         "selective_prediction": {"enabled": bool(selective_cfg.get("enabled", False))},
@@ -737,6 +741,14 @@ def checkpoint_requires_robust_validation(cfg: dict) -> bool:
 
 
 def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
+    removed_sections = [
+        key for key in ("semantic_cross_attention", "semantic_reconstruction") if key in cfg
+    ]
+    if removed_sections:
+        raise ValueError(
+            "The formal lean pipeline no longer accepts semantic interaction/reconstruction "
+            f"config sections: {removed_sections}. Remove these legacy sections from the YAML."
+        )
     model_cfg = cfg.get("model", {})
     api_cfg = model_cfg.get("api_encoder", {})
     graph_cfg = model_cfg.get("graph_encoder", {})
@@ -780,8 +792,6 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
         use_conflict_evidence=bool(gate_cfg.get("use_conflict_evidence", True)),
         use_perturbation_evidence=bool(gate_cfg.get("use_perturbation_evidence", False)),
         apply_alive_mask_to_learned_gate=bool(gate_cfg.get("apply_alive_mask", True)),
-        semantic_reconstruction_config=cfg.get("semantic_reconstruction", {}) or {},
-        semantic_cross_attention_config=cfg.get("semantic_cross_attention", {}) or {},
         discount_fusion_config=fusion_cfg,
     )
 
@@ -1322,9 +1332,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
                 labels,
                 extra,
                 loss_cfg,
-                batch=graph,
                 evidence=extra.get("gate_evidence"),
-                semantic_reconstruction_cfg=cfg.get("semantic_reconstruction", {}) or {},
             )
             loss = loss / max(grad_accum, 1)
         for key in GATE_DIAGNOSTIC_KEYS:
@@ -1362,7 +1370,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
             " ".join(
                 f"{key}={value / steps:.4f}"
                 for key, value in sorted(loss_part_sums.items())
-                if key.startswith(("loss_recon_", "mask_rate_", "valid_recon_"))
+                if key in {"loss", "ce", "branch_aux", "branch_aux_weight"}
             ),
         )
         logger.info(

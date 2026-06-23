@@ -2,12 +2,11 @@ defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
 method:
-  name: i3_no_probability_calibration
+  name: mechanism_no_probability_calibration
 
 train:
-  exp_name: i3_no_probability_calibration
+  exp_name: mechanism_no_probability_calibration
 
 fusion:
   probability_calibration:
     enabled: false
-    weight: 0.0

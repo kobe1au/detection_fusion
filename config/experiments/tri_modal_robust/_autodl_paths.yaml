@@ -1,4 +1,5 @@
 data:
+  root: /root/autodl-tmp/code/detection
   train_pt_dir: /root/autodl-tmp/pts/train
   val_pt_dir: /pts/val
   test_pt_dir: /pts/test
@@ -6,8 +7,3 @@ data:
   val_csv: labels/val.csv
   test_csv: labels/test.csv
   out_dir: results/tri_modal_robust_new
-
-# Eval-only experiments must load the checkpoint produced under the AutoDL
-# output root rather than silently falling back to an older local result.
-eval:
-  checkpoint_path: results/tri_modal_robust_new/final_seed_42/42/best_tri_modal_robust.pt

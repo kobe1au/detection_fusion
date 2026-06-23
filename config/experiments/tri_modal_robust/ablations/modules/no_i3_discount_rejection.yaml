@@ -1,8 +1,0 @@
-defaults:
-  - ../../baselines/learned_evidence_logit_fusion.yaml
-
-method:
-  name: module_no_i3_discount_rejection
-
-train:
-  exp_name: module_no_i3_discount_rejection

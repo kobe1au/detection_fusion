@@ -1,14 +1,17 @@
 defaults:
-  - ../observable_reliability_discount_fusion.yaml
+  - ../base_tri_modal_robust.yaml
 
 fusion:
   mode: legacy_learned_gate
+  use_reliability_discount: false
+  use_support_discount: false
+  use_conflict_discount: false
+  use_confidence_proxy: false
+  use_hard_alive_mask: false
   reliability_calibration:
     enabled: false
-    weight: 0.0
   probability_calibration:
     enabled: false
-    weight: 0.0
 
 calibration:
   enabled: false

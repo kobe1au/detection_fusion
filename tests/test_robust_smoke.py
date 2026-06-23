@@ -449,7 +449,7 @@ def test_robust_model_forward_and_loss():
         logits,
         torch.tensor([0, 1]),
         extra,
-        {"branch_aux_weight": 0.05, "cross_source_consistency_weight": 0.05, "gate_prior_weight": 0.01},
+        {"branch_aux_weight": 0.05},
     )
     assert logits.shape == (2, 2)
     assert extra["gate_weights"].shape == (2, 4)
@@ -457,15 +457,13 @@ def test_robust_model_forward_and_loss():
     assert torch.allclose(extra["gate_evidence"][:, 4], extra["api_graph_anchor_support"])
     assert "api_graph_consistency" not in extra
     assert extra["gate_prior_enabled"] is True
-    assert extra["api_semantic_category_counts"].shape == (2, 12)
-    assert extra["api_semantic_logits"].shape == (2, 12)
+    assert "api_semantic_logits" not in extra
     assert extra["manifest_to_code_conflict"].shape == (2,)
     assert extra["code_to_manifest_conflict"].shape == (2,)
     assert torch.isfinite(loss)
     assert parts["branch_aux_weight"] == 0.05
-    assert parts["cross_source_consistency_weight"] == 0.05
-    assert parts["gate_prior_weight"] == 0.01
-    assert parts["gate_prior"] >= 0.0
+    assert "cross_source_consistency_weight" not in parts
+    assert "gate_prior_weight" not in parts
 
     batch.q_api = torch.full((2, 1), 0.8)
     batch.pert_api = torch.full((2, 1), 0.5)
@@ -909,27 +907,17 @@ def test_heuristic_joint_gate_uses_manifest_reliability():
     assert weights[0, 3] > weights[1, 3]
 
 
-def test_gate_prior_loss_only_applies_to_learned_gate():
+def test_removed_legacy_loss_weights_are_rejected():
     logits = torch.zeros(2, 2, requires_grad=True)
     labels = torch.tensor([0, 1], dtype=torch.long)
-    extra = {
-        "gate_weights_train": torch.full((2, 4), 0.25, requires_grad=True),
-        "r_api": torch.ones(2),
-        "r_graph": torch.zeros(2),
-        "r_manifest": torch.zeros(2),
-        "api_manifest_consistency": torch.zeros(2),
-        "graph_manifest_consistency": torch.zeros(2),
-        "api_alive": torch.ones(2),
-        "graph_alive": torch.ones(2),
-        "manifest_alive": torch.zeros(2),
-        "gate_prior_enabled": False,
-    }
-    _, disabled = compute_robust_loss(logits, labels, extra, {"gate_prior_weight": 0.01})
-    assert disabled["gate_prior"] == 0.0
-
-    extra["gate_prior_enabled"] = True
-    _, enabled = compute_robust_loss(logits, labels, extra, {"gate_prior_weight": 0.01})
-    assert enabled["gate_prior"] > 0.0
+    extra = {"gate_weights_train": torch.full((2, 4), 0.25, requires_grad=True)}
+    for cfg in (
+        {"gate_prior_weight": 0.01},
+        {"cross_source_consistency_weight": 0.05},
+        {"semantic_reconstruction_weight": 0.1},
+    ):
+        with pytest.raises(ValueError, match="removed from the formal lean pipeline"):
+            compute_robust_loss(logits, labels, extra, cfg)
 
 
 def _perturbation_sample():
@@ -1244,57 +1232,16 @@ def test_manifest_missing_zeroes_manifest_counts_and_q_manifest():
     assert data["pert_manifest"] == 1.0
 
 
-def test_cross_source_consistency_loss_is_separate_from_semantic_reconstruction():
-    logits = torch.zeros(2, 2, requires_grad=True)
-    labels = torch.tensor([0, 1], dtype=torch.long)
-    counts = torch.zeros(2, 12)
-    counts[:, 0] = 1.0
-    extra = {
-        "api_semantic_logits": torch.zeros(2, 12, requires_grad=True),
-        "graph_semantic_logits": torch.zeros(2, 12, requires_grad=True),
-        "manifest_semantic_logits": torch.zeros(2, 12, requires_grad=True),
-        "api_semantic_category_counts": counts,
-        "graph_semantic_category_counts": counts,
-        "manifest_category_counts": counts,
-        "r_api": torch.ones(2),
-        "r_graph": torch.ones(2),
-        "r_manifest": torch.ones(2),
-    }
-    loss, parts = compute_robust_loss(
-        logits,
-        labels,
-        extra,
-        {"cross_source_consistency_weight": 0.05, "semantic_reconstruction_weight": 0.0},
-    )
-    assert parts["cross_source_consistency"] > 0.0
-    assert parts["semantic_reconstruction"] > 0.0
-    assert parts["semantic_reconstruction_weight"] == 0.0
-    loss.backward()
-    assert extra["api_semantic_logits"].grad is not None
-
-
-def test_cross_source_consistency_does_not_include_self_reconstruction_terms():
+def test_removed_cross_source_and_semantic_losses_are_not_supported():
     logits = torch.zeros(1, 2, requires_grad=True)
     labels = torch.tensor([0], dtype=torch.long)
-    counts = torch.zeros(1, 12)
-    counts[:, 0] = 1.0
-    extra = {
-        "api_semantic_logits": torch.zeros(1, 12, requires_grad=True),
-        "graph_semantic_logits": torch.zeros(1, 12, requires_grad=True),
-        "api_semantic_category_counts": counts,
-        "graph_semantic_category_counts": counts,
-        "r_api": torch.ones(1),
-        "r_graph": torch.ones(1),
-        "r_manifest": torch.zeros(1),
-    }
-    _, parts = compute_robust_loss(
-        logits,
-        labels,
-        extra,
-        {"semantic_reconstruction_weight": 0.1, "cross_source_consistency_weight": 0.1},
-    )
-    assert parts["semantic_reconstruction"] > 0.0
-    assert parts["cross_source_consistency"] == 0.0
+    with pytest.raises(ValueError, match="removed from the formal lean pipeline"):
+        compute_robust_loss(
+            logits,
+            labels,
+            {},
+            {"semantic_reconstruction_weight": 0.1, "cross_source_consistency_weight": 0.1},
+        )
 
 
 def test_loss_rejects_negative_auxiliary_weight():
@@ -1682,7 +1629,7 @@ def test_learned_gate_receives_gradient():
         logits,
         torch.tensor([0, 1]),
         extra,
-        {"gate_prior_weight": 0.01},
+        {"branch_aux_weight": 0.05},
     )
     loss.backward()
 

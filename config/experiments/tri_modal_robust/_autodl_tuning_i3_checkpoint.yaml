@@ -1,3 +1,0 @@
-# Apply after _autodl_paths.yaml when running tuning_i3.
-eval:
-  checkpoint_path: results/tri_modal_robust_new/tuning_full_candidate/42/best_tri_modal_robust.pt

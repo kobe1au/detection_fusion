@@ -7,29 +7,7 @@ method:
 train:
   exp_name: module_no_i1_observable_reliability
 
-model:
-  gate:
-    use_consistency_evidence: false
-    use_conflict_evidence: false
-    apply_alive_mask: false
-
-semantic_cross_attention:
-  use_relation_mask: false
-  use_reliability_bias: false
-  use_support_bias: false
-  use_conflict_bias: false
-
-semantic_reconstruction:
-  use_integrity_conditioning: false
-
-loss:
-  reliability_weighted_aux: false
-
 fusion:
   use_reliability_discount: false
-  use_support_discount: false
-  use_conflict_discount: false
-  use_hard_alive_mask: false
   reliability_calibration:
     enabled: false
-    weight: 0.0

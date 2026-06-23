@@ -2,12 +2,10 @@ defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
 method:
-  name: i3_no_hard_alive_mask
+  name: mechanism_no_hard_alive_mask
 
 train:
-  exp_name: i3_no_hard_alive_mask
+  exp_name: mechanism_no_hard_alive_mask
 
 fusion:
   use_hard_alive_mask: false
-  reliability_calibration:
-    apply_alive_mask: false

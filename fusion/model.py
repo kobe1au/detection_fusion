@@ -5,7 +5,6 @@ import warnings
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from fusion.evidence import build_evidence
 
 from fusion.constants import ArchitectureConstants, EvidenceIndex, GateConstants
@@ -17,8 +16,7 @@ from fusion.gates import (
     apply_alive_mask,
 )
 from fusion.graph_encoders import GraphEncoderGAT, GraphEncoderGCN
-from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM, validate_api_type_mapping
-from fusion.semantic_cross_attention import ReliabilityAwareSemanticCrossAttention
+from fusion.semantic_categories import validate_api_type_mapping
 from torch_geometric.utils import softmax
 
 
@@ -192,21 +190,6 @@ def build_main_head(in_dim: int, num_classes: int) -> nn.Sequential:
         nn.Dropout(drop),
         nn.Linear(hidden, num_classes),
     )
-
-
-def build_mlp(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Sequential:
-    return nn.Sequential(
-        nn.Linear(in_dim, hidden_dim),
-        nn.GELU(),
-        nn.Linear(hidden_dim, out_dim),
-    )
-
-
-def sample_semantic_mask(batch_size: int, mask_prob: float, device) -> torch.Tensor:
-    mask_prob = float(mask_prob)
-    if not 0.0 <= mask_prob <= 1.0:
-        raise ValueError(f"semantic mask probability must be within [0, 1], got {mask_prob}")
-    return torch.rand(batch_size, device=device) < mask_prob
 
 
 class ApiSequenceEncoder(nn.Module):
@@ -429,8 +412,6 @@ class TriModalRobustModel(nn.Module):
         use_conflict_evidence: bool = True,
         use_perturbation_evidence: bool = False,
         apply_alive_mask_to_learned_gate: bool = True,
-        semantic_reconstruction_config: dict | None = None,
-        semantic_cross_attention_config: dict | None = None,
         discount_fusion_config: dict | None = None,
     ):
         super().__init__()
@@ -457,22 +438,6 @@ class TriModalRobustModel(nn.Module):
             )
         self.use_perturbation_evidence = False
         self.apply_alive_mask_to_learned_gate = bool(apply_alive_mask_to_learned_gate)
-        self.semantic_reconstruction_config = dict(semantic_reconstruction_config or {})
-        self.semantic_reconstruction_enabled = bool(self.semantic_reconstruction_config.get("enabled", False))
-        self.semantic_dim = int(self.semantic_reconstruction_config.get("semantic_dim", 128))
-        if self.semantic_dim <= 0:
-            raise ValueError("semantic_reconstruction.semantic_dim must be positive")
-        self.semantic_cross_attention_config = dict(semantic_cross_attention_config or {})
-        self.semantic_cross_attention_enabled = bool(
-            self.semantic_cross_attention_config.get("enabled", False)
-        )
-        self.attach_cross_attention_to_joint = bool(
-            self.semantic_cross_attention_config.get("attach_to_joint", True)
-        )
-        self.attach_cross_attention_to_reconstruction = bool(
-            self.semantic_cross_attention_config.get("attach_to_reconstruction", True)
-        )
-
         self.api_encoder = ApiSequenceEncoder(
             num_hash_buckets=api_num_hash_buckets,
             type_vocab_size=api_type_vocab_size,
@@ -521,123 +486,16 @@ class TriModalRobustModel(nn.Module):
             nn.Linear(max(joint_emb_dim * 2, 128), joint_emb_dim),
             nn.LayerNorm(joint_emb_dim),
         )
-        if self.semantic_cross_attention_enabled:
-            cross_dim = int(self.semantic_cross_attention_config.get("dim", joint_emb_dim))
-            if cross_dim <= 0:
-                raise ValueError("semantic_cross_attention.dim must be positive")
-            cross_security_tokens = int(
-                self.semantic_cross_attention_config.get(
-                    "num_security_tokens", SEMANTIC_CATEGORY_DIM
-                )
-            )
-            if cross_security_tokens != SEMANTIC_CATEGORY_DIM:
-                raise ValueError(
-                    "semantic_cross_attention.num_security_tokens must match the "
-                    f"current {SEMANTIC_CATEGORY_DIM}-D security taxonomy"
-                )
-            self.semantic_cross_attention_dim = cross_dim
-            self.cross_attention_input_projections = nn.ModuleDict(
-                {
-                    "api": nn.Identity() if api_emb_dim == cross_dim else nn.Linear(api_emb_dim, cross_dim),
-                    "graph": nn.Identity() if graph_emb_dim == cross_dim else nn.Linear(graph_emb_dim, cross_dim),
-                    "manifest": (
-                        nn.Identity()
-                        if manifest_emb_dim == cross_dim
-                        else nn.Linear(manifest_emb_dim, cross_dim)
-                    ),
-                }
-            )
-            self.semantic_cross_attention = ReliabilityAwareSemanticCrossAttention(
-                dim=cross_dim,
-                num_heads=int(self.semantic_cross_attention_config.get("num_heads", 4)),
-                num_security_tokens=cross_security_tokens,
-                num_residual_tokens=int(
-                    self.semantic_cross_attention_config.get("num_residual_tokens", 4)
-                ),
-                dropout=float(self.semantic_cross_attention_config.get("dropout", 0.1)),
-                residual_gate_init=float(
-                    self.semantic_cross_attention_config.get("residual_gate_init", 0.0)
-                ),
-                use_reliability_bias=bool(
-                    self.semantic_cross_attention_config.get("use_reliability_bias", True)
-                ),
-                use_support_bias=bool(
-                    self.semantic_cross_attention_config.get("use_support_bias", True)
-                ),
-                use_conflict_bias=bool(
-                    self.semantic_cross_attention_config.get("use_conflict_bias", True)
-                ),
-                use_relation_mask=bool(
-                    self.semantic_cross_attention_config.get("use_relation_mask", True)
-                ),
-                use_semantic_presence_prior=bool(
-                    self.semantic_cross_attention_config.get(
-                        "use_semantic_presence_prior", True
-                    )
-                ),
-            )
-            self.cross_attention_joint_projection = (
-                nn.Identity()
-                if cross_dim == joint_emb_dim
-                else nn.Linear(cross_dim, joint_emb_dim)
-            )
-            joint_residual_gate_init = float(
-                self.semantic_cross_attention_config.get(
-                    "joint_residual_gate_init", -3.0
-                )
-            )
-            if not math.isfinite(joint_residual_gate_init):
-                raise ValueError(
-                    "semantic_cross_attention.joint_residual_gate_init must be finite"
-                )
-            self.cross_attention_joint_gate = nn.Parameter(
-                torch.tensor(joint_residual_gate_init)
-            )
-            self.cross_attention_reconstruction_projections = nn.ModuleDict(
-                {
-                    "api": nn.Identity() if cross_dim == api_emb_dim else nn.Linear(cross_dim, api_emb_dim),
-                    "graph": (
-                        nn.Identity()
-                        if cross_dim == graph_emb_dim
-                        else nn.Linear(cross_dim, graph_emb_dim)
-                    ),
-                    "manifest": (
-                        nn.Identity()
-                        if cross_dim == manifest_emb_dim
-                        else nn.Linear(cross_dim, manifest_emb_dim)
-                    ),
-                }
-            )
-        else:
-            self.semantic_cross_attention_dim = 0
-
         self.api_head = build_main_head(api_emb_dim, num_classes)
         self.graph_head = build_main_head(graph_emb_dim, num_classes)
         self.manifest_head = build_main_head(manifest_emb_dim, num_classes)
         self.joint_head = build_main_head(joint_emb_dim, num_classes)
-        self.api_semantic_head = nn.Linear(api_emb_dim, SEMANTIC_CATEGORY_DIM)
-        self.graph_semantic_head = nn.Linear(graph_emb_dim, SEMANTIC_CATEGORY_DIM)
-        self.manifest_semantic_head = nn.Linear(manifest_emb_dim, SEMANTIC_CATEGORY_DIM)
         self.api_graph_concat_head = build_main_head(api_emb_dim + graph_emb_dim, num_classes)
         self.tri_concat_head = build_main_head(api_emb_dim + graph_emb_dim + manifest_emb_dim, num_classes)
         self.gate_net = FourBranchEvidenceGate(
             evidence_dim=EvidenceIndex.BASE_DIM,
             hidden_dim=gate_hidden_dim,
         )
-        if self.semantic_reconstruction_enabled:
-            semantic_hidden = max(self.semantic_dim, 128)
-            self.api_semantic_projector = build_mlp(api_emb_dim, semantic_hidden, self.semantic_dim)
-            self.graph_semantic_projector = build_mlp(graph_emb_dim, semantic_hidden, self.semantic_dim)
-            self.manifest_semantic_projector = build_mlp(manifest_emb_dim, semantic_hidden, self.semantic_dim)
-            self.reconstruct_api_semantic = build_mlp(
-                2 * self.semantic_dim, semantic_hidden, SEMANTIC_CATEGORY_DIM
-            )
-            self.reconstruct_graph_semantic = build_mlp(
-                2 * self.semantic_dim, semantic_hidden, SEMANTIC_CATEGORY_DIM
-            )
-            self.reconstruct_manifest_semantic = build_mlp(
-                2 * self.semantic_dim, semantic_hidden, SEMANTIC_CATEGORY_DIM
-            )
         self.discount_fusion = DiscountProbabilityFusion(discount_fusion_config)
 
     def calibration_parameters(self) -> list[nn.Parameter]:
@@ -668,130 +526,6 @@ class TriModalRobustModel(nn.Module):
         _, pooled, _ = self.api_encoder(graph_data, batch_size, device, dtype)
         return pooled
 
-    def _semantic_reconstruction_outputs(
-        self,
-        api_emb: torch.Tensor,
-        graph_emb: torch.Tensor,
-        manifest_emb: torch.Tensor,
-        api_alive: torch.Tensor,
-        graph_alive: torch.Tensor,
-        manifest_alive: torch.Tensor,
-        api_source_weight: torch.Tensor,
-        graph_source_weight: torch.Tensor,
-        manifest_source_weight: torch.Tensor,
-        semantic_source_embeddings_by_target: dict[str, dict[str, torch.Tensor]] | None = None,
-    ) -> dict[str, torch.Tensor]:
-        if not self.semantic_reconstruction_enabled:
-            return {}
-        batch_size = api_emb.size(0)
-        device = api_emb.device
-        original_embeddings = {
-            "api": api_emb,
-            "graph": graph_emb,
-            "manifest": manifest_emb,
-        }
-        projectors = {
-            "api": self.api_semantic_projector,
-            "graph": self.graph_semantic_projector,
-            "manifest": self.manifest_semantic_projector,
-        }
-        base_z = {
-            name: F.normalize(projectors[name](embedding), dim=-1)
-            for name, embedding in original_embeddings.items()
-        }
-        semantic_source_embeddings_by_target = semantic_source_embeddings_by_target or {}
-
-        def source_z(target_name: str, source_name: str) -> torch.Tensor:
-            target_sources = semantic_source_embeddings_by_target.get(target_name, {})
-            embedding = target_sources.get(source_name, original_embeddings[source_name])
-            return F.normalize(projectors[source_name](embedding), dim=-1)
-
-        if self.training and self.semantic_reconstruction_enabled:
-            mask_api = sample_semantic_mask(
-                batch_size, self.semantic_reconstruction_config.get("mask_prob_api", 0.15), device
-            )
-            mask_graph = sample_semantic_mask(
-                batch_size, self.semantic_reconstruction_config.get("mask_prob_graph", 0.15), device
-            )
-            mask_manifest = sample_semantic_mask(
-                batch_size, self.semantic_reconstruction_config.get("mask_prob_manifest", 0.15), device
-            )
-        else:
-            mask_api = torch.zeros(batch_size, device=device, dtype=torch.bool)
-            mask_graph = torch.zeros(batch_size, device=device, dtype=torch.bool)
-            mask_manifest = torch.zeros(batch_size, device=device, dtype=torch.bool)
-
-        def masked_input(
-            z: torch.Tensor,
-            alive: torch.Tensor,
-            mask: torch.Tensor,
-            weight: torch.Tensor,
-        ) -> torch.Tensor:
-            available = alive.view(batch_size, 1).bool() & ~mask.view(batch_size, 1)
-            weighted = z * weight.view(batch_size, 1).clamp(0.0, 1.0)
-            return torch.where(available, weighted, torch.zeros_like(z))
-
-        alive = {"api": api_alive, "graph": graph_alive, "manifest": manifest_alive}
-        source_weight = {
-            "api": api_source_weight,
-            "graph": graph_source_weight,
-            "manifest": manifest_source_weight,
-        }
-        if not bool(
-            self.semantic_reconstruction_config.get("use_integrity_conditioning", True)
-        ):
-            source_weight = {
-                name: torch.ones_like(weight) for name, weight in source_weight.items()
-            }
-        masks = {"api": mask_api, "graph": mask_graph, "manifest": mask_manifest}
-
-        def reconstruction_input(target_name: str, source_name: str) -> torch.Tensor:
-            return masked_input(
-                source_z(target_name, source_name),
-                alive[source_name],
-                masks[source_name],
-                source_weight[source_name],
-            )
-
-        return {
-            "z_api": base_z["api"],
-            "z_graph": base_z["graph"],
-            "z_manifest": base_z["manifest"],
-            "recon_api_semantic_logits": self.reconstruct_api_semantic(
-                torch.cat(
-                    [
-                        reconstruction_input("api", "graph"),
-                        reconstruction_input("api", "manifest"),
-                    ],
-                    dim=-1,
-                )
-            ),
-            "recon_graph_semantic_logits": self.reconstruct_graph_semantic(
-                torch.cat(
-                    [
-                        reconstruction_input("graph", "api"),
-                        reconstruction_input("graph", "manifest"),
-                    ],
-                    dim=-1,
-                )
-            ),
-            "recon_manifest_semantic_logits": self.reconstruct_manifest_semantic(
-                torch.cat(
-                    [
-                        reconstruction_input("manifest", "api"),
-                        reconstruction_input("manifest", "graph"),
-                    ],
-                    dim=-1,
-                )
-            ),
-            "mask_api_semantic": mask_api.to(dtype=api_emb.dtype),
-            "mask_graph_semantic": mask_graph.to(dtype=api_emb.dtype),
-            "mask_manifest_semantic": mask_manifest.to(dtype=api_emb.dtype),
-            "semantic_source_weight_api": source_weight["api"].view(-1),
-            "semantic_source_weight_graph": source_weight["graph"].view(-1),
-            "semantic_source_weight_manifest": source_weight["manifest"].view(-1),
-        }
-
     @staticmethod
     def _availability_mask(
         graph_data,
@@ -810,49 +544,6 @@ class TriModalRobustModel(nn.Module):
         if value.size(1) == 0:
             return torch.zeros((batch_size, 1), device=device, dtype=dtype)
         return value[:, :1].gt(0.0).to(dtype=dtype)
-
-    @staticmethod
-    def _observable_weight(
-        graph_data,
-        name: str,
-        legacy_quality_name: str,
-        batch_size: int,
-        device,
-        dtype,
-    ) -> torch.Tensor:
-        value = getattr(graph_data, name, None)
-        if not isinstance(value, torch.Tensor):
-            value = getattr(graph_data, legacy_quality_name, None)
-        if not isinstance(value, torch.Tensor):
-            return torch.ones((batch_size, 1), device=device, dtype=dtype)
-        value = value.to(device=device, dtype=dtype).view(batch_size, -1)
-        if value.size(1) == 0:
-            return torch.zeros((batch_size, 1), device=device, dtype=dtype)
-        return torch.nan_to_num(
-            value[:, :1].clamp(0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0
-        )
-
-    @staticmethod
-    def _semantic_presence(
-        graph_data,
-        batch_size: int,
-        device,
-        dtype,
-    ) -> dict[str, torch.Tensor]:
-        out: dict[str, torch.Tensor] = {}
-        for name, attribute in (
-            ("api", "api_semantic_category_counts"),
-            ("graph", "graph_semantic_category_counts"),
-            ("manifest", "manifest_category_counts"),
-        ):
-            value = getattr(graph_data, attribute, None)
-            if not isinstance(value, torch.Tensor):
-                continue
-            value = value.to(device=device, dtype=dtype)
-            value = value.view(1, -1).expand(batch_size, -1) if value.ndim == 1 else value.view(batch_size, -1)
-            if value.size(1) == SEMANTIC_CATEGORY_DIM:
-                out[name] = value.gt(0.0).to(dtype=dtype)
-        return out
 
     def forward(
         self,
@@ -877,15 +568,6 @@ class TriModalRobustModel(nn.Module):
         manifest_joint_mask = self._availability_mask(
             graph_data, "manifest_alive", "q_manifest", batch_size, device, dtype
         )
-        api_semantic_weight = self._observable_weight(
-            graph_data, "api_integrity", "q_api", batch_size, device, dtype
-        )
-        graph_semantic_weight = self._observable_weight(
-            graph_data, "graph_integrity", "q_graph", batch_size, device, dtype
-        )
-        manifest_semantic_weight = self._observable_weight(
-            graph_data, "manifest_integrity", "q_manifest", batch_size, device, dtype
-        )
         api_emb_for_joint = api_emb * api_joint_mask
         graph_emb_for_joint = graph_emb * graph_joint_mask
         manifest_emb_for_joint = manifest_emb * manifest_joint_mask
@@ -894,64 +576,7 @@ class TriModalRobustModel(nn.Module):
         api_logits = self.api_head(api_emb)
         graph_logits = self.graph_head(graph_emb)
         manifest_logits = self.manifest_head(manifest_emb)
-        base_joint_emb = self.joint_encoder(joint_input)
-        base_joint_logits = self.joint_head(base_joint_emb)
-
-        cross_attention_outputs: dict[str, torch.Tensor] = {}
-        semantic_source_embeddings_by_target: dict[str, dict[str, torch.Tensor]] | None = None
-        joint_emb = base_joint_emb
-        if self.semantic_cross_attention_enabled:
-            observable_evidence, _ = build_evidence(
-                graph_data,
-                api_logits,
-                graph_logits,
-                manifest_logits,
-                base_joint_logits,
-                api_emb,
-                graph_emb,
-                manifest_emb,
-                use_consistency_evidence=True,
-                use_conflict_evidence=True,
-                use_perturbation_evidence=False,
-            )
-            cross_attention_outputs = self.semantic_cross_attention(
-                self.cross_attention_input_projections["api"](api_emb),
-                self.cross_attention_input_projections["graph"](graph_emb),
-                self.cross_attention_input_projections["manifest"](manifest_emb),
-                observable_evidence,
-                semantic_presence=self._semantic_presence(
-                    graph_data, batch_size, device, dtype
-                ),
-            )
-            if self.attach_cross_attention_to_joint:
-                cross_attention_joint_emb = self.cross_attention_joint_projection(
-                    cross_attention_outputs["enhanced_joint"]
-                )
-                joint_gate = torch.sigmoid(self.cross_attention_joint_gate)
-                joint_emb = base_joint_emb + joint_gate * cross_attention_joint_emb
-                joint_alive_mask = (
-                    api_joint_mask.bool()
-                    | graph_joint_mask.bool()
-                    | manifest_joint_mask.bool()
-                ).to(dtype=joint_emb.dtype)
-                joint_emb = joint_emb * joint_alive_mask
-                cross_attention_outputs["semantic_joint_residual_gate"] = (
-                    joint_gate.view(1).expand(batch_size)
-                )
-            if self.attach_cross_attention_to_reconstruction:
-                semantic_source_embeddings_by_target = {}
-                modality_names = ("api", "graph", "manifest")
-                for target_name in modality_names:
-                    target_excluded = cross_attention_outputs[
-                        f"enhanced_semantic_excluding_{target_name}"
-                    ]
-                    semantic_source_embeddings_by_target[target_name] = {
-                        source_name: self.cross_attention_reconstruction_projections[
-                            source_name
-                        ](target_excluded[:, source_index])
-                        for source_index, source_name in enumerate(modality_names)
-                        if source_name != target_name
-                    }
+        joint_emb = self.joint_encoder(joint_input)
         joint_logits = self.joint_head(joint_emb)
 
         extra = {
@@ -959,31 +584,7 @@ class TriModalRobustModel(nn.Module):
             "graph_logits_aux": graph_logits,
             "manifest_logits_aux": manifest_logits,
             "joint_logits_aux": joint_logits,
-            "api_semantic_logits": self.api_semantic_head(api_emb),
-            "graph_semantic_logits": self.graph_semantic_head(graph_emb),
-            "manifest_semantic_logits": self.manifest_semantic_head(manifest_emb),
-            "semantic_cross_attention_enabled": torch.full(
-                (batch_size,),
-                float(self.semantic_cross_attention_enabled),
-                device=device,
-                dtype=dtype,
-            ),
         }
-        extra.update(cross_attention_outputs)
-        extra.update(
-            self._semantic_reconstruction_outputs(
-                api_emb,
-                graph_emb,
-                manifest_emb,
-                api_joint_mask,
-                graph_joint_mask,
-                manifest_joint_mask,
-                api_semantic_weight,
-                graph_semantic_weight,
-                manifest_semantic_weight,
-                semantic_source_embeddings_by_target=semantic_source_embeddings_by_target,
-            )
-        )
 
         handler = FUSION_DISPATCH[self.fusion_mode]
         logits, gate_weights, extra = handler(
@@ -1037,6 +638,5 @@ class TriModalRobustModel(nn.Module):
             extra["graph_emb_for_joint"] = graph_emb_for_joint
             extra["manifest_emb_for_joint"] = manifest_emb_for_joint
             extra["joint_emb"] = joint_emb
-            extra["base_joint_emb"] = base_joint_emb
 
         return logits, extra

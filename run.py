@@ -13,39 +13,19 @@ os.chdir(ROOT)
 PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
 CONFIG_DIR = Path("config/experiments/tri_modal_robust")
 
-# Historical configs retained for provenance but hidden from runnable targets
-# because their overridden field is disabled by the current formal method or
-# their behavior is identical to a canonical config.
-OBSOLETE_CONFIGS = {
-    "ablations/i2/no_semantic_cross_attention.yaml",
-    "tuning/i1/missing_relation_support_0_5.yaml",
-    "tuning/i1/missing_relation_support_1_0.yaml",
-    "sensitivity/i1/missing_relation_support_0_5.yaml",
-    "sensitivity/i1/missing_relation_support_1_0.yaml",
-    "tuning/i1/best_i1_candidate_1.yaml",
-    "tuning/i1/best_i1_candidate_2.yaml",
-    "tuning/i1/best_i1_candidate_3.yaml",
-    "tuning/i2/dropout_0_0.yaml",
-    "tuning/tuning_final_candidate.yaml",
-    "tuning/i3/acceptance_product_eval.yaml",
-    "sensitivity/i3/acceptance_product.yaml",
-    # Historical confirmations retained for provenance. They resolve to the
-    # current frozen objective and would otherwise duplicate canonical runs.
-    "tuning/objective/branch_aux_weight_0_20.yaml",
-    "tuning/objective/tuning_objective_combined_0.2_0.02.yaml",
-}
+FINAL = "observable_reliability_discount_fusion.yaml"
 
 ALIASES = {
-    "final": "observable_reliability_discount_fusion.yaml",
+    "final": FINAL,
     "api": "baselines/api_only.yaml",
     "graph": "baselines/graph_only.yaml",
     "manifest": "baselines/manifest_only.yaml",
     "concat": "baselines/tri_modal_concat.yaml",
-    "learned": "baselines/learned_evidence_logit_fusion.yaml",
-    "no_i3": "ablations/modules/no_i3_discount_rejection.yaml",
+    "late": "baselines/fixed_logit_fusion.yaml",
+    "no_i1": "ablations/modules/no_i1_observable_reliability.yaml",
+    "no_i2": "ablations/modules/no_i2_discount_fusion.yaml",
+    "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
 }
-
-LEARNED_EVIDENCE_LOGIT_FUSION = "baselines/learned_evidence_logit_fusion.yaml"
 
 BASELINES = [
     "baselines/api_only.yaml",
@@ -54,142 +34,35 @@ BASELINES = [
     "baselines/api_graph_concat.yaml",
     "baselines/tri_modal_concat.yaml",
     "baselines/fixed_logit_fusion.yaml",
-    "baselines/confidence_logit_fusion.yaml",
-    "baselines/heuristic_reliability_logit_fusion.yaml",
-    LEARNED_EVIDENCE_LOGIT_FUSION,
-]
-
-PAPER_BASELINES = [
-    "baselines/api_only.yaml",
-    "baselines/graph_only.yaml",
-    "baselines/manifest_only.yaml",
-    "baselines/tri_modal_concat.yaml",
-    "baselines/fixed_logit_fusion.yaml",
 ]
 
 MODULE_ABLATIONS = [
     "ablations/modules/no_i1_observable_reliability.yaml",
-    "ablations/modules/no_i2_semantic_interaction.yaml",
-    "ablations/modules/no_i3_discount_rejection.yaml",
+    "ablations/modules/no_i2_discount_fusion.yaml",
+    "ablations/modules/no_i3_selective_rejection.yaml",
 ]
 
-I1_ABLATIONS = [
-    "ablations/i1/no_reliability_calibration.yaml",
-    "ablations/i1/integrity_alive_only.yaml",
-    "ablations/i1/no_alive_applicability_mask.yaml",
-]
-
-I1_APPENDIX_ABLATIONS = [
-    "ablations/i1/no_support_evidence.yaml",
-    "ablations/i1/no_conflict_evidence.yaml",
-]
-
-I2_ABLATIONS = [
-    "ablations/i2/plain_semantic_cross_attention.yaml",
-    "ablations/i2/no_cross_attention_relation_mask.yaml",
-    "ablations/i2/no_cross_attention_residual_tokens.yaml",
-]
-
-I2_APPENDIX_ABLATIONS = [
-    "ablations/i2/no_cross_attention_reliability_bias.yaml",
-    "ablations/i2/no_cross_attention_support_bias.yaml",
-    "ablations/i2/no_cross_attention_conflict_bias.yaml",
-    "ablations/i2/no_semantic_presence_prior.yaml",
-    "ablations/i2/joint_only_cross_attention.yaml",
-]
-
-I3_ABLATIONS = [
+MECHANISM_ABLATIONS = [
+    "ablations/modules/no_i1_observable_reliability.yaml",
+    "ablations/i2/no_support_conflict_discount.yaml",
+    "ablations/i2/no_confidence_proxy_discount.yaml",
+    "ablations/i2/no_hard_alive_mask.yaml",
     "ablations/i3/no_probability_calibration.yaml",
-    "ablations/i3/no_support_conflict_discount.yaml",
-    "ablations/i3/no_confidence_proxy_discount.yaml",
-    "ablations/i3/no_selective_rejection.yaml",
-]
-
-I3_APPENDIX_ABLATIONS = [
-    "ablations/i3/no_support_discount.yaml",
-    "ablations/i3/no_conflict_discount.yaml",
-    "ablations/i3/no_hard_alive_mask.yaml",
-    "ablations/i3/raw_discount_no_posthoc_calibration.yaml",
-]
-
-TUNING_FULL = "tuning/full_candidate.yaml"
-
-TUNING_I1 = [
-    "tuning/i1/reliability_hidden_dim_8.yaml",
-    "tuning/i1/reliability_hidden_dim_32.yaml",
-    "tuning/i1/support_base_0_25.yaml",
-    "tuning/i1/support_base_0_75.yaml",
-    "tuning/i1/conflict_min_0_1.yaml",
-    "tuning/i1/conflict_min_0_2.yaml",
-]
-
-BEST_I1_CANDIDATES = [
-    "tuning/i1/conflict_min_0_2.yaml",
-]
-
-TUNING_I2 = [
-    "tuning/i2/residual_tokens_2.yaml",
-    "tuning/i2/residual_tokens_8.yaml",
-    "tuning/i2/attention_heads_2.yaml",
-    "tuning/i2/attention_heads_8.yaml",
-    "tuning/i2/dropout_0_2.yaml",
-]
-
-TUNING_I3 = [
-    "tuning/i3/acceptance_min_eval.yaml",
-    "tuning/i3/coverage_80_eval.yaml",
-    "tuning/i3/coverage_95_eval.yaml",
-]
-
-
-TUNING_OBJECTIVE = [
-    TUNING_FULL,
-    "tuning/objective/branch_aux_weight_0_02.yaml",
-    "tuning/objective/branch_aux_weight_0_10.yaml",
-    "tuning/objective/branch_aux_weight_0_15.yaml",
-    "tuning/objective/branch_aux_weight_0_25.yaml",
-    "tuning/objective/semantic_reconstruction_weight_0_01.yaml",
-    "tuning/objective/semantic_reconstruction_weight_0_04.yaml",
-    "tuning/objective/semantic_reconstruction_weight_0_05.yaml",
-    "tuning/objective/semantic_reconstruction_weight_0_06.yaml",
-]
-
-# Compact confirmation after graph-budget, FP32-decision, and stratified-split
-# semantics changed. Historical broad sweeps remain provenance only.
-REFREEZE = [
-    TUNING_FULL,
-    "tuning/objective/branch_aux_weight_0_15.yaml",
-    "tuning/objective/branch_aux_weight_0_25.yaml",
-    "tuning/objective/semantic_reconstruction_weight_0_01.yaml",
-    "tuning/objective/tuning_objective_combined_0.2_0.03.yaml",
-    "tuning/i1/conflict_min_0_1.yaml",
-    "tuning/i2/dropout_0_2.yaml",
+    "ablations/modules/no_i3_selective_rejection.yaml",
 ]
 
 TRAINING_ABLATIONS = [
-    "ablations/training/no_masked_semantic_reconstruction.yaml",
     "ablations/training/no_train_augmentation.yaml",
-]
-
-TRAINING_APPENDIX_ABLATIONS = [
     "ablations/training/no_branch_auxiliary.yaml",
-    "ablations/training/no_reliability_weighted_aux.yaml",
 ]
 
 SENSITIVITY = [
     "sensitivity/i1/reliability_hidden_dim_8.yaml",
     "sensitivity/i1/reliability_hidden_dim_32.yaml",
-    "sensitivity/i1/support_base_0_25.yaml",
-    "sensitivity/i1/support_base_0_75.yaml",
-    "sensitivity/i1/conflict_min_0_1.yaml",
-    "sensitivity/i1/conflict_min_0_2.yaml",
-    "sensitivity/i2/residual_tokens_2.yaml",
-    "sensitivity/i2/residual_tokens_8.yaml",
-    "sensitivity/i2/attention_heads_2.yaml",
-    "sensitivity/i2/attention_heads_8.yaml",
+    "sensitivity/i2/conflict_min_0_1.yaml",
+    "sensitivity/i2/conflict_min_0_2.yaml",
     "sensitivity/i3/acceptance_min.yaml",
     "sensitivity/i3/coverage_80.yaml",
-    "sensitivity/i3/coverage_95.yaml",
 ]
 
 EXTERNAL_EVAL = [
@@ -205,124 +78,26 @@ SEEDS = [
     "seeds/seed_3407.yaml",
 ]
 
-FINAL = "observable_reliability_discount_fusion.yaml"
-
 GROUPS = {
     "main": [FINAL, *BASELINES],
     "baselines": BASELINES,
-    "paper_baselines": PAPER_BASELINES,
     "module": MODULE_ABLATIONS,
-    "tuning_base": [TUNING_FULL],
-    "tuning_i1": TUNING_I1,
-    "best_i1_c": BEST_I1_CANDIDATES,
-    "BEST_I1_C": BEST_I1_CANDIDATES,
-    "tuning_i2": TUNING_I2,
-    "tuning_i3": TUNING_I3,
-    "tuning_objective": TUNING_OBJECTIVE,
-    "refreeze": REFREEZE,
-    "i1": I1_ABLATIONS,
-    "i1_appendix": I1_APPENDIX_ABLATIONS,
-    "i1_full": [*I1_ABLATIONS, *I1_APPENDIX_ABLATIONS],
-    "i2": ["ablations/modules/no_i2_semantic_interaction.yaml", *I2_ABLATIONS],
-    "i2_appendix": I2_APPENDIX_ABLATIONS,
-    "i2_full": [
-        "ablations/modules/no_i2_semantic_interaction.yaml",
-        *I2_ABLATIONS,
-        *I2_APPENDIX_ABLATIONS,
-    ],
-    "i3": ["ablations/modules/no_i3_discount_rejection.yaml", *I3_ABLATIONS],
-    "i3_appendix": I3_APPENDIX_ABLATIONS,
-    "i3_full": [
-        "ablations/modules/no_i3_discount_rejection.yaml",
-        *I3_ABLATIONS,
-        *I3_APPENDIX_ABLATIONS,
-    ],
-    "ablation": [
-        *MODULE_ABLATIONS,
-        *TRAINING_ABLATIONS,
-    ],
-    "component": [
-        *I1_ABLATIONS,
-        *I1_APPENDIX_ABLATIONS,
-        *I2_ABLATIONS,
-        *I2_APPENDIX_ABLATIONS,
-        *I3_ABLATIONS,
-        *I3_APPENDIX_ABLATIONS,
-    ],
-    "mechanism": [
-        *I1_ABLATIONS,
-        *I2_ABLATIONS,
-        *I3_ABLATIONS,
-    ],
-    "paper_mechanism": [
-        *I1_ABLATIONS,
-        *I2_ABLATIONS,
-        *I3_ABLATIONS,
-    ],
-    "ablation_appendix": [
-        *I1_APPENDIX_ABLATIONS,
-        *I2_APPENDIX_ABLATIONS,
-        *I3_APPENDIX_ABLATIONS,
-        *TRAINING_APPENDIX_ABLATIONS,
-    ],
-    "ablation_full": [
-        *I1_ABLATIONS,
-        *I1_APPENDIX_ABLATIONS,
-        *I2_ABLATIONS,
-        *I2_APPENDIX_ABLATIONS,
-        *I3_ABLATIONS,
-        *I3_APPENDIX_ABLATIONS,
-        *TRAINING_ABLATIONS,
-        *TRAINING_APPENDIX_ABLATIONS,
-    ],
+    "mechanism": MECHANISM_ABLATIONS,
     "training_ablation": TRAINING_ABLATIONS,
-    "training_ablation_appendix": TRAINING_APPENDIX_ABLATIONS,
-    "training_ablation_full": [*TRAINING_ABLATIONS, *TRAINING_APPENDIX_ABLATIONS],
+    "sensitivity": SENSITIVITY,
     "external": EXTERNAL_EVAL,
     "obfuscapk": EXTERNAL_EVAL,
-    "sensitivity": SENSITIVITY,
-    "sensitivity_with_seed": [SEEDS[0], *SENSITIVITY],
     "seed": SEEDS,
     "full": SEEDS,
-    "paper": [
-        *PAPER_BASELINES,
-        *MODULE_ABLATIONS,
-        *TRAINING_ABLATIONS,
-        *SEEDS,
-    ],
-    "paper_main": [
-        *PAPER_BASELINES,
-        *MODULE_ABLATIONS,
-        *TRAINING_ABLATIONS,
-        *SEEDS,
-    ],
-    "paper_appendix": [
-        *I1_APPENDIX_ABLATIONS,
-        *I2_APPENDIX_ABLATIONS,
-        *I3_APPENDIX_ABLATIONS,
-        *TRAINING_APPENDIX_ABLATIONS,
-        *SENSITIVITY,
-    ],
+    "paper": [*BASELINES, *MODULE_ABLATIONS, *TRAINING_ABLATIONS, *SEEDS],
+    "paper_main": [*BASELINES, *MODULE_ABLATIONS, *SEEDS],
+    "paper_mechanism": MECHANISM_ABLATIONS,
     "paper_external": EXTERNAL_EVAL,
-    "paper_appendix_with_seed": [
-        SEEDS[0],
-        *I1_APPENDIX_ABLATIONS,
-        *I2_APPENDIX_ABLATIONS,
-        *I3_APPENDIX_ABLATIONS,
-        *TRAINING_APPENDIX_ABLATIONS,
-        *SENSITIVITY,
-    ],
     "paper_all": [
-        *PAPER_BASELINES,
+        *BASELINES,
         *MODULE_ABLATIONS,
-        *I1_ABLATIONS,
-        *I1_APPENDIX_ABLATIONS,
-        *I2_ABLATIONS,
-        *I2_APPENDIX_ABLATIONS,
-        *I3_ABLATIONS,
-        *I3_APPENDIX_ABLATIONS,
+        *MECHANISM_ABLATIONS,
         *TRAINING_ABLATIONS,
-        *TRAINING_APPENDIX_ABLATIONS,
         *SEEDS,
         *SENSITIVITY,
         *EXTERNAL_EVAL,
@@ -333,13 +108,13 @@ GROUPS = {
 def available_configs() -> dict[str, Path]:
     configs: dict[str, Path] = {}
     stem_paths: dict[str, list[Path]] = {}
+    if not CONFIG_DIR.is_dir():
+        return configs
     for path in sorted(CONFIG_DIR.rglob("*.yaml")):
         relative = path.relative_to(CONFIG_DIR)
         if any(part.startswith(".") for part in relative.parts):
             continue
         if path.name == "base_tri_modal_robust.yaml" or path.stem.startswith("_"):
-            continue
-        if relative.as_posix() in OBSOLETE_CONFIGS:
             continue
         key = relative.with_suffix("").as_posix()
         configs[key] = path
@@ -428,30 +203,33 @@ def main() -> None:
         "--extra-config",
         nargs="*",
         default=[],
-        help="Additional YAML overlays appended to every selected experiment config.",
+        help="Additional YAML config overlays appended after each selected config.",
     )
     args = parser.parse_args()
 
     if args.list:
-        seen: set[Path] = set()
-        for path in sorted(available_configs().values()):
-            resolved = path.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                print(path.relative_to(CONFIG_DIR).with_suffix("").as_posix() + f": {path}")
+        configs = available_configs()
+        print("Groups:")
+        for name in sorted(GROUPS):
+            print(f"  {name}")
+        print("Aliases:")
+        for name in sorted(ALIASES):
+            print(f"  {name} -> {ALIASES[name]}")
+        print("Configs:")
+        for key in sorted(configs):
+            print(f"  {key}: {configs[key]}")
         return
 
-    targets = resolve_target_specs(args.target)
-    extra_configs = [Path(path) for path in args.extra_config]
+    extra_configs = [Path(item) for item in args.extra_config]
     missing_extra = [str(path) for path in extra_configs if not path.is_file()]
     if missing_extra:
-        raise ValueError(f"Extra config overlay not found: {missing_extra}")
+        raise ValueError(f"Extra config not found: {missing_extra}")
+
+    targets = resolve_target_specs(args.target)
     if args.dry_run:
         for path in targets:
-            if extra_configs:
-                print(str(path) + " + " + " + ".join(str(item) for item in extra_configs))
-            else:
-                print(path)
+            suffix = f" + {' + '.join(str(p) for p in extra_configs)}" if extra_configs else ""
+            print(f"{path}{suffix}")
         return
     for path in targets:
         run_config(path, extra_configs)

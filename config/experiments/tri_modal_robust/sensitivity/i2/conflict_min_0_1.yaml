@@ -2,10 +2,10 @@ defaults:
   - ../../observable_reliability_discount_fusion.yaml
 
 method:
-  name: sensitivity_i1_conflict_min_0_1
+  name: sensitivity_conflict_min_0_1
 
 train:
-  exp_name: sensitivity_i1_conflict_min_0_1
+  exp_name: sensitivity_conflict_min_0_1
 
 fusion:
   conflict_factor:

@@ -9,4 +9,3 @@ train:
 
 robust:
   train_aug: false
-  perturb_prob: 0.0

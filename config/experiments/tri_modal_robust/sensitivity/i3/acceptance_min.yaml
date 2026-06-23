@@ -1,14 +1,14 @@
 defaults:
-  - ../../observable_reliability_discount_fusion.yaml
+  - ../../seeds/seed_42.yaml
 
 method:
-  name: sensitivity_i3_acceptance_min
-
-eval:
-  eval_only: true
-  checkpoint_path: results/tri_modal_robust/final_seed_42/42/best_tri_modal_robust.pt
-  output_name: sensitivity_i3_acceptance_min
-  refit_rejection_threshold: true
+  name: sensitivity_acceptance_min
 
 fusion:
   acceptance_aggregation: min
+
+eval:
+  eval_only: true
+  output_name: sensitivity_acceptance_min
+  checkpoint_path: results/tri_modal_robust_new/final_seed_42/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: true
