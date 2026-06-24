@@ -7,6 +7,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fusion.constants import EvidenceIndex, GateConstants
+from fusion.evidential import (
+    EVIDENCE_BRANCHES,
+    COMBINATION_RULES,
+    combine_opinions,
+    logits_to_opinion,
+    opinion_to_prob,
+    trust_discount,
+)
 from fusion.reliability_calibration import (
     BRANCH_NAMES,
     MonotonicReliabilityCalibrator,
@@ -108,10 +116,23 @@ class DiscountProbabilityFusion(nn.Module):
                 missing_relation_support=float(reliability_cfg.get("missing_relation_support", 0.0)),
                 use_relation_evidence=bool(reliability_cfg.get("use_relation_evidence", False)),
                 apply_alive_mask=bool(reliability_cfg.get("apply_alive_mask", True)),
+                use_evidential_uncertainty=bool(
+                    reliability_cfg.get("use_evidential_uncertainty", False)
+                ),
             )
             if bool(reliability_cfg.get("enabled", False))
             else None
         )
+        # I2 combination rule. "linear" keeps the legacy reliability-discount
+        # probability average (an ablation baseline); the evidential rules build
+        # subjective-logic opinions and combine them conflict-awarely.
+        combination = str(self.config.get("combination", "linear")).lower()
+        if combination != "linear" and combination not in COMBINATION_RULES:
+            raise ValueError(
+                f"fusion.combination must be 'linear' or one of {COMBINATION_RULES}, got {combination}"
+            )
+        self.combination = combination
+        self.evidence_activation = str(self.config.get("evidence_activation", "softplus")).lower()
         probability_cfg = self.config.get("probability_calibration", {}) or {}
         self.temperature_parameters = None
         if bool(probability_cfg.get("enabled", False)):
@@ -197,6 +218,166 @@ class DiscountProbabilityFusion(nn.Module):
                 config,
             )
 
+    def _forward_evidential_fp32(
+        self,
+        api_logits: torch.Tensor,
+        graph_logits: torch.Tensor,
+        manifest_logits: torch.Tensor,
+        joint_logits: torch.Tensor,
+        evidence: torch.Tensor,
+        cfg: dict,
+        rule: str,
+    ) -> dict[str, torch.Tensor]:
+        """I2: conflict-aware evidential fusion of the three real modalities.
+
+        Each modality emits a Dirichlet/subjective-logic opinion (I1). The
+        opinion is trust-discounted by its reliability (competence x observable
+        quality x evidential certainty) and the three are combined with a
+        conflict-aware rule (Yager by default). The joint branch is NOT combined
+        -- it is a learned interaction of the same three embeddings and would
+        double-count -- it stays an auxiliary head only. Conflict mass becomes
+        fused uncertainty, which is the natural selective-rejection signal (I3).
+        """
+        eps = float(cfg.get("min_discount", GateConstants.EPS))
+        use_hard_alive = bool(cfg.get("use_hard_alive_mask", True))
+        use_reliability = bool(cfg.get("use_reliability_discount", True))
+        reliability_exponent = float(cfg.get("reliability_discount_exponent", 1.0))
+        if not math.isfinite(reliability_exponent) or reliability_exponent <= 0.0:
+            raise ValueError("fusion.reliability_discount_exponent must be finite and positive")
+        competence_cfg = cfg.get("branch_competence_prior", {}) or {}
+        use_competence = bool(competence_cfg.get("enabled", False))
+        base_rate = float(cfg.get("base_rate", 0.5))
+
+        logits_by_branch = {
+            "api": api_logits,
+            "graph": graph_logits,
+            "manifest": manifest_logits,
+            "joint": joint_logits,
+        }
+        opinions = {
+            name: logits_to_opinion(
+                logits, evidence_activation=self.evidence_activation, eps=eps
+            )
+            for name, logits in logits_by_branch.items()
+        }
+        evidential_certainty = {
+            name: (1.0 - opinions[name]["uncertainty"]).clamp(0.0, 1.0) for name in BRANCH_NAMES
+        }
+
+        api_integrity = _column(evidence, EvidenceIndex.API_INTEGRITY)
+        graph_integrity = _column(evidence, EvidenceIndex.GRAPH_INTEGRITY)
+        manifest_integrity = _column(evidence, EvidenceIndex.MANIFEST_INTEGRITY)
+        integrity_by_branch = {
+            "api": api_integrity,
+            "graph": graph_integrity,
+            "manifest": manifest_integrity,
+        }
+        alive_by_branch = {
+            "api": _column(evidence, EvidenceIndex.API_ALIVE).clamp(0.0, 1.0),
+            "graph": _column(evidence, EvidenceIndex.GRAPH_ALIVE).clamp(0.0, 1.0),
+            "manifest": _column(evidence, EvidenceIndex.MANIFEST_ALIVE).clamp(0.0, 1.0),
+        }
+
+        # Observable reliability: calibrated dual-source estimate when active,
+        # otherwise raw observable integrity (optionally multiplied by evidential
+        # certainty so the second source still participates in ablations).
+        reliability_outputs: dict[str, torch.Tensor] = {}
+        calibrated = self.reliability_calibrator is not None and self.calibration_active
+        if calibrated:
+            reliability_outputs = self.reliability_calibrator(evidence, evidential_certainty)
+            observable_reliability = {
+                name: reliability_outputs[f"predicted_reliability_{name}"].clamp(0.0, 1.0)
+                for name in EVIDENCE_BRANCHES
+            }
+        else:
+            use_evidential = bool(
+                (cfg.get("reliability_calibration", {}) or {}).get("use_evidential_uncertainty", False)
+            )
+            observable_reliability = {}
+            for name in EVIDENCE_BRANCHES:
+                base = integrity_by_branch[name].clamp(0.0, 1.0)
+                if use_evidential:
+                    base = base * evidential_certainty[name]
+                observable_reliability[name] = base.clamp(0.0, 1.0)
+
+        if use_competence and self.branch_competence_active:
+            competence_prior = self._branch_competence_prior.to(
+                device=api_integrity.device, dtype=api_integrity.dtype
+            )
+        else:
+            competence_prior = torch.ones(
+                len(BRANCH_NAMES), device=api_integrity.device, dtype=api_integrity.dtype
+            )
+        competence_by_branch = {name: competence_prior[i] for i, name in enumerate(BRANCH_NAMES)}
+
+        beliefs: list[torch.Tensor] = []
+        uncertainties: list[torch.Tensor] = []
+        trust_by_branch: dict[str, torch.Tensor] = {}
+        for name in EVIDENCE_BRANCHES:
+            reliability = observable_reliability[name]
+            if use_reliability:
+                reliability = reliability.clamp(0.0, 1.0).pow(reliability_exponent)
+            else:
+                reliability = torch.ones_like(reliability)
+            trust = (competence_by_branch[name] * reliability).clamp(0.0, 1.0)
+            if use_hard_alive:
+                # Dead modalities become vacuous opinions (the identity element of
+                # the fusion), contributing nothing instead of voting.
+                trust = trust * alive_by_branch[name]
+            trust_by_branch[name] = trust
+            discounted_belief, discounted_u = trust_discount(
+                opinions[name]["belief"], opinions[name]["uncertainty"], trust
+            )
+            beliefs.append(discounted_belief)
+            uncertainties.append(discounted_u)
+
+        fused_belief, fused_uncertainty = combine_opinions(beliefs, uncertainties, rule=rule, eps=eps)
+        final_prob = opinion_to_prob(fused_belief, fused_uncertainty, base_rate=base_rate, eps=eps)
+        final_logits = torch.log(final_prob.clamp_min(eps))
+
+        # Pseudo fusion weights for diagnostics / gate dump: how much each
+        # modality's (trusted) belief contributed. Joint is fixed at 0.
+        contribution = torch.stack(
+            [trust_by_branch[name] * (1.0 - opinions[name]["uncertainty"]) for name in EVIDENCE_BRANCHES],
+            dim=-1,
+        )
+        contribution_sum = contribution.sum(dim=-1, keepdim=True).clamp_min(eps)
+        weights3 = contribution / contribution_sum
+        fusion_weights = torch.cat([weights3, torch.zeros_like(weights3[:, :1])], dim=-1)
+
+        total_reliability = (weights3 * torch.stack(
+            [observable_reliability[name] for name in EVIDENCE_BRANCHES], dim=-1
+        )).sum(dim=-1).clamp(0.0, 1.0)
+        acceptance_score = (1.0 - fused_uncertainty).clamp(0.0, 1.0)
+
+        batch = final_logits.size(0)
+        outputs: dict[str, torch.Tensor] = {
+            "final_prob": final_prob,
+            "final_logits": final_logits,
+            "final_is_log_probability": torch.ones((), device=final_logits.device, dtype=torch.bool),
+            "fusion_weights": fusion_weights,
+            "fused_uncertainty": fused_uncertainty,
+            "fused_belief_malware": fused_belief[:, 1] if fused_belief.size(-1) > 1 else fused_belief[:, 0],
+            "total_reliability": total_reliability,
+            "acceptance_score": acceptance_score,
+            "combination_rule_is_evidential": torch.ones((batch,), device=final_logits.device, dtype=final_logits.dtype),
+            "calibration_active": torch.full(
+                (batch,), float(self.calibration_active), device=final_logits.device, dtype=final_logits.dtype
+            ),
+            "fallback_used": torch.zeros((batch,), device=final_logits.device, dtype=final_logits.dtype),
+        }
+        outputs.update(reliability_outputs)
+        for index, name in enumerate(BRANCH_NAMES):
+            outputs[f"fusion_weight_{name}"] = fusion_weights[:, index]
+            outputs[f"uncertainty_proxy_{name}"] = opinions[name]["uncertainty"]
+            outputs[f"evidential_certainty_{name}"] = evidential_certainty[name]
+            outputs[f"calibrated_log_prob_{name}"] = torch.log(
+                opinions[name]["expected_prob"].clamp_min(eps)
+            )
+            if name in trust_by_branch:
+                outputs[f"discount_{name}"] = trust_by_branch[name]
+        return outputs
+
     def _forward_fp32(
         self,
         api_logits: torch.Tensor,
@@ -212,6 +393,12 @@ class DiscountProbabilityFusion(nn.Module):
             raise ValueError(
                 f"DiscountProbabilityFusion expected [B, >= {EvidenceIndex.BASE_DIM}] evidence, "
                 f"got {tuple(evidence.shape)}"
+            )
+
+        combination = str(cfg.get("combination", self.combination)).lower()
+        if combination in COMBINATION_RULES:
+            return self._forward_evidential_fp32(
+                api_logits, graph_logits, manifest_logits, joint_logits, evidence, cfg, combination
             )
 
         eps = float(cfg.get("min_discount", GateConstants.EPS))

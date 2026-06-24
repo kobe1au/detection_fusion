@@ -47,8 +47,18 @@ def build_monotonic_reliability_features(
     *,
     missing_relation_support: float = 0.0,
     use_relation_evidence: bool = True,
+    evidential_certainty: dict[str, torch.Tensor] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Build branch-specific features where larger always means more reliable."""
+    """Build branch-specific features where larger always means more reliable.
+
+    When ``evidential_certainty`` (a per-branch ``1 - u`` from the Dirichlet
+    evidence head) is supplied, it is appended as an extra monotone-positive
+    feature column so the calibrator estimates reliability from BOTH the
+    observable parse quality and the model's own evidential certainty (I1's
+    dual-source design). The two sources are complementary: observable quality
+    flags missing/degraded modalities, evidential certainty flags semantically
+    ambiguous samples.
+    """
     if evidence.ndim != 2 or evidence.size(-1) < EvidenceIndex.BASE_DIM:
         raise ValueError(
             f"Expected [B, >= {EvidenceIndex.BASE_DIM}] evidence, got {tuple(evidence.shape)}"
@@ -176,6 +186,16 @@ def build_monotonic_reliability_features(
         "alive_manifest": manifest_alive.float(),
         "alive_joint": joint_alive.float(),
     }
+    if evidential_certainty is not None:
+        # Append the learned evidential certainty (1 - u) as a sixth
+        # monotone-positive feature for every branch. Missing entries default to
+        # a neutral 1.0 so the calibrator is never penalised for absent evidence.
+        for name in BRANCH_NAMES:
+            cert = evidential_certainty.get(name)
+            if cert is None:
+                cert = torch.ones_like(api_integrity)
+            cert = cert.to(device=evidence.device, dtype=evidence.dtype).view(-1, 1).clamp(0.0, 1.0)
+            features[name] = torch.cat([features[name], cert], dim=-1)
     return features, diagnostics
 
 
@@ -188,6 +208,7 @@ class MonotonicReliabilityCalibrator(nn.Module):
         missing_relation_support: float = 0.0,
         use_relation_evidence: bool = True,
         apply_alive_mask: bool = True,
+        use_evidential_uncertainty: bool = False,
     ):
         super().__init__()
         if hidden_dim <= 0:
@@ -197,18 +218,30 @@ class MonotonicReliabilityCalibrator(nn.Module):
         self.missing_relation_support = float(missing_relation_support)
         self.use_relation_evidence = bool(use_relation_evidence)
         self.apply_alive_mask = bool(apply_alive_mask)
+        self.use_evidential_uncertainty = bool(use_evidential_uncertainty)
+        input_dim = 6 if self.use_evidential_uncertainty else 5
         self.branches = nn.ModuleDict(
             {
-                name: MonotonicBranchCalibrator(input_dim=5, hidden_dim=hidden_dim)
+                name: MonotonicBranchCalibrator(input_dim=input_dim, hidden_dim=hidden_dim)
                 for name in BRANCH_NAMES
             }
         )
 
-    def forward(self, evidence: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        evidence: torch.Tensor,
+        evidential_certainty: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if self.use_evidential_uncertainty and evidential_certainty is None:
+            raise ValueError(
+                "reliability calibrator was built with use_evidential_uncertainty=true "
+                "but no evidential certainty was provided"
+            )
         features, diagnostics = build_monotonic_reliability_features(
             evidence,
             missing_relation_support=self.missing_relation_support,
             use_relation_evidence=self.use_relation_evidence,
+            evidential_certainty=evidential_certainty if self.use_evidential_uncertainty else None,
         )
         outputs = dict(diagnostics)
         for name in BRANCH_NAMES:

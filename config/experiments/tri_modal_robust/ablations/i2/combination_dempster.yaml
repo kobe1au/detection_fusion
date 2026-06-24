@@ -1,0 +1,14 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+# I2 ablation: classic Dempster-Shafer combination (normalises conflict away).
+# Expected to be over-confident on high-conflict degraded samples -- the
+# baseline that motivates the conflict-aware Yager rule.
+method:
+  name: ablation_combination_dempster
+
+train:
+  exp_name: ablation_combination_dempster
+
+fusion:
+  combination: dempster

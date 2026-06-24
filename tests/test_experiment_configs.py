@@ -102,6 +102,7 @@ def test_lean_full_method_excludes_semantic_interaction_modules():
 def test_module_ablations_match_lean_paper_claims():
     no_i1 = _resolved(ROOT / "ablations/modules/no_i1_observable_reliability.yaml")
     assert no_i1["fusion"]["reliability_calibration"]["enabled"] is False
+    assert no_i1["fusion"]["branch_competence_prior"]["enabled"] is False
     assert no_i1["fusion"]["use_reliability_discount"] is False
     assert no_i1["fusion"]["use_support_discount"] is True
     assert no_i1["fusion"]["use_conflict_discount"] is True

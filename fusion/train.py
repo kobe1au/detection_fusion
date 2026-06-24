@@ -1192,6 +1192,142 @@ def _selective_metrics_from_rows(
     )
 
 
+# ── I3: class-conditional (Mondrian) conformal selective prediction ───────────
+# Replaces the heuristic coverage threshold with split-conformal calibration so
+# the abstention has a finite-sample guarantee: on exchangeable data,
+# P(true label in prediction set | label = c) >= 1 - alpha. This abstains on
+# low-evidence / high-conflict degraded samples rather than forcing a confident
+# decision. Note the guarantee is on coverage, NOT a bound on the rejection rate.
+
+def _conformal_quantile(scores: list[float], alpha: float) -> float:
+    finite = sorted(float(s) for s in scores if s is not None and math.isfinite(float(s)))
+    n = len(finite)
+    if n == 0:
+        return float("inf")  # no calibration evidence -> never reject on this class
+    rank = int(math.ceil((n + 1) * (1.0 - alpha)))
+    if rank > n:
+        return float("inf")
+    if rank < 1:
+        rank = 1
+    return float(finite[rank - 1])
+
+
+def fit_conformal_thresholds(
+    rows: list[dict[str, Any]], config: dict | None = None
+) -> dict[str, Any] | None:
+    """Fit per-class conformal nonconformity thresholds on calibration rows."""
+    config = config or {}
+    if not bool(config.get("enabled", False)):
+        return None
+    if str(config.get("mode", "threshold")).lower() != "conformal":
+        return None
+    target_coverage = float(config.get("target_coverage", 0.9))
+    alpha = float(config.get("alpha", 1.0 - target_coverage))
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("conformal selective_prediction.alpha must be within (0, 1)")
+    class_conditional = bool(config.get("class_conditional", True))
+    scores: dict[int, list[float]] = {0: [], 1: []}
+    for row in rows:
+        prob = row.get("prob_malware")
+        label = row.get("label")
+        if prob is None or label is None:
+            continue
+        p1 = float(prob)
+        label = int(label)
+        # Nonconformity of the TRUE class, computed identically to the
+        # prediction-set test below (malware: 1 - p1, benign: p1) so calibration
+        # and inference scores match exactly and avoid float knife-edges.
+        nonconformity = (1.0 - p1) if label == 1 else p1
+        scores.setdefault(label, []).append(nonconformity)
+    if class_conditional:
+        q_benign = _conformal_quantile(scores.get(0, []), alpha)
+        q_malware = _conformal_quantile(scores.get(1, []), alpha)
+    else:
+        pooled = scores.get(0, []) + scores.get(1, [])
+        q_benign = q_malware = _conformal_quantile(pooled, alpha)
+    return {
+        "mode": "conformal",
+        "alpha": alpha,
+        "class_conditional": class_conditional,
+        "q_benign": q_benign,
+        "q_malware": q_malware,
+        "num_calibration": int(len(scores.get(0, [])) + len(scores.get(1, []))),
+    }
+
+
+def _conformal_prediction_set(p1: float, thresholds: dict[str, Any]) -> tuple[bool, bool]:
+    """Return (include_benign, include_malware) for the conformal prediction set."""
+    q_benign = float(thresholds.get("q_benign", float("inf")))
+    q_malware = float(thresholds.get("q_malware", float("inf")))
+    include_malware = (1.0 - p1) <= q_malware  # nonconformity of class malware
+    include_benign = p1 <= q_benign            # nonconformity of class benign
+    return bool(include_benign), bool(include_malware)
+
+
+def conformal_selective_metrics(
+    rows: list[dict[str, Any]], thresholds: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Security-oriented selective metrics under class-conditional conformal."""
+    if not thresholds:
+        return {}
+    valid = [r for r in rows if r.get("prob_malware") is not None and r.get("label") is not None]
+    if not valid:
+        return {}
+    n = len(valid)
+    accepted = 0
+    per_class_total = {0: 0, 1: 0}
+    per_class_accepted = {0: 0, 1: 0}
+    true_in_set = {0: 0, 1: 0}        # empirical conformal coverage check
+    accepted_errors = 0
+    malware_fn_accepted = 0           # accepted samples that are malware but predicted benign
+    for row in valid:
+        p1 = float(row["prob_malware"])
+        y = int(row["label"])
+        include_benign, include_malware = _conformal_prediction_set(p1, thresholds)
+        size = int(include_benign) + int(include_malware)
+        is_accept = size == 1
+        pred = 1 if (include_malware and not include_benign) else 0
+        per_class_total[y] = per_class_total.get(y, 0) + 1
+        true_in_set[y] = true_in_set.get(y, 0) + int(include_malware if y == 1 else include_benign)
+        if is_accept:
+            accepted += 1
+            per_class_accepted[y] = per_class_accepted.get(y, 0) + 1
+            if pred != y:
+                accepted_errors += 1
+            if y == 1 and pred == 0:
+                malware_fn_accepted += 1
+
+    def _ratio(num: int, den: int) -> float | None:
+        return float(num) / float(den) if den > 0 else None
+
+    out: dict[str, Any] = {
+        "conformal_alpha": float(thresholds.get("alpha", 0.0)),
+        "conformal_class_conditional": bool(thresholds.get("class_conditional", True)),
+        # Acceptance rate = fraction whose prediction set is a singleton. This is
+        # NOT conformal coverage -- see conformal_empirical_coverage_* below for
+        # the actual guaranteed quantity.
+        "conformal_acceptance_rate": _ratio(accepted, n),
+        "conformal_rejection_rate": _ratio(n - accepted, n),
+        "conformal_benign_acceptance_rate": _ratio(per_class_accepted[0], per_class_total[0]),
+        "conformal_malware_acceptance_rate": _ratio(per_class_accepted[1], per_class_total[1]),
+        "conformal_malware_rejection_rate": (
+            None if per_class_total[1] == 0
+            else 1.0 - (per_class_accepted[1] / per_class_total[1])
+        ),
+        # Malware missed despite being accepted -- the dangerous failure mode.
+        "conformal_malware_fn_after_rejection": _ratio(malware_fn_accepted, per_class_total[1]),
+        "conformal_selective_risk": _ratio(accepted_errors, accepted),
+        "conformal_selective_acc": (None if accepted == 0 else 1.0 - accepted_errors / accepted),
+        # TRUE conformal coverage: P(true label in prediction set | label = c).
+        # Should be >= 1 - alpha on exchangeable calibration/test data.
+        "conformal_empirical_coverage_benign": _ratio(true_in_set[0], per_class_total[0]),
+        "conformal_empirical_coverage_malware": _ratio(true_in_set[1], per_class_total[1]),
+        "conformal_num_accepted": int(accepted),
+        "conformal_num_rejected": int(n - accepted),
+    }
+    return out
+
+
 @torch.no_grad()
 def evaluate(
     model,
@@ -1449,6 +1585,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
                 extra,
                 loss_cfg,
                 evidence=extra.get("gate_evidence"),
+                epoch=epoch,
             )
             loss = loss / max(grad_accum, 1)
         for key in GATE_DIAGNOSTIC_KEYS:
@@ -1724,6 +1861,7 @@ def run(cfg: dict) -> dict[str, Any]:
         rejection_threshold = (
             float(rejection_threshold) if rejection_threshold is not None else None
         )
+        conformal_thresholds = ckpt.get("conformal_thresholds")
         logger.info("eval-only mode loaded checkpoint: %s", best_path)
     else:
         assert train_loader is not None
@@ -1845,16 +1983,23 @@ def run(cfg: dict) -> dict[str, Any]:
         rejection_threshold = fit_rejection_threshold(
             val_calibration_rows, cfg.get("selective_prediction", {}) or {}
         )
+        conformal_thresholds = fit_conformal_thresholds(
+            val_calibration_rows, cfg.get("selective_prediction", {}) or {}
+        )
         if not eval_only and best_path.exists():
             ckpt = torch.load(best_path, map_location="cpu", weights_only=True)
             ckpt["model"] = model.state_dict()
             ckpt["calibration"] = calibration_summary
             ckpt["branch_competence_prior"] = branch_competence_summary
             ckpt["rejection_threshold"] = rejection_threshold
+            ckpt["conformal_thresholds"] = conformal_thresholds
             ckpt["validation_split"] = validation_split_summary
             torch.save(ckpt, best_path)
     val_calibration_metrics.update(
         _selective_metrics_from_rows(val_calibration_rows, rejection_threshold)
+    )
+    val_calibration_metrics.update(
+        conformal_selective_metrics(val_calibration_rows, conformal_thresholds)
     )
 
     val_metrics, val_rows = evaluate(
@@ -1867,6 +2012,7 @@ def run(cfg: dict) -> dict[str, Any]:
         selective_threshold=rejection_threshold,
     )
     enforce_failed_ratio(val_metrics, cfg, "val_selection")
+    val_metrics.update(conformal_selective_metrics(val_rows, conformal_thresholds))
     val_robust_results = evaluate_robust_validation(
         model,
         robust_val_loaders,
@@ -1891,6 +2037,9 @@ def run(cfg: dict) -> dict[str, Any]:
             selective_threshold=rejection_threshold,
         )
         enforce_failed_ratio(test_metrics, cfg, "test_clean")
+        # Conformal selective metrics on clean test (test_rows is still clean
+        # here -- robust rows are appended only inside the loop below).
+        test_metrics.update(conformal_selective_metrics(test_rows, conformal_thresholds))
         if run_robust_test:
             perturb_tests = list(eval_cfg.get("perturb_tests", ["clean"]))
             if eval_cfg.get("perturb_strengths") is not None:
@@ -1920,6 +2069,7 @@ def run(cfg: dict) -> dict[str, Any]:
                         selective_threshold=rejection_threshold,
                     )
                     enforce_failed_ratio(metrics, cfg, f"test_{result_key}")
+                    metrics.update(conformal_selective_metrics(rows, conformal_thresholds))
                     robust_results[result_key] = metrics
                     test_rows.extend(rows)
 
@@ -2004,6 +2154,7 @@ def run(cfg: dict) -> dict[str, Any]:
         "calibration": calibration_summary,
         "branch_competence_prior": branch_competence_summary,
         "rejection_threshold": rejection_threshold,
+        "conformal_thresholds": conformal_thresholds,
         "val": val_metrics,
         "val_selection": val_metrics,
         "val_calibration": val_calibration_metrics,

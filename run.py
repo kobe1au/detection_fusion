@@ -15,8 +15,18 @@ CONFIG_DIR = Path("config/experiments/tri_modal_robust")
 
 FINAL = "observable_reliability_discount_fusion.yaml"
 
+EVIDENTIAL_MAIN = "evidential_trusted_fusion.yaml"
+
+EVIDENTIAL_ABLATIONS = [
+    "ablations/i1/no_edl_reliability_source.yaml",
+    "ablations/i2/combination_dempster.yaml",
+    "ablations/i2/combination_cumulative.yaml",
+    "ablations/i3/marginal_conformal.yaml",
+]
+
 ALIASES = {
     "final": FINAL,
+    "evidential": "evidential_trusted_fusion.yaml",
     "api": "baselines/api_only.yaml",
     "graph": "baselines/graph_only.yaml",
     "manifest": "baselines/manifest_only.yaml",
@@ -27,6 +37,10 @@ ALIASES = {
     "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
     "rel_exp_025": "sensitivity/i1/reliability_exponent_0_25.yaml",
     "rel_acceptance_only": "sensitivity/i1/reliability_acceptance_only.yaml",
+    "no_edl": "ablations/i1/no_edl_reliability_source.yaml",
+    "dempster": "ablations/i2/combination_dempster.yaml",
+    "cumulative": "ablations/i2/combination_cumulative.yaml",
+    "marginal_conformal": "ablations/i3/marginal_conformal.yaml",
 }
 
 BASELINES = [
@@ -89,6 +103,8 @@ SEEDS = [
 
 GROUPS = {
     "main": [FINAL, *BASELINES],
+    "evidential": [EVIDENTIAL_MAIN, *EVIDENTIAL_ABLATIONS],
+    "evidential_ablation": EVIDENTIAL_ABLATIONS,
     "baselines": BASELINES,
     "module": MODULE_ABLATIONS,
     "mechanism": MECHANISM_ABLATIONS,

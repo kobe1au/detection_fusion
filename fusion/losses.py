@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from fusion.constants import EvidenceIndex
+from fusion.evidential import evidential_loss
 
 
 BRANCH_AUX_KEYS = (
@@ -236,6 +237,7 @@ def compute_robust_loss(
     loss_cfg: dict | None = None,
     *,
     evidence: torch.Tensor | None = None,
+    epoch: int = 0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Robust objective with independently attributable auxiliary terms."""
     extra = extra or {}
@@ -244,10 +246,12 @@ def compute_robust_loss(
     branch_aux_weight = float(loss_cfg.get("branch_aux_weight", 0.05))
     reliability_calibration_weight = float(loss_cfg.get("reliability_calibration_weight", 0.0))
     probability_calibration_weight = float(loss_cfg.get("probability_calibration_weight", 0.0))
+    evidential_loss_weight = float(loss_cfg.get("evidential_loss_weight", 0.0))
     named_weights = {
         "branch_aux_weight": branch_aux_weight,
         "reliability_calibration_weight": reliability_calibration_weight,
         "probability_calibration_weight": probability_calibration_weight,
+        "evidential_loss_weight": evidential_loss_weight,
     }
     for name, value in named_weights.items():
         if not math.isfinite(value) or value < 0.0:
@@ -331,11 +335,88 @@ def compute_robust_loss(
         )
         calibration_diagnostics.update(probability_diag)
 
+    # I1 evidential (EDL) objective: Bayes-risk + annealed KL on each branch's
+    # Dirichlet evidence head. The KL coefficient ramps from 0 to 1 over
+    # ``evidential.anneal_epochs`` so clean accuracy is not destroyed early.
+    evidential_total = logits.new_tensor(0.0)
+    evidential_diagnostics: dict[str, torch.Tensor] = {}
+    if evidential_loss_weight > 0.0:
+        edl_cfg = loss_cfg.get("evidential", {}) or {}
+        anneal_epochs = max(int(edl_cfg.get("anneal_epochs", 10)), 1)
+        anneal_coef = min(1.0, float(max(epoch, 0)) / anneal_epochs)
+        activation = str(edl_cfg.get("evidence_activation", "softplus"))
+        edl_branches = edl_cfg.get("branches") or ["api", "graph", "manifest"]
+        # Optional class weighting so EDL evidence does not collapse onto the
+        # majority class under malware/benign imbalance. "balanced" uses per-batch
+        # inverse frequency; a list/dict gives explicit per-class weights.
+        class_weight_cfg = edl_cfg.get("class_weight")
+        class_weight_per_sample = None
+        if class_weight_cfg:
+            num_classes = logits.size(-1)
+            label_idx = labels.long().view(-1)
+            if isinstance(class_weight_cfg, str) and class_weight_cfg.lower() == "balanced":
+                counts = torch.bincount(label_idx, minlength=num_classes).to(logits.dtype)
+                present = (counts > 0).sum().clamp_min(1)
+                per_class = torch.where(
+                    counts > 0,
+                    label_idx.numel() / (present * counts.clamp_min(1.0)),
+                    torch.ones_like(counts),
+                )
+            elif isinstance(class_weight_cfg, (list, tuple, dict)):
+                values = (
+                    [float(class_weight_cfg[i]) for i in range(num_classes)]
+                    if isinstance(class_weight_cfg, dict)
+                    else [float(v) for v in class_weight_cfg]
+                )
+                if len(values) != num_classes:
+                    raise ValueError("loss.evidential.class_weight length must equal num_classes")
+                per_class = logits.new_tensor(values)
+            else:
+                raise ValueError("loss.evidential.class_weight must be 'balanced' or a list/dict")
+            class_weight_per_sample = per_class[label_idx]
+        alive = (
+            _branch_alive_masks(evidence)
+            if isinstance(evidence, torch.Tensor) and evidence.ndim == 2
+            and evidence.size(-1) >= EvidenceIndex.BASE_DIM
+            else None
+        )
+        edl_losses = []
+        for key in BRANCH_AUX_KEYS:
+            branch_name = BRANCH_AUX_NAMES[key]
+            if branch_name not in edl_branches:
+                continue
+            aux_logits = extra.get(key)
+            if not isinstance(aux_logits, torch.Tensor) or aux_logits.shape != logits.shape:
+                continue
+            weight = alive[branch_name].view(-1) if alive is not None else None
+            if class_weight_per_sample is not None:
+                weight = (
+                    class_weight_per_sample
+                    if weight is None
+                    else weight * class_weight_per_sample
+                )
+            if weight is not None and not bool((weight.sum() > 0).item()):
+                continue
+            branch_edl = evidential_loss(
+                aux_logits,
+                labels,
+                anneal_coef=anneal_coef,
+                evidence_activation=activation,
+                sample_weight=weight,
+            )
+            edl_losses.append(branch_edl)
+            evidential_diagnostics[f"evidential_loss_{branch_name}"] = branch_edl.detach()
+        if edl_losses:
+            evidential_total = torch.stack(edl_losses).mean()
+        evidential_diagnostics["evidential_anneal_coef"] = logits.new_tensor(anneal_coef)
+        evidential_diagnostics["evidential_loss"] = evidential_total.detach()
+
     total = (
         ce
         + branch_aux_weight * branch_loss
         + reliability_calibration_weight * reliability_calibration
         + probability_calibration_weight * probability_calibration
+        + evidential_loss_weight * evidential_total
     )
     parts = {
         "loss": float(total.detach().item()),
@@ -346,8 +427,10 @@ def compute_robust_loss(
         "reliability_calibration_weight": reliability_calibration_weight,
         "probability_calibration": float(probability_calibration.detach().item()),
         "probability_calibration_weight": probability_calibration_weight,
+        "evidential_loss": float(evidential_total.detach().item()),
+        "evidential_loss_weight": evidential_loss_weight,
     }
-    for source in (aux_diagnostics, calibration_diagnostics):
+    for source in (aux_diagnostics, calibration_diagnostics, evidential_diagnostics):
         for key, value in source.items():
             if isinstance(value, torch.Tensor) and value.numel() == 1:
                 parts[key] = float(value.detach().item())

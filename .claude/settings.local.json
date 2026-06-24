@@ -18,7 +18,18 @@
       "Bash(/d/software/env/miniconda3/envs/malware/python.exe -m pytest tests/test_robust_smoke.py -q --basetemp=D:/code/detection/.pytest_tmp -p no:cacheprovider)",
       "Bash(/d/software/env/miniconda3/envs/malware/python.exe -m pytest tests/test_robust_smoke.py --basetemp=D:/code/detection/.pytest_tmp -p no:cacheprovider -v)",
       "Bash(git -C \"D:/code/detection\" status)",
-      "Bash(git -C \"D:/code/detection\" diff HEAD -- fusion/robust/perturbations.py)"
+      "Bash(git -C \"D:/code/detection\" diff HEAD -- fusion/robust/perturbations.py)",
+      "Bash(python -m pytest tests/test_evidential.py tests/test_conformal_selective.py -q)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\); import torch; print\\('torch', torch.__version__\\)\")",
+      "Bash(python -c \"import torch_geometric; print\\('pyg ok'\\)\")",
+      "Bash(conda env *)",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -c \"import torch, numpy, torch_geometric, pytest; print\\('all deps ok'\\)\")",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_evidential.py tests/test_conformal_selective.py -q)",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/ -q)",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -)",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_experiment_configs.py -q)",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_evidential.py::test_full_evidential_pipeline_forward_loss_backward -q)",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_conformal_selective.py tests/test_evidential.py -q)"
     ]
   }
 }

@@ -1,0 +1,15 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+# I3 ablation: marginal (not class-conditional) split conformal. Marginal
+# coverage can hide poor malware-class coverage -- this isolates the value of
+# the Mondrian / per-class calibration for the security setting.
+method:
+  name: ablation_marginal_conformal
+
+train:
+  exp_name: ablation_marginal_conformal
+
+selective_prediction:
+  mode: conformal
+  class_conditional: false

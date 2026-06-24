@@ -9,5 +9,7 @@ train:
 
 fusion:
   use_reliability_discount: false
+  branch_competence_prior:
+    enabled: false
   reliability_calibration:
     enabled: false
