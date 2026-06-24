@@ -118,6 +118,12 @@ GATE_DIAGNOSTIC_KEYS = (
     "predicted_reliability_graph",
     "predicted_reliability_manifest",
     "predicted_reliability_joint",
+    "branch_competence_active",
+    "branch_competence_prior_api",
+    "branch_competence_prior_graph",
+    "branch_competence_prior_manifest",
+    "branch_competence_prior_joint",
+    "weight_sharpening_gamma",
     "temperature_api",
     "temperature_graph",
     "temperature_manifest",
@@ -161,6 +167,29 @@ def configure_determinism(enabled: bool, strict: bool = False) -> None:
             torch.backends.cuda.enable_math_sdp(True)
     torch.use_deterministic_algorithms(enabled, warn_only=not strict)
 
+
+def configure_multiprocessing_sharing(cfg: dict) -> None:
+    train_cfg = cfg.get("train", {}) or {}
+    strategy = str(train_cfg.get("multiprocessing_sharing_strategy", "") or "").strip()
+    if not strategy or strategy.lower() in {"default", "none", "false"}:
+        return
+    mp = torch.multiprocessing
+    try:
+        available = set(mp.get_all_sharing_strategies())
+    except (AttributeError, RuntimeError):
+        available = set()
+    if available and strategy not in available:
+        logger.warning(
+            "train.multiprocessing_sharing_strategy=%s is unavailable; available=%s",
+            strategy,
+            sorted(available),
+        )
+        return
+    try:
+        mp.set_sharing_strategy(strategy)
+        logger.info("torch_multiprocessing_sharing_strategy=%s", strategy)
+    except (AttributeError, RuntimeError) as exc:
+        logger.warning("Unable to set torch multiprocessing sharing strategy %s: %s", strategy, exc)
 
 def select_device(value: str) -> torch.device:
     value = str(value or "auto").lower()
@@ -450,15 +479,21 @@ def build_loader(cfg: dict, dataset, is_train: bool):
             "forcing pin_memory=false. Set train.allow_pyg_pin_memory=true to override."
         )
         pin_memory = False
-    return DataLoader(
-        dataset,
-        batch_size=int(train_cfg.get("batch_size" if is_train else "eval_batch_size", train_cfg.get("batch_size", 32))),
-        shuffle=is_train,
-        num_workers=workers,
-        pin_memory=pin_memory,
-        persistent_workers=bool(train_cfg.get("persistent_workers", False)) and workers > 0,
-        collate_fn=robust_collate_fn,
-    )
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": int(train_cfg.get("batch_size" if is_train else "eval_batch_size", train_cfg.get("batch_size", 32))),
+        "shuffle": is_train,
+        "num_workers": workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": bool(train_cfg.get("persistent_workers", False)) and workers > 0,
+        "collate_fn": robust_collate_fn,
+    }
+    if workers > 0 and train_cfg.get("prefetch_factor") is not None:
+        prefetch_factor = int(train_cfg.get("prefetch_factor"))
+        if prefetch_factor <= 0:
+            raise ValueError("train.prefetch_factor must be positive when num_workers > 0")
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(**loader_kwargs)
 
 
 def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[str, Any]]:
@@ -963,6 +998,87 @@ def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, 
             out[f"{branch}_reliability_ap"] = float("nan")
     return out
 
+def estimate_branch_competence_prior(
+    rows: list[dict[str, Any]],
+    cfg: dict,
+) -> dict[str, Any]:
+    """Estimate a validation-calibrated global competence prior for each branch."""
+    prior_cfg = (cfg.get("fusion", {}) or {}).get("branch_competence_prior", {}) or {}
+    if not bool(prior_cfg.get("enabled", False)):
+        return {"enabled": False}
+    metric = str(prior_cfg.get("metric", "macro_f1")).lower()
+    normalization = str(prior_cfg.get("normalization", "best")).lower()
+    min_value = float(prior_cfg.get("min_value", 0.5))
+    if metric not in {"macro_f1", "accuracy", "inverse_brier"}:
+        raise ValueError("fusion.branch_competence_prior.metric must be macro_f1, accuracy, or inverse_brier")
+    if normalization not in {"best", "direct"}:
+        raise ValueError("fusion.branch_competence_prior.normalization must be best or direct")
+    if not math.isfinite(min_value) or not 0.0 <= min_value <= 1.0:
+        raise ValueError("fusion.branch_competence_prior.min_value must be within [0, 1]")
+
+    scores: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for branch in BRANCH_EVAL_LOGIT_KEYS:
+        labels: list[int] = []
+        preds: list[int] = []
+        probs: list[float] = []
+        for row in rows:
+            try:
+                label = int(row["label"])
+                pred = int(row[f"{branch}_pred"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            labels.append(label)
+            preds.append(pred)
+            prob = _finite_row_float(row, f"{branch}_prob")
+            if prob is not None:
+                probs.append(min(1.0, max(0.0, prob)))
+        counts[branch] = len(labels)
+        if not labels:
+            scores[branch] = 0.0
+            continue
+        if metric == "accuracy":
+            scores[branch] = float(np.mean(np.asarray(labels) == np.asarray(preds)))
+        elif metric == "inverse_brier":
+            if len(probs) != len(labels):
+                raise ValueError(
+                    f"branch {branch} is missing probabilities required for inverse_brier competence"
+                )
+            y = np.asarray(labels, dtype=np.float64)
+            p = np.asarray(probs, dtype=np.float64)
+            scores[branch] = float(1.0 - np.mean((p - y) ** 2))
+        else:
+            scores[branch] = float(f1_score(labels, preds, average="macro", zero_division=0))
+
+    max_score = max(scores.values()) if scores else 0.0
+    prior: dict[str, float] = {}
+    for branch, score in scores.items():
+        value = score
+        if normalization == "best" and max_score > 0.0:
+            value = score / max_score
+        prior[branch] = float(min(1.0, max(min_value, value)))
+    values = [prior[name] for name in BRANCH_EVAL_LOGIT_KEYS]
+    return {
+        "enabled": True,
+        "metric": metric,
+        "normalization": normalization,
+        "min_value": min_value,
+        "scores": scores,
+        "counts": counts,
+        "prior": prior,
+        "values": values,
+    }
+
+
+def apply_branch_competence_prior(model, summary: dict[str, Any]) -> None:
+    if not bool((summary or {}).get("enabled", False)):
+        return
+    values = summary.get("values")
+    if values is None:
+        prior = summary.get("prior") or {}
+        values = [prior[name] for name in BRANCH_EVAL_LOGIT_KEYS]
+    model.discount_fusion.set_branch_competence_prior(values, enabled=True)
+
 
 def _selective_metrics(
     labels: list[int],
@@ -1461,6 +1577,7 @@ def run(cfg: dict) -> dict[str, Any]:
         bool(train_cfg.get("deterministic", False)),
         strict=bool(train_cfg.get("strict_deterministic", False)),
     )
+    configure_multiprocessing_sharing(cfg)
     device = select_device(str(train_cfg.get("device", "auto")))
     use_amp = bool(train_cfg.get("use_amp", True))
     run_test = bool(eval_cfg.get("run_test", True))
@@ -1582,6 +1699,15 @@ def run(cfg: dict) -> dict[str, Any]:
             allow_mismatch=bool(eval_cfg.get("allow_checkpoint_config_mismatch", False)),
         )
         model.load_state_dict(ckpt["model"])
+        branch_competence_summary = dict(ckpt.get("branch_competence_prior") or {"enabled": False})
+        apply_branch_competence_prior(model, branch_competence_summary)
+        if (
+            bool(((cfg.get("fusion", {}) or {}).get("branch_competence_prior", {}) or {}).get("enabled", False))
+            and not bool(branch_competence_summary.get("enabled", False))
+        ):
+            logger.warning(
+                "fusion.branch_competence_prior.enabled=true but checkpoint has no fitted prior; using neutral priors"
+            )
         best_score = float(ckpt.get("checkpoint_score", -1.0))
         best_val_f1 = float((ckpt.get("val") or {}).get("macro_f1", -1.0))
         checkpoint_metric_name = str(ckpt.get("checkpoint_metric", "loaded_checkpoint"))
@@ -1692,6 +1818,29 @@ def run(cfg: dict) -> dict[str, Any]:
         dump_rows=True,
     )
     enforce_failed_ratio(val_calibration_metrics, cfg, "val_calibration")
+    if not eval_only:
+        branch_competence_summary = estimate_branch_competence_prior(
+            val_calibration_rows,
+            cfg,
+        )
+        apply_branch_competence_prior(model, branch_competence_summary)
+        if bool(branch_competence_summary.get("enabled", False)):
+            logger.info(
+                "branch_competence_prior %s",
+                " ".join(
+                    f"{name}={value:.4f}"
+                    for name, value in branch_competence_summary["prior"].items()
+                ),
+            )
+            val_calibration_metrics, val_calibration_rows = evaluate(
+                model,
+                val_calibration_loader,
+                device,
+                use_amp,
+                "val_calibration",
+                dump_rows=True,
+            )
+            enforce_failed_ratio(val_calibration_metrics, cfg, "val_calibration")
     if not eval_only or refit_rejection_threshold:
         rejection_threshold = fit_rejection_threshold(
             val_calibration_rows, cfg.get("selective_prediction", {}) or {}
@@ -1700,6 +1849,7 @@ def run(cfg: dict) -> dict[str, Any]:
             ckpt = torch.load(best_path, map_location="cpu", weights_only=True)
             ckpt["model"] = model.state_dict()
             ckpt["calibration"] = calibration_summary
+            ckpt["branch_competence_prior"] = branch_competence_summary
             ckpt["rejection_threshold"] = rejection_threshold
             ckpt["validation_split"] = validation_split_summary
             torch.save(ckpt, best_path)
@@ -1852,6 +2002,7 @@ def run(cfg: dict) -> dict[str, Any]:
         "checkpoint_metric": checkpoint_metric_name,
         "tuning_robust_composite_score": tuning_robust_composite_score,
         "calibration": calibration_summary,
+        "branch_competence_prior": branch_competence_summary,
         "rejection_threshold": rejection_threshold,
         "val": val_metrics,
         "val_selection": val_metrics,

@@ -93,6 +93,7 @@ def test_lean_full_method_excludes_semantic_interaction_modules():
     assert cfg["fusion"]["mode"] == "discount_probability"
     assert cfg["fusion"]["reliability_calibration"]["enabled"] is True
     assert cfg["fusion"]["probability_calibration"]["enabled"] is True
+    assert cfg["fusion"]["reliability_discount_exponent"] == 0.5
     assert cfg["loss"]["reliability_weighted_aux"] is True
     assert cfg["selective_prediction"]["enabled"] is True
     assert cfg["selective_prediction"]["target_coverage"] == 0.95
@@ -116,6 +117,20 @@ def test_module_ablations_match_lean_paper_claims():
     assert no_i3["selective_prediction"]["enabled"] is False
     assert no_i3["fusion"]["mode"] == "discount_probability"
 
+
+def test_reliability_sensitivity_configs_have_distinct_meanings():
+    full = _resolved(ROOT / "observable_reliability_discount_fusion.yaml")
+    assert full["fusion"]["use_reliability_discount"] is True
+    assert full["fusion"]["reliability_discount_exponent"] == 0.5
+
+    exp_025 = _resolved(ROOT / "sensitivity/i1/reliability_exponent_0_25.yaml")
+    assert exp_025["fusion"]["use_reliability_discount"] is True
+    assert exp_025["fusion"]["reliability_discount_exponent"] == 0.25
+
+    acceptance_only = _resolved(ROOT / "sensitivity/i1/reliability_acceptance_only.yaml")
+    assert acceptance_only["fusion"]["use_reliability_discount"] is False
+    assert acceptance_only["fusion"]["use_reliability_acceptance"] is True
+    assert acceptance_only["fusion"]["reliability_calibration"]["enabled"] is True
 
 def test_mechanism_group_contains_only_lean_mechanism_splits():
     paths = run.resolve_targets("mechanism")

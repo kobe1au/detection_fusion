@@ -224,3 +224,88 @@ def test_fallback_preserves_missing_branch_zero_weight():
     assert outputs["fallback_used"].item() == 1.0
     assert outputs["fusion_weight_api"].item() == 0.0
     assert torch.allclose(outputs["fusion_weights"].sum(dim=-1), torch.ones(1))
+
+
+def test_reliability_discount_exponent_tempers_fusion_discount():
+    evidence = _evidence(1)
+    evidence[:, EvidenceIndex.API_INTEGRITY] = 0.25
+    common = {
+        "use_support_discount": False,
+        "use_conflict_discount": False,
+        "use_confidence_proxy": False,
+    }
+
+    strict = _run(evidence, config={**common, "reliability_discount_exponent": 1.0})
+    tempered = _run(evidence, config={**common, "reliability_discount_exponent": 0.5})
+
+    assert torch.allclose(strict["discount_api"], torch.tensor([0.25]))
+    assert torch.allclose(tempered["discount_api"], torch.tensor([0.5]))
+    assert tempered["discount_api"].item() > strict["discount_api"].item()
+    assert tempered["reliability_discount_exponent"].item() == 0.5
+
+
+def test_reliability_can_drive_acceptance_without_fusion_discount():
+    evidence = _evidence(1)
+    evidence[:, EvidenceIndex.API_INTEGRITY] = 0.25
+    evidence[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.25
+    evidence[:, EvidenceIndex.MANIFEST_INTEGRITY] = 0.25
+    evidence[:, EvidenceIndex.CODE_INTEGRITY] = 0.25
+
+    outputs = _run(
+        evidence,
+        config={
+            "use_reliability_discount": False,
+            "use_reliability_acceptance": True,
+            "use_support_discount": False,
+            "use_conflict_discount": False,
+            "use_confidence_proxy": False,
+        },
+    )
+
+    assert torch.allclose(outputs["fusion_weights"], torch.full((1, 4), 0.25))
+    assert outputs["total_reliability"].item() == 0.25
+    assert outputs["reliability_discount_active"].item() == 0.0
+    assert outputs["reliability_acceptance_active"].item() == 1.0
+
+
+def test_branch_competence_prior_scales_fusion_weights_after_fit():
+    fusion = DiscountProbabilityFusion(
+        {
+            "branch_competence_prior": {"enabled": True},
+            "use_reliability_discount": False,
+            "use_support_discount": False,
+            "use_conflict_discount": False,
+            "use_confidence_proxy": False,
+        }
+    )
+    fusion.set_branch_competence_prior([1.0, 0.5, 0.5, 0.5])
+
+    outputs = fusion(*_logits(1), _evidence(1))
+
+    assert outputs["branch_competence_active"].item() == 1.0
+    assert outputs["branch_competence_prior_api"].item() == 1.0
+    assert torch.allclose(
+        outputs["fusion_weights"],
+        torch.tensor([[0.4, 0.2, 0.2, 0.2]]),
+        atol=1e-6,
+    )
+
+
+def test_weight_sharpening_gamma_emphasizes_larger_discounts():
+    base_cfg = {
+        "branch_competence_prior": {"enabled": True},
+        "use_reliability_discount": False,
+        "use_support_discount": False,
+        "use_conflict_discount": False,
+        "use_confidence_proxy": False,
+    }
+    flat = DiscountProbabilityFusion(base_cfg)
+    flat.set_branch_competence_prior([1.0, 0.5, 0.5, 0.5])
+    sharp = DiscountProbabilityFusion({**base_cfg, "weight_sharpening_gamma": 2.0})
+    sharp.set_branch_competence_prior([1.0, 0.5, 0.5, 0.5])
+
+    flat_out = flat(*_logits(1), _evidence(1))
+    sharp_out = sharp(*_logits(1), _evidence(1))
+
+    assert sharp_out["fusion_weight_api"].item() > flat_out["fusion_weight_api"].item()
+    assert sharp_out["weight_sharpening_gamma"].item() == 2.0

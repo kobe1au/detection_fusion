@@ -25,6 +25,8 @@ ALIASES = {
     "no_i1": "ablations/modules/no_i1_observable_reliability.yaml",
     "rel_only_discount": "ablations/modules/reliability_only_discount_fusion.yaml",
     "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
+    "rel_exp_025": "sensitivity/i1/reliability_exponent_0_25.yaml",
+    "rel_acceptance_only": "sensitivity/i1/reliability_acceptance_only.yaml",
 }
 
 BASELINES = [
@@ -37,9 +39,12 @@ BASELINES = [
 ]
 
 MODULE_ABLATIONS = [
+    "seeds/seed_42.yaml",
     "ablations/modules/no_i1_observable_reliability.yaml",
     "ablations/modules/reliability_only_discount_fusion.yaml",
     "ablations/modules/no_i3_selective_rejection.yaml",
+    "seeds/seed_2024.yaml",
+    "seeds/seed_3407.yaml",
 ]
 
 MECHANISM_ABLATIONS = [
@@ -59,6 +64,8 @@ TRAINING_ABLATIONS = [
 SENSITIVITY = [
     "sensitivity/i1/reliability_hidden_dim_8.yaml",
     "sensitivity/i1/reliability_hidden_dim_32.yaml",
+    "sensitivity/i1/reliability_exponent_0_25.yaml",
+    "sensitivity/i1/reliability_acceptance_only.yaml",
     "sensitivity/i2/conflict_min_0_1.yaml",
     "sensitivity/i2/conflict_min_0_2.yaml",
     "sensitivity/i3/acceptance_min.yaml",

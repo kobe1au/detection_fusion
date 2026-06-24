@@ -1,4 +1,4 @@
-﻿class ArchitectureConstants:
+class ArchitectureConstants:
     HEAD_HIDDEN_DIMS = [256, 128]
     HEAD_DROPOUT_RATES = [0.3, 0.2]
     HEAD_DROPOUT = 0.2
@@ -144,6 +144,14 @@ class TriModalConfigDefaults:
             "detach_confidence_proxy": True,
             "use_confidence_proxy": True,
             "use_reliability_discount": True,
+            "reliability_discount_exponent": 0.5,
+            "branch_competence_prior": {
+                "enabled": True,
+                "metric": "macro_f1",
+                "normalization": "best",
+                "min_value": 0.5,
+            },
+            "weight_sharpening_gamma": 1.0,
             "use_support_discount": True,
             "use_conflict_discount": True,
             "use_hard_alive_mask": True,

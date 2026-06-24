@@ -91,6 +91,16 @@ class DiscountProbabilityFusion(nn.Module):
         if not bool(self.config.get("force_fp32_decision", True)):
             raise ValueError("fusion.force_fp32_decision=false is unsupported")
         self.register_buffer("_calibration_active", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer(
+            "_branch_competence_active",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_branch_competence_prior",
+            torch.ones(len(BRANCH_NAMES), dtype=torch.float32),
+            persistent=False,
+        )
         reliability_cfg = self.config.get("reliability_calibration", {}) or {}
         self.reliability_calibrator = (
             MonotonicReliabilityCalibrator(
@@ -135,6 +145,31 @@ class DiscountProbabilityFusion(nn.Module):
 
     def set_calibration_active(self, enabled: bool) -> None:
         self._calibration_active.fill_(bool(enabled))
+
+    @property
+    def branch_competence_active(self) -> bool:
+        return bool(self._branch_competence_active.item())
+
+    def set_branch_competence_prior(self, values, enabled: bool = True) -> None:
+        tensor = torch.as_tensor(
+            values,
+            dtype=self._branch_competence_prior.dtype,
+            device=self._branch_competence_prior.device,
+        ).view(-1)
+        if tensor.numel() != len(BRANCH_NAMES):
+            raise ValueError(
+                f"branch competence prior expects {len(BRANCH_NAMES)} values, got {tensor.numel()}"
+            )
+        if not torch.isfinite(tensor).all():
+            raise ValueError("branch competence prior contains non-finite values")
+        if bool((tensor < 0.0).any()) or bool((tensor > 1.0).any()):
+            raise ValueError("branch competence prior values must be within [0, 1]")
+        self._branch_competence_prior.copy_(tensor.clamp(0.0, 1.0))
+        self._branch_competence_active.fill_(bool(enabled))
+
+    def branch_competence_prior_values(self) -> dict[str, float]:
+        values = self._branch_competence_prior.detach().cpu().tolist()
+        return {name: float(value) for name, value in zip(BRANCH_NAMES, values)}
 
     def _temperature(self, name: str, confidence_cfg: dict) -> float | torch.Tensor:
         if self.temperature_parameters is None or not self.calibration_active:
@@ -187,8 +222,21 @@ class DiscountProbabilityFusion(nn.Module):
         use_hard_alive = bool(cfg.get("use_hard_alive_mask", True))
         use_confidence = bool(cfg.get("use_confidence_proxy", True))
         use_reliability = bool(cfg.get("use_reliability_discount", True))
+        use_reliability_acceptance = bool(
+            cfg.get("use_reliability_acceptance", use_reliability)
+        )
+        reliability_exponent = float(cfg.get("reliability_discount_exponent", 1.0))
+        if not math.isfinite(reliability_exponent) or reliability_exponent <= 0.0:
+            raise ValueError(
+                "fusion.reliability_discount_exponent must be finite and positive"
+            )
         use_conflict = bool(cfg.get("use_conflict_discount", True))
         use_support = bool(cfg.get("use_support_discount", True))
+        competence_cfg = cfg.get("branch_competence_prior", {}) or {}
+        use_competence = bool(competence_cfg.get("enabled", False))
+        weight_gamma = float(cfg.get("weight_sharpening_gamma", 1.0))
+        if not math.isfinite(weight_gamma) or weight_gamma <= 0.0:
+            raise ValueError("fusion.weight_sharpening_gamma must be finite and positive")
 
         confidence_cfg = cfg.get("confidence_proxy", {}) or {}
         logits_by_branch = (api_logits, graph_logits, manifest_logits, joint_logits)
@@ -328,16 +376,41 @@ class DiscountProbabilityFusion(nn.Module):
                 manifest_integrity,
                 mean_alive_integrity,
             ]
-        if not use_reliability:
-            base_reliability = [
+        estimated_reliability = [
+            value.clamp(0.0, 1.0) for value in base_reliability
+        ]
+        if use_reliability:
+            reliability_for_fusion = [
+                value.pow(reliability_exponent).clamp(0.0, 1.0)
+                for value in estimated_reliability
+            ]
+        else:
+            reliability_for_fusion = [
                 torch.ones_like(api_integrity) for _ in BRANCH_NAMES
             ]
+        if use_reliability_acceptance:
+            reliability_for_acceptance = estimated_reliability
+        else:
+            reliability_for_acceptance = [
+                torch.ones_like(api_integrity) for _ in BRANCH_NAMES
+            ]
+        if use_competence and self.branch_competence_active:
+            competence_prior = self._branch_competence_prior.to(
+                device=api_integrity.device,
+                dtype=api_integrity.dtype,
+            )
+        else:
+            competence_prior = torch.ones(
+                len(BRANCH_NAMES),
+                device=api_integrity.device,
+                dtype=api_integrity.dtype,
+            )
         raw_discounts = torch.stack(
             [
-                base_reliability[0] * code_anchor_factor * code_conflict_factor * confidence_factors[0],
-                base_reliability[1] * code_anchor_factor * code_conflict_factor * confidence_factors[1],
-                base_reliability[2] * manifest_support_factor * manifest_conflict_factor * confidence_factors[2],
-                base_reliability[3] * joint_support_factor * joint_conflict_factor * confidence_factors[3],
+                competence_prior[0] * reliability_for_fusion[0] * code_anchor_factor * code_conflict_factor * confidence_factors[0],
+                competence_prior[1] * reliability_for_fusion[1] * code_anchor_factor * code_conflict_factor * confidence_factors[1],
+                competence_prior[2] * reliability_for_fusion[2] * manifest_support_factor * manifest_conflict_factor * confidence_factors[2],
+                competence_prior[3] * reliability_for_fusion[3] * joint_support_factor * joint_conflict_factor * confidence_factors[3],
             ],
             dim=-1,
         )
@@ -346,6 +419,8 @@ class DiscountProbabilityFusion(nn.Module):
         discounts_for_weight = discounts.detach() if detach_discount else discounts
         if use_hard_alive:
             discounts_for_weight = discounts_for_weight * alive_mask.to(discounts_for_weight.dtype)
+        if weight_gamma != 1.0:
+            discounts_for_weight = discounts_for_weight.clamp_min(0.0).pow(weight_gamma)
 
         valid_sum = discounts_for_weight.sum(dim=-1, keepdim=True)
         fallback_used = valid_sum <= eps
@@ -372,7 +447,7 @@ class DiscountProbabilityFusion(nn.Module):
         final_prob = final_prob / final_prob.sum(dim=-1, keepdim=True).clamp_min(eps)
         final_logits = torch.log(final_prob.clamp_min(eps))
         final_proxy = compute_branch_confidence_proxy(final_logits, temperature=1.0, eps=eps)
-        reliability_matrix = torch.stack(base_reliability, dim=-1)
+        reliability_matrix = torch.stack(reliability_for_acceptance, dim=-1)
         total_reliability = (fusion_weights * reliability_matrix).sum(dim=-1).clamp(0.0, 1.0)
         effective_conflict = (
             torch.maximum(
@@ -434,6 +509,36 @@ class DiscountProbabilityFusion(nn.Module):
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             ),
+            "reliability_discount_active": torch.full(
+                (final_logits.size(0),),
+                float(use_reliability),
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
+            "reliability_acceptance_active": torch.full(
+                (final_logits.size(0),),
+                float(use_reliability_acceptance),
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
+            "reliability_discount_exponent": torch.full(
+                (final_logits.size(0),),
+                reliability_exponent,
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
+            "branch_competence_active": torch.full(
+                (final_logits.size(0),),
+                float(use_competence and self.branch_competence_active),
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
+            "weight_sharpening_gamma": torch.full(
+                (final_logits.size(0),),
+                weight_gamma,
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
             "joint_conflict_factor": joint_conflict_factor,
             "api_graph_support_applicable": api_graph_applicable.to(dtype=discounts.dtype),
             "manifest_code_conflict_applicable": manifest_code_applicable.to(dtype=discounts.dtype),
@@ -443,6 +548,12 @@ class DiscountProbabilityFusion(nn.Module):
         for index, name in enumerate(BRANCH_NAMES):
             outputs[f"discount_{name}"] = discounts[:, index]
             outputs[f"fusion_weight_{name}"] = fusion_weights[:, index]
+            outputs[f"branch_competence_prior_{name}"] = torch.full(
+                (final_logits.size(0),),
+                float(competence_prior[index].detach().cpu().item()),
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            )
             outputs[f"calibrated_log_prob_{name}"] = torch.log(
                 proxies[name]["prob"].clamp_min(eps)
             )

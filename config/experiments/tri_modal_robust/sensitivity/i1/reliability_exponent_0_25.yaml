@@ -1,0 +1,11 @@
+﻿defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+method:
+  name: sensitivity_reliability_exponent_0_25
+
+train:
+  exp_name: sensitivity_reliability_exponent_0_25
+
+fusion:
+  reliability_discount_exponent: 0.25

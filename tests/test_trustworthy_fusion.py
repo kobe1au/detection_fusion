@@ -16,6 +16,7 @@ from fusion.train import (
     _selective_ranking_metrics,
     _write_metrics_json,
     compute_branch_reliability_metrics,
+    estimate_branch_competence_prior,
     fit_posthoc_calibration,
     fit_rejection_threshold,
     split_validation_dataset,
@@ -586,3 +587,33 @@ def test_metrics_json_replaces_nonfinite_values_with_null(tmp_path):
     assert "NaN" not in raw
     assert "Infinity" not in raw
     assert json.loads(raw) == {"auc": None, "nested": [None, 1.0]}
+
+
+
+def test_estimate_branch_competence_prior_uses_validation_branch_macro_f1():
+    rows = [
+        {"label": 0, "api_pred": 0, "graph_pred": 0, "manifest_pred": 1, "joint_pred": 0, "api_prob": 0.1, "graph_prob": 0.2, "manifest_prob": 0.9, "joint_prob": 0.1},
+        {"label": 1, "api_pred": 1, "graph_pred": 0, "manifest_pred": 0, "joint_pred": 1, "api_prob": 0.9, "graph_prob": 0.4, "manifest_prob": 0.2, "joint_prob": 0.8},
+        {"label": 0, "api_pred": 0, "graph_pred": 0, "manifest_pred": 0, "joint_pred": 0, "api_prob": 0.2, "graph_prob": 0.3, "manifest_prob": 0.4, "joint_prob": 0.2},
+        {"label": 1, "api_pred": 1, "graph_pred": 0, "manifest_pred": 0, "joint_pred": 1, "api_prob": 0.8, "graph_prob": 0.2, "manifest_prob": 0.3, "joint_prob": 0.9},
+    ]
+    summary = estimate_branch_competence_prior(
+        rows,
+        {
+            "fusion": {
+                "branch_competence_prior": {
+                    "enabled": True,
+                    "metric": "macro_f1",
+                    "normalization": "best",
+                    "min_value": 0.5,
+                }
+            }
+        },
+    )
+
+    assert summary["enabled"] is True
+    assert summary["prior"]["api"] == pytest.approx(1.0)
+    assert summary["prior"]["joint"] == pytest.approx(1.0)
+    assert summary["prior"]["manifest"] < summary["prior"]["api"]
+    assert summary["prior"]["graph"] == pytest.approx(0.5)
+    assert summary["counts"] == {"api": 4, "graph": 4, "manifest": 4, "joint": 4}

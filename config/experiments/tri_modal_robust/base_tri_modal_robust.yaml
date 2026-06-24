@@ -1,4 +1,4 @@
-﻿log_level: INFO
+log_level: INFO
 
 data:
   root: ""
@@ -24,6 +24,13 @@ train:
 # I1: observable reliability estimation.
 fusion:
   use_reliability_discount: true
+  reliability_discount_exponent: 0.5
+  branch_competence_prior:
+    enabled: true
+    metric: macro_f1
+    normalization: best
+    min_value: 0.5
+  weight_sharpening_gamma: 1.0
   reliability_calibration:
     enabled: true
     hidden_dim: 16
