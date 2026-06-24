@@ -1,5 +1,5 @@
-﻿defaults:
-  - ../../observable_reliability_discount_fusion.yaml
+defaults:
+  - ../../evidential_trusted_fusion.yaml
 
 method:
   name: sensitivity_reliability_exponent_0_25

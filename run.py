@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import os
@@ -13,35 +13,20 @@ os.chdir(ROOT)
 PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
 CONFIG_DIR = Path("config/experiments/tri_modal_robust")
 
-FINAL = "observable_reliability_discount_fusion.yaml"
+# Main method of the thesis: the evidential trusted-fusion pipeline
+# (I1 dual-source reliability, I2 conflict-aware Yager fusion, I3 conformal).
+#
+# The runnable "final" entry is seed_42 rather than the bare template, because
+# decision-only configs (I3 coverage variants and external evals) reuse the
+# seed-42 checkpoint path. Keeping seed_42 first makes one-shot paper groups
+# executable from a clean results directory.
+FINAL_TEMPLATE = "evidential_trusted_fusion.yaml"
+PRIMARY_SEED = "seeds/seed_42.yaml"
+FINAL = PRIMARY_SEED
 
-EVIDENTIAL_MAIN = "evidential_trusted_fusion.yaml"
-
-EVIDENTIAL_ABLATIONS = [
-    "ablations/i1/no_edl_reliability_source.yaml",
-    "ablations/i2/combination_dempster.yaml",
-    "ablations/i2/combination_cumulative.yaml",
-    "ablations/i3/marginal_conformal.yaml",
-]
-
-ALIASES = {
-    "final": FINAL,
-    "evidential": "evidential_trusted_fusion.yaml",
-    "api": "baselines/api_only.yaml",
-    "graph": "baselines/graph_only.yaml",
-    "manifest": "baselines/manifest_only.yaml",
-    "concat": "baselines/tri_modal_concat.yaml",
-    "late": "baselines/fixed_logit_fusion.yaml",
-    "no_i1": "ablations/modules/no_i1_observable_reliability.yaml",
-    "rel_only_discount": "ablations/modules/reliability_only_discount_fusion.yaml",
-    "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
-    "rel_exp_025": "sensitivity/i1/reliability_exponent_0_25.yaml",
-    "rel_acceptance_only": "sensitivity/i1/reliability_acceptance_only.yaml",
-    "no_edl": "ablations/i1/no_edl_reliability_source.yaml",
-    "dempster": "ablations/i2/combination_dempster.yaml",
-    "cumulative": "ablations/i2/combination_cumulative.yaml",
-    "marginal_conformal": "ablations/i3/marginal_conformal.yaml",
-}
+# The previous lean linear discount-fusion method, kept as a strong prior-method
+# baseline (no EDL, no subjective-logic combination, no conformal).
+PRIOR_METHOD = "observable_reliability_discount_fusion.yaml"
 
 BASELINES = [
     "baselines/api_only.yaml",
@@ -50,42 +35,45 @@ BASELINES = [
     "baselines/api_graph_concat.yaml",
     "baselines/tri_modal_concat.yaml",
     "baselines/fixed_logit_fusion.yaml",
+    PRIOR_METHOD,
 ]
 
+# Remove a whole innovation from the main method.
 MODULE_ABLATIONS = [
-    "seeds/seed_42.yaml",
-    "ablations/modules/no_i1_observable_reliability.yaml",
-    "ablations/modules/reliability_only_discount_fusion.yaml",
+    "ablations/modules/no_i1_reliability.yaml",
     "ablations/modules/no_i3_selective_rejection.yaml",
-    "seeds/seed_2024.yaml",
-    "seeds/seed_3407.yaml",
 ]
 
-MECHANISM_ABLATIONS = [
-    "ablations/modules/no_i1_observable_reliability.yaml",
-    "ablations/i2/no_support_conflict_discount.yaml",
-    "ablations/i2/no_confidence_proxy_discount.yaml",
-    "ablations/i2/no_hard_alive_mask.yaml",
-    "ablations/i3/no_probability_calibration.yaml",
-    "ablations/modules/no_i3_selective_rejection.yaml",
+# Vary the mechanism within each innovation.
+I1_ABLATIONS = ["ablations/i1/no_edl_reliability_source.yaml"]
+I2_ABLATIONS = [
+    "ablations/i2/combination_dempster.yaml",
+    "ablations/i2/combination_cumulative.yaml",
+    "ablations/i2/combination_log_pool.yaml",
 ]
+I3_ABLATIONS = [
+    "ablations/i3/marginal_conformal.yaml",
+    "ablations/i3/threshold_rejection.yaml",
+]
+MECHANISM_ABLATIONS = [*I1_ABLATIONS, *I2_ABLATIONS, *I3_ABLATIONS]
 
 TRAINING_ABLATIONS = [
     "ablations/training/no_train_augmentation.yaml",
     "ablations/training/no_branch_auxiliary.yaml",
+    "ablations/training/no_edl_class_weight.yaml",
 ]
 
 SENSITIVITY = [
+    "sensitivity/i1/evidential_weight_0_05.yaml",
+    "sensitivity/i1/evidential_weight_0_2.yaml",
+    "sensitivity/i1/anneal_epochs_5.yaml",
+    "sensitivity/i1/anneal_epochs_20.yaml",
     "sensitivity/i1/reliability_hidden_dim_8.yaml",
     "sensitivity/i1/reliability_hidden_dim_32.yaml",
-    "sensitivity/i1/reliability_exponent_0_25.yaml",
-    "sensitivity/i1/reliability_acceptance_only.yaml",
-    "sensitivity/i2/conflict_min_0_1.yaml",
-    "sensitivity/i2/conflict_min_0_2.yaml",
-    "sensitivity/i2/weight_sharpening_gamma_1_5.yaml",
-    "sensitivity/i2/weight_sharpening_gamma_2_0.yaml",
-    "sensitivity/i3/acceptance_min.yaml",
-    "sensitivity/i3/coverage_80.yaml",
+    "sensitivity/i2/reliability_exponent_0_25.yaml",
+    "sensitivity/i2/reliability_exponent_1_0.yaml",
+    "sensitivity/i3/coverage_90.yaml",
+    "sensitivity/i3/coverage_99.yaml",
 ]
 
 EXTERNAL_EVAL = [
@@ -96,39 +84,72 @@ EXTERNAL_EVAL = [
 ]
 
 SEEDS = [
-    "seeds/seed_42.yaml",
+    PRIMARY_SEED,
     "seeds/seed_2024.yaml",
     "seeds/seed_3407.yaml",
 ]
 
+ALIASES = {
+    "final": FINAL,
+    "evidential": FINAL,
+    "evidential_template": FINAL_TEMPLATE,
+    "prior": PRIOR_METHOD,
+    "linear": PRIOR_METHOD,
+    "api": "baselines/api_only.yaml",
+    "graph": "baselines/graph_only.yaml",
+    "manifest": "baselines/manifest_only.yaml",
+    "concat": "baselines/tri_modal_concat.yaml",
+    "late": "baselines/fixed_logit_fusion.yaml",
+    "no_i1": "ablations/modules/no_i1_reliability.yaml",
+    "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
+    "no_edl": "ablations/i1/no_edl_reliability_source.yaml",
+    "dempster": "ablations/i2/combination_dempster.yaml",
+    "cumulative": "ablations/i2/combination_cumulative.yaml",
+    "log_pool": "ablations/i2/combination_log_pool.yaml",
+    "marginal_conformal": "ablations/i3/marginal_conformal.yaml",
+    "threshold_rejection": "ablations/i3/threshold_rejection.yaml",
+}
+
 GROUPS = {
     "main": [FINAL, *BASELINES],
-    "evidential": [EVIDENTIAL_MAIN, *EVIDENTIAL_ABLATIONS],
-    "evidential_ablation": EVIDENTIAL_ABLATIONS,
     "baselines": BASELINES,
     "module": MODULE_ABLATIONS,
     "mechanism": MECHANISM_ABLATIONS,
+    "i1": I1_ABLATIONS,
+    "i2": I2_ABLATIONS,
+    "i3": [PRIMARY_SEED, *I3_ABLATIONS],
     "training_ablation": TRAINING_ABLATIONS,
     "sensitivity": SENSITIVITY,
-    "external": EXTERNAL_EVAL,
-    "obfuscapk": EXTERNAL_EVAL,
+    "sensitivity_with_seed": [PRIMARY_SEED, *SENSITIVITY],
+    "external": [PRIMARY_SEED, *EXTERNAL_EVAL],
+    "obfuscapk": [PRIMARY_SEED, *EXTERNAL_EVAL],
     "seed": SEEDS,
     "full": SEEDS,
-    "paper": [*BASELINES, *MODULE_ABLATIONS, *TRAINING_ABLATIONS, *SEEDS],
-    "paper_main": [*BASELINES, *MODULE_ABLATIONS, *SEEDS],
-    "paper_mechanism": MECHANISM_ABLATIONS,
-    "paper_external": EXTERNAL_EVAL,
-    "paper_all": [
+    # Paper plans (evidential method is the protagonist).
+    "paper_main": [*SEEDS, *BASELINES],
+    "paper_ablation": [
+        PRIMARY_SEED,
+        *MODULE_ABLATIONS,
+        *MECHANISM_ABLATIONS,
+        *TRAINING_ABLATIONS,
+    ],
+    "paper_external": [PRIMARY_SEED, *EXTERNAL_EVAL],
+    "paper_evidential": [
+        *SEEDS,
+        *BASELINES,
+        *MODULE_ABLATIONS,
+        *MECHANISM_ABLATIONS,
+    ],
+    "paper_evidential_all": [
+        *SEEDS,
         *BASELINES,
         *MODULE_ABLATIONS,
         *MECHANISM_ABLATIONS,
         *TRAINING_ABLATIONS,
-        *SEEDS,
         *SENSITIVITY,
         *EXTERNAL_EVAL,
     ],
 }
-
 
 def available_configs() -> dict[str, Path]:
     configs: dict[str, Path] = {}

@@ -1,9 +1,9 @@
 defaults:
-  - ../observable_reliability_discount_fusion.yaml
+  - ../evidential_trusted_fusion.yaml
 
 method:
-  name: final_seed_3407
+  name: evidential_seed_3407
 
 train:
-  exp_name: final_seed_3407
+  exp_name: evidential_seed_3407
   seed: 3407

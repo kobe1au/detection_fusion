@@ -1,5 +1,5 @@
 defaults:
-  - ../../observable_reliability_discount_fusion.yaml
+  - ../../evidential_trusted_fusion.yaml
 
 method:
   name: training_no_train_augmentation

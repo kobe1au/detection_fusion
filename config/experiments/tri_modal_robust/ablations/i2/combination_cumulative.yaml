@@ -1,8 +1,7 @@
 defaults:
   - ../../evidential_trusted_fusion.yaml
 
-# I2 ablation: Jøsang cumulative belief fusion (associative, accumulates
-# evidence). An alternative conflict-tolerant rule for comparison with Yager.
+# I2 mechanism: Josang cumulative belief fusion (associative, accumulates evidence).
 method:
   name: ablation_combination_cumulative
 

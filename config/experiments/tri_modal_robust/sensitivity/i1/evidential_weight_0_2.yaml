@@ -1,0 +1,11 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: sensitivity_evidential_weight_0_2
+
+train:
+  exp_name: sensitivity_evidential_weight_0_2
+
+loss:
+  evidential_loss_weight: 0.2

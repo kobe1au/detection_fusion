@@ -29,7 +29,9 @@
       "Bash(D:/IDE/miniconda/envs/malware/python.exe -)",
       "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_experiment_configs.py -q)",
       "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_evidential.py::test_full_evidential_pipeline_forward_loss_backward -q)",
-      "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_conformal_selective.py tests/test_evidential.py -q)"
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_conformal_selective.py tests/test_evidential.py -q)",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe scripts/_gen_evidential_configs.py)",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe run.py paper_evidential_all --dry-run)"
     ]
   }
 }

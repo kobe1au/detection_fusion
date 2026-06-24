@@ -7,7 +7,7 @@ method:
 eval:
   eval_only: true
   output_name: obfuscapk_code_eval
-  checkpoint_path: results/tri_modal_robust_new/final_seed_42/42/best_tri_modal_robust.pt
+  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
   refit_rejection_threshold: true
   run_test: false
   run_robust_test: false

@@ -1,0 +1,12 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: sensitivity_anneal_epochs_5
+
+train:
+  exp_name: sensitivity_anneal_epochs_5
+
+loss:
+  evidential:
+    anneal_epochs: 5

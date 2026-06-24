@@ -19,24 +19,21 @@ fusion:
     use_evidential_uncertainty: true   # I1 second source feeds the calibrator
   # The evidential path does not use temperature scaling or the entropy/margin
   # confidence proxy: EDL owns uncertainty, conformal owns rejection calibration.
-  # Disable the legacy post-hoc temperature calibration so it is not silently
-  # "enabled but inert" on this path.
   probability_calibration:
     enabled: false
     weight: 0.0
   use_confidence_proxy: false
 
 loss:
-  # EDL Bayes-risk (Brier) + annealed KL on the api/graph/manifest evidence heads.
   evidential_loss_weight: 0.1
   evidential:
     anneal_epochs: 10
     evidence_activation: softplus
     branches: [api, graph, manifest]
-    class_weight: balanced       # per-batch inverse-frequency; guards EDL against imbalance
+    class_weight: balanced
 
 selective_prediction:
   enabled: true
-  mode: conformal               # class-conditional split conformal (Mondrian)
+  mode: conformal
   class_conditional: true
   target_coverage: 0.95

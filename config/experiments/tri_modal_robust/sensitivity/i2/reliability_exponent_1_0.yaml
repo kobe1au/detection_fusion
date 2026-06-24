@@ -1,0 +1,11 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: sensitivity_reliability_exponent_1_0
+
+train:
+  exp_name: sensitivity_reliability_exponent_1_0
+
+fusion:
+  reliability_discount_exponent: 1.0

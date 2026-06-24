@@ -18,6 +18,8 @@ from fusion.train import (
 
 
 ROOT = Path("config/experiments/tri_modal_robust")
+MAIN = ROOT / "evidential_trusted_fusion.yaml"
+PRIOR = ROOT / "observable_reliability_discount_fusion.yaml"
 
 
 def _resolved(path: Path) -> dict:
@@ -33,6 +35,8 @@ def _semantic_key(cfg: dict) -> str:
     return json.dumps(normalized, sort_keys=True, default=str)
 
 
+# ── Generic resolve/build/protocol checks ─────────────────────────────────────
+
 def test_all_runnable_experiment_configs_resolve_and_build():
     paths = run.resolve_targets("all")
     assert paths
@@ -40,22 +44,6 @@ def test_all_runnable_experiment_configs_resolve_and_build():
         cfg = _resolved(path)
         _dataset_common_kwargs(cfg, is_train=False)
         build_model(cfg, feature_dim=515)
-
-
-def test_experiment_pt_paths_match_current_builder_output():
-    build_cfg = yaml.safe_load(Path("config/build_pts.yaml").read_text(encoding="utf-8"))
-    out_root = str(build_cfg["data"]["out_root"]).replace("\\", "/").rstrip("/")
-    cfg = _resolved(ROOT / "observable_reliability_discount_fusion.yaml")
-    for split in ("train", "val", "test"):
-        configured = str(cfg["data"][f"{split}_pt_dir"]).replace("\\", "/").rstrip("/")
-        assert configured == f"{out_root}/{split}"
-
-
-def test_curated_csv_can_select_a_strict_subset_of_current_pts():
-    cfg = _resolved(ROOT / "observable_reliability_discount_fusion.yaml")
-    kwargs = _dataset_common_kwargs(cfg, is_train=True)
-    assert kwargs["strict_split_integrity"] is True
-    assert kwargs["allow_pt_superset"] is True
 
 
 def test_runner_groups_and_aliases_reference_existing_configs():
@@ -75,108 +63,6 @@ def test_formal_configs_use_clean_validation_selection():
         assert eval_cfg["robust_val"]["enabled"] is False, path
 
 
-def test_baselines_share_train_augmentation_but_disable_posthoc_rejection():
-    full = _resolved(ROOT / "observable_reliability_discount_fusion.yaml")
-    for relative in run.BASELINES:
-        cfg = _resolved(ROOT / relative)
-        assert cfg["robust"] == full["robust"], relative
-        assert cfg["calibration"]["enabled"] is False, relative
-        assert cfg["selective_prediction"]["enabled"] is False, relative
-        assert cfg["fusion"]["mode"] == "legacy_learned_gate", relative
-
-
-def test_lean_full_method_excludes_semantic_interaction_modules():
-    cfg = _resolved(ROOT / "observable_reliability_discount_fusion.yaml")
-    assert "semantic_cross_attention" not in cfg
-    assert "semantic_reconstruction" not in cfg
-    assert cfg["model"]["fusion_mode"] == "discount_probability"
-    assert cfg["fusion"]["mode"] == "discount_probability"
-    assert cfg["fusion"]["reliability_calibration"]["enabled"] is True
-    assert cfg["fusion"]["probability_calibration"]["enabled"] is True
-    assert cfg["fusion"]["reliability_discount_exponent"] == 0.5
-    assert cfg["loss"]["reliability_weighted_aux"] is True
-    assert cfg["selective_prediction"]["enabled"] is True
-    assert cfg["selective_prediction"]["target_coverage"] == 0.95
-
-
-def test_module_ablations_match_lean_paper_claims():
-    no_i1 = _resolved(ROOT / "ablations/modules/no_i1_observable_reliability.yaml")
-    assert no_i1["fusion"]["reliability_calibration"]["enabled"] is False
-    assert no_i1["fusion"]["branch_competence_prior"]["enabled"] is False
-    assert no_i1["fusion"]["use_reliability_discount"] is False
-    assert no_i1["fusion"]["use_support_discount"] is True
-    assert no_i1["fusion"]["use_conflict_discount"] is True
-
-    reliability_only = _resolved(ROOT / "ablations/modules/reliability_only_discount_fusion.yaml")
-    assert reliability_only["fusion"]["use_support_discount"] is False
-    assert reliability_only["fusion"]["use_conflict_discount"] is False
-    assert reliability_only["fusion"]["use_confidence_proxy"] is False
-    assert reliability_only["fusion"]["use_hard_alive_mask"] is False
-    assert reliability_only["fusion"]["use_reliability_discount"] is True
-
-    no_i3 = _resolved(ROOT / "ablations/modules/no_i3_selective_rejection.yaml")
-    assert no_i3["selective_prediction"]["enabled"] is False
-    assert no_i3["fusion"]["mode"] == "discount_probability"
-
-
-def test_reliability_sensitivity_configs_have_distinct_meanings():
-    full = _resolved(ROOT / "observable_reliability_discount_fusion.yaml")
-    assert full["fusion"]["use_reliability_discount"] is True
-    assert full["fusion"]["reliability_discount_exponent"] == 0.5
-
-    exp_025 = _resolved(ROOT / "sensitivity/i1/reliability_exponent_0_25.yaml")
-    assert exp_025["fusion"]["use_reliability_discount"] is True
-    assert exp_025["fusion"]["reliability_discount_exponent"] == 0.25
-
-    acceptance_only = _resolved(ROOT / "sensitivity/i1/reliability_acceptance_only.yaml")
-    assert acceptance_only["fusion"]["use_reliability_discount"] is False
-    assert acceptance_only["fusion"]["use_reliability_acceptance"] is True
-    assert acceptance_only["fusion"]["reliability_calibration"]["enabled"] is True
-
-
-def test_weight_sharpening_sensitivity_configs_are_registered():
-    gamma_15 = _resolved(ROOT / "sensitivity/i2/weight_sharpening_gamma_1_5.yaml")
-    gamma_20 = _resolved(ROOT / "sensitivity/i2/weight_sharpening_gamma_2_0.yaml")
-    assert gamma_15["fusion"]["weight_sharpening_gamma"] == 1.5
-    assert gamma_20["fusion"]["weight_sharpening_gamma"] == 2.0
-    sensitivity_paths = {path.as_posix() for path in run.resolve_targets("sensitivity")}
-    assert (ROOT / "sensitivity/i2/weight_sharpening_gamma_1_5.yaml").as_posix() in sensitivity_paths
-    assert (ROOT / "sensitivity/i2/weight_sharpening_gamma_2_0.yaml").as_posix() in sensitivity_paths
-
-def test_mechanism_group_contains_only_lean_mechanism_splits():
-    paths = run.resolve_targets("mechanism")
-    expected = [run.CONFIG_DIR / relative for relative in run.MECHANISM_ABLATIONS]
-    assert paths == expected
-
-
-def test_paper_plan_excludes_sensitivity_configs():
-    paper_paths = {path.resolve() for path in run.resolve_targets("paper")}
-    sensitivity_paths = {path.resolve() for path in run.resolve_targets("sensitivity")}
-    assert not (paper_paths & sensitivity_paths)
-
-
-def test_external_obfuscapk_eval_configs_reuse_seed_42_checkpoint_safely():
-    seed_cfg = _resolved(ROOT / "seeds/seed_42.yaml")
-    for relative in run.EXTERNAL_EVAL:
-        cfg = _resolved(ROOT / relative)
-        assert cfg["eval"]["eval_only"] is True
-        assert cfg["eval"]["run_test"] is False
-        assert cfg["eval"]["run_robust_test"] is False
-        assert cfg["eval"]["refit_rejection_threshold"] is True
-        assert "final_seed_42/42/best_tri_modal_robust.pt" in cfg["eval"]["checkpoint_path"]
-        assert cfg["eval"].get("extra_sets"), relative
-        validate_eval_checkpoint_config(cfg, seed_cfg)
-
-
-def test_decision_only_sensitivities_reuse_seed_42_checkpoint_safely():
-    seed_cfg = _resolved(ROOT / "seeds/seed_42.yaml")
-    for relative in ("sensitivity/i3/acceptance_min.yaml", "sensitivity/i3/coverage_80.yaml"):
-        cfg = _resolved(ROOT / relative)
-        assert cfg["eval"]["eval_only"] is True
-        assert cfg["eval"]["refit_rejection_threshold"] is True
-        validate_eval_checkpoint_config(cfg, seed_cfg)
-
-
 def test_runnable_configs_share_validation_protocol():
     for path in run.resolve_targets("all"):
         cfg = _resolved(path)
@@ -189,17 +75,181 @@ def test_runnable_configs_share_validation_protocol():
         assert cfg["fusion"]["force_fp32_decision"] is True, path
 
 
-def test_seed_overlays_change_only_the_training_seed():
-    base_path = ROOT / "observable_reliability_discount_fusion.yaml"
-    base = _resolved(base_path)
+def test_experiment_pt_paths_match_current_builder_output():
+    build_cfg = yaml.safe_load(Path("config/build_pts.yaml").read_text(encoding="utf-8"))
+    out_root = str(build_cfg["data"]["out_root"]).replace("\\", "/").rstrip("/")
+    cfg = _resolved(MAIN)
+    for split in ("train", "val", "test"):
+        configured = str(cfg["data"][f"{split}_pt_dir"]).replace("\\", "/").rstrip("/")
+        assert configured == f"{out_root}/{split}"
+
+
+def test_curated_csv_can_select_a_strict_subset_of_current_pts():
+    kwargs = _dataset_common_kwargs(_resolved(MAIN), is_train=True)
+    assert kwargs["strict_split_integrity"] is True
+    assert kwargs["allow_pt_superset"] is True
+
+
+# ── Main evidential method ────────────────────────────────────────────────────
+
+def test_evidential_main_method_configuration():
+    cfg = _resolved(MAIN)
+    assert cfg["model"]["fusion_mode"] == "discount_probability"
+    # I1: dual-source reliability
+    assert cfg["fusion"]["reliability_calibration"]["enabled"] is True
+    assert cfg["fusion"]["reliability_calibration"]["use_evidential_uncertainty"] is True
+    assert cfg["loss"]["evidential_loss_weight"] > 0.0
+    assert cfg["loss"]["evidential"]["class_weight"] == "balanced"
+    # I2: conflict-aware Yager evidential fusion; legacy temperature off
+    assert cfg["fusion"]["combination"] == "yager"
+    assert cfg["fusion"]["probability_calibration"]["enabled"] is False
+    assert cfg["fusion"]["use_confidence_proxy"] is False
+    # I3: class-conditional conformal rejection
+    assert cfg["selective_prediction"]["enabled"] is True
+    assert cfg["selective_prediction"]["mode"] == "conformal"
+    assert cfg["selective_prediction"]["class_conditional"] is True
+    assert cfg["selective_prediction"]["target_coverage"] == 0.95
+
+
+def test_prior_method_is_linear_discount_baseline():
+    cfg = _resolved(PRIOR)
+    assert cfg["model"]["fusion_mode"] == "discount_probability"
+    # The prior method uses linear discount fusion (no evidential combination).
+    assert cfg["fusion"].get("combination", "linear") == "linear"
+    assert PRIOR.name == run.PRIOR_METHOD
+
+
+# ── Baselines ─────────────────────────────────────────────────────────────────
+
+def test_baselines_disable_reliability_calibration_and_rejection():
+    main = _resolved(MAIN)
+    for relative in ("baselines/api_only.yaml", "baselines/graph_only.yaml",
+                     "baselines/manifest_only.yaml", "baselines/tri_modal_concat.yaml",
+                     "baselines/fixed_logit_fusion.yaml", "baselines/api_graph_concat.yaml"):
+        cfg = _resolved(ROOT / relative)
+        assert cfg["fusion"]["mode"] == "legacy_learned_gate", relative
+        assert cfg["calibration"]["enabled"] is False, relative
+        assert cfg["selective_prediction"]["enabled"] is False, relative
+        # Baselines share the same training augmentation as the main method.
+        assert cfg["robust"] == main["robust"], relative
+
+
+# ── Module / mechanism ablations ──────────────────────────────────────────────
+
+def test_module_ablations_remove_whole_innovations():
+    no_i1 = _resolved(ROOT / "ablations/modules/no_i1_reliability.yaml")
+    assert no_i1["fusion"]["use_reliability_discount"] is False
+    assert no_i1["fusion"]["branch_competence_prior"]["enabled"] is False
+    assert no_i1["fusion"]["reliability_calibration"]["enabled"] is False
+    assert no_i1["loss"]["evidential_loss_weight"] == 0.0
+
+    no_i3 = _resolved(ROOT / "ablations/modules/no_i3_selective_rejection.yaml")
+    assert no_i3["selective_prediction"]["enabled"] is False
+    assert no_i3["fusion"]["combination"] == "yager"
+
+
+def test_i1_mechanism_ablation_removes_only_edl_source():
+    cfg = _resolved(ROOT / "ablations/i1/no_edl_reliability_source.yaml")
+    assert cfg["fusion"]["reliability_calibration"]["use_evidential_uncertainty"] is False
+    assert cfg["loss"]["evidential_loss_weight"] == 0.0
+    # The Yager evidential fusion itself is still active.
+    assert cfg["fusion"]["combination"] == "yager"
+    assert cfg["fusion"]["reliability_calibration"]["enabled"] is True
+
+
+def test_i2_mechanism_ablations_switch_combination_rule():
+    for relative, rule in (
+        ("ablations/i2/combination_dempster.yaml", "dempster"),
+        ("ablations/i2/combination_cumulative.yaml", "cumulative"),
+        ("ablations/i2/combination_log_pool.yaml", "log_pool"),
+    ):
+        cfg = _resolved(ROOT / relative)
+        assert cfg["fusion"]["combination"] == rule, relative
+
+
+def test_i3_mechanism_ablations_are_decision_only():
+    marginal = _resolved(ROOT / "ablations/i3/marginal_conformal.yaml")
+    assert marginal["selective_prediction"]["class_conditional"] is False
+    assert marginal["eval"]["eval_only"] is True
+    assert marginal["eval"]["refit_rejection_threshold"] is True
+
+    threshold = _resolved(ROOT / "ablations/i3/threshold_rejection.yaml")
+    assert threshold["selective_prediction"]["mode"] == "threshold"
+    assert threshold["eval"]["eval_only"] is True
+
+
+def test_mechanism_group_matches_declared_splits():
+    paths = run.resolve_targets("mechanism")
+    expected = [run.CONFIG_DIR / relative for relative in run.MECHANISM_ABLATIONS]
+    assert paths == expected
+
+
+# ── Sensitivity ───────────────────────────────────────────────────────────────
+
+def test_i1_sensitivity_configs_have_distinct_meanings():
+    main = _resolved(MAIN)
+    assert main["loss"]["evidential_loss_weight"] == 0.1
+    w05 = _resolved(ROOT / "sensitivity/i1/evidential_weight_0_05.yaml")
+    w20 = _resolved(ROOT / "sensitivity/i1/evidential_weight_0_2.yaml")
+    assert w05["loss"]["evidential_loss_weight"] == 0.05
+    assert w20["loss"]["evidential_loss_weight"] == 0.2
+    a5 = _resolved(ROOT / "sensitivity/i1/anneal_epochs_5.yaml")
+    assert a5["loss"]["evidential"]["anneal_epochs"] == 5
+    hd8 = _resolved(ROOT / "sensitivity/i1/reliability_hidden_dim_8.yaml")
+    assert hd8["fusion"]["reliability_calibration"]["hidden_dim"] == 8
+
+
+def test_i2_sensitivity_reliability_exponent():
+    e025 = _resolved(ROOT / "sensitivity/i2/reliability_exponent_0_25.yaml")
+    e100 = _resolved(ROOT / "sensitivity/i2/reliability_exponent_1_0.yaml")
+    assert e025["fusion"]["reliability_discount_exponent"] == 0.25
+    assert e100["fusion"]["reliability_discount_exponent"] == 1.0
+
+
+def test_paper_evidential_plan_excludes_sensitivity():
+    paper = {p.resolve() for p in run.resolve_targets("paper_evidential")}
+    sensitivity = {p.resolve() for p in run.resolve_targets("sensitivity")}
+    assert not (paper & sensitivity)
+
+
+# ── Seeds / external / eval-only reuse ────────────────────────────────────────
+
+def test_seed_overlays_change_only_method_and_seed():
+    base = _resolved(MAIN)
     for seed in (42, 2024, 3407):
-        seed_path = ROOT / f"seeds/seed_{seed}.yaml"
-        resolved = _resolved(seed_path)
+        resolved = _resolved(ROOT / f"seeds/seed_{seed}.yaml")
         expected = copy.deepcopy(base)
-        expected["method"] = {"name": f"final_seed_{seed}"}
-        expected["train"]["exp_name"] = f"final_seed_{seed}"
+        expected["method"] = {"name": f"evidential_seed_{seed}"}
+        expected["train"]["exp_name"] = f"evidential_seed_{seed}"
         expected["train"]["seed"] = seed
-        assert resolved == expected
+        assert resolved == expected, seed
+
+
+def test_external_obfuscapk_eval_configs_reuse_seed_42_checkpoint_safely():
+    seed_cfg = _resolved(ROOT / "seeds/seed_42.yaml")
+    for relative in run.EXTERNAL_EVAL:
+        cfg = _resolved(ROOT / relative)
+        assert cfg["eval"]["eval_only"] is True
+        assert cfg["eval"]["run_test"] is False
+        assert cfg["eval"]["run_robust_test"] is False
+        assert cfg["eval"]["refit_rejection_threshold"] is True
+        assert "evidential_seed_42/42/best_tri_modal_robust.pt" in cfg["eval"]["checkpoint_path"]
+        assert cfg["eval"].get("extra_sets"), relative
+        validate_eval_checkpoint_config(cfg, seed_cfg)
+
+
+def test_decision_only_configs_reuse_seed_42_checkpoint_safely():
+    seed_cfg = _resolved(ROOT / "seeds/seed_42.yaml")
+    for relative in (
+        "sensitivity/i3/coverage_90.yaml",
+        "sensitivity/i3/coverage_99.yaml",
+        "ablations/i3/marginal_conformal.yaml",
+        "ablations/i3/threshold_rejection.yaml",
+    ):
+        cfg = _resolved(ROOT / relative)
+        assert cfg["eval"]["eval_only"] is True
+        assert cfg["eval"]["refit_rejection_threshold"] is True
+        validate_eval_checkpoint_config(cfg, seed_cfg)
 
 
 def test_non_seed_experiments_have_unique_resolved_behavior():

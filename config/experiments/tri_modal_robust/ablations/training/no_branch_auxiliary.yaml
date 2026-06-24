@@ -1,5 +1,5 @@
 defaults:
-  - ../../observable_reliability_discount_fusion.yaml
+  - ../../evidential_trusted_fusion.yaml
 
 method:
   name: training_no_branch_auxiliary
@@ -9,3 +9,4 @@ train:
 
 loss:
   branch_aux_weight: 0.0
+  reliability_weighted_aux: false

@@ -361,6 +361,12 @@ class DiscountProbabilityFusion(nn.Module):
             "total_reliability": total_reliability,
             "acceptance_score": acceptance_score,
             "combination_rule_is_evidential": torch.ones((batch,), device=final_logits.device, dtype=final_logits.dtype),
+            "branch_competence_active": torch.full(
+                (batch,),
+                float(use_competence and self.branch_competence_active),
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
             "calibration_active": torch.full(
                 (batch,), float(self.calibration_active), device=final_logits.device, dtype=final_logits.dtype
             ),
@@ -371,6 +377,12 @@ class DiscountProbabilityFusion(nn.Module):
             outputs[f"fusion_weight_{name}"] = fusion_weights[:, index]
             outputs[f"uncertainty_proxy_{name}"] = opinions[name]["uncertainty"]
             outputs[f"evidential_certainty_{name}"] = evidential_certainty[name]
+            outputs[f"branch_competence_prior_{name}"] = torch.full(
+                (batch,),
+                float(competence_prior[index].detach().cpu().item()),
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            )
             outputs[f"calibrated_log_prob_{name}"] = torch.log(
                 opinions[name]["expected_prob"].clamp_min(eps)
             )

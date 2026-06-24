@@ -1,15 +1,19 @@
 defaults:
-  - ../../evidential_trusted_fusion.yaml
+  - ../../seeds/seed_42.yaml
 
-# I3 ablation: marginal (not class-conditional) split conformal. Marginal
-# coverage can hide poor malware-class coverage -- this isolates the value of
-# the Mondrian / per-class calibration for the security setting.
+# I3 mechanism: marginal (not class-conditional) conformal. Marginal coverage
+# can hide poor malware-class coverage -- isolates the value of Mondrian
+# per-class calibration for the security setting. Decision-only: reuses the
+# evidential seed-42 checkpoint and only re-fits the threshold.
 method:
   name: ablation_marginal_conformal
-
-train:
-  exp_name: ablation_marginal_conformal
 
 selective_prediction:
   mode: conformal
   class_conditional: false
+
+eval:
+  eval_only: true
+  output_name: ablation_marginal_conformal
+  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: true

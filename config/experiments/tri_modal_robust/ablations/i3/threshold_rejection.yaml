@@ -1,0 +1,17 @@
+defaults:
+  - ../../seeds/seed_42.yaml
+
+# I3 mechanism: heuristic acceptance-score threshold (the pre-conformal method),
+# no coverage guarantee. Decision-only: reuses the evidential seed-42 checkpoint.
+method:
+  name: ablation_threshold_rejection
+
+selective_prediction:
+  mode: threshold
+  target_coverage: 0.95
+
+eval:
+  eval_only: true
+  output_name: ablation_threshold_rejection
+  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: true
