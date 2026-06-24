@@ -1,0 +1,11 @@
+defaults:
+  - ../../observable_reliability_discount_fusion.yaml
+
+method:
+  name: sensitivity_weight_sharpening_gamma_2_0
+
+train:
+  exp_name: sensitivity_weight_sharpening_gamma_2_0
+
+fusion:
+  weight_sharpening_gamma: 2.0

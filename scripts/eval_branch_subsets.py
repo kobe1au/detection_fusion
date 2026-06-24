@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import copy
@@ -31,6 +31,7 @@ from fusion.train import (
     load_config,
     select_device,
     set_seed,
+    apply_branch_competence_prior,
 )
 
 
@@ -251,12 +252,14 @@ def _parse_variant(raw: str) -> tuple[str, tuple[str, ...]]:
 
 def _load_checkpoint_model(cfg: dict, checkpoint_path: Path, device: torch.device):
     ckpt = torch.load(checkpoint_path, map_location="cpu")
-    checkpoint_cfg = ckpt.get("config") if isinstance(ckpt, dict) else None
+    checkpoint_cfg = (ckpt.get("cfg") or ckpt.get("config")) if isinstance(ckpt, dict) else None
     model_cfg = _copy_runtime_paths(checkpoint_cfg, cfg) if isinstance(checkpoint_cfg, dict) else cfg
     train_ds = build_dataset(model_cfg, "train", is_train=False)
     feature_dim = int(train_ds.feature_dim)
     model = build_model(model_cfg, feature_dim).to(device)
     model.load_state_dict(ckpt["model"])
+    branch_competence_summary = dict(ckpt.get("branch_competence_prior") or {"enabled": False})
+    apply_branch_competence_prior(model, branch_competence_summary)
     model.eval()
     return model, model_cfg, ckpt
 

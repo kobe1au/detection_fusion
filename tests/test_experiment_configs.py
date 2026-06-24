@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import copy
 import json
@@ -131,6 +131,16 @@ def test_reliability_sensitivity_configs_have_distinct_meanings():
     assert acceptance_only["fusion"]["use_reliability_discount"] is False
     assert acceptance_only["fusion"]["use_reliability_acceptance"] is True
     assert acceptance_only["fusion"]["reliability_calibration"]["enabled"] is True
+
+
+def test_weight_sharpening_sensitivity_configs_are_registered():
+    gamma_15 = _resolved(ROOT / "sensitivity/i2/weight_sharpening_gamma_1_5.yaml")
+    gamma_20 = _resolved(ROOT / "sensitivity/i2/weight_sharpening_gamma_2_0.yaml")
+    assert gamma_15["fusion"]["weight_sharpening_gamma"] == 1.5
+    assert gamma_20["fusion"]["weight_sharpening_gamma"] == 2.0
+    sensitivity_paths = {path.as_posix() for path in run.resolve_targets("sensitivity")}
+    assert (ROOT / "sensitivity/i2/weight_sharpening_gamma_1_5.yaml").as_posix() in sensitivity_paths
+    assert (ROOT / "sensitivity/i2/weight_sharpening_gamma_2_0.yaml").as_posix() in sensitivity_paths
 
 def test_mechanism_group_contains_only_lean_mechanism_splits():
     paths = run.resolve_targets("mechanism")

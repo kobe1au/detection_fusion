@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import os
@@ -68,6 +68,8 @@ SENSITIVITY = [
     "sensitivity/i1/reliability_acceptance_only.yaml",
     "sensitivity/i2/conflict_min_0_1.yaml",
     "sensitivity/i2/conflict_min_0_2.yaml",
+    "sensitivity/i2/weight_sharpening_gamma_1_5.yaml",
+    "sensitivity/i2/weight_sharpening_gamma_2_0.yaml",
     "sensitivity/i3/acceptance_min.yaml",
     "sensitivity/i3/coverage_80.yaml",
 ]
