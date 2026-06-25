@@ -143,16 +143,29 @@ def apply_graph_encoder_budget(
     data["graph_truncated_by_encoder_budget"] = 1.0
     data["graph_integrity_before_encoder_budget"] = raw_integrity
     refresh_observable_signals(data)
-    effective_graph_integrity = max(
-        0.0,
-        min(1.0, float(data["graph_integrity"]) * data["graph_encoder_coverage"]),
+    # effective_graph_integrity = max(
+    #     0.0,
+    #     min(1.0, float(data["graph_integrity"]) * data["graph_encoder_coverage"]),
+    # )
+    # data["graph_integrity"] = effective_graph_integrity
+    # data["code_integrity"] = math.sqrt(
+    #     max(0.0, float(data["api_integrity"]) * effective_graph_integrity)
+    # )
+    # data["q_graph"] = effective_graph_integrity
+    # data["r_graph"] = effective_graph_integrity
+    
+    # Keep graph_integrity/q_graph/r_graph as the observable structural integrity
+    # of the graph after budgeted graph construction. Do NOT multiply coverage into
+    # these aliases here; build_evidence()/visible_integrity_modifier applies the
+    # encoder-coverage correction exactly once.
+
+    graph_integrity = max(0.0, min(1.0, float(data["graph_integrity"])))
+    graph_coverage = max(0.0, min(1.0, float(data["graph_encoder_coverage"])))
+
+    data["effective_graph_integrity"] = graph_integrity * graph_coverage
+    data["effective_code_integrity"] = math.sqrt(
+        max(0.0, float(data["api_integrity"]) * data["effective_graph_integrity"])
     )
-    data["graph_integrity"] = effective_graph_integrity
-    data["code_integrity"] = math.sqrt(
-        max(0.0, float(data["api_integrity"]) * effective_graph_integrity)
-    )
-    data["q_graph"] = effective_graph_integrity
-    data["r_graph"] = effective_graph_integrity
     return data
 
 class FatalDatasetConfigError(RuntimeError):

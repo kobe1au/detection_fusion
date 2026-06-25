@@ -1,0 +1,15 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: sensitivity_visible_modifier_beta_2_0
+
+train:
+  exp_name: sensitivity_visible_modifier_beta_2_0
+
+fusion:
+  visible_integrity_modifier:
+    enabled: true
+    beta: 2.0
+    min_value: 0.5
+    min_reference: 1.0e-6

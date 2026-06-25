@@ -475,10 +475,48 @@ def test_graph_encoder_budget_refreshes_alignment_and_effective_integrity():
     assert out["method_api_edge_index"].tolist() == [[0], [0]]
     assert out["api_method_index"].tolist() == [0, -1]
     assert out["api_in_graph_mask"].tolist() == [1.0, 0.0]
-    assert out["graph_integrity"] < out["graph_integrity_before_encoder_budget"]
-    assert out["code_integrity"] == pytest.approx(
-        math.sqrt(out["api_integrity"] * out["graph_integrity"])
+    # assert out["graph_integrity"] < out["graph_integrity_before_encoder_budget"]
+    # assert out["code_integrity"] == pytest.approx(
+    #     math.sqrt(out["api_integrity"] * out["graph_integrity"])
+    # )
+    assert out["graph_encoder_coverage"] == pytest.approx(0.6)
+    assert out["graph_truncated_by_encoder_budget"] == 1.0
+
+    # graph_integrity remains the post-budget structural integrity,
+    # coverage is not multiplied into graph_integrity itself.
+    assert out["q_graph"] == pytest.approx(out["graph_integrity"])
+    assert out["r_graph"] == pytest.approx(out["graph_integrity"])
+
+    # effective_graph_integrity is where coverage correction happens.
+    assert out["effective_graph_integrity"] == pytest.approx(
+        out["graph_integrity"] * out["graph_encoder_coverage"]
     )
+    assert out["effective_graph_integrity"] <= out["graph_integrity"]
+
+def test_graph_visible_modifier_does_not_double_count_coverage():
+    fusion = DiscountProbabilityFusion({
+        "combination": "yager",
+        "use_reliability_discount": False,
+        "visible_integrity_modifier": {
+            "enabled": True,
+            "beta": 1.0,
+            "min_value": 0.5,
+        },
+    })
+    fusion.set_visible_integrity_reference([1.0, 1.0, 1.0])
+
+    evidence = torch.ones(1, EvidenceIndex.BASE_DIM)
+    evidence[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 0.0
+    evidence[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 0.0
+    evidence[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.8
+    evidence[:, EvidenceIndex.GRAPH_ENCODER_COVERAGE] = 0.5
+
+    out = fusion(*_logits(1), evidence)
+
+    assert torch.allclose(out["effective_graph_integrity"], torch.tensor([0.4]))
+    assert torch.allclose(out["visible_modifier_graph"], torch.tensor([0.4]))
+    assert torch.allclose(out["visible_modifier_factor_graph"], torch.tensor([0.7]))
+    assert torch.allclose(out["discount_graph"], torch.tensor([0.7]))
 
 def test_selective_metrics_and_validation_threshold():
     rows = [

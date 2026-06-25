@@ -70,6 +70,10 @@ SENSITIVITY = [
     "sensitivity/i1/anneal_epochs_20.yaml",
     "sensitivity/i1/reliability_hidden_dim_8.yaml",
     "sensitivity/i1/reliability_hidden_dim_32.yaml",
+    "sensitivity/i1/visible_modifier_beta_0_5.yaml",
+    "sensitivity/i1/visible_modifier_beta_2_0.yaml",
+    "sensitivity/i1/visible_modifier_min_0_3.yaml",
+    "sensitivity/i1/visible_modifier_min_0_7.yaml",
     "sensitivity/i2/reliability_exponent_0_25.yaml",
     "sensitivity/i2/reliability_exponent_1_0.yaml",
     "sensitivity/i3/coverage_90.yaml",
@@ -108,6 +112,10 @@ ALIASES = {
     "log_pool": "ablations/i2/combination_log_pool.yaml",
     "marginal_conformal": "ablations/i3/marginal_conformal.yaml",
     "threshold_rejection": "ablations/i3/threshold_rejection.yaml",
+    "visible_beta_0_5": "sensitivity/i1/visible_modifier_beta_0_5.yaml",
+    "visible_beta_2_0": "sensitivity/i1/visible_modifier_beta_2_0.yaml",
+    "visible_min_0_3": "sensitivity/i1/visible_modifier_min_0_3.yaml",
+    "visible_min_0_7": "sensitivity/i1/visible_modifier_min_0_7.yaml",
 }
 
 GROUPS = {
