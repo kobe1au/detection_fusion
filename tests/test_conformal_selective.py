@@ -3,6 +3,7 @@ import pytest
 from fusion.train import (
     conformal_selective_metrics,
     fit_conformal_thresholds,
+    fit_rejection_threshold,
 )
 
 
@@ -54,3 +55,11 @@ def test_conformal_coverage_meets_target_on_calibration_data():
 
 def test_conformal_metrics_empty_without_thresholds():
     assert conformal_selective_metrics(_rows([(0.9, 1)]), None) == {}
+
+def test_threshold_rejection_is_disabled_in_conformal_mode():
+    rows = [
+        {"acceptance_score": 0.9, "label": 1, "pred": 1},
+        {"acceptance_score": 0.4, "label": 0, "pred": 1},
+    ]
+    assert fit_rejection_threshold(rows, {"enabled": True, "mode": "conformal"}) is None
+    assert fit_rejection_threshold(rows, {"enabled": True, "mode": "threshold", "target_coverage": 0.5}) == pytest.approx(0.9)

@@ -1180,6 +1180,8 @@ def fit_rejection_threshold(rows: list[dict[str, Any]], config: dict | None = No
     config = config or {}
     if not bool(config.get("enabled", False)):
         return None
+    if str(config.get("mode", "threshold")).lower() == "conformal":
+        return None
     target_coverage = float(config.get("target_coverage", 0.9))
     if not 0.0 < target_coverage <= 1.0:
         raise ValueError("selective_prediction.target_coverage must be within (0, 1]")
@@ -1276,6 +1278,11 @@ def fit_conformal_thresholds(
         "q_malware": q_malware,
         "num_calibration": int(len(scores.get(0, [])) + len(scores.get(1, []))),
     }
+
+
+def _uses_conformal_selective(config: dict | None = None) -> bool:
+    config = config or {}
+    return bool(config.get("enabled", False)) and str(config.get("mode", "threshold")).lower() == "conformal"
 
 
 def _conformal_prediction_set(p1: float, thresholds: dict[str, Any]) -> tuple[bool, bool]:
@@ -1872,19 +1879,22 @@ def run(cfg: dict) -> dict[str, Any]:
         best_val_f1 = float((ckpt.get("val") or {}).get("macro_f1", -1.0))
         checkpoint_metric_name = str(ckpt.get("checkpoint_metric", "loaded_checkpoint"))
         calibration_summary = dict(ckpt.get("calibration") or {"enabled": False})
+        selective_cfg = cfg.get("selective_prediction", {}) or {}
         rejection_threshold = ckpt.get("rejection_threshold")
-        if (
-            bool((cfg.get("selective_prediction", {}) or {}).get("enabled", False))
-            and rejection_threshold is None
-            and not refit_rejection_threshold
-        ):
-            raise ValueError(
-                "Selective eval-only mode requires rejection_threshold saved in the checkpoint"
-            )
+        conformal_thresholds = ckpt.get("conformal_thresholds")
+        if bool(selective_cfg.get("enabled", False)) and not refit_rejection_threshold:
+            if _uses_conformal_selective(selective_cfg):
+                if conformal_thresholds is None:
+                    raise ValueError(
+                        "Conformal eval-only mode requires conformal_thresholds saved in the checkpoint"
+                    )
+            elif rejection_threshold is None:
+                raise ValueError(
+                    "Threshold eval-only mode requires rejection_threshold saved in the checkpoint"
+                )
         rejection_threshold = (
             float(rejection_threshold) if rejection_threshold is not None else None
         )
-        conformal_thresholds = ckpt.get("conformal_thresholds")
         logger.info("eval-only mode loaded checkpoint: %s", best_path)
     else:
         assert train_loader is not None
@@ -2014,7 +2024,10 @@ def run(cfg: dict) -> dict[str, Any]:
             ckpt["model"] = model.state_dict()
             ckpt["calibration"] = calibration_summary
             ckpt["branch_competence_prior"] = branch_competence_summary
-            ckpt["rejection_threshold"] = rejection_threshold
+            if rejection_threshold is not None:
+                ckpt["rejection_threshold"] = rejection_threshold
+            else:
+                ckpt.pop("rejection_threshold", None)
             ckpt["conformal_thresholds"] = conformal_thresholds
             ckpt["validation_split"] = validation_split_summary
             torch.save(ckpt, best_path)
@@ -2140,6 +2153,7 @@ def run(cfg: dict) -> dict[str, Any]:
             selective_threshold=rejection_threshold,
         )
         enforce_failed_ratio(metrics, cfg, split_name, max_failed_ratio=extra.get("max_failed_ratio"))
+        metrics.update(conformal_selective_metrics(rows, conformal_thresholds))
         metrics = {
             **metrics,
             "pt_dir": str(pt_dir),
@@ -2176,7 +2190,6 @@ def run(cfg: dict) -> dict[str, Any]:
         "tuning_robust_composite_score": tuning_robust_composite_score,
         "calibration": calibration_summary,
         "branch_competence_prior": branch_competence_summary,
-        "rejection_threshold": rejection_threshold,
         "conformal_thresholds": conformal_thresholds,
         "val": val_metrics,
         "val_selection": val_metrics,
@@ -2187,6 +2200,8 @@ def run(cfg: dict) -> dict[str, Any]:
         "robust": robust_results,
         "extra_eval": extra_results,
     }
+    if rejection_threshold is not None:
+        summary["rejection_threshold"] = rejection_threshold
     with open(out_dir / "summary.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(_json_compatible(summary), f, sort_keys=False)
     logger.info("finished: %s", out_dir)
