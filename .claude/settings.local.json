@@ -31,7 +31,10 @@
       "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_evidential.py::test_full_evidential_pipeline_forward_loss_backward -q)",
       "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_conformal_selective.py tests/test_evidential.py -q)",
       "Bash(D:/IDE/miniconda/envs/malware/python.exe scripts/_gen_evidential_configs.py)",
-      "Bash(D:/IDE/miniconda/envs/malware/python.exe run.py paper_evidential_all --dry-run)"
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe run.py paper_evidential_all --dry-run)",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_modality_independence.py -q)",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -c \"import ast; ast.parse\\(open\\('fusion/dataset.py',encoding='utf-8'\\).read\\(\\)\\); print\\('dataset.py parses OK'\\)\")",
+      "Bash(D:/IDE/miniconda/envs/malware/python.exe -m pytest tests/test_observable_reliability.py tests/test_modality_independence.py tests/test_robust_smoke.py -q)"
     ]
   }
 }

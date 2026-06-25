@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import random
 from typing import Iterable
@@ -101,6 +101,12 @@ def _select_api_events(data: dict, keep: torch.Tensor) -> None:
     if n_api <= 0:
         return
     data.setdefault("api_event_count_raw", n_api)
+    # Preserve the pre-perturbation, post-encoder-budget event count. API
+    # integrity uses this as the reference for visible retention, so synthetic
+    # dropout is observable even though encoder-budget truncation itself is not
+    # treated as extraction failure.
+    data.setdefault("api_event_count_before_encoder_budget", n_api)
+    data.setdefault("api_event_count_after_encoder_budget", n_api)
     keep_idx = torch.where(keep)[0]
 
     for key in (

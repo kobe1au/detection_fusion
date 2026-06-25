@@ -46,6 +46,11 @@ OBSERVABLE_RATIO_FIELDS = (
 
 OBSERVABLE_OPTIONAL_NUMERIC_FIELDS = (
     "dex_parse_success_ratio",
+    "api_event_count_before_encoder_budget",
+    "api_event_count_after_encoder_budget",
+    "api_encoder_coverage",
+    "api_truncated_by_encoder_budget",
+    "api_integrity_before_encoder_budget",
 )
 
 OBSERVABLE_ERROR_FIELDS = (
@@ -150,28 +155,39 @@ def graph_structure_stats(edge_index: Any, num_nodes: int) -> tuple[int, float]:
 def compute_api_integrity_v2(source: Any) -> float:
     """Observable API extraction completeness, independent of availability.
 
-    A successful parse that legitimately yields no framework API events remains
-    complete. ``api_alive`` separately represents whether usable content exists.
+    Completeness reflects (a) a successful parse, (b) the survival of extracted
+    API events through synthetic degradation, and (c) API-type coverage. It
+    deliberately does NOT penalise:
+      * the raw->extracted gap -- ``api_event_count_raw`` counts every invoke
+        seen, while only framework API events are kept by design, so raw >> kept
+        is normal and is NOT a parse failure; and
+      * runtime encoder-budget truncation -- tracked separately through
+        ``api_encoder_coverage``.
+    Synthetic API dropout still reduces integrity through ``visible_retention``
+    (kept events after perturbation relative to the post-budget event count).
     """
     if not _bool(source, "api_parse_ok") or not _bool(source, "dex_parse_ok"):
         return 0.0
-    raw = _count(source, "api_event_count_raw")
     kept = _count(source, "api_event_count_kept")
+    extracted = _count(source, "api_event_count_before_encoder_budget", kept)
+    after_budget = _count(source, "api_event_count_after_encoder_budget", extracted)
+    extracted = max(extracted, kept)
+    after_budget = max(min(after_budget, extracted), kept)
     known = _count(source, "api_known_type_count")
     unknown = _count(source, "api_unknown_type_count")
     dex_ratio = clamp01(_number(source, "dex_parse_success_ratio", 1.0))
-    if raw <= 0 and kept <= 0:
+    if extracted <= 0 and kept <= 0:
+        # Successfully parsed but legitimately no framework API events.
         return dex_ratio
-    if raw <= 0 < kept:
-        return clamp01(0.20 * dex_ratio)
-    truncation_ratio = clamp01(_number(source, "api_truncation_ratio"))
-    retention = clamp01(kept / raw)
-    count_consistency = 1.0 if kept <= raw else 0.0
+    # Visible retention: how many post-budget events survived synthetic
+    # degradation. Clean data -> 1.0; API dropout lowers it.
+    visible_retention = clamp01(kept / after_budget) if after_budget > 0 else 1.0
+    count_consistency = 1.0 if kept <= after_budget else 0.0
     type_total = known + unknown
     type_coverage = 0.0 if kept <= 0 else clamp01(known / max(type_total, kept))
     integrity = clamp01(
         0.20
-        + 0.55 * min(retention, 1.0 - truncation_ratio)
+        + 0.55 * visible_retention
         + 0.10 * count_consistency
         + 0.15 * type_coverage
     )
@@ -354,11 +370,28 @@ def refresh_observable_metadata(data: dict[str, Any]) -> None:
     data.setdefault("dex_file_count", 1)
     data.setdefault("dex_parse_success_ratio", 1.0)
     data.setdefault("class_count", 0)
-    raw = max(_count(data, "api_event_count_raw", kept), kept)
+    extracted_before_budget = _count(data, "api_event_count_before_encoder_budget", kept)
+    extracted_before_budget = max(extracted_before_budget, kept)
+    after_budget_default = min(extracted_before_budget, kept) if extracted_before_budget > 0 else kept
+    after_budget = _count(data, "api_event_count_after_encoder_budget", after_budget_default)
+    after_budget = max(after_budget, kept)
+    raw = max(_count(data, "api_event_count_raw", extracted_before_budget), extracted_before_budget)
     data["api_event_count_kept"] = kept
+    data["api_event_count_before_encoder_budget"] = extracted_before_budget
+    data["api_event_count_after_encoder_budget"] = after_budget
     data["api_event_count_raw"] = raw
-    data["api_truncated"] = bool(kept < raw)
-    data["api_truncation_ratio"] = clamp01(1.0 - kept / raw) if raw > 0 else 0.0
+    data["api_truncated"] = bool(extracted_before_budget < raw)
+    data["api_truncation_ratio"] = (
+        clamp01(1.0 - extracted_before_budget / raw) if raw > 0 else 0.0
+    )
+    data["api_encoder_coverage"] = (
+        clamp01(after_budget / extracted_before_budget)
+        if extracted_before_budget > 0
+        else 1.0
+    )
+    data["api_truncated_by_encoder_budget"] = float(
+        extracted_before_budget > 0 and after_budget < extracted_before_budget
+    )
     if isinstance(api_types, torch.Tensor) and api_types.numel() == kept:
         data["api_known_type_count"] = int((api_types.view(-1).long() > 0).sum().item())
         data["api_unknown_type_count"] = kept - int(data["api_known_type_count"])
@@ -436,6 +469,7 @@ def refresh_observable_signals(data: dict[str, Any]) -> None:
     data.update(
         {
             "api_integrity": api_integrity,
+            "api_integrity_before_encoder_budget": api_integrity,
             "graph_integrity": graph_integrity,
             "manifest_integrity": manifest_integrity,
             "code_integrity": code_integrity,

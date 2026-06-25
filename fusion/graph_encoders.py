@@ -162,51 +162,20 @@ def truncate_per_graph(data, max_nodes: int, use_behavior_hint: bool = False):
                             for g in range(num_graphs)]
         return data.x, data.edge_index, batch, keep_local_parts
 
+    # Intrinsic, modality-independent priority: keep sensitive method nodes
+    # first (sensitivity is a property of the method itself). We deliberately do
+    # NOT prioritise by API alignment (method_api_edge_index): selecting graph
+    # nodes by their API links would couple the graph branch to the API branch
+    # and break the evidential-fusion independence premise. Non-sensitive nodes
+    # keep their original (positional) order within each graph.
     sensitive_mask = getattr(data, "sensitive_mask", None)
-    if use_behavior_hint and sensitive_mask is not None and sensitive_mask.numel() == num_nodes_total:
-        sensitive_nodes = sensitive_mask.bool()
+    if isinstance(sensitive_mask, torch.Tensor) and sensitive_mask.numel() == num_nodes_total:
+        sensitive_nodes = sensitive_mask.bool().to(device)
     else:
         sensitive_nodes = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
 
-    api_aligned_nodes = torch.zeros(num_nodes_total, dtype=torch.bool, device=device)
-    method_api_edge_index = getattr(data, "method_api_edge_index", None)
-    if use_behavior_hint and (
-        isinstance(method_api_edge_index, torch.Tensor)
-        and method_api_edge_index.ndim == 2
-        and method_api_edge_index.size(0) == 2
-        and method_api_edge_index.numel() > 0
-    ):
-        src = method_api_edge_index[0].long()
-        valid_edge = (src >= 0) & (src < num_nodes_total)
-
-        dst = method_api_edge_index[1].long()
-        api_sensitive = getattr(data, "api_sensitive_mask", None)
-        api_types = getattr(data, "api_type_ids", None)
-        if (
-            isinstance(api_sensitive, torch.Tensor)
-            and isinstance(api_types, torch.Tensor)
-            and api_sensitive.numel() == api_types.numel()
-            and api_sensitive.numel() > 0
-        ):
-            valid_dst = (dst >= 0) & (dst < api_sensitive.numel())
-            relevance = torch.zeros_like(valid_edge)
-            if valid_dst.any():
-                relevant_api = (
-                    (api_sensitive.to(device=device).float() > 0.5)
-                    & (api_types.to(device=device).long() > 0)
-                )
-                relevance[valid_dst] = relevant_api[dst[valid_dst].to(device=device)]
-            valid_edge = valid_edge & relevance
-
-        valid_src = src[valid_edge]
-        if valid_src.numel() > 0:
-            api_aligned_nodes[valid_src.unique()] = True
-
-    # Alignment-aware truncation: keep method nodes with explicit API events.
-    # Otherwise method-API supervision is often truncated before cross-attention.
-    priority = torch.full((num_nodes_total,), 2, dtype=torch.long, device=device)
-    priority[sensitive_nodes | api_aligned_nodes] = 1
-    priority[sensitive_nodes & api_aligned_nodes] = 0
+    priority = torch.ones(num_nodes_total, dtype=torch.long, device=device)
+    priority[sensitive_nodes] = 0
 
     graph_offsets = torch.zeros(num_graphs + 1, dtype=torch.long, device=device)
     graph_offsets[1:] = graph_sizes.cumsum(dim=0)

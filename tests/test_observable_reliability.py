@@ -233,33 +233,70 @@ def test_empty_but_parse_ok_integrity_stays_high_and_alive_is_zero():
     assert compute_raw_alive(source) == (0.0, 0.0, 0.0)
 
 
-def test_api_integrity_decreases_with_truncation_and_partial_dex_parse():
+def test_api_integrity_decreases_with_visible_dropout_and_partial_dex_parse():
     clean = {
         "api_parse_ok": True,
         "dex_parse_ok": True,
         "dex_parse_success_ratio": 1.0,
-        "api_event_count_raw": 10,
+        "api_event_count_before_encoder_budget": 10,
+        "api_event_count_after_encoder_budget": 10,
         "api_event_count_kept": 10,
         "api_known_type_count": 10,
         "api_unknown_type_count": 0,
+    }
+    # Half the post-budget events removed by synthetic dropout.
+    dropped = {**clean, "api_event_count_kept": 5, "api_known_type_count": 5}
+    partial = {**clean, "dex_parse_success_ratio": 0.5}
+    assert compute_api_integrity_v2(clean) > compute_api_integrity_v2(dropped)
+    assert compute_api_integrity_v2(clean) > compute_api_integrity_v2(partial)
+    fully_dropped = {**clean, "api_event_count_kept": 0, "api_known_type_count": 0}
+    assert compute_api_integrity_v2(fully_dropped) < 0.5
+
+
+def test_api_encoder_budget_does_not_reduce_clean_api_integrity():
+    clean_budgeted = {
+        "api_parse_ok": True,
+        "dex_parse_ok": True,
+        "dex_parse_success_ratio": 1.0,
+        "api_event_count_raw": 5800,
+        "api_event_count_before_encoder_budget": 5800,
+        "api_event_count_after_encoder_budget": 2048,
+        "api_event_count_kept": 2048,
+        "api_known_type_count": 2048,
+        "api_unknown_type_count": 0,
         "api_truncation_ratio": 0.0,
     }
-    truncated = {
-        **clean,
-        "api_event_count_kept": 5,
-        "api_known_type_count": 5,
-        "api_truncation_ratio": 0.5,
+    degraded_visible_events = {
+        **clean_budgeted,
+        "api_event_count_kept": 205,
+        "api_known_type_count": 205,
     }
-    partial = {**clean, "dex_parse_success_ratio": 0.5}
-    assert compute_api_integrity_v2(clean) > compute_api_integrity_v2(truncated)
-    assert compute_api_integrity_v2(clean) > compute_api_integrity_v2(partial)
-    fully_truncated = {
-        **clean,
-        "api_event_count_kept": 0,
-        "api_known_type_count": 0,
-        "api_truncation_ratio": 1.0,
+
+    assert compute_api_integrity_v2(clean_budgeted) == pytest.approx(1.0)
+    assert compute_api_integrity_v2(degraded_visible_events) < compute_api_integrity_v2(clean_budgeted)
+
+
+def test_limit_api_events_records_encoder_budget_without_changing_extraction_counts():
+    dataset = RobustTriModalDataset.__new__(RobustTriModalDataset)
+    dataset.max_api_events_per_sample = 3
+    parts = {
+        "api_ids": torch.arange(5),
+        "api_type_ids": torch.ones(5, dtype=torch.long),
+        "api_sensitive_mask": torch.zeros(5),
+        "api_method_index": torch.arange(5),
+        "api_in_graph_mask": torch.ones(5),
+        "method_api_edge_index": torch.tensor([[0, 1, 2, 3, 4], [0, 1, 2, 3, 4]], dtype=torch.long),
     }
-    assert compute_api_integrity_v2(fully_truncated) < 0.5
+
+    out = dataset._limit_api_events(parts)
+
+    # No sensitive events here -> the budget keeps a contiguous prefix of the
+    # non-sensitive events (preserving sequence locality), i.e. the first N.
+    assert out["api_ids"].tolist() == [0, 1, 2]
+    assert out["api_event_count_before_encoder_budget"] == 5
+    assert out["api_event_count_after_encoder_budget"] == 3
+    assert out["api_encoder_coverage"] == pytest.approx(0.6)
+    assert out["api_truncated_by_encoder_budget"] == 1.0
 
 
 def test_graph_integrity_decreases_for_partial_dex_and_extreme_fragmentation():

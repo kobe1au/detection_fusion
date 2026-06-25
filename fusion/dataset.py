@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
@@ -623,13 +623,41 @@ class RobustTriModalDataset(Dataset):
         return out
 
     def _limit_api_events(self, parts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        n = int(parts["api_ids"].numel())
+        parts["api_event_count_before_encoder_budget"] = n
+        parts["api_event_count_after_encoder_budget"] = n
+        parts["api_encoder_coverage"] = 1.0
+        parts["api_truncated_by_encoder_budget"] = 0.0
         if self.max_api_events_per_sample is None:
             return parts
-        n = int(parts["api_ids"].numel())
         if n <= self.max_api_events_per_sample:
             return parts
         limit = max(0, int(self.max_api_events_per_sample))
-        keep = torch.arange(limit, device=parts["api_ids"].device)
+        parts["api_event_count_after_encoder_budget"] = limit
+        parts["api_encoder_coverage"] = float(limit / max(n, 1))
+        parts["api_truncated_by_encoder_budget"] = 1.0
+        device = parts["api_ids"].device
+        # Intrinsic, modality-independent priority: keep all sensitive API events
+        # (a property of the API call itself), then fill the remaining budget
+        # with a CONTIGUOUS prefix of the non-sensitive events. Contiguity is
+        # essential -- the API branch is a sequence model that learns local
+        # behavioural n-grams, so an even/strided subsample would shatter those
+        # patterns. We deliberately do NOT use api_in_graph_mask /
+        # method_api_edge_index here: making the kept API set depend on the graph
+        # would couple the branches and break the evidential independence premise.
+        sensitive = parts.get("api_sensitive_mask")
+        if isinstance(sensitive, torch.Tensor) and sensitive.numel() == n:
+            sens_flag = sensitive.to(device).view(-1) > 0.5
+            sens_idx = torch.nonzero(sens_flag, as_tuple=False).view(-1)
+            if int(sens_idx.numel()) >= limit:
+                keep = sens_idx[:limit]
+            else:
+                non_idx = torch.nonzero(~sens_flag, as_tuple=False).view(-1)
+                remaining = limit - int(sens_idx.numel())
+                keep = torch.cat([sens_idx, non_idx[:remaining]])
+            keep = keep.sort().values
+        else:
+            keep = torch.arange(limit, device=device)
         for key in ("api_ids", "api_type_ids", "api_sensitive_mask", "api_method_index", "api_in_graph_mask"):
             value = parts[key]
             parts[key] = value[keep.to(value.device)] if value.numel() > 0 else value[:0]
@@ -811,6 +839,10 @@ class RobustTriModalDataset(Dataset):
             "q_api": q_api,
             "q_graph": q_graph,
             "q_align": q_align,
+            "api_event_count_before_encoder_budget": api_parts.get("api_event_count_before_encoder_budget", int(final_api_ids.numel())),
+            "api_event_count_after_encoder_budget": api_parts.get("api_event_count_after_encoder_budget", int(final_api_ids.numel())),
+            "api_encoder_coverage": api_parts.get("api_encoder_coverage", 1.0),
+            "api_truncated_by_encoder_budget": api_parts.get("api_truncated_by_encoder_budget", 0.0),
             "pert_api": 0.0,
             "pert_graph": 0.0,
             "api_aug_type": "none",

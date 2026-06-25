@@ -771,6 +771,9 @@ def test_multidex_api_limit_is_sample_level_and_preserves_alignment(tmp_path: Pa
         max_api_events_per_sample=3,
     )
     graph = next(iter(DataLoader(dataset, batch_size=1, collate_fn=robust_collate_fn)))["graph_batch"]
+    # All 4 events are sensitive and the budget (3) forces a drop; the sensitive
+    # tier keeps a contiguous prefix (indices 0,1,2 -> ids 1,2,3) and the
+    # API<->graph alignment is remapped consistently.
     assert graph.api_ids.tolist() == [1, 2, 3]
     assert graph.method_api_edge_index[1].tolist() == [0, 1, 2]
     assert graph.method_api_edge_index[0].tolist() == [0, 1, 2]
