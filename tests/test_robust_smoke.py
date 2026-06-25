@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import csv
 from pathlib import Path
@@ -9,6 +9,7 @@ import yaml
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch, Data
 
+from fusion.constants import EvidenceIndex
 from fusion.dataset import (
     FatalDatasetConfigError,
     RobustTriModalDataset,
@@ -453,7 +454,7 @@ def test_robust_model_forward_and_loss():
     )
     assert logits.shape == (2, 2)
     assert extra["gate_weights"].shape == (2, 4)
-    assert extra["gate_evidence"].shape == (2, 11)
+    assert extra["gate_evidence"].shape == (2, EvidenceIndex.BASE_DIM)
     assert torch.allclose(extra["gate_evidence"][:, 4], extra["api_graph_anchor_support"])
     assert "api_graph_consistency" not in extra
     assert extra["gate_prior_enabled"] is True

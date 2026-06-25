@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 from torch_geometric.data import Data
 
+from fusion.constants import EvidenceIndex
 from fusion.dataset import FatalDatasetConfigError, RobustTriModalDataset
 from fusion.evidence import build_evidence
 from fusion.manifest_features import DEFAULT_CATEGORIES, vectorize_manifest_record
@@ -432,7 +433,7 @@ def test_main_evidence_excludes_perturbation_fields():
         use_consistency_evidence=True,
         use_conflict_evidence=True,
     )
-    assert evidence.shape == (1, 11)
+    assert evidence.shape == (1, EvidenceIndex.BASE_DIM)
     assert all(key not in diagnostics for key in ("pert_api", "pert_graph", "pert_manifest"))
     before = evidence.clone()
     data.pert_api.fill_(0.0)

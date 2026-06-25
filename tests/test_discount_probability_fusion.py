@@ -309,3 +309,31 @@ def test_weight_sharpening_gamma_emphasizes_larger_discounts():
 
     assert sharp_out["fusion_weight_api"].item() > flat_out["fusion_weight_api"].item()
     assert sharp_out["weight_sharpening_gamma"].item() == 2.0
+
+
+def test_visible_integrity_modifier_scales_evidential_trust_after_reference():
+    fusion = DiscountProbabilityFusion(
+        {
+            "combination": "yager",
+            "use_reliability_discount": False,
+            "visible_integrity_modifier": {
+                "enabled": True,
+                "beta": 1.0,
+                "min_value": 0.5,
+            },
+        }
+    )
+    fusion.set_visible_integrity_reference([1.0, 1.0, 1.0])
+    evidence = _evidence(1)
+    evidence[:, EvidenceIndex.API_INTEGRITY] = 0.5
+    evidence[:, EvidenceIndex.API_ENCODER_COVERAGE] = 0.5
+
+    outputs = fusion(*_logits(1), evidence)
+
+    assert outputs["visible_integrity_modifier_active"].item() == 1.0
+    assert torch.allclose(outputs["effective_api_integrity"], torch.tensor([0.25]))
+    assert torch.allclose(outputs["visible_modifier_api"], torch.tensor([0.25]))
+    assert torch.allclose(outputs["visible_modifier_factor_api"], torch.tensor([0.625]))
+    assert torch.allclose(outputs["discount_api"], torch.tensor([0.625]))
+    assert outputs["discount_graph"].item() == 1.0
+    assert outputs["discount_manifest"].item() == 1.0

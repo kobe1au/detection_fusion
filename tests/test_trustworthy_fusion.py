@@ -17,6 +17,7 @@ from fusion.train import (
     _write_metrics_json,
     compute_branch_reliability_metrics,
     estimate_branch_competence_prior,
+    estimate_model_visible_integrity_reference,
     fit_posthoc_calibration,
     fit_rejection_threshold,
     split_validation_dataset,
@@ -617,3 +618,42 @@ def test_estimate_branch_competence_prior_uses_validation_branch_macro_f1():
     assert summary["prior"]["manifest"] < summary["prior"]["api"]
     assert summary["prior"]["graph"] == pytest.approx(0.5)
     assert summary["counts"] == {"api": 4, "graph": 4, "manifest": 4, "joint": 4}
+
+
+def test_estimate_model_visible_integrity_reference_uses_clean_effective_median():
+    rows = [
+        {
+            "api_integrity": 0.8,
+            "api_encoder_coverage": 0.5,
+            "graph_integrity": 0.9,
+            "graph_encoder_coverage": 1.0,
+            "manifest_integrity": 0.7,
+        },
+        {
+            "api_integrity": 1.0,
+            "api_encoder_coverage": 0.8,
+            "graph_integrity": 0.7,
+            "graph_encoder_coverage": 0.5,
+            "manifest_integrity": 0.9,
+        },
+    ]
+    summary = estimate_model_visible_integrity_reference(
+        rows,
+        {
+            "fusion": {
+                "visible_integrity_modifier": {
+                    "enabled": True,
+                    "beta": 2.0,
+                    "min_value": 0.4,
+                }
+            }
+        },
+    )
+
+    assert summary["enabled"] is True
+    assert summary["reference"]["api"] == pytest.approx(0.6)
+    assert summary["reference"]["graph"] == pytest.approx(0.625)
+    assert summary["reference"]["manifest"] == pytest.approx(0.8)
+    assert summary["values"] == pytest.approx([0.6, 0.625, 0.8])
+    assert summary["beta"] == 2.0
+    assert summary["min_value"] == 0.4

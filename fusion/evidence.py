@@ -177,6 +177,12 @@ def build_evidence(
     evidence_manifest_conflict = manifest_conflict if use_conflict_evidence else torch.zeros_like(manifest_conflict)
     evidence_code_conflict = code_conflict if use_conflict_evidence else torch.zeros_like(code_conflict)
 
+    api_encoder_coverage = scalar_attr(
+        graph_data, "api_encoder_coverage", batch_size, device, dtype, 1.0
+    )
+    graph_encoder_coverage = scalar_attr(
+        graph_data, "graph_encoder_coverage", batch_size, device, dtype, 1.0
+    )
     evidence = None
     if not diagnostics_only:
         evidence = torch.cat(
@@ -192,6 +198,8 @@ def build_evidence(
                 api_alive,
                 graph_alive,
                 manifest_alive,
+                api_encoder_coverage,
+                graph_encoder_coverage,
             ],
             dim=-1,
         )
@@ -203,9 +211,6 @@ def build_evidence(
 
     api_manifest_consistency = cosine_counts(api_counts, manifest_counts)
     graph_manifest_consistency = cosine_counts(graph_counts, manifest_counts)
-    api_encoder_coverage = scalar_attr(
-        graph_data, "api_encoder_coverage", batch_size, device, dtype, 1.0
-    )
     api_truncated = scalar_attr(
         graph_data,
         "api_truncated_by_encoder_budget",
@@ -221,9 +226,6 @@ def build_evidence(
         device,
         dtype,
         0.0,
-    )
-    graph_encoder_coverage = scalar_attr(
-        graph_data, "graph_encoder_coverage", batch_size, device, dtype, 1.0
     )
     graph_truncated = scalar_attr(
         graph_data,
@@ -244,13 +246,16 @@ def build_evidence(
     diagnostics = {
         "api_integrity": api_integrity.detach().view(batch_size),
         "api_encoder_coverage": api_encoder_coverage.detach().view(batch_size),
+        "effective_api_integrity": (api_integrity * api_encoder_coverage).detach().view(batch_size),
         "api_truncated_by_encoder_budget": api_truncated.detach().view(batch_size),
         "api_integrity_before_encoder_budget": api_integrity_before_budget.detach().view(batch_size),
         "graph_integrity": graph_integrity.detach().view(batch_size),
         "graph_encoder_coverage": graph_encoder_coverage.detach().view(batch_size),
+        "effective_graph_integrity": (graph_integrity * graph_encoder_coverage).detach().view(batch_size),
         "graph_truncated_by_encoder_budget": graph_truncated.detach().view(batch_size),
         "graph_integrity_before_encoder_budget": graph_integrity_before_budget.detach().view(batch_size),
         "manifest_integrity": manifest_integrity.detach().view(batch_size),
+        "effective_manifest_integrity": manifest_integrity.detach().view(batch_size),
         "code_integrity": code_integrity.detach().view(batch_size),
         "api_graph_anchor_support": anchor_support.detach().view(batch_size),
         "manifest_code_support": manifest_support.detach().view(batch_size),

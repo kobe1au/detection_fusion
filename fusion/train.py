@@ -64,13 +64,16 @@ class EmptyExtraEvalSetError(RuntimeError):
 GATE_DIAGNOSTIC_KEYS = (
     "api_integrity",
     "api_encoder_coverage",
+    "effective_api_integrity",
     "api_truncated_by_encoder_budget",
     "api_integrity_before_encoder_budget",
     "graph_integrity",
     "graph_encoder_coverage",
+    "effective_graph_integrity",
     "graph_truncated_by_encoder_budget",
     "graph_integrity_before_encoder_budget",
     "manifest_integrity",
+    "effective_manifest_integrity",
     "code_integrity",
     "api_graph_anchor_support",
     "manifest_code_support",
@@ -126,6 +129,18 @@ GATE_DIAGNOSTIC_KEYS = (
     "branch_competence_prior_graph",
     "branch_competence_prior_manifest",
     "branch_competence_prior_joint",
+    "visible_integrity_modifier_active",
+    "visible_integrity_modifier_beta",
+    "visible_integrity_modifier_min_value",
+    "visible_modifier_api",
+    "visible_modifier_graph",
+    "visible_modifier_manifest",
+    "visible_modifier_factor_api",
+    "visible_modifier_factor_graph",
+    "visible_modifier_factor_manifest",
+    "visible_integrity_reference_api",
+    "visible_integrity_reference_graph",
+    "visible_integrity_reference_manifest",
     "weight_sharpening_gamma",
     "temperature_api",
     "temperature_graph",
@@ -1103,6 +1118,75 @@ def apply_branch_competence_prior(model, summary: dict[str, Any]) -> None:
     model.discount_fusion.set_branch_competence_prior(values, enabled=True)
 
 
+def estimate_model_visible_integrity_reference(
+    rows: list[dict[str, Any]],
+    cfg: dict,
+) -> dict[str, Any]:
+    """Fit clean calibration references for model-visible evidence integrity."""
+    modifier_cfg = (cfg.get("fusion", {}) or {}).get("visible_integrity_modifier", {}) or {}
+    if not bool(modifier_cfg.get("enabled", False)):
+        return {"enabled": False}
+    min_reference = float(modifier_cfg.get("min_reference", 1.0e-6))
+    beta = float(modifier_cfg.get("beta", 1.0))
+    min_value = float(modifier_cfg.get("min_value", 0.5))
+    if not math.isfinite(min_reference) or not 0.0 < min_reference <= 1.0:
+        raise ValueError("fusion.visible_integrity_modifier.min_reference must be within (0, 1]")
+    if not math.isfinite(beta) or beta <= 0.0:
+        raise ValueError("fusion.visible_integrity_modifier.beta must be finite and positive")
+    if not math.isfinite(min_value) or not 0.0 <= min_value <= 1.0:
+        raise ValueError("fusion.visible_integrity_modifier.min_value must be within [0, 1]")
+
+    def _effective_value(row: dict[str, Any], branch: str) -> float | None:
+        direct = _finite_row_float(row, f"effective_{branch}_integrity")
+        if direct is not None:
+            return min(1.0, max(0.0, direct))
+        integrity = _finite_row_float(row, f"{branch}_integrity")
+        if integrity is None:
+            return None
+        if branch == "api":
+            coverage = _finite_row_float(row, "api_encoder_coverage")
+        elif branch == "graph":
+            coverage = _finite_row_float(row, "graph_encoder_coverage")
+        else:
+            coverage = 1.0
+        if coverage is None:
+            coverage = 1.0
+        return min(1.0, max(0.0, integrity * coverage))
+
+    references: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for branch in ("api", "graph", "manifest"):
+        values = [
+            value
+            for row in rows
+            if (value := _effective_value(row, branch)) is not None and math.isfinite(value)
+        ]
+        counts[branch] = len(values)
+        if not values:
+            references[branch] = 1.0
+            continue
+        references[branch] = float(min(1.0, max(min_reference, float(np.median(values)))))
+    return {
+        "enabled": True,
+        "metric": "median_clean_effective_integrity",
+        "beta": beta,
+        "min_value": min_value,
+        "min_reference": min_reference,
+        "counts": counts,
+        "reference": references,
+        "values": [references[name] for name in ("api", "graph", "manifest")],
+    }
+
+
+def apply_model_visible_integrity_reference(model, summary: dict[str, Any]) -> None:
+    if not bool((summary or {}).get("enabled", False)):
+        return
+    values = summary.get("values")
+    if values is None:
+        reference = summary.get("reference") or {}
+        values = [reference[name] for name in ("api", "graph", "manifest")]
+    model.discount_fusion.set_visible_integrity_reference(values, enabled=True)
+
 def _selective_metrics(
     labels: list[int],
     preds: list[int],
@@ -1217,7 +1301,7 @@ def _selective_metrics_from_rows(
     )
 
 
-# ── I3: class-conditional (Mondrian) conformal selective prediction ───────────
+# I3: class-conditional (Mondrian) conformal selective prediction
 # Replaces the heuristic coverage threshold with split-conformal calibration so
 # the abstention has a finite-sample guarantee: on exchangeable data,
 # P(true label in prediction set | label = c) >= 1 - alpha. This abstains on
@@ -1875,6 +1959,15 @@ def run(cfg: dict) -> dict[str, Any]:
             logger.warning(
                 "fusion.branch_competence_prior.enabled=true but checkpoint has no fitted prior; using neutral priors"
             )
+        visible_integrity_summary = dict(ckpt.get("model_visible_integrity_reference") or {"enabled": False})
+        apply_model_visible_integrity_reference(model, visible_integrity_summary)
+        if (
+            bool(((cfg.get("fusion", {}) or {}).get("visible_integrity_modifier", {}) or {}).get("enabled", False))
+            and not bool(visible_integrity_summary.get("enabled", False))
+        ):
+            logger.warning(
+                "fusion.visible_integrity_modifier.enabled=true but checkpoint has no fitted reference; using neutral modifiers"
+            )
         best_score = float(ckpt.get("checkpoint_score", -1.0))
         best_val_f1 = float((ckpt.get("val") or {}).get("macro_f1", -1.0))
         checkpoint_metric_name = str(ckpt.get("checkpoint_metric", "loaded_checkpoint"))
@@ -2012,6 +2105,29 @@ def run(cfg: dict) -> dict[str, Any]:
                 dump_rows=True,
             )
             enforce_failed_ratio(val_calibration_metrics, cfg, "val_calibration")
+    if not eval_only:
+        visible_integrity_summary = estimate_model_visible_integrity_reference(
+            val_calibration_rows,
+            cfg,
+        )
+        apply_model_visible_integrity_reference(model, visible_integrity_summary)
+        if bool(visible_integrity_summary.get("enabled", False)):
+            logger.info(
+                "model_visible_integrity_reference %s",
+                " ".join(
+                    f"{name}={value:.4f}"
+                    for name, value in visible_integrity_summary["reference"].items()
+                ),
+            )
+            val_calibration_metrics, val_calibration_rows = evaluate(
+                model,
+                val_calibration_loader,
+                device,
+                use_amp,
+                "val_calibration",
+                dump_rows=True,
+            )
+            enforce_failed_ratio(val_calibration_metrics, cfg, "val_calibration")
     if not eval_only or refit_rejection_threshold:
         rejection_threshold = fit_rejection_threshold(
             val_calibration_rows, cfg.get("selective_prediction", {}) or {}
@@ -2024,6 +2140,7 @@ def run(cfg: dict) -> dict[str, Any]:
             ckpt["model"] = model.state_dict()
             ckpt["calibration"] = calibration_summary
             ckpt["branch_competence_prior"] = branch_competence_summary
+            ckpt["model_visible_integrity_reference"] = visible_integrity_summary
             if rejection_threshold is not None:
                 ckpt["rejection_threshold"] = rejection_threshold
             else:
@@ -2190,6 +2307,7 @@ def run(cfg: dict) -> dict[str, Any]:
         "tuning_robust_composite_score": tuning_robust_composite_score,
         "calibration": calibration_summary,
         "branch_competence_prior": branch_competence_summary,
+        "model_visible_integrity_reference": visible_integrity_summary,
         "conformal_thresholds": conformal_thresholds,
         "val": val_metrics,
         "val_selection": val_metrics,

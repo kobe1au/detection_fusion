@@ -64,6 +64,12 @@ def _column(evidence: torch.Tensor, index: int) -> torch.Tensor:
     return evidence[:, index].clamp(0.0, 1.0)
 
 
+def _optional_column(evidence: torch.Tensor, index: int, default: float = 1.0) -> torch.Tensor:
+    if evidence.size(-1) > index:
+        return _column(evidence, index)
+    return torch.full_like(evidence[:, 0], float(default)).clamp(0.0, 1.0)
+
+
 def _mean_alive_integrity(
     integrities: torch.Tensor,
     alive: torch.Tensor,
@@ -107,6 +113,16 @@ class DiscountProbabilityFusion(nn.Module):
         self.register_buffer(
             "_branch_competence_prior",
             torch.ones(len(BRANCH_NAMES), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_visible_integrity_reference_active",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_visible_integrity_reference",
+            torch.ones(len(EVIDENCE_BRANCHES), dtype=torch.float32),
             persistent=False,
         )
         reliability_cfg = self.config.get("reliability_calibration", {}) or {}
@@ -192,6 +208,78 @@ class DiscountProbabilityFusion(nn.Module):
         values = self._branch_competence_prior.detach().cpu().tolist()
         return {name: float(value) for name, value in zip(BRANCH_NAMES, values)}
 
+    @property
+    def visible_integrity_reference_active(self) -> bool:
+        return bool(self._visible_integrity_reference_active.item())
+
+    def set_visible_integrity_reference(self, values, enabled: bool = True) -> None:
+        tensor = torch.as_tensor(
+            values,
+            dtype=self._visible_integrity_reference.dtype,
+            device=self._visible_integrity_reference.device,
+        ).view(-1)
+        if tensor.numel() != len(EVIDENCE_BRANCHES):
+            raise ValueError(
+                f"visible integrity reference expects {len(EVIDENCE_BRANCHES)} values, got {tensor.numel()}"
+            )
+        if not torch.isfinite(tensor).all():
+            raise ValueError("visible integrity reference contains non-finite values")
+        if bool((tensor <= 0.0).any()) or bool((tensor > 1.0).any()):
+            raise ValueError("visible integrity reference values must be within (0, 1]")
+        self._visible_integrity_reference.copy_(tensor.clamp(1.0e-6, 1.0))
+        self._visible_integrity_reference_active.fill_(bool(enabled))
+
+    def visible_integrity_reference_values(self) -> dict[str, float]:
+        values = self._visible_integrity_reference.detach().cpu().tolist()
+        return {name: float(value) for name, value in zip(EVIDENCE_BRANCHES, values)}
+
+    def _visible_integrity_terms(
+        self,
+        evidence: torch.Tensor,
+        cfg: dict,
+        eps: float,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor, float, float]:
+        modifier_cfg = cfg.get("visible_integrity_modifier", {}) or {}
+        enabled = bool(modifier_cfg.get("enabled", False))
+        beta = float(modifier_cfg.get("beta", 1.0))
+        min_value = float(modifier_cfg.get("min_value", 0.5))
+        if not math.isfinite(beta) or beta <= 0.0:
+            raise ValueError("fusion.visible_integrity_modifier.beta must be finite and positive")
+        if not math.isfinite(min_value) or not 0.0 <= min_value <= 1.0:
+            raise ValueError("fusion.visible_integrity_modifier.min_value must be within [0, 1]")
+
+        api_integrity = _column(evidence, EvidenceIndex.API_INTEGRITY)
+        graph_integrity = _column(evidence, EvidenceIndex.GRAPH_INTEGRITY)
+        manifest_integrity = _column(evidence, EvidenceIndex.MANIFEST_INTEGRITY)
+        api_coverage = _optional_column(evidence, EvidenceIndex.API_ENCODER_COVERAGE, 1.0)
+        graph_coverage = _optional_column(evidence, EvidenceIndex.GRAPH_ENCODER_COVERAGE, 1.0)
+        effective = {
+            "api": (api_integrity * api_coverage).clamp(0.0, 1.0),
+            "graph": (graph_integrity * graph_coverage).clamp(0.0, 1.0),
+            "manifest": manifest_integrity.clamp(0.0, 1.0),
+        }
+        device = evidence.device
+        dtype = evidence.dtype
+        if enabled and self.visible_integrity_reference_active:
+            reference = self._visible_integrity_reference.to(device=device, dtype=dtype).clamp_min(eps)
+            reference_by_branch = {name: reference[i] for i, name in enumerate(EVIDENCE_BRANCHES)}
+            relative = {
+                name: (effective[name] / reference_by_branch[name]).clamp(0.0, 1.0)
+                for name in EVIDENCE_BRANCHES
+            }
+            factor = {
+                name: (min_value + (1.0 - min_value) * relative[name].pow(beta)).clamp(0.0, 1.0)
+                for name in EVIDENCE_BRANCHES
+            }
+            active = torch.full((evidence.size(0),), 1.0, device=device, dtype=dtype)
+        else:
+            reference_by_branch = {
+                name: torch.ones((), device=device, dtype=dtype) for name in EVIDENCE_BRANCHES
+            }
+            relative = {name: torch.ones_like(effective[name]) for name in EVIDENCE_BRANCHES}
+            factor = {name: torch.ones_like(effective[name]) for name in EVIDENCE_BRANCHES}
+            active = torch.zeros((evidence.size(0),), device=device, dtype=dtype)
+        return effective, relative, factor, active, beta, min_value
     def _temperature(self, name: str, confidence_cfg: dict) -> float | torch.Tensor:
         if self.temperature_parameters is None or not self.calibration_active:
             return float(confidence_cfg.get(f"temperature_{name}", 1.0))
@@ -309,6 +397,14 @@ class DiscountProbabilityFusion(nn.Module):
                 len(BRANCH_NAMES), device=api_integrity.device, dtype=api_integrity.dtype
             )
         competence_by_branch = {name: competence_prior[i] for i, name in enumerate(BRANCH_NAMES)}
+        (
+            visible_effective_integrity,
+            visible_modifier,
+            visible_modifier_factor,
+            visible_modifier_active,
+            visible_modifier_beta,
+            visible_modifier_min_value,
+        ) = self._visible_integrity_terms(evidence, cfg, eps)
 
         beliefs: list[torch.Tensor] = []
         uncertainties: list[torch.Tensor] = []
@@ -319,7 +415,7 @@ class DiscountProbabilityFusion(nn.Module):
                 reliability = reliability.clamp(0.0, 1.0).pow(reliability_exponent)
             else:
                 reliability = torch.ones_like(reliability)
-            trust = (competence_by_branch[name] * reliability).clamp(0.0, 1.0)
+            trust = (competence_by_branch[name] * reliability * visible_modifier_factor[name]).clamp(0.0, 1.0)
             if use_hard_alive:
                 # Dead modalities become vacuous opinions (the identity element of
                 # the fusion), contributing nothing instead of voting.
@@ -346,7 +442,7 @@ class DiscountProbabilityFusion(nn.Module):
         fusion_weights = torch.cat([weights3, torch.zeros_like(weights3[:, :1])], dim=-1)
 
         total_reliability = (weights3 * torch.stack(
-            [observable_reliability[name] for name in EVIDENCE_BRANCHES], dim=-1
+            [trust_by_branch[name] for name in EVIDENCE_BRANCHES], dim=-1
         )).sum(dim=-1).clamp(0.0, 1.0)
         acceptance_score = (1.0 - fused_uncertainty).clamp(0.0, 1.0)
 
@@ -367,6 +463,19 @@ class DiscountProbabilityFusion(nn.Module):
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             ),
+            "visible_integrity_modifier_active": visible_modifier_active,
+            "visible_integrity_modifier_beta": torch.full(
+                (batch,),
+                visible_modifier_beta,
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
+            "visible_integrity_modifier_min_value": torch.full(
+                (batch,),
+                visible_modifier_min_value,
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
             "calibration_active": torch.full(
                 (batch,), float(self.calibration_active), device=final_logits.device, dtype=final_logits.dtype
             ),
@@ -383,6 +492,17 @@ class DiscountProbabilityFusion(nn.Module):
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             )
+            if name in visible_effective_integrity:
+                ref_index = EVIDENCE_BRANCHES.index(name)
+                outputs[f"effective_{name}_integrity"] = visible_effective_integrity[name]
+                outputs[f"visible_modifier_{name}"] = visible_modifier[name]
+                outputs[f"visible_modifier_factor_{name}"] = visible_modifier_factor[name]
+                outputs[f"visible_integrity_reference_{name}"] = torch.full(
+                    (batch,),
+                    float(self._visible_integrity_reference[ref_index].detach().cpu().item()),
+                    device=final_logits.device,
+                    dtype=final_logits.dtype,
+                )
             outputs[f"calibrated_log_prob_{name}"] = torch.log(
                 opinions[name]["expected_prob"].clamp_min(eps)
             )
@@ -604,11 +724,19 @@ class DiscountProbabilityFusion(nn.Module):
                 device=api_integrity.device,
                 dtype=api_integrity.dtype,
             )
+        (
+            visible_effective_integrity,
+            visible_modifier,
+            visible_modifier_factor,
+            visible_modifier_active,
+            visible_modifier_beta,
+            visible_modifier_min_value,
+        ) = self._visible_integrity_terms(evidence, cfg, eps)
         raw_discounts = torch.stack(
             [
-                competence_prior[0] * reliability_for_fusion[0] * code_anchor_factor * code_conflict_factor * confidence_factors[0],
-                competence_prior[1] * reliability_for_fusion[1] * code_anchor_factor * code_conflict_factor * confidence_factors[1],
-                competence_prior[2] * reliability_for_fusion[2] * manifest_support_factor * manifest_conflict_factor * confidence_factors[2],
+                competence_prior[0] * reliability_for_fusion[0] * visible_modifier_factor["api"] * code_anchor_factor * code_conflict_factor * confidence_factors[0],
+                competence_prior[1] * reliability_for_fusion[1] * visible_modifier_factor["graph"] * code_anchor_factor * code_conflict_factor * confidence_factors[1],
+                competence_prior[2] * reliability_for_fusion[2] * visible_modifier_factor["manifest"] * manifest_support_factor * manifest_conflict_factor * confidence_factors[2],
                 competence_prior[3] * reliability_for_fusion[3] * joint_support_factor * joint_conflict_factor * confidence_factors[3],
             ],
             dim=-1,
@@ -685,6 +813,7 @@ class DiscountProbabilityFusion(nn.Module):
             )
         acceptance_score = acceptance_score.clamp(0.0, 1.0)
 
+        batch = final_logits.size(0)
         outputs: dict[str, torch.Tensor] = {
             "discounts": discounts,
             "fusion_weights": fusion_weights,
@@ -696,6 +825,19 @@ class DiscountProbabilityFusion(nn.Module):
             "final_uncertainty_proxy": final_proxy["uncertainty_proxy"],
             "effective_conflict": effective_conflict,
             "acceptance_score": acceptance_score,
+            "visible_integrity_modifier_active": visible_modifier_active,
+            "visible_integrity_modifier_beta": torch.full(
+                (batch,),
+                visible_modifier_beta,
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
+            "visible_integrity_modifier_min_value": torch.full(
+                (batch,),
+                visible_modifier_min_value,
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
             "calibration_active": torch.full(
                 (final_logits.size(0),),
                 float(self.calibration_active),
@@ -753,6 +895,17 @@ class DiscountProbabilityFusion(nn.Module):
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             )
+            if name in visible_effective_integrity:
+                ref_index = EVIDENCE_BRANCHES.index(name)
+                outputs[f"effective_{name}_integrity"] = visible_effective_integrity[name]
+                outputs[f"visible_modifier_{name}"] = visible_modifier[name]
+                outputs[f"visible_modifier_factor_{name}"] = visible_modifier_factor[name]
+                outputs[f"visible_integrity_reference_{name}"] = torch.full(
+                    (batch,),
+                    float(self._visible_integrity_reference[ref_index].detach().cpu().item()),
+                    device=final_logits.device,
+                    dtype=final_logits.dtype,
+                )
             outputs[f"calibrated_log_prob_{name}"] = torch.log(
                 proxies[name]["prob"].clamp_min(eps)
             )

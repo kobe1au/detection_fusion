@@ -44,8 +44,10 @@ class EvidenceIndex:
     API_ALIVE = 8
     GRAPH_ALIVE = 9
     MANIFEST_ALIVE = 10
+    API_ENCODER_COVERAGE = 11
+    GRAPH_ENCODER_COVERAGE = 12
 
-    BASE_DIM = 11
+    BASE_DIM = 13
 
     # Compatibility aliases for old gate/loss code. They point only to
     # observable integrity/support fields and never to synthetic pert_*.
@@ -53,7 +55,6 @@ class EvidenceIndex:
     R_GRAPH = GRAPH_INTEGRITY
     R_MANIFEST = MANIFEST_INTEGRITY
     Q_ALIGN = API_GRAPH_ANCHOR_SUPPORT
-
 
 
 class TriModalConfigDefaults:
@@ -150,6 +151,12 @@ class TriModalConfigDefaults:
                 "metric": "macro_f1",
                 "normalization": "best",
                 "min_value": 0.5,
+            },
+            "visible_integrity_modifier": {
+                "enabled": True,
+                "beta": 1.0,
+                "min_value": 0.5,
+                "min_reference": 1.0e-6,
             },
             "weight_sharpening_gamma": 1.0,
             "use_support_discount": True,

@@ -30,6 +30,11 @@ fusion:
     metric: macro_f1
     normalization: best
     min_value: 0.5
+  visible_integrity_modifier:
+    enabled: true
+    beta: 1.0
+    min_value: 0.5
+    min_reference: 1.0e-6
   weight_sharpening_gamma: 1.0
   reliability_calibration:
     enabled: true

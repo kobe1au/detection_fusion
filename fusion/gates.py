@@ -31,9 +31,10 @@ class FourBranchEvidenceGate(nn.Module):
 
 
 def heuristic_reliability_gate(evidence: torch.Tensor) -> torch.Tensor:
-    if evidence.size(-1) < EvidenceIndex.BASE_DIM:
+    required_dim = EvidenceIndex.MANIFEST_ALIVE + 1
+    if evidence.size(-1) < required_dim:
         raise ValueError(
-            f"heuristic_reliability_gate expected ≥{EvidenceIndex.BASE_DIM} evidence dims, "
+            f"heuristic_reliability_gate expected >= {required_dim} evidence dims, "
             f"got {evidence.size(-1)}"
         )
     r_api = evidence[:, EvidenceIndex.R_API : EvidenceIndex.R_API + 1]
