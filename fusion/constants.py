@@ -74,6 +74,10 @@ class TriModalConfigDefaults:
             "strict_split_integrity": True,
             "strict_partition_isolation": True,
             "allow_pt_superset": True,
+            # Cache
+            "cache_mode": "none",
+            "cache_dir": "",
+            "cache_tag": "base_processed",
         },
         "train": {
             "tuning_mode": False,
@@ -214,6 +218,7 @@ class TriModalConfigDefaults:
             "weight_decay": 0.0,
             "grad_clip": 5.0,
             "include_robust_val": False,
+            "cache_branch_outputs": False,
         },
         "selective_prediction": {
             "enabled": True,

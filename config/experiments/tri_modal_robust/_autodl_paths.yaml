@@ -14,3 +14,11 @@ train:
   persistent_workers: false
   prefetch_factor: 1
   multiprocessing_sharing_strategy: file_system
+
+data:
+  cache_mode: disk
+  cache_dir: /root/autodl-tmp/pts_cache/robust
+  cache_tag: base_processed_v1
+
+calibration:
+  cache_branch_outputs: true
