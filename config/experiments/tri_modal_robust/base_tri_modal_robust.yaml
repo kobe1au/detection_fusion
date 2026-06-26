@@ -16,8 +16,8 @@ train:
   epochs: 60
   patience: 8
   batch_size: 48
-  eval_batch_size: 64
-  num_workers: 8
+  eval_batch_size: 48
+  num_workers: 4
   eval_num_workers: 4
   lr: 0.0003
 

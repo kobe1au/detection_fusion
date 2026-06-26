@@ -1,5 +1,5 @@
 data:
-  root: /root/autodl-tmp/code/detection
+  root: /root/autodl-tmp/code
   train_pt_dir: /root/autodl-tmp/pts/train
   val_pt_dir: /pts/val
   test_pt_dir: /pts/test
