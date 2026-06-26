@@ -88,7 +88,7 @@ EXTERNAL_EVAL = [
 ]
 
 SEEDS = [
-    # PRIMARY_SEED,
+    PRIMARY_SEED,
     "seeds/seed_2024.yaml",
     "seeds/seed_3407.yaml",
 ]

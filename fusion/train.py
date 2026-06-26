@@ -407,11 +407,6 @@ def _dataset_common_kwargs(
         "strict_partition_isolation",
         "allow_pt_superset",
         "label_map",
-
-        # Cache
-        "cache_mode",
-        "cache_dir",
-        "cache_tag",
     }
     unknown_data_keys = sorted(set(data_cfg) - allowed_data_keys)
     if unknown_data_keys:
@@ -444,14 +439,6 @@ def _dataset_common_kwargs(
         "label_map": data_cfg.get("label_map"),
         "strict_split_integrity": bool(data_cfg.get("strict_split_integrity", True)),
         "allow_pt_superset": bool(data_cfg.get("allow_pt_superset", False)),
-        # Cache
-        "cache_mode": str(data_cfg.get("cache_mode", "none")),
-        "cache_dir": (
-            resolve(data_cfg.get("root", ""), data_cfg["cache_dir"])
-            if str(data_cfg.get("cache_dir", "") or "").strip()
-            else None
-        ),
-        "cache_tag": str(data_cfg.get("cache_tag", "base_processed")),
     }
 
 
@@ -1561,87 +1548,6 @@ def evaluate(
         metrics.update(compute_branch_reliability_metrics(rows))
     return metrics, rows
 
-@torch.no_grad()
-def collect_posthoc_calibration_cache(
-    model,
-    loaders: list,
-    device,
-    use_amp: bool,
-) -> list[dict[str, torch.Tensor]]:
-    """Cache frozen-model branch logits and evidence for post-hoc calibration."""
-    model.eval()
-    cached: list[dict[str, torch.Tensor]] = []
-    required = (
-        "api_logits_aux",
-        "graph_logits_aux",
-        "manifest_logits_aux",
-        "joint_logits_aux",
-        "gate_evidence",
-    )
-
-    for loader in loaders:
-        for batch in tqdm(loader, desc="collect calibration cache", leave=False):
-            graph, labels, _, _quality, _failed = prepare_robust_batch(batch, device)
-            if graph is None:
-                continue
-            with get_amp_context(device, use_amp):
-                _logits, extra = model(graph, return_features=False)
-
-            missing = [key for key in required if key not in extra]
-            if missing:
-                raise RuntimeError(f"Missing calibration cache fields: {missing}")
-
-            cached.append(
-                {
-                    "labels": labels.detach().cpu(),
-                    "api_logits_aux": extra["api_logits_aux"].detach().cpu(),
-                    "graph_logits_aux": extra["graph_logits_aux"].detach().cpu(),
-                    "manifest_logits_aux": extra["manifest_logits_aux"].detach().cpu(),
-                    "joint_logits_aux": extra["joint_logits_aux"].detach().cpu(),
-                    "gate_evidence": extra["gate_evidence"].detach().cpu(),
-                }
-            )
-
-    if not cached:
-        raise RuntimeError("Post-hoc calibration cache collected no valid batches")
-    return cached
-
-
-def calibration_step_from_cached_batch(
-    model,
-    item: dict[str, torch.Tensor],
-    device,
-    cfg: dict,
-):
-    labels = item["labels"].to(device, non_blocking=True)
-    api_logits = item["api_logits_aux"].to(device, non_blocking=True)
-    graph_logits = item["graph_logits_aux"].to(device, non_blocking=True)
-    manifest_logits = item["manifest_logits_aux"].to(device, non_blocking=True)
-    joint_logits = item["joint_logits_aux"].to(device, non_blocking=True)
-    evidence = item["gate_evidence"].to(device, non_blocking=True)
-
-    outputs = model.discount_fusion(
-        api_logits,
-        graph_logits,
-        manifest_logits,
-        joint_logits,
-        evidence,
-    )
-    outputs.update(
-        {
-            "api_logits_aux": api_logits,
-            "graph_logits_aux": graph_logits,
-            "manifest_logits_aux": manifest_logits,
-            "joint_logits_aux": joint_logits,
-            "gate_evidence": evidence,
-        }
-    )
-    return compute_posthoc_calibration_loss(
-        outputs,
-        labels,
-        evidence,
-        cfg.get("fusion", {}) or {},
-    )
 
 def fit_posthoc_calibration(
     model,
@@ -1683,16 +1589,6 @@ def fit_posthoc_calibration(
     for param in model.parameters():
         param.requires_grad_(id(param) in calibration_ids)
 
-    # Cache
-    cached_calibration_batches = None
-    if bool(calibration_cfg.get("cache_branch_outputs", False)):
-        cached_calibration_batches = collect_posthoc_calibration_cache(
-            model,
-            loaders,
-            device,
-            use_amp,
-        )
-
     epoch_losses: list[float] = []
     total_steps = 0
     best_loss = float("inf")
@@ -1705,48 +1601,28 @@ def fit_posthoc_calibration(
         for epoch in range(1, epochs + 1):
             total = 0.0
             steps = 0
-            if cached_calibration_batches is not None:
-                for item in tqdm(cached_calibration_batches, desc=f"calibrate {epoch}", leave=False):
+            for loader in loaders:
+                for batch in tqdm(loader, desc=f"calibrate {epoch}", leave=False):
+                    graph, labels, _, _quality, _failed = prepare_robust_batch(batch, device)
+                    if graph is None:
+                        continue
                     optimizer.zero_grad(set_to_none=True)
-                    loss, _parts = calibration_step_from_cached_batch(
-                        model,
-                        item,
-                        device,
-                        cfg,
+                    with get_amp_context(device, use_amp):
+                        _logits, extra = model(graph, return_features=False)
+                    loss, _parts = compute_posthoc_calibration_loss(
+                        extra,
+                        labels,
+                        extra.get("gate_evidence"),
+                        cfg.get("fusion", {}) or {},
                     )
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(
-                        parameters,
-                        float(calibration_cfg.get("grad_clip", 5.0)),
+                        parameters, float(calibration_cfg.get("grad_clip", 5.0))
                     )
                     optimizer.step()
                     total += float(loss.detach().item())
                     steps += 1
                     total_steps += 1
-            else:
-                for loader in loaders:
-                    for batch in tqdm(loader, desc=f"calibrate {epoch}", leave=False):
-                        graph, labels, _, _quality, _failed = prepare_robust_batch(batch, device)
-                        if graph is None:
-                            continue
-                        optimizer.zero_grad(set_to_none=True)
-                        with get_amp_context(device, use_amp):
-                            _logits, extra = model(graph, return_features=False)
-                        loss, _parts = compute_posthoc_calibration_loss(
-                            extra,
-                            labels,
-                            extra.get("gate_evidence"),
-                            cfg.get("fusion", {}) or {},
-                        )
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            parameters,
-                            float(calibration_cfg.get("grad_clip", 5.0)),
-                        )
-                        optimizer.step()
-                        total += float(loss.detach().item())
-                        steps += 1
-                        total_steps += 1
             epoch_loss = total / max(steps, 1)
             epoch_losses.append(epoch_loss)
             logger.info("posthoc_calibration epoch=%s loss=%.6f", epoch, epoch_loss)

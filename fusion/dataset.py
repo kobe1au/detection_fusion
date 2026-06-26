@@ -7,9 +7,6 @@ import math
 import random
 from pathlib import Path
 from typing import Any
-import copy
-import json
-import os
 
 import pandas as pd
 import torch
@@ -156,7 +153,7 @@ def apply_graph_encoder_budget(
     # )
     # data["q_graph"] = effective_graph_integrity
     # data["r_graph"] = effective_graph_integrity
-
+    
     # Keep graph_integrity/q_graph/r_graph as the observable structural integrity
     # of the graph after budgeted graph construction. Do NOT multiply coverage into
     # these aliases here; build_evidence()/visible_integrity_modifier applies the
@@ -207,28 +204,6 @@ def _temporary_random_seed(seed: int):
     finally:
         random.setstate(py_state)
         torch.random.set_rng_state(torch_state)
-
-BASE_PROCESSED_CACHE_VERSION = 1
-
-
-def _clone_cached_value(value):
-    """Clone cached tensors before train-time perturbation mutates the sample."""
-    if isinstance(value, torch.Tensor):
-        return value.clone()
-    if isinstance(value, dict):
-        return {key: _clone_cached_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_clone_cached_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_clone_cached_value(item) for item in value)
-    return copy.deepcopy(value)
-
-
-def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    torch.save(payload, tmp_path)
-    tmp_path.replace(path)
 
 
 def _as_float_tensor(value, length: int, default: float = 0.0) -> torch.Tensor:
@@ -395,11 +370,6 @@ class RobustTriModalDataset(Dataset):
         label_map: dict | None = None,
         strict_split_integrity: bool = True,
         allow_pt_superset: bool = False,
-
-        # Cache
-        cache_mode: str = "none",
-        cache_dir: str | Path | None = None,
-        cache_tag: str = "base_processed",
     ):
         if eval_perturb_type not in EVAL_PERTURB_TYPES:
             raise ValueError(f"Unsupported eval_perturb_type: {eval_perturb_type}")
@@ -452,20 +422,6 @@ class RobustTriModalDataset(Dataset):
         self.graph_semantic_source = src
         self.strict_split_integrity = bool(strict_split_integrity)
         self.allow_pt_superset = bool(allow_pt_superset)
-
-        # Cache
-        self.cache_mode = str(cache_mode or "none").lower()
-        if self.cache_mode not in {"none", "memory", "disk"}:
-            raise ValueError("data.cache_mode must be one of: none, memory, disk")
-
-        self.cache_tag = str(cache_tag or "base_processed")
-        self.cache_dir = Path(cache_dir) if cache_dir else None
-        if self.cache_mode == "disk":
-            if self.cache_dir is None:
-                raise ValueError("data.cache_dir is required when data.cache_mode=disk")
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-        self._memory_base_cache: dict[str, dict[str, Any]] = {}
 
         df = pd.read_csv(csv_path)
         id_col = next((c for c in ["id", "ID", "Id", "sha256"] if c in df.columns), None)
@@ -595,98 +551,6 @@ class RobustTriModalDataset(Dataset):
             except Exception as exc:
                 logger.warning("feature_dim inference failed for %s: %s", pt_file, exc)
         return int(default_dim)
-    
-    def _base_cache_key(self, pt_path: Path, sid: str) -> str:
-        stat = pt_path.stat()
-        payload = {
-            "cache_version": BASE_PROCESSED_CACHE_VERSION,
-            "sid": str(sid),
-            "pt_path": str(pt_path.resolve()),
-            "pt_size": int(stat.st_size),
-            "pt_mtime_ns": int(stat.st_mtime_ns),
-            "pt_schema_version": PT_SCHEMA_VERSION,
-            "observable_schema_version": OBSERVABLE_SCHEMA_VERSION,
-            "feature_dim": int(self.feature_dim),
-            "max_api_events_per_sample": self.max_api_events_per_sample,
-            "manifest_dim": self.manifest_dim,
-            "manifest_category_dim": self.manifest_category_dim,
-            "manifest_stats_dim": self.manifest_stats_dim,
-            "manifest_permission_dim": self.manifest_permission_dim,
-            "manifest_intent_dim": self.manifest_intent_dim,
-            "manifest_feature_dim": self.manifest_feature_dim,
-            "drop_graph_behavior_hints": self.drop_graph_behavior_hints,
-            "graph_semantic_source": self.graph_semantic_source,
-            "cache_tag": self.cache_tag,
-        }
-        text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-    def _base_cache_path(self, key: str) -> Path:
-        assert self.cache_dir is not None
-        return self.cache_dir / self.cache_tag / key[:2] / f"{key}.pt"
-
-    def _load_base_processed_uncached(self, pt_path: Path) -> dict[str, Any] | None:
-        raw = torch.load(pt_path, map_location="cpu", weights_only=False)
-        dex_list, sources = _validate_current_pt_payload(raw, pt_path)
-
-        data = self._aggregate_api_graph(dex_list)
-        if data is None:
-            return None
-
-        apply_dex_success_ratio(data, sources)
-        data.update(self._manifest_payload(raw))
-        data.update(raw["observable_metadata"])
-        refresh_observable_signals(data)
-        return data
-
-    def _load_base_processed(self, pt_path: Path, sid: str) -> dict[str, Any] | None:
-        if self.cache_mode == "none":
-            return self._load_base_processed_uncached(pt_path)
-
-        key = self._base_cache_key(pt_path, sid)
-
-        if self.cache_mode == "memory":
-            cached = self._memory_base_cache.get(key)
-            if cached is None:
-                data = self._load_base_processed_uncached(pt_path)
-                if data is None:
-                    return None
-                self._memory_base_cache[key] = _clone_cached_value(data)
-                cached = self._memory_base_cache[key]
-            return _clone_cached_value(cached)
-
-        if self.cache_mode == "disk":
-            cache_path = self._base_cache_path(key)
-            if cache_path.exists():
-                try:
-                    payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-                    if (
-                        isinstance(payload, dict)
-                        and payload.get("cache_version") == BASE_PROCESSED_CACHE_VERSION
-                        and payload.get("cache_key") == key
-                        and isinstance(payload.get("data"), dict)
-                    ):
-                        return _clone_cached_value(payload["data"])
-                except Exception as exc:
-                    logger.warning("Ignoring unreadable base cache %s: %s", cache_path, exc)
-
-            data = self._load_base_processed_uncached(pt_path)
-            if data is None:
-                return None
-            try:
-                _atomic_torch_save(
-                    {
-                        "cache_version": BASE_PROCESSED_CACHE_VERSION,
-                        "cache_key": key,
-                        "data": data,
-                    },
-                    cache_path,
-                )
-            except Exception as exc:
-                logger.warning("Failed to write base cache %s: %s", cache_path, exc)
-            return _clone_cached_value(data)
-
-        raise RuntimeError(f"Unexpected cache_mode={self.cache_mode!r}")
 
     def _dummy(self, label: int, sid: str, year: int, reason: str, pt_path: Path | None = None) -> Data:
         data = Data(
@@ -1156,26 +1020,23 @@ class RobustTriModalDataset(Dataset):
     def __getitem__(self, idx: int):
         pt_path, label, sid, year = self.samples[idx]
         try:
-            data = self._load_base_processed(pt_path, sid)
+            raw = torch.load(pt_path, map_location="cpu", weights_only=False)
+            dex_list, sources = _validate_current_pt_payload(raw, pt_path)
+            data = self._aggregate_api_graph(dex_list)
             if data is None:
                 return self._dummy(label, sid, year, "empty valid sample", pt_path)
-
+            apply_dex_success_ratio(data, sources)
+            data.update(self._manifest_payload(raw))
+            data.update(raw["observable_metadata"])
+            refresh_observable_signals(data)
             if self.robust_aug and self.is_train:
-                perturb_type, strength = sample_training_perturbation(
-                    self.perturb_prob,
-                    self.perturb_strengths,
-                )
+                perturb_type, strength = sample_training_perturbation(self.perturb_prob, self.perturb_strengths)
                 data = apply_perturbation(data, perturb_type, strength)
             elif not self.is_train and self.eval_perturb_type:
                 # Keep aggregate perturbation subtypes stable across strength sweeps.
                 seed = _stable_seed(sid, self.eval_perturb_type)
                 with _temporary_random_seed(seed):
-                    data = apply_perturbation(
-                        data,
-                        self.eval_perturb_type,
-                        self.eval_perturb_strength,
-                    )
-
+                    data = apply_perturbation(data, self.eval_perturb_type, self.eval_perturb_strength)
             data = apply_graph_encoder_budget(
                 data,
                 self.max_graph_nodes_per_sample,
