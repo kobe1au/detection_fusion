@@ -52,7 +52,6 @@ OBSERVABLE_OPTIONAL_NUMERIC_FIELDS = (
     "api_truncated_by_encoder_budget",
     "api_integrity_before_encoder_budget",
 
-    # add graph encoder-budget diagnostics
     "graph_encoder_coverage",
     "graph_truncated_by_encoder_budget",
     "graph_integrity_before_encoder_budget",

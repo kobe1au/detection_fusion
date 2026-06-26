@@ -4,9 +4,12 @@ import math
 import pytest
 import torch
 import torch.nn as nn
+from torch_geometric.data import Data
 
 from fusion.constants import EvidenceIndex
-from fusion.dataset import apply_graph_encoder_budget
+from fusion.dataset import apply_graph_encoder_budget, robust_collate_fn
+from fusion.evidence import build_evidence
+from fusion.quality import OBSERVABLE_NUMERIC_FIELDS, OBSERVABLE_SIGNAL_FIELDS
 from fusion.discount_fusion import DiscountProbabilityFusion
 from fusion.losses import compute_posthoc_calibration_loss
 from fusion.reliability_calibration import MonotonicReliabilityCalibrator
@@ -492,6 +495,93 @@ def test_graph_encoder_budget_refreshes_alignment_and_effective_integrity():
         out["graph_integrity"] * out["graph_encoder_coverage"]
     )
     assert out["effective_graph_integrity"] <= out["graph_integrity"]
+
+def test_graph_encoder_budget_diagnostics_survive_collate_and_evidence_building():
+    data = Data(
+        x=torch.ones((3, 3), dtype=torch.float32),
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        y=torch.tensor(1, dtype=torch.long),
+    )
+
+    data.sid = "sample-graph-budget"
+    data.year = torch.tensor(2024, dtype=torch.long)
+    data.sensitive_mask = torch.zeros((3,), dtype=torch.uint8)
+
+    data.api_ids = torch.tensor([10, 11], dtype=torch.long)
+    data.api_type_ids = torch.tensor([1, 2], dtype=torch.long)
+    data.api_sensitive_mask = torch.zeros((2,), dtype=torch.float32)
+    data.api_method_index = torch.tensor([0, 1], dtype=torch.long)
+    data.api_in_graph_mask = torch.ones((2,), dtype=torch.float32)
+    data.method_api_edge_index = torch.tensor([[0, 1], [0, 1]], dtype=torch.long)
+
+    data.api_semantic_category_counts = torch.ones((12,), dtype=torch.float32)
+    data.graph_semantic_category_counts = torch.ones((12,), dtype=torch.float32)
+    data.api_category_counts = data.api_semantic_category_counts
+    data.graph_category_counts = data.graph_semantic_category_counts
+
+    data.manifest_x = torch.zeros((1, 256), dtype=torch.float32)
+    data.manifest_permission_ids = torch.tensor([1], dtype=torch.long)
+    data.manifest_intent_ids = torch.tensor([1], dtype=torch.long)
+    data.manifest_category_counts = torch.ones((12,), dtype=torch.float32)
+    data.manifest_stats = torch.ones((11,), dtype=torch.float32)
+
+    data.q_api = torch.tensor([0.9], dtype=torch.float32)
+    data.q_graph = torch.tensor([0.8], dtype=torch.float32)
+    data.q_manifest = torch.tensor([0.95], dtype=torch.float32)
+    data.q_align = torch.tensor([0.7], dtype=torch.float32)
+    data.pert_api = torch.tensor([0.0], dtype=torch.float32)
+    data.pert_graph = torch.tensor([0.0], dtype=torch.float32)
+    data.pert_manifest = torch.tensor([0.0], dtype=torch.float32)
+
+    # Populate all observable fields required by robust_collate_fn().
+    for key in OBSERVABLE_NUMERIC_FIELDS:
+        setattr(data, key, torch.tensor([0.0], dtype=torch.float32))
+    for key in OBSERVABLE_SIGNAL_FIELDS:
+        setattr(data, key, torch.tensor([1.0], dtype=torch.float32))
+
+    data.api_integrity = torch.tensor([0.9], dtype=torch.float32)
+    data.graph_integrity = torch.tensor([0.8], dtype=torch.float32)
+    data.manifest_integrity = torch.tensor([0.95], dtype=torch.float32)
+    data.code_integrity = torch.tensor([0.85], dtype=torch.float32)
+    data.api_alive = torch.tensor([1.0], dtype=torch.float32)
+    data.graph_alive = torch.tensor([1.0], dtype=torch.float32)
+    data.manifest_alive = torch.tensor([1.0], dtype=torch.float32)
+
+    # The three fields that were previously dropped during collate.
+    data.graph_encoder_coverage = torch.tensor([0.5], dtype=torch.float32)
+    data.graph_truncated_by_encoder_budget = torch.tensor([1.0], dtype=torch.float32)
+    data.graph_integrity_before_encoder_budget = torch.tensor([0.8], dtype=torch.float32)
+
+    batch = robust_collate_fn([data])
+    graph_batch = batch["graph_batch"]
+
+    assert hasattr(graph_batch, "graph_encoder_coverage")
+    assert hasattr(graph_batch, "graph_truncated_by_encoder_budget")
+    assert hasattr(graph_batch, "graph_integrity_before_encoder_budget")
+
+    assert graph_batch.graph_encoder_coverage.view(-1).item() == pytest.approx(0.5)
+    assert graph_batch.graph_truncated_by_encoder_budget.view(-1).item() == pytest.approx(1.0)
+    assert graph_batch.graph_integrity_before_encoder_budget.view(-1).item() == pytest.approx(0.8)
+
+    api_logits, graph_logits, manifest_logits, joint_logits = _logits(batch_size=1)
+    _, diagnostics = build_evidence(
+        graph_batch,
+        api_logits,
+        graph_logits,
+        manifest_logits,
+        joint_logits,
+        torch.empty((1, 1)),
+        torch.empty((1, 1)),
+        torch.empty((1, 1)),
+        use_consistency_evidence=False,
+        use_conflict_evidence=False,
+        diagnostics_only=True,
+    )
+
+    assert diagnostics["graph_encoder_coverage"].item() == pytest.approx(0.5)
+    assert diagnostics["graph_truncated_by_encoder_budget"].item() == pytest.approx(1.0)
+    assert diagnostics["graph_integrity_before_encoder_budget"].item() == pytest.approx(0.8)
+    assert diagnostics["effective_graph_integrity"].item() == pytest.approx(0.4)
 
 def test_graph_visible_modifier_does_not_double_count_coverage():
     fusion = DiscountProbabilityFusion({
