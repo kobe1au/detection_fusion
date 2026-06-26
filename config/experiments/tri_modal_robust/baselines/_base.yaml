@@ -19,3 +19,7 @@ calibration:
 
 selective_prediction:
   enabled: false
+
+loss:
+  reliability_weighted_aux: false
+  branch_aux_weight: 0.0

@@ -51,6 +51,11 @@ OBSERVABLE_OPTIONAL_NUMERIC_FIELDS = (
     "api_encoder_coverage",
     "api_truncated_by_encoder_budget",
     "api_integrity_before_encoder_budget",
+
+     # Graph encoder-budget observable fields.
+    "graph_encoder_coverage",
+    "graph_truncated_by_encoder_budget",
+    "graph_integrity_before_encoder_budget",
 )
 
 OBSERVABLE_ERROR_FIELDS = (
