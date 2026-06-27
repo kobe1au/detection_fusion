@@ -268,7 +268,7 @@ class _PosthocCalibrationModel(nn.Module):
                 "reliability_calibration": {
                     "enabled": True,
                     "hidden_dim": 8,
-                    "use_relation_evidence": False,
+                    "use_relation_evidence": True,
                 },
                 "probability_calibration": {"enabled": True},
             }

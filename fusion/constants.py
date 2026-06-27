@@ -177,7 +177,7 @@ class TriModalConfigDefaults:
                 "enabled": True,
                 "hidden_dim": 16,
                 "missing_relation_support": 0.0,
-                "use_relation_evidence": False,
+                "use_relation_evidence": True,
                 "apply_alive_mask": True,
                 "loss": "bce",
                 "weight": 1.0,

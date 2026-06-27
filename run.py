@@ -14,7 +14,7 @@ PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
 CONFIG_DIR = Path("config/experiments/tri_modal_robust")
 
 # Main method of the thesis: the evidential trusted-fusion pipeline
-# (I1 dual-source reliability, I2 conflict-aware Yager fusion, I3 conformal).
+# (I1 模态质量与跨模态关系感知可靠性估计，I2 Yager 冲突感知融合，I3 conformal 拒识).
 #
 # The runnable "final" entry is seed_42 rather than the bare template, because
 # decision-only configs (I3 coverage variants and external evals) reuse the

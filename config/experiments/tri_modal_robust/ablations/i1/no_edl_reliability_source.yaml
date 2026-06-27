@@ -1,13 +1,7 @@
 defaults:
   - ../../evidential_trusted_fusion.yaml
 
-# I1 mechanism: removes the EDL-supervised reliability source only. The Yager
-# fusion still derives Dirichlet uncertainty from the branch logits; what is
-# ablated is (a) feeding learned (1-u) into the reliability calibrator and
-# (b) the EDL training objective. Reliability then comes from observable parse
-# quality alone. Paper wording: "w/o EDL-supervised reliability source"
-# (NOT "w/o evidential uncertainty"). The pure no-evidential, linear-fusion
-# baseline is observable_reliability_discount_fusion.yaml.
+# w/o EDL source 不是只剩 parse quality，而是剩下“可观测质量 + 跨模态关系证据”。
 method:
   name: ablation_no_edl_reliability_source
 
