@@ -22,9 +22,10 @@ fusion:
   # Keep I1 reliability discount.
   use_reliability_discount: true
 
-  # Keep relation-aware reliability factors.
-  use_support_discount: true
-  use_conflict_discount: true
+  # Avoid applying relation/conflict twice.
+  # Relation evidence is already included in reliability_calibration.
+  use_support_discount: false
+  use_conflict_discount: false
 
   reliability_calibration:
     enabled: true
