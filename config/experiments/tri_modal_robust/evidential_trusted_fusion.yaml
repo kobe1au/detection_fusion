@@ -12,11 +12,12 @@ train:
 #   I2  conflict-aware fusion     = subjective-logic trust discounting + Yager
 #   I3  class-conditional conformal selective rejection
 fusion:
-  combination: yager            # conflict mass -> uncertainty (not normalised away)
+  combination: yager
   evidence_activation: softplus
   reliability_calibration:
     enabled: true
-    use_evidential_uncertainty: true   # I1 second source feeds the calibrator
+    use_relation_evidence: true
+    use_evidential_uncertainty: true
   # The evidential path does not use temperature scaling or the entropy/margin
   # confidence proxy: EDL owns uncertainty, conformal owns rejection calibration.
   probability_calibration:
