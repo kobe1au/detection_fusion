@@ -558,7 +558,9 @@ class DiscountProbabilityFusion(nn.Module):
             raise ValueError("fusion.weight_sharpening_gamma must be finite and positive")
 
         confidence_cfg = cfg.get("confidence_proxy", {}) or {}
+        reliability_cfg = cfg.get("reliability_calibration", {}) or {}
         logits_by_branch = (api_logits, graph_logits, manifest_logits, joint_logits)
+
         proxies: dict[str, dict[str, torch.Tensor]] = {}
         for name, logits in zip(BRANCH_NAMES, logits_by_branch):
             proxies[name] = compute_branch_confidence_proxy(
@@ -566,6 +568,25 @@ class DiscountProbabilityFusion(nn.Module):
                 temperature=self._temperature(name, confidence_cfg),
                 eps=eps,
             )
+
+        # I1 support for linear no-I2 ablation:
+        # Compute EDL certainty for reliability calibration only.
+        # This does NOT enable I2 because these opinions are not combined by
+        # Dempster/Yager/cumulative rules; they only provide the 6th reliability feature.
+        evidential_certainty: dict[str, torch.Tensor] | None = None
+        if bool(reliability_cfg.get("use_evidential_uncertainty", False)):
+            opinions_for_reliability = {
+                name: logits_to_opinion(
+                    logits,
+                    evidence_activation=self.evidence_activation,
+                    eps=eps,
+                )
+                for name, logits in zip(BRANCH_NAMES, logits_by_branch)
+            }
+            evidential_certainty = {
+                name: (1.0 - opinions_for_reliability[name]["uncertainty"]).clamp(0.0, 1.0)
+                for name in BRANCH_NAMES
+            }
 
         confidence_factors = []
         for name in BRANCH_NAMES:
@@ -670,13 +691,15 @@ class DiscountProbabilityFusion(nn.Module):
         )
         reliability_outputs: dict[str, torch.Tensor] = {}
         if calibrated_reliability_active:
-            reliability_outputs = self.reliability_calibrator(evidence)
+            reliability_outputs = self.reliability_calibrator(
+                evidence,
+                evidential_certainty=evidential_certainty,
+            )
             base_reliability = [
                 reliability_outputs[f"predicted_reliability_{name}"]
                 for name in BRANCH_NAMES
             ]
         else:
-            reliability_cfg = cfg.get("reliability_calibration", {}) or {}
             features, feature_diagnostics = build_monotonic_reliability_features(
                 evidence,
                 missing_relation_support=float(
@@ -685,6 +708,7 @@ class DiscountProbabilityFusion(nn.Module):
                 use_relation_evidence=bool(
                     reliability_cfg.get("use_relation_evidence", False)
                 ),
+                evidential_certainty=evidential_certainty,
             )
             reliability_outputs.update(feature_diagnostics)
             for name, value in features.items():
@@ -889,6 +913,8 @@ class DiscountProbabilityFusion(nn.Module):
         for index, name in enumerate(BRANCH_NAMES):
             outputs[f"discount_{name}"] = discounts[:, index]
             outputs[f"fusion_weight_{name}"] = fusion_weights[:, index]
+            if evidential_certainty is not None:
+                outputs[f"evidential_certainty_{name}"] = evidential_certainty[name]
             outputs[f"branch_competence_prior_{name}"] = torch.full(
                 (final_logits.size(0),),
                 float(competence_prior[index].detach().cpu().item()),

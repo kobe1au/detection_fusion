@@ -2,8 +2,13 @@ defaults:
   - ../../evidential_trusted_fusion.yaml
 
 # I2 OFF:
-# Replace subjective-logic/Yager evidential fusion with legacy reliability-weighted
-# probability fusion. Keep I1 reliability estimation and I3 conformal rejection.
+# Replace subjective-logic/Yager evidential opinion fusion with
+# reliability-weighted probability fusion.
+#
+# Keep I1 complete:
+# observable evidence + relation evidence + EDL certainty are still used
+# by the reliability calibrator. The EDL opinions are not fused; they only
+# provide branch-level certainty features for reliability estimation.
 method:
   name: module_no_i2_evidential_fusion
 
@@ -11,36 +16,27 @@ train:
   exp_name: module_no_i2_evidential_fusion
 
 fusion:
-  # Main switch: no Yager / no subjective-logic opinion combination.
-  # The model falls back to linear reliability-discounted probability fusion.
+  # No Yager / no subjective-logic opinion combination.
   combination: linear
 
-  # Keep reliability discount so I1 is still active.
+  # Keep I1 reliability discount.
   use_reliability_discount: true
 
-  # Keep observable relation factors as part of reliability-aware discounting.
+  # Keep relation-aware reliability factors.
   use_support_discount: true
   use_conflict_discount: true
 
-  # Important:
-  # The current linear fusion path calls reliability_calibrator(evidence)
-  # without passing evidential_certainty. Therefore this must be false,
-  # otherwise MonotonicReliabilityCalibrator will raise an error.
   reliability_calibration:
     enabled: true
     use_relation_evidence: true
-    use_evidential_uncertainty: false
+    use_evidential_uncertainty: true
 
-  # Keep this aligned with the final method.
   probability_calibration:
     enabled: false
     weight: 0.0
 
-# Keep post-hoc calibration because I1 reliability calibration is still used.
 calibration:
   enabled: true
 
-# Keep EDL branch supervision if you want branches to retain evidential training.
-# However, the final fusion will not use subjective-logic combination.
 loss:
   evidential_loss_weight: 0.1
