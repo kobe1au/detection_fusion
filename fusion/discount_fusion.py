@@ -551,6 +551,7 @@ class DiscountProbabilityFusion(nn.Module):
             )
         use_conflict = bool(cfg.get("use_conflict_discount", True))
         use_support = bool(cfg.get("use_support_discount", True))
+        linear_use_joint = bool(cfg.get("linear_use_joint_branch", True))
         competence_cfg = cfg.get("branch_competence_prior", {}) or {}
         use_competence = bool(competence_cfg.get("enabled", False))
         weight_gamma = float(cfg.get("weight_sharpening_gamma", 1.0))
@@ -766,6 +767,23 @@ class DiscountProbabilityFusion(nn.Module):
             dim=-1,
         )
         alive_mask = torch.stack([alive_api, alive_graph, alive_manifest, alive_joint], dim=-1)
+        if not linear_use_joint:
+            # Keep tensor shape [B, 4] for diagnostics compatibility,
+            # but force the joint branch to contribute zero probability mass.
+            raw_discounts = torch.cat(
+                [
+                    raw_discounts[:, :3],
+                    torch.zeros_like(raw_discounts[:, 3:4]),
+                ],
+                dim=-1,
+            )
+            alive_mask = torch.cat(
+                [
+                    alive_mask[:, :3],
+                    torch.zeros_like(alive_mask[:, 3:4]),
+                ],
+                dim=-1,
+            )
         discounts = raw_discounts * alive_mask.to(raw_discounts.dtype) if use_hard_alive else raw_discounts
         discounts_for_weight = discounts.detach() if detach_discount else discounts
         if use_hard_alive:
@@ -778,7 +796,16 @@ class DiscountProbabilityFusion(nn.Module):
         fallback = str(cfg.get("fallback", "uniform")).lower()
         if fallback != "uniform":
             raise ValueError(f"Unsupported discount fusion fallback: {fallback}")
-        fallback_weights = torch.full_like(discounts_for_weight, 1.0 / len(BRANCH_NAMES))
+        if linear_use_joint:
+            fallback_weights = torch.full_like(discounts_for_weight, 1.0 / len(BRANCH_NAMES))
+        else:
+            fallback_weights = torch.cat(
+                [
+                    torch.full_like(discounts_for_weight[:, :3], 1.0 / len(EVIDENCE_BRANCHES)),
+                    torch.zeros_like(discounts_for_weight[:, 3:4]),
+                ],
+                dim=-1,
+            )
         if use_hard_alive:
             alive_fallback = alive_mask.to(discounts_for_weight.dtype)
             alive_count = alive_fallback.sum(dim=-1, keepdim=True)
@@ -865,6 +892,12 @@ class DiscountProbabilityFusion(nn.Module):
             "calibration_active": torch.full(
                 (final_logits.size(0),),
                 float(self.calibration_active),
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
+            "linear_joint_branch_active": torch.full(
+                (final_logits.size(0),),
+                float(linear_use_joint),
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             ),

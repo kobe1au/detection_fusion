@@ -18,6 +18,7 @@ train:
 fusion:
   # No Yager / no subjective-logic opinion combination.
   combination: linear
+  linear_use_joint_branch: false
 
   # Keep I1 reliability discount.
   use_reliability_discount: true
