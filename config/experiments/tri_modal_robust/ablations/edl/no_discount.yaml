@@ -1,0 +1,15 @@
+defaults:
+  - ../evidential_trusted_fusion.yaml
+
+method:
+  name: edl_loss_0.03
+
+train:
+  exp_name: edl_loss_0.03
+
+fusion:
+  use_reliability_discount: false
+  reliability_calibration:
+    enabled: true
+    use_relation_evidence: true
+    use_evidential_uncertainty: true

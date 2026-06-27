@@ -1,0 +1,17 @@
+defaults:
+  - ../evidential_trusted_fusion.yaml
+
+method:
+  name: no_edl_certain_with_reliability
+
+train:
+  exp_name: no_edl_certain_with_reliability
+
+fusion:
+  reliability_calibration:
+    enabled: true
+    use_relation_evidence: true
+    use_evidential_uncertainty: false
+
+loss:
+  evidential_loss_weight: 0.1

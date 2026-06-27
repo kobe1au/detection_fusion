@@ -1,0 +1,11 @@
+defaults:
+  - ../evidential_trusted_fusion.yaml
+
+method:
+  name: edl_loss_0.03
+
+train:
+  exp_name: edl_loss_0.03
+
+loss:
+  evidential_loss_weight: 0.03
