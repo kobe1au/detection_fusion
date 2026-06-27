@@ -1,5 +1,5 @@
 defaults:
-  - ../../evidential_trusted_fusion.yaml
+  -  ../../debug_fast.yaml
 
 method:
   name: no_edl_certain

@@ -1,5 +1,5 @@
 defaults:
-  - ../../evidential_trusted_fusion.yaml
+  - ../../debug_fast.yaml
 
 method:
   name: edl_loss_0.03

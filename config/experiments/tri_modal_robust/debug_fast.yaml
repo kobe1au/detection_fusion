@@ -1,0 +1,21 @@
+defaults:
+  - evidential_trusted_fusion.yaml
+
+method:
+  name: debug_fast
+
+train:
+  exp_name: debug_fast
+  epochs: 5
+  patience: 2
+
+eval:
+  run_test: true
+  run_robust_test: true
+  perturb_strengths: [0.5]
+  perturb_tests:
+    - clean
+    - all_degraded
+    - api_missing
+    - graph_missing
+    - manifest_missing
