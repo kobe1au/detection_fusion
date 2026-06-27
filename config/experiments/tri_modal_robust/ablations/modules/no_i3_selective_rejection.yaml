@@ -1,7 +1,8 @@
 defaults:
   - ../../evidential_trusted_fusion.yaml
 
-# I3 OFF: full-coverage prediction, no conformal abstention.
+# I3 OFF:
+# Full-coverage prediction. No conformal abstention / rejection.
 method:
   name: module_no_i3_selective_rejection
 
