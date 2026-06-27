@@ -1,5 +1,5 @@
 defaults:
-  - ../evidential_trusted_fusion.yaml
+  - ../../evidential_trusted_fusion.yaml
 
 method:
   name: edl_loss_0.05
