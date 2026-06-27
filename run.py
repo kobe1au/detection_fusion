@@ -91,11 +91,12 @@ EXTERNAL_EVAL = [
     "external/obfuscapk_combined_eval.yaml",
 ]
 NO_EDL = [
-    "ablations/edl/edl_loss_0.03.yaml",
-    "ablations/edl/edl_loss_0.05.yaml",
+    # "ablations/edl/edl_loss_0.03.yaml",
+    # "ablations/edl/edl_loss_0.05.yaml",
     "ablations/edl/no_discount.yaml",
-    "ablations/edl/no_edl_certain_with_reliability.yaml",
     "ablations/edl/no_edl_certain.yaml",
+    "ablations/edl/no_edl_certain_with_reliability.yaml",
+    
 ]
 
 SEEDS = [

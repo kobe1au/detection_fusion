@@ -207,7 +207,7 @@ class TriModalConfigDefaults:
             "validation_fraction": 0.5,
             "split_seed": 42,
             "stratified_group_split": True,
-            "epochs": 20,
+            "epochs": 30,
             "patience": 4,
             "min_delta": 0.00001,
             "lr": 0.001,

@@ -6,8 +6,8 @@ method:
 
 train:
   exp_name: debug_fast
-  epochs: 5
-  patience: 2
+  epochs: 60
+  patience: 8
 
 eval:
   run_test: true
