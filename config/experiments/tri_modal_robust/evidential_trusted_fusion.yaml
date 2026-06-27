@@ -8,7 +8,7 @@ train:
   exp_name: evidential_trusted_fusion
 
 # Upgraded three-innovation pipeline:
-#   I1  dual-source reliability  = observable parse quality + evidential (1-u)
+#   模态可用性、特征完整性、跨模态支持/冲突关系与分支预测确定性共同构成可靠性估计信号。
 #   I2  conflict-aware fusion     = subjective-logic trust discounting + Yager
 #   I3  class-conditional conformal selective rejection
 fusion:

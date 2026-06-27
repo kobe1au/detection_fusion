@@ -45,7 +45,10 @@ MODULE_ABLATIONS = [
 ]
 
 # Vary the mechanism within each innovation.
-I1_ABLATIONS = ["ablations/i1/no_edl_reliability_source.yaml"]
+I1_ABLATIONS = [
+    "ablations/i1/no_edl_reliability_source.yaml",
+    "ablations/i1/no_relation_evidence.yaml",
+]
 I2_ABLATIONS = [
     "ablations/i2/combination_dempster.yaml",
     "ablations/i2/combination_cumulative.yaml",
@@ -107,6 +110,7 @@ ALIASES = {
     "no_i1": "ablations/modules/no_i1_reliability.yaml",
     "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
     "no_edl": "ablations/i1/no_edl_reliability_source.yaml",
+    "no_relation": "ablations/i1/no_relation_evidence.yaml",
     "dempster": "ablations/i2/combination_dempster.yaml",
     "cumulative": "ablations/i2/combination_cumulative.yaml",
     "log_pool": "ablations/i2/combination_log_pool.yaml",

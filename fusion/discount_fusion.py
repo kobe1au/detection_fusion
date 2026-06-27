@@ -130,7 +130,7 @@ class DiscountProbabilityFusion(nn.Module):
             MonotonicReliabilityCalibrator(
                 hidden_dim=int(reliability_cfg.get("hidden_dim", 16)),
                 missing_relation_support=float(reliability_cfg.get("missing_relation_support", 0.0)),
-                use_relation_evidence=bool(reliability_cfg.get("use_relation_evidence", False)),
+                use_relation_evidence=bool(reliability_cfg.get("use_relation_evidence", True)),
                 apply_alive_mask=bool(reliability_cfg.get("apply_alive_mask", True)),
                 use_evidential_uncertainty=bool(
                     reliability_cfg.get("use_evidential_uncertainty", False)
