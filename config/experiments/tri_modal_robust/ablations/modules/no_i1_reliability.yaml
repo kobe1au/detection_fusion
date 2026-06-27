@@ -1,8 +1,6 @@
 defaults:
   - ../../evidential_trusted_fusion.yaml
 
-# I1 OFF: all alive modalities are trusted equally (no reliability weighting,
-# no EDL source, no competence prior). Isolates the reliability mechanism.
 method:
   name: module_no_i1_reliability
 
@@ -13,9 +11,18 @@ fusion:
   use_reliability_discount: false
   branch_competence_prior:
     enabled: false
+  visible_integrity_modifier:
+    enabled: false
   reliability_calibration:
     enabled: false
     use_evidential_uncertainty: false
+  probability_calibration:
+    enabled: false
+    weight: 0.0
+
+calibration:
+  enabled: false
 
 loss:
   evidential_loss_weight: 0.0
+  reliability_weighted_aux: false
