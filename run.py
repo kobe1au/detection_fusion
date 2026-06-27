@@ -90,6 +90,13 @@ EXTERNAL_EVAL = [
     "external/obfuscapk_encryption_eval.yaml",
     "external/obfuscapk_combined_eval.yaml",
 ]
+NO_EDL = [
+    "ablations/edl/edl_loss_0.03.yaml",
+    "ablations/edl/edl_loss_0.05.yaml",
+    "ablations/edl/no_discount.yaml",
+    "ablations/edl/no_edl_certain_with_reliability.yaml",
+    "ablations/edl/no_edl_certain.yaml",
+]
 
 SEEDS = [
     PRIMARY_SEED,
@@ -111,7 +118,7 @@ ALIASES = {
     "no_i1": "ablations/modules/no_i1_reliability.yaml",
     "no_i2": "ablations/modules/no_i2_evidential_fusion.yaml",
     "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
-    "no_edl": "ablations/i1/no_edl_reliability_source.yaml",
+    "no_edl_rel": "ablations/i1/no_edl_reliability_source.yaml",
     "no_relation": "ablations/i1/no_relation_evidence.yaml",
     "dempster": "ablations/i2/combination_dempster.yaml",
     "cumulative": "ablations/i2/combination_cumulative.yaml",
@@ -129,6 +136,7 @@ GROUPS = {
     "baselines": BASELINES,
     "module": MODULE_ABLATIONS,
     "mechanism": MECHANISM_ABLATIONS,
+    "no_edl": NO_EDL,
     "i1": I1_ABLATIONS,
     "i2": I2_ABLATIONS,
     "i3": [PRIMARY_SEED, *I3_ABLATIONS],
