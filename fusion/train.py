@@ -815,23 +815,20 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
     elif configured_fusion_mode not in {"", "legacy_learned_gate"}:
         raise ValueError(f"Unsupported fusion.mode: {configured_fusion_mode}")
 
-    # Independence guardrail: evidential combination (subjective-logic / DS /
-    # cumulative) treats API, Graph and Manifest as INDEPENDENT evidence sources.
-    # Two switches would break that premise by making one branch's input or
-    # reliability depend on another modality, so they are incompatible with the
-    # evidential combination rules and must be turned off there.
+    # Independence guardrail: evidential combination treats API, Graph and
+    # Manifest as independent class-evidence sources. Cross-modal relation
+    # evidence is allowed because it is used only to calibrate source reliability
+    # / trust discounting, not as an additional opinion or class evidence source.
     combination = str(fusion_cfg.get("combination", "linear")).lower()
     if combination in {"yager", "dempster", "cumulative"}:
         coupling = []
-        if bool((fusion_cfg.get("reliability_calibration", {}) or {}).get("use_relation_evidence", False)):
-            coupling.append("fusion.reliability_calibration.use_relation_evidence")
         if bool(graph_cfg.get("use_behavior_hint", False)):
             coupling.append("model.graph_encoder.use_behavior_hint")
         if coupling:
             raise ValueError(
                 f"fusion.combination={combination} assumes independent modality evidence, "
-                f"but these settings couple modalities at the input/reliability level: {coupling}. "
-                "Disable them, or use fusion.combination=linear for a coupled (legacy) pipeline."
+                f"but these settings couple modalities at the input level: {coupling}. "
+                "Disable them, or use fusion.combination=linear for a coupled legacy pipeline."
             )
 
     return TriModalRobustModel(

@@ -2,11 +2,8 @@
 
 This module is the formal core of the upgraded I1/I2:
 
-* I1 -- each branch turns its raw logits into a Dirichlet *evidence* opinion
-  (Sensoy et al., 2018, "Evidential Deep Learning to Quantify Classification
-  Uncertainty"). The resulting epistemic uncertainty ``u`` is a *learned*,
-  per-sample reliability source that complements the *observable* parse-quality
-  reliability already produced by ``fusion.quality``.
+* I1 provides sample-level modality reliability from observable modality 
+quality, cross-modal relation evidence, and optional evidential certainty.
 
 * I2 -- per-branch opinions are discounted by their reliability (Jøsang's
   subjective-logic *trust discounting*) and then combined with a
