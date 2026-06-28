@@ -99,7 +99,8 @@ NO_EDL = [
 ]
 
 FINAL_V2 = [
-    "final_v2/seed_42_0.03.yaml"
+    # "final_v2/seed_42_0.03.yaml",
+    "final_v2/seed_42_0.05.yaml"
 ]
 
 FINAL_V2_FULL_ROBUST_EVAL = [
