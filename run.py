@@ -96,7 +96,10 @@ NO_EDL = [
     "ablations/edl/no_discount.yaml",
     "ablations/edl/no_edl_certain.yaml",
     "ablations/edl/no_edl_certain_with_reliability.yaml",
-    
+]
+
+FINAL_V2 = [
+    "final_v2/seed_42_0.03.yaml"
 ]
 
 SEEDS = [
@@ -137,6 +140,7 @@ GROUPS = {
     "baselines": BASELINES,
     "module": MODULE_ABLATIONS,
     "mechanism": MECHANISM_ABLATIONS,
+    "final_v2": FINAL_V2,
     "no_edl": NO_EDL,
     "i1": I1_ABLATIONS,
     "i2": I2_ABLATIONS,
