@@ -39,7 +39,7 @@ calibration:
 
 loss:
   # Remove EDL reliability/uncertainty supervision.
-  evidential_loss_weight: 0.0
+  evidential_loss_weight: 0.05
 
   # Do not weight auxiliary branches by modality reliability.
   reliability_weighted_aux: false

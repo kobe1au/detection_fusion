@@ -21,7 +21,7 @@ fusion:
   linear_use_joint_branch: false
 
   # Keep I1 reliability discount.
-  use_reliability_discount: true
+  use_reliability_discount: false
 
   # Avoid applying relation/conflict twice.
   # Relation evidence is already included in reliability_calibration.
@@ -31,7 +31,7 @@ fusion:
   reliability_calibration:
     enabled: true
     use_relation_evidence: true
-    use_evidential_uncertainty: true
+    use_evidential_uncertainty: false
 
   probability_calibration:
     enabled: false
@@ -41,4 +41,4 @@ calibration:
   enabled: true
 
 loss:
-  evidential_loss_weight: 0.1
+  evidential_loss_weight: 0.05
