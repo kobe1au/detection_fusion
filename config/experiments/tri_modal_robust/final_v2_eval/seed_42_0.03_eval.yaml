@@ -1,0 +1,29 @@
+# config/experiments/tri_modal_robust/final_v2_eval/seed_42_0.03_full_robust_eval.yaml
+defaults:
+  - ../final_v2/seed_42_0.03.yaml
+
+method:
+  name: seed_42_0.03_eval
+
+train:
+  seed: 42
+
+eval:
+  eval_only: true
+  output_name: seed_42_0.03_eval
+  checkpoint_path: results/tri_modal_robust_new/seed_42_0.03/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: true
+
+  run_test: true
+  run_robust_test: true
+  perturb_strengths: [0.1, 0.3, 0.5, 0.7, 0.9]
+  perturb_tests:
+    - clean
+    - api_degraded
+    - graph_degraded
+    - api_graph_degraded
+    - manifest_degraded
+    - all_degraded
+    - api_missing
+    - graph_missing
+    - manifest_missing

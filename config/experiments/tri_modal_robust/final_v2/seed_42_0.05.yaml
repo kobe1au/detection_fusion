@@ -2,10 +2,10 @@ defaults:
   -  ../../debug_fast.yaml
 
 method:
-  name: seed_42_0.03
+  name: seed_42_0.05
 
 train:
-  exp_name: seed_42_0.03
+  exp_name: seed_42_0.05
 
 fusion:
   reliability_calibration:
@@ -14,4 +14,4 @@ fusion:
     use_evidential_uncertainty: false
 
 loss:
-  evidential_loss_weight: 0.03
+  evidential_loss_weight: 0.05

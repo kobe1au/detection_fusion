@@ -102,6 +102,12 @@ FINAL_V2 = [
     "final_v2/seed_42_0.03.yaml"
 ]
 
+FINAL_V2_FULL_ROBUST_EVAL = [
+    "final_v2_eval/seed_42_0.03_eval.yaml",
+    "final_v2_eval/seed_42_0.05_eval.yaml",
+    "final_v2_eval/seed_42_0.1_eval.yaml",
+]
+
 SEEDS = [
     PRIMARY_SEED,
     "seeds/seed_2024.yaml",
@@ -141,6 +147,7 @@ GROUPS = {
     "module": MODULE_ABLATIONS,
     "mechanism": MECHANISM_ABLATIONS,
     "final_v2": FINAL_V2,
+    "final_v2_full_robust_eval": FINAL_V2_FULL_ROBUST_EVAL,
     "no_edl": NO_EDL,
     "i1": I1_ABLATIONS,
     "i2": I2_ABLATIONS,
