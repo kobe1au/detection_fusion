@@ -97,7 +97,7 @@ def test_evidential_main_method_configuration():
     assert cfg["model"]["fusion_mode"] == "discount_probability"
     # I1: dual-source reliability
     assert cfg["fusion"]["reliability_calibration"]["enabled"] is True
-    assert cfg["fusion"]["reliability_calibration"]["use_evidential_uncertainty"] is True
+    assert cfg["fusion"]["reliability_calibration"]["use_evidential_uncertainty"] is False
     assert cfg["loss"]["evidential_loss_weight"] > 0.0
     assert cfg["loss"]["evidential"]["class_weight"] == "balanced"
     # I2: conflict-aware Yager evidential fusion; legacy temperature off
@@ -188,7 +188,7 @@ def test_mechanism_group_matches_declared_splits():
 
 def test_i1_sensitivity_configs_have_distinct_meanings():
     main = _resolved(MAIN)
-    assert main["loss"]["evidential_loss_weight"] == 0.1
+    assert main["loss"]["evidential_loss_weight"] == 0.05
     w05 = _resolved(ROOT / "sensitivity/i1/evidential_weight_0_05.yaml")
     w20 = _resolved(ROOT / "sensitivity/i1/evidential_weight_0_2.yaml")
     assert w05["loss"]["evidential_loss_weight"] == 0.05

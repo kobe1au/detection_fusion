@@ -1,0 +1,29 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: mechanism_no_reliability_discount
+
+train:
+  exp_name: mechanism_no_reliability_discount
+
+fusion:
+  opinion_source: evidential
+  combination: yager
+
+  use_reliability_discount: false
+
+  branch_competence_prior:
+    enabled: false
+
+  visible_integrity_modifier:
+    enabled: false
+
+  reliability_calibration:
+    enabled: false
+    use_relation_evidence: false
+    use_evidential_uncertainty: false
+
+loss:
+  evidential_loss_weight: 0.05
+  reliability_weighted_aux: false

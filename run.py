@@ -40,8 +40,8 @@ BASELINES = [
 
 # Remove a whole innovation from the main method.
 MODULE_ABLATIONS = [
-    "ablations/modules/no_i1_reliability.yaml",
-    "ablations/modules/no_i2_evidential_fusion.yaml",
+    "ablations/modules/no_i1_uncertainty_modeling.yaml",
+    "ablations/modules/no_i2_conflict_aware_fusion.yaml",
     "ablations/modules/no_i3_selective_rejection.yaml",
 ]
 
@@ -126,9 +126,10 @@ ALIASES = {
     "manifest": "baselines/manifest_only.yaml",
     "concat": "baselines/tri_modal_concat.yaml",
     "late": "baselines/fixed_logit_fusion.yaml",
-    "no_i1": "ablations/modules/no_i1_reliability.yaml",
-    "no_i2": "ablations/modules/no_i2_evidential_fusion.yaml",
+    "no_i1": "ablations/modules/no_i1_uncertainty_modeling.yaml",
+    "no_i2": "ablations/modules/no_i2_conflict_aware_fusion.yaml",
     "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
+    "no_reliability_discount": "ablations/modules/no_reliability_discount.yaml",
     "no_edl_rel": "ablations/i1/no_edl_reliability_source.yaml",
     "no_relation": "ablations/i1/no_relation_evidence.yaml",
     "dempster": "ablations/i2/combination_dempster.yaml",
