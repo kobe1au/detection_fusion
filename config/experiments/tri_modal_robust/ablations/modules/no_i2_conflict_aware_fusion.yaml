@@ -1,0 +1,39 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+# I2 OFF:
+# Keep I1 evidential uncertainty modeling.
+# Replace Yager conflict-aware evidential fusion with linear probability fusion.
+method:
+  name: module_no_i2_conflict_aware_fusion
+
+train:
+  exp_name: module_no_i2_conflict_aware_fusion
+
+fusion:
+  opinion_source: evidential
+  combination: linear
+  linear_use_joint_branch: false
+
+  use_reliability_discount: true
+
+  # Avoid applying relation/conflict twice in the linear path.
+  use_support_discount: false
+  use_conflict_discount: false
+
+  reliability_calibration:
+    enabled: true
+    use_relation_evidence: true
+    use_evidential_uncertainty: false
+
+  probability_calibration:
+    enabled: false
+    weight: 0.0
+
+loss:
+  evidential_loss_weight: 0.05
+  evidential:
+    anneal_epochs: 10
+    evidence_activation: softplus
+    branches: [api, graph, manifest]
+    class_weight: balanced
