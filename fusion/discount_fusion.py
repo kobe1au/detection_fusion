@@ -14,6 +14,7 @@ from fusion.evidential import (
     logits_to_opinion,
     opinion_to_prob,
     trust_discount,
+    logits_to_softmax_opinion
 )
 from fusion.reliability_calibration import (
     BRANCH_NAMES,
@@ -342,12 +343,31 @@ class DiscountProbabilityFusion(nn.Module):
             "manifest": manifest_logits,
             "joint": joint_logits,
         }
-        opinions = {
-            name: logits_to_opinion(
-                logits, evidence_activation=self.evidence_activation, eps=eps
-            )
-            for name, logits in logits_by_branch.items()
-        }
+        opinion_source = str(cfg.get("opinion_source", "evidential")).lower()
+
+        if opinion_source == "evidential":
+            opinions = {
+                name: logits_to_opinion(
+                    logits, evidence_activation=self.evidence_activation, eps=eps
+                )
+                for name, logits in logits_by_branch.items()
+            }
+        elif opinion_source == "softmax_fixed_uncertainty":
+            softmax_cfg = cfg.get("softmax_opinion", {}) or {}
+            fixed_u = float(softmax_cfg.get("uncertainty", 0.5))
+            temperature = float(softmax_cfg.get("temperature", 1.0))
+            opinions = {
+                name: logits_to_softmax_opinion(
+                    logits,
+                    uncertainty=fixed_u,
+                    temperature=temperature,
+                    eps=eps,
+                )
+                for name, logits in logits_by_branch.items()
+            }
+        else:
+            raise ValueError(f"Unsupported fusion.opinion_source: {opinion_source}")
+        
         evidential_certainty = {
             name: (1.0 - opinions[name]["uncertainty"]).clamp(0.0, 1.0) for name in BRANCH_NAMES
         }

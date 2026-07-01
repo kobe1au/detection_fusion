@@ -31,6 +31,39 @@ EVIDENCE_BRANCHES = ("api", "graph", "manifest")
 
 COMBINATION_RULES = ("yager", "dempster", "cumulative", "log_pool")
 
+def logits_to_softmax_opinion(
+    logits: torch.Tensor,
+    *,
+    uncertainty: float = 0.5,
+    temperature: float = 1.0,
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Map logits to a pseudo subjective-logic opinion without Dirichlet evidence.
+
+    This is used for w/o I1: no evidential/Dirichlet uncertainty modeling.
+    The branch still provides class probabilities, but its uncertainty is fixed,
+    so I2 conflict-aware fusion can be tested independently.
+    """
+    if logits.ndim != 2 or logits.size(-1) < 2:
+        raise ValueError(f"logits_to_softmax_opinion expects [B, C>=2], got {tuple(logits.shape)}")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    u_value = float(uncertainty)
+    if not 0.0 <= u_value <= 1.0:
+        raise ValueError("uncertainty must be within [0, 1]")
+
+    prob = F.softmax(logits / float(temperature), dim=-1)
+    u = torch.full((logits.size(0),), u_value, device=logits.device, dtype=logits.dtype)
+    belief = prob * (1.0 - u.view(-1, 1))
+
+    return {
+        "evidence": torch.zeros_like(logits),
+        "alpha": torch.ones_like(logits),
+        "strength": torch.full((logits.size(0),), float(logits.size(-1)), device=logits.device, dtype=logits.dtype),
+        "belief": belief,
+        "uncertainty": u,
+        "expected_prob": prob,
+    }
 
 def logits_to_opinion(
     logits: torch.Tensor,
