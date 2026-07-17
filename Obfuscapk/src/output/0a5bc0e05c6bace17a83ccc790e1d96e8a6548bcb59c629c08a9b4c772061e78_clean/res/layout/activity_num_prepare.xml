@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout android:layout_width="fill_parent" android:layout_height="fill_parent"
-  xmlns:android="http://schemas.android.com/apk/res/android">
-    <ImageView android:layout_width="fill_parent" android:layout_height="fill_parent" android:src="@drawable/bj_kaishi_0302" android:scaleType="centerCrop" />
-    <ImageView android:id="@id/iv_close" android:padding="20.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/close_20200302" />
-    <TextView android:textSize="28.0sp" android:textColor="#ffffffff" android:gravity="left" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="100.0dip" android:text="准备好，马上开始咯！" android:layout_centerHorizontal="true" />
-    <ImageView android:id="@id/iv_num" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/num_3" android:layout_centerInParent="true" />
-    <TextView android:textSize="13.0sp" android:textColor="#ffffffff" android:gravity="left" android:id="@id/num_prepare_tips" android:paddingLeft="50.0dip" android:paddingRight="50.0dip" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginBottom="60.0dip" android:text="数字的读法是有规则哦，熟记每个规则 练习效果更加事半功倍哦，例：203读作 Two hundred and three" android:layout_alignParentBottom="true" android:lineSpacingExtra="5.0dip" />
-</RelativeLayout>

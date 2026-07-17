@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginTop="12.0dip"
-  xmlns:android="http://schemas.android.com/apk/res/android">
-    <TextView android:textSize="17.0sp" android:textColor="#ff333333" android:id="@id/tv_search_word" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="15.0dip" android:layout_marginRight="10.0dip" android:text="go" android:includeFontPadding="false" />
-    <TextView android:textSize="12.0sp" android:textColor="#ff333333" android:id="@id/tv_search_word_accent" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="2.0dip" android:text="/gou/" android:layout_toRightOf="@id/tv_search_word" />
-    <TextView android:textSize="12.0sp" android:textColor="#ff333333" android:ellipsize="end" android:id="@id/tv_search_word_trans" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginLeft="15.0dip" android:layout_marginTop="9.0dip" android:layout_marginRight="15.0dip" android:text="v.去; 走；变为；发出...声音；进行；n.轮到的顺序；尝试；精力..." android:maxLines="1" android:layout_below="@id/tv_search_word" />
-    <TextView android:background="#fff7f7f7" android:layout_width="fill_parent" android:layout_height="0.5dip" android:layout_marginTop="12.0dip" android:layout_below="@id/tv_search_word_trans" />
-</RelativeLayout>

@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<LinearLayout android:orientation="horizontal" android:id="@id/rl_num_item" android:layout_width="fill_parent" android:layout_height="60.0dip"
-  xmlns:android="http://schemas.android.com/apk/res/android">
-    <TextView android:layout_gravity="center_vertical" android:id="@id/tv_num_line" android:background="@drawable/line_num_index" android:visibility="invisible" android:layout_width="5.0dip" android:layout_height="30.0dip" />
-    <TextView android:textSize="19.0sp" android:textStyle="bold" android:textColor="#ff282828" android:gravity="left" android:layout_gravity="center_vertical" android:id="@id/tv_num_title" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="25.0dip" android:text="基础数字组合" />
-    <TextView android:textSize="12.0sp" android:textStyle="bold" android:textColor="#ffffffff" android:gravity="center" android:id="@id/mRecommend" android:background="@drawable/bg_num_recation_recommend" android:visibility="gone" android:layout_width="34.0dip" android:layout_height="16.0dip" android:layout_marginLeft="5.0dip" android:layout_marginTop="10.0dip" android:text="推荐" />
-    <TextView android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_weight="1.0" />
-    <TextView android:textSize="15.0sp" android:textColor="#ffd0d0d0" android:gravity="left" android:layout_gravity="center_vertical" android:id="@id/tv_practice" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginRight="25.0dip" android:drawableRight="@drawable/ic_sanjiao_0302" android:drawablePadding="15.0dip" />
-</LinearLayout>

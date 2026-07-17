@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <color name="gt_one_login_bg_color">#ff2e2e30</color>
-    <color name="gt_one_login_nav_color">#ff2e2e30</color>
-    <color name="gt_one_login_nav_text_color">@android:color/white</color>
-    <color name="gt_one_login_number_color">@android:color/white</color>
-    <color name="gt_one_login_slogan_text_color">#ffd0d1e2</color>
-    <color name="gt_one_login_switch_text_color">#ff6794ff</color>
-</resources>

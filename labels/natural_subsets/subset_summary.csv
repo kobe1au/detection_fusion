@@ -1,5 +1,0 @@
-subset,csv,split,evidence,direction,quantile,threshold,diagnostic_count,csv_count,evidence_mean,benign_count,malware_count
-api_low_effective_integrity,labels/natural_subsets/test_api_low_effective_integrity.csv,test_clean,effective_api_integrity,low,0.3333333333333333,0.896484375,1040,1040,0.537702751532197,659,381
-api_graph_low_support,labels/natural_subsets/test_api_graph_low_support.csv,test_clean,api_graph_anchor_support,low,0.3333333333333333,0.3603515625,994,994,0.25826338647117075,709,285
-raw_high_conflict,labels/natural_subsets/test_raw_high_conflict.csv,test_clean,raw_conflict,high,0.3333333333333333,0.0060852592190106004,993,993,0.10710432382876356,674,319
-low_acceptance,labels/natural_subsets/test_low_acceptance.csv,test_clean,acceptance_score,low,0.3333333333333333,0.7676663597424824,993,993,0.5804180141842257,489,504

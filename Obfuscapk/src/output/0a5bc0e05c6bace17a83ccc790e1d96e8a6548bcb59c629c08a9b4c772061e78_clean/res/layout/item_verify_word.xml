@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout android:layout_width="fill_parent" android:layout_height="70.0dip"
-  xmlns:android="http://schemas.android.com/apk/res/android">
-    <TextView android:textSize="15.0sp" android:textStyle="bold" android:textColor="#ff1a1a1a" android:id="@id/tv_word" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="20.0dip" android:layout_marginTop="15.0dip" android:text="adversary" android:includeFontPadding="false" />
-    <TextView android:textSize="13.0sp" android:textColor="#ff000000" android:ellipsize="end" android:id="@id/tv_trans" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="20.0dip" android:layout_marginTop="10.0dip" android:layout_marginRight="20.0dip" android:text="n.对手，敌手" android:maxLines="1" android:includeFontPadding="false" android:layout_below="@id/tv_word" />
-    <TextView android:textSize="11.0sp" android:textColor="#ff51dc8e" android:gravity="center" android:id="@id/tv_word_status" android:layout_width="38.0dip" android:layout_height="18.0dip" android:layout_marginLeft="10.0dip" android:layout_marginTop="15.0dip" android:text="正确" android:layout_toRightOf="@id/tv_word" />
-    <CheckBox android:id="@id/cb_verify" android:padding="10.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="5.0dip" android:layout_marginTop="5.0dip" android:layout_marginRight="5.0dip" android:button="@drawable/del_word_selector" android:layout_alignParentRight="true" />
-    <TextView android:background="#fff3f4f6" android:layout_width="fill_parent" android:layout_height="0.5dip" android:layout_alignParentBottom="true" />
-</RelativeLayout>

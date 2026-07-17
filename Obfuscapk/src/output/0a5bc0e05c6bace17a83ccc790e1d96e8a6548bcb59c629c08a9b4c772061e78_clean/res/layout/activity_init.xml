@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout android:layout_width="fill_parent" android:layout_height="fill_parent"
-  xmlns:android="http://schemas.android.com/apk/res/android">
-    <ImageView android:id="@id/iv_welcome" android:visibility="gone" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="165.0dip" android:src="@drawable/qidongye_191129" android:layout_centerHorizontal="true" />
-    <ProgressBar android:id="@id/sb_download" android:visibility="invisible" android:layout_width="fill_parent" android:layout_height="15.0dip" android:layout_marginLeft="30.0dip" android:layout_marginRight="25.0dip" android:layout_marginBottom="60.0dip" android:max="100" android:progress="0" android:progressDrawable="@drawable/bg_download_sb" android:layout_alignParentBottom="true" style="?android:progressBarStyleHorizontal" />
-    <TextView android:textSize="12.0sp" android:textColor="#ff333333" android:id="@id/tv_sb" android:visibility="invisible" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="30.0dip" android:layout_marginTop="10.0dip" android:layout_marginBottom="35.0dip" android:text="正在下载中....." android:includeFontPadding="false" android:layout_alignParentBottom="true" />
-</RelativeLayout>

@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<LinearLayout android:gravity="center_horizontal" android:orientation="vertical" android:id="@id/rl_empty" android:layout_width="fill_parent" android:layout_height="fill_parent"
-  xmlns:android="http://schemas.android.com/apk/res/android">
-    <ImageView android:id="@id/iv_nodata" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="73.0dip" android:src="@drawable/neirong_191203" />
-    <TextView android:textSize="15.0sp" android:textColor="#ff808080" android:gravity="center" android:id="@id/tv_nodata" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="哇！很棒呢，目前还没有错词哟~\n去学习后再来吧" android:lineSpacingExtra="8.0dip" />
-</LinearLayout>

@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<LinearLayout android:gravity="bottom" android:orientation="vertical" android:background="#00000000" android:padding="5.0dip" android:layout_width="fill_parent" android:layout_height="fill_parent"
-  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
-    <top.limuyang2.shadowlayoutlib.ShadowLinearLayout android:orientation="vertical" android:layout_width="fill_parent" android:layout_height="wrap_content" app:l_radius="8.0dip">
-        <TextView android:textSize="14.0sp" android:textColor="#ffcfcfcf" android:gravity="center" android:id="@id/mTv_Title" android:padding="10.0dip" android:visibility="visible" android:layout_width="fill_parent" android:layout_height="38.0dip" />
-        <ListView android:id="@id/dialog_list" android:layout_width="fill_parent" android:layout_height="wrap_content" android:listSelector="@android:color/transparent" android:cacheColorHint="@android:color/transparent" android:divider="#ffdad9db" android:dividerHeight="0.5dip" />
-    </top.limuyang2.shadowlayoutlib.ShadowLinearLayout>
-    <Button android:textSize="14.0sp" android:textColor="#ff0073ff" android:gravity="center" android:id="@id/mBtn_Cancel" android:background="@drawable/dialog_item_bg_only" android:layout_width="fill_parent" android:layout_height="40.0dip" android:layout_marginTop="5.0dip" android:text="取消" />
-</LinearLayout>

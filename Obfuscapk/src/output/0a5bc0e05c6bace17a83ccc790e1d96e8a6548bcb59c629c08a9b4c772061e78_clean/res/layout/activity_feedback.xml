@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<LinearLayout android:orientation="vertical" android:layout_width="fill_parent" android:layout_height="fill_parent"
-  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
-    <include layout="@layout/include_head" />
-    <in.srain.cube.views.ptr.PtrClassicFrameLayout android:id="@id/ptrframe" android:layout_width="fill_parent" android:layout_height="fill_parent" app:ptr_duration_to_close="200" app:ptr_duration_to_close_header="1000" app:ptr_keep_header_when_refresh="true" app:ptr_pull_to_fresh="false">
-        <p4d236d9a.pabb3141d.p62608e08.widgets.CustomWebView android:id="@id/web_feedback" android:layout_width="fill_parent" android:layout_height="fill_parent" />
-    </in.srain.cube.views.ptr.PtrClassicFrameLayout>
-</LinearLayout>

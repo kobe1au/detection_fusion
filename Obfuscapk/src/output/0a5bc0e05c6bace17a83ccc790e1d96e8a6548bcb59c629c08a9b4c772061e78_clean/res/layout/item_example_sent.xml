@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout android:layout_width="fill_parent" android:layout_height="wrap_content"
-  xmlns:android="http://schemas.android.com/apk/res/android">
-    <TextView android:textSize="14.0sp" android:textColor="#ff000000" android:id="@id/tv_sent" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginLeft="20.0dip" android:layout_marginTop="10.0dip" android:layout_marginRight="46.0dip" android:text="Lorem ipsum dolor sit amet, " android:includeFontPadding="false" android:lineSpacingExtra="4.0dip" />
-    <ImageView android:id="@id/iv_sent" android:padding="15.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/libiao_voice1_191126" android:layout_alignParentRight="true" />
-    <TextView android:textSize="14.0sp" android:textColor="#ff333333" android:id="@id/tv_sent_trans" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="20.0dip" android:layout_marginTop="10.0dip" android:layout_marginRight="45.0dip" android:layout_marginBottom="14.0dip" android:text="这里是翻译，这里是翻译啊" android:includeFontPadding="false" android:layout_below="@id/tv_sent" android:lineSpacingExtra="4.0dip" />
-</RelativeLayout>

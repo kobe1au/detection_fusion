@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<animation-list android:oneshot="false"
-  xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:duration="200" android:drawable="@drawable/yuanshen3_20191202" />
-    <item android:duration="200" android:drawable="@drawable/yuanshen2_20191202" />
-    <item android:duration="200" android:drawable="@drawable/yuanshen1_20191202" />
-</animation-list>

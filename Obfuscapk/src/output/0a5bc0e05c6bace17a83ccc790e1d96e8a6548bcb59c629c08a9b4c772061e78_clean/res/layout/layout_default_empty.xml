@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<com.dreamliner.rvhelper.empty.DefaultEmptyLayout android:gravity="center" android:orientation="vertical" android:layout_width="fill_parent" android:layout_height="fill_parent"
-  xmlns:android="http://schemas.android.com/apk/res/android">
-    <TextView android:textSize="14.0sp" android:textColor="#ff333333" android:gravity="center" android:id="@id/empty_status_tv" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginLeft="50.0dip" android:layout_marginTop="10.0dip" android:layout_marginRight="50.0dip" android:lineSpacingExtra="2.0dip" />
-</com.dreamliner.rvhelper.empty.DefaultEmptyLayout>

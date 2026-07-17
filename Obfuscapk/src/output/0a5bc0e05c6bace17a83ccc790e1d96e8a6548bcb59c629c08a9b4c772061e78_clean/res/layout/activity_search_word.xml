@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<LinearLayout android:orientation="vertical" android:layout_width="fill_parent" android:layout_height="fill_parent"
-  xmlns:android="http://schemas.android.com/apk/res/android">
-    <include layout="@layout/include_head" />
-    <p4d236d9a.pabb3141d.p62608e08.widgets.practiceview.WordDetailView android:id="@id/word_view" android:paddingTop="10.0dip" android:layout_width="fill_parent" android:layout_height="fill_parent" />
-</LinearLayout>
