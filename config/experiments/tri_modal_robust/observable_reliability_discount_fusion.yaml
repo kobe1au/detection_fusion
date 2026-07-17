@@ -1,8 +1,0 @@
-defaults:
-  - base_tri_modal_robust.yaml
-
-method:
-  name: observable_reliability_discount_fusion
-
-train:
-  exp_name: observable_reliability_discount_fusion

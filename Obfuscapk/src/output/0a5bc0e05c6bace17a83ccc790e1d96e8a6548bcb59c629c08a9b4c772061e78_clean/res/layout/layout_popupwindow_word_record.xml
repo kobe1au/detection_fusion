@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:orientation="vertical" android:id="@id/rl_back" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <LinearLayout android:gravity="center_horizontal" android:orientation="vertical" android:background="@drawable/bg_word_record_bottom" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_alignParentBottom="true">
+        <TextView android:textSize="23.0sp" android:textStyle="bold" android:textColor="#ff426dfe" android:id="@id/tv_record_word" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="13.0dip" android:layout_marginBottom="13.0dip" android:text="promising" />
+        <TextView android:layout_width="wrap_content" android:layout_height="0.0dip" android:layout_weight="1.0" />
+        <p4d236d9a.pabb3141d.p62608e08.widgets.practiceview.RecordView android:id="@id/recordview" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginBottom="20.0dip" />
+    </LinearLayout>
+</RelativeLayout>

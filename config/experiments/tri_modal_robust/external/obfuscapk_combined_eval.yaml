@@ -1,19 +1,19 @@
 defaults:
-  - ../seeds/seed_42.yaml
+  - ../evidential_trusted_fusion.yaml
 
 method:
-  name: obfuscapk_combined_eval
+  name: external_obfuscapk_combined_eval
 
 eval:
   eval_only: true
-  output_name: obfuscapk_combined_eval
+  output_name: external_obfuscapk_combined_eval
   checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
-  refit_rejection_threshold: true
+  refit_rejection_threshold: false
   run_test: false
   run_robust_test: false
   extra_sets:
     - name: obfuscapk_combined
-      pt_dir: ../../pts_obfuscapk/combined
+      pt_dir: /root/autodl-tmp/pts_obfuscapk/combined
       csv: labels/obfuscapk_combined.csv
-      allow_pt_superset: true
-      skip_if_empty: true
+      allow_pt_superset: false
+      skip_if_empty: false

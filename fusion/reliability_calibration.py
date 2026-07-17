@@ -9,6 +9,24 @@ from fusion.constants import EvidenceIndex
 
 BRANCH_NAMES = ("api", "graph", "manifest", "joint")
 
+# Keep the learned calibrator topology invariant across mechanism ablations.
+# Feature flags below mask their slot to zero instead of changing a branch
+# network's input dimension.  This prevents an I1 feature ablation from
+# consuming a different number of RNG draws and thereby changing the global
+# opinion router's initialization.
+RELIABILITY_FEATURE_SUPERSET_LAYOUT = {
+    "api": ("integrity", "model_visibility", "api_graph_support", "evidential_certainty"),
+    "graph": ("integrity", "model_visibility", "api_graph_support", "evidential_certainty"),
+    "manifest": ("integrity", "evidential_certainty"),
+    "joint": (
+        "mean_alive_integrity",
+        "effective_code_integrity",
+        "api_graph_support",
+        "alive_fraction",
+        "evidential_certainty",
+    ),
+}
+
 
 def _column(evidence: torch.Tensor, index: int) -> torch.Tensor:
     return evidence[:, index].clamp(0.0, 1.0)
@@ -47,17 +65,18 @@ def build_monotonic_reliability_features(
     *,
     missing_relation_support: float = 0.0,
     use_relation_evidence: bool = True,
+    use_model_visibility: bool = False,
     evidential_certainty: dict[str, torch.Tensor] | None = None,
+    fixed_superset_layout: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Build branch-specific features where larger always means more reliable.
+    """Build branch-specific monotone reliability features.
 
-    When ``evidential_certainty`` (a per-branch ``1 - u`` from the Dirichlet
-    evidence head) is supplied, it is appended as an extra monotone-positive
-    feature column so the calibrator estimates reliability from BOTH the
-    observable parse quality and the model's own evidential certainty (I1's
-    dual-source design). The two sources are complementary: observable quality
-    flags missing/degraded modalities, evidential certainty flags semantically
-    ambiguous samples.
+    API-Graph anchor support is retained because it has a stable positive
+    interpretation for the two code branches. Manifest-Code semantic
+    support/conflict remains available in diagnostics, but is not forced into
+    the monotone calibrator: its empirical direction can vary with declarations,
+    libraries, and code visibility. Learned evidential certainty can be appended
+    as a complementary sample-difficulty signal.
     """
     if evidence.ndim != 2 or evidence.size(-1) < EvidenceIndex.BASE_DIM:
         raise ValueError(
@@ -72,6 +91,8 @@ def build_monotonic_reliability_features(
     manifest_support = _column(evidence, EvidenceIndex.MANIFEST_CODE_SUPPORT)
     manifest_conflict = _column(evidence, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT)
     code_conflict = _column(evidence, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT)
+    api_visibility = _column(evidence, EvidenceIndex.API_ENCODER_COVERAGE)
+    graph_visibility = _column(evidence, EvidenceIndex.GRAPH_ENCODER_COVERAGE)
 
     api_alive = _column(evidence, EvidenceIndex.API_ALIVE).bool()
     graph_alive = _column(evidence, EvidenceIndex.GRAPH_ALIVE).bool()
@@ -87,9 +108,9 @@ def build_monotonic_reliability_features(
     manifest_code_applicable = manifest_alive & code_alive & manifest_code_relation_observed
 
     missing_support = torch.full_like(anchor_support, float(missing_relation_support))
-    # Unavailable relations contribute no positive evidence. Applicability is
-    # kept as a diagnostic mask rather than treating missing counterparts as
-    # either maximum support or maximum conflict.
+    # Relation evidence is an optional positive contribution. When the
+    # counterpart is unavailable, no relation contribution is added; missing
+    # support must never be encoded as maximal agreement.
     anchor_good = torch.where(api_graph_applicable, anchor_support, missing_support)
     manifest_support_good = torch.where(
         manifest_code_applicable, manifest_support, missing_support
@@ -107,11 +128,9 @@ def build_monotonic_reliability_features(
         manifest_conflict_good = no_relation_evidence
         code_conflict_good = no_relation_evidence
 
-    # Single-modality reliability uses intrinsic quality exactly once. The
-    # reserved context slot stays neutral; pair quality is represented only by
-    # the explicit support/conflict features, while code_integrity is reserved
-    # for the joint branch.
-    zero_context = torch.zeros_like(api_integrity)
+    # Single-modality reliability uses intrinsic quality exactly once.
+    # Manifest-Code relations remain diagnostic because their direction is not
+    # stable enough to impose as a universally positive monotone feature.
     effective_code_integrity = torch.where(
         api_alive & graph_alive,
         code_integrity,
@@ -126,51 +145,53 @@ def build_monotonic_reliability_features(
         integrities * alive_float
     ).sum(dim=-1) / alive_float.sum(dim=-1).clamp_min(1.0)
     alive_fraction = alive_float.mean(dim=-1)
-    pair_values = torch.stack([anchor_good, manifest_support_good], dim=-1)
-    conflict_good = torch.minimum(manifest_conflict_good, code_conflict_good)
-
-    features = {
+    legacy_features = {
         "api": torch.stack(
             [
                 api_integrity,
-                zero_context,
                 anchor_good,
-                manifest_support_good,
-                zero_context,
             ],
             dim=-1,
         ),
         "graph": torch.stack(
             [
                 graph_integrity,
-                zero_context,
                 anchor_good,
-                manifest_support_good,
-                zero_context,
             ],
             dim=-1,
         ),
-        "manifest": torch.stack(
-            [
-                manifest_integrity,
-                zero_context,
-                manifest_support_good,
-                manifest_conflict_good,
-                code_conflict_good,
-            ],
-            dim=-1,
-        ),
+        "manifest": manifest_integrity.unsqueeze(-1),
         "joint": torch.stack(
             [
                 mean_alive_integrity,
                 effective_code_integrity,
-                pair_values.mean(dim=-1),
-                conflict_good,
+                anchor_good,
                 alive_fraction,
             ],
             dim=-1,
         ),
     }
+    if use_model_visibility:
+        # Visibility helps estimate branch correctness on clean calibration
+        # data. The main routed method may additionally apply a relative
+        # effective-integrity modifier as an explicit deployment-shift guard;
+        # that separate constraint is reported in the diagnostics.
+        legacy_features["api"] = torch.cat(
+            [
+                legacy_features["api"][:, :1],
+                api_visibility.unsqueeze(-1),
+                legacy_features["api"][:, 1:],
+            ],
+            dim=-1,
+        )
+        legacy_features["graph"] = torch.cat(
+            [
+                legacy_features["graph"][:, :1],
+                graph_visibility.unsqueeze(-1),
+                legacy_features["graph"][:, 1:],
+            ],
+            dim=-1,
+        )
     diagnostics = {
         "api_graph_support_applicable": api_graph_applicable.float(),
         "manifest_code_conflict_applicable": manifest_code_applicable.float(),
@@ -186,16 +207,62 @@ def build_monotonic_reliability_features(
         "alive_manifest": manifest_alive.float(),
         "alive_joint": joint_alive.float(),
     }
+    certainty_by_branch: dict[str, torch.Tensor] = {}
     if evidential_certainty is not None:
-        # Append the learned evidential certainty (1 - u) as a sixth
-        # monotone-positive feature for every branch. Missing entries default to
-        # a neutral 1.0 so the calibrator is never penalised for absent evidence.
+        # Append learned evidential certainty (1 - u) as a complementary
+        # monotone-positive feature. Missing entries default to neutral 1.0;
+        # the explicit alive mask still removes unavailable branches.
         for name in BRANCH_NAMES:
             cert = evidential_certainty.get(name)
             if cert is None:
                 cert = torch.ones_like(api_integrity)
-            cert = cert.to(device=evidence.device, dtype=evidence.dtype).view(-1, 1).clamp(0.0, 1.0)
-            features[name] = torch.cat([features[name], cert], dim=-1)
+            cert = (
+                cert.to(device=evidence.device, dtype=evidence.dtype)
+                .view(-1)
+                .clamp(0.0, 1.0)
+            )
+            certainty_by_branch[name] = cert
+            legacy_features[name] = torch.cat(
+                [legacy_features[name], cert.unsqueeze(-1)], dim=-1
+            )
+
+    if not fixed_superset_layout:
+        return legacy_features, diagnostics
+
+    zeros = torch.zeros_like(api_integrity)
+    api_visibility_feature = api_visibility if use_model_visibility else zeros
+    graph_visibility_feature = graph_visibility if use_model_visibility else zeros
+    certainty = {
+        name: certainty_by_branch.get(name, zeros) for name in BRANCH_NAMES
+    }
+    features = {
+        "api": torch.stack(
+            [api_integrity, api_visibility_feature, anchor_good, certainty["api"]],
+            dim=-1,
+        ),
+        "graph": torch.stack(
+            [
+                graph_integrity,
+                graph_visibility_feature,
+                anchor_good,
+                certainty["graph"],
+            ],
+            dim=-1,
+        ),
+        "manifest": torch.stack(
+            [manifest_integrity, certainty["manifest"]], dim=-1
+        ),
+        "joint": torch.stack(
+            [
+                mean_alive_integrity,
+                effective_code_integrity,
+                anchor_good,
+                alive_fraction,
+                certainty["joint"],
+            ],
+            dim=-1,
+        ),
+    }
     return features, diagnostics
 
 
@@ -207,6 +274,7 @@ class MonotonicReliabilityCalibrator(nn.Module):
         hidden_dim: int = 16,
         missing_relation_support: float = 0.0,
         use_relation_evidence: bool = True,
+        use_model_visibility: bool = False,
         apply_alive_mask: bool = True,
         use_evidential_uncertainty: bool = False,
     ):
@@ -217,12 +285,15 @@ class MonotonicReliabilityCalibrator(nn.Module):
             raise ValueError("reliability_calibration.missing_relation_support must be within [0, 1]")
         self.missing_relation_support = float(missing_relation_support)
         self.use_relation_evidence = bool(use_relation_evidence)
+        self.use_model_visibility = bool(use_model_visibility)
         self.apply_alive_mask = bool(apply_alive_mask)
         self.use_evidential_uncertainty = bool(use_evidential_uncertainty)
-        input_dim = 6 if self.use_evidential_uncertainty else 5
         self.branches = nn.ModuleDict(
             {
-                name: MonotonicBranchCalibrator(input_dim=input_dim, hidden_dim=hidden_dim)
+                name: MonotonicBranchCalibrator(
+                    input_dim=len(RELIABILITY_FEATURE_SUPERSET_LAYOUT[name]),
+                    hidden_dim=hidden_dim,
+                )
                 for name in BRANCH_NAMES
             }
         )
@@ -241,7 +312,9 @@ class MonotonicReliabilityCalibrator(nn.Module):
             evidence,
             missing_relation_support=self.missing_relation_support,
             use_relation_evidence=self.use_relation_evidence,
+            use_model_visibility=self.use_model_visibility,
             evidential_certainty=evidential_certainty if self.use_evidential_uncertainty else None,
+            fixed_superset_layout=True,
         )
         outputs = dict(diagnostics)
         for name in BRANCH_NAMES:
@@ -249,6 +322,27 @@ class MonotonicReliabilityCalibrator(nn.Module):
             reliability = self.branches[name](features[name])
             if self.apply_alive_mask:
                 reliability = reliability * alive
-            outputs[f"reliability_features_{name}"] = features[name]
+            # Preserve the historical active-feature diagnostic for downstream
+            # reports while exposing the invariant network input explicitly.
+            # The learned branch always consumes the fixed superset tensor.
+            outputs[f"reliability_features_superset_{name}"] = features[name]
+            if name in {"api", "graph"}:
+                active_indices = [0]
+                if self.use_model_visibility:
+                    active_indices.append(1)
+                active_indices.append(2)
+                if self.use_evidential_uncertainty:
+                    active_indices.append(3)
+            elif name == "manifest":
+                active_indices = [0] + (
+                    [1] if self.use_evidential_uncertainty else []
+                )
+            else:
+                active_indices = [0, 1, 2, 3] + (
+                    [4] if self.use_evidential_uncertainty else []
+                )
+            outputs[f"reliability_features_{name}"] = features[name][
+                :, active_indices
+            ]
             outputs[f"predicted_reliability_{name}"] = reliability
         return outputs

@@ -23,8 +23,10 @@ from fusion.quality import (
     compute_manifest_code_support_and_conflict,
     compute_manifest_integrity_v2,
     compute_raw_alive,
+    refresh_observable_metadata,
     refresh_observable_signals,
 )
+from extract.extract_graph_api import ApiEvent, select_api_events
 from scripts.build_tri_modal_pts_direct import build_observable_payload
 from scripts.diagnose_observable_signals import _distribution_table, _output_checks, _trend_table
 
@@ -97,12 +99,19 @@ def test_observable_schema_strict_accepts_complete_merged_payload(tmp_path: Path
             "api_parse_error": "",
             "api_event_count_raw": 2,
             "api_event_count_kept": 2,
+            "api_event_count_before_method_budget": 2,
+            "api_event_count_after_method_budget": 2,
+            "api_event_count_before_extractor_budget": 2,
+            "api_event_count_after_extractor_budget": 2,
+            "api_extractor_coverage": 1.0,
+            "api_truncated_by_extractor_budget": 0.0,
             "api_truncated": False,
             "api_truncation_ratio": 0.0,
             "api_known_type_count": 1,
             "api_unknown_type_count": 1,
             "dex_parse_ok": True,
             "dex_file_count": 1,
+            "dex_parse_success_ratio": 1.0,
             "class_count": 1,
             "method_count": 2,
             "graph_parse_ok": True,
@@ -277,6 +286,50 @@ def test_api_encoder_budget_does_not_reduce_clean_api_integrity():
     assert compute_api_integrity_v2(degraded_visible_events) < compute_api_integrity_v2(clean_budgeted)
 
 
+def test_api_budget_accounting_separates_extractor_and_runtime_coverage():
+    data = {
+        "api_ids": torch.arange(100),
+        "api_type_ids": torch.ones(100, dtype=torch.long),
+        "api_event_count_kept": 500,
+        "api_event_count_before_method_budget": 1000,
+        "api_event_count_after_method_budget": 800,
+        "api_event_count_before_extractor_budget": 800,
+        "api_event_count_after_extractor_budget": 500,
+        "api_event_count_before_encoder_budget": 500,
+        "api_event_count_after_encoder_budget": 100,
+    }
+
+    refresh_observable_metadata(data)
+
+    assert data["api_extractor_coverage"] == pytest.approx(0.5)
+    assert data["api_runtime_encoder_coverage"] == pytest.approx(0.2)
+    assert data["api_encoder_coverage"] == pytest.approx(0.1)
+    assert data["api_truncated_by_extractor_budget"] == 1.0
+    assert data["api_truncated_by_encoder_budget"] == 1.0
+
+
+def test_api_event_selection_keeps_sensitive_calls_and_contiguous_prefix_fill():
+    events = [
+        ApiEvent(
+            old_method_idx=0,
+            token=f"api-{index}",
+            category_id=0,
+            sensitive=index in {4, 7},
+        )
+        for index in range(10)
+    ]
+
+    selected = select_api_events(events, 5)
+
+    assert [event.token for event in selected] == [
+        "api-0",
+        "api-1",
+        "api-2",
+        "api-4",
+        "api-7",
+    ]
+
+
 def test_limit_api_events_records_encoder_budget_without_changing_extraction_counts():
     dataset = RobustTriModalDataset.__new__(RobustTriModalDataset)
     dataset.max_api_events_per_sample = 3
@@ -321,6 +374,24 @@ def test_graph_integrity_decreases_for_partial_dex_and_extreme_fragmentation():
     partial = {**clean, "dex_parse_success_ratio": 0.5}
     assert compute_graph_integrity_v2(clean) > compute_graph_integrity_v2(fragmented)
     assert compute_graph_integrity_v2(clean) > compute_graph_integrity_v2(partial)
+
+
+def test_graph_integrity_decreases_when_node_features_are_masked():
+    clean = {
+        "dex_parse_ok": True,
+        "dex_parse_success_ratio": 1.0,
+        "graph_parse_ok": True,
+        "graph_timeout": False,
+        "graph_node_count_raw": 10,
+        "graph_edge_count_raw": 9,
+        "graph_isolated_node_count": 0,
+        "graph_largest_component_ratio": 1.0,
+        "graph_feature_valid_ratio": 1.0,
+        "method_count": 10,
+    }
+    masked = {**clean, "graph_feature_valid_ratio": 0.0}
+
+    assert compute_graph_integrity_v2(masked) < compute_graph_integrity_v2(clean)
 
 
 def test_api_graph_anchor_support_ignores_invalid_edges():
@@ -450,6 +521,34 @@ def test_main_evidence_excludes_perturbation_fields():
         use_conflict_evidence=True,
     )
     assert torch.equal(before, after)
+
+
+def test_api_visibility_uses_runtime_encoder_coverage_only():
+    data = _evidence_data()
+    data.api_encoder_coverage = torch.tensor([[0.08]], dtype=torch.float32)
+    data.api_extractor_coverage = torch.tensor([[0.10]], dtype=torch.float32)
+    data.api_runtime_encoder_coverage = torch.tensor([[0.75]], dtype=torch.float32)
+    logits = torch.zeros(1, 2)
+    emb = torch.zeros(1, 4)
+
+    evidence, diagnostics = build_evidence(
+        data,
+        logits,
+        logits,
+        logits,
+        logits,
+        emb,
+        emb,
+        emb,
+        use_consistency_evidence=True,
+        use_conflict_evidence=True,
+    )
+
+    assert evidence[0, EvidenceIndex.API_ENCODER_COVERAGE].item() == pytest.approx(0.75)
+    assert diagnostics["api_encoder_coverage"].item() == pytest.approx(0.75)
+    assert diagnostics["api_runtime_encoder_coverage"].item() == pytest.approx(0.75)
+    assert diagnostics["api_total_pipeline_coverage"].item() == pytest.approx(0.08)
+    assert diagnostics["effective_api_integrity"].item() == pytest.approx(0.8 * 0.75)
 
 
 def test_manifest_perturbation_refreshes_observables():

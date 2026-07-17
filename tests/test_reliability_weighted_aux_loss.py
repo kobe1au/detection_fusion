@@ -60,3 +60,32 @@ def test_reliability_weighted_aux_loss_averages_active_branches():
     assert torch.allclose(loss, expected)
     assert diagnostics["aux_active_branch_count"].item() == 4.0
 
+
+def test_reliability_weighted_aux_loss_can_exclude_joint_auxiliary_head():
+    outputs = _outputs(2)
+    labels = torch.tensor([0, 1])
+
+    loss, diagnostics = compute_reliability_weighted_aux_loss(
+        outputs,
+        labels,
+        _evidence(2),
+        {
+            "min_aux_weight": 0.2,
+            "branch_aux_weights": {
+                "api": 1.0,
+                "graph": 1.0,
+                "manifest": 1.0,
+                "joint": 0.0,
+            },
+        },
+    )
+
+    expected = torch.stack(
+        [
+            F.cross_entropy(outputs[f"{name}_logits_aux"], labels)
+            for name in ("api", "graph", "manifest")
+        ]
+    ).mean()
+    assert torch.allclose(loss, expected)
+    assert diagnostics["aux_active_branch_count"].item() == 3.0
+    assert torch.equal(diagnostics["aux_weight_joint"], torch.zeros(2))

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <include layout="@layout/include_head" />
+    <RelativeLayout android:layout_width="fill_parent" android:layout_height="fill_parent">
+        <LinearLayout android:orientation="horizontal" android:id="@id/rl_top_wordnum" android:paddingTop="11.0dip" android:layout_width="fill_parent" android:layout_height="wrap_content">
+            <p4d236d9a.pabb3141d.p62608e08.widgets.html.HtmlTextView android:gravity="center" android:id="@id/tv_all_num" android:layout_width="0.0dip" android:layout_height="fill_parent" android:includeFontPadding="false" android:layout_weight="1.0" />
+            <p4d236d9a.pabb3141d.p62608e08.widgets.html.HtmlTextView android:gravity="center" android:id="@id/tv_learn_num" android:layout_width="0.0dip" android:layout_height="fill_parent" android:includeFontPadding="false" android:layout_weight="1.0" />
+            <p4d236d9a.pabb3141d.p62608e08.widgets.html.HtmlTextView android:gravity="center" android:id="@id/tv_master_num" android:layout_width="0.0dip" android:layout_height="fill_parent" android:includeFontPadding="false" android:layout_weight="1.0" />
+            <p4d236d9a.pabb3141d.p62608e08.widgets.html.HtmlTextView android:gravity="center" android:id="@id/tv_collect_num" android:visibility="gone" android:layout_width="0.0dip" android:layout_height="wrap_content" android:includeFontPadding="false" android:layout_weight="1.0" />
+        </LinearLayout>
+        <p4d236d9a.pabb3141d.p62608e08.widgets.CustomSlidingTabLayout android:id="@id/slide_word_list" android:background="@color/white" android:layout_width="fill_parent" android:layout_height="12.0dip" android:layout_below="@id/rl_top_wordnum" app:tl_indicator_color="#ff517ffe" app:tl_indicator_corner_radius="2.0dip" app:tl_indicator_height="3.0dip" app:tl_indicator_margin_bottom="2.0dip" app:tl_indicator_width="30.0dip" app:tl_textSelectColor="#ffff5991" app:tl_textSelectSize="18.0sp" app:tl_textUnselectColor="#ffff5991" app:tl_textsize="14.0sp" />
+        <p4d236d9a.pabb3141d.p62608e08.widgets.CustomViewPager android:id="@id/vp_wordlist" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_below="@id/slide_word_list" />
+        <TextView android:id="@id/tv_start_practice" android:layout_marginLeft="45.0dip" android:layout_marginRight="45.0dip" android:layout_marginBottom="23.0dip" android:text="开始背词" android:layout_alignParentBottom="true" style="@style/Bule_btn" />
+    </RelativeLayout>
+</LinearLayout>

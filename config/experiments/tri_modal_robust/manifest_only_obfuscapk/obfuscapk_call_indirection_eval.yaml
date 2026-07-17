@@ -1,0 +1,19 @@
+defaults:
+  - ../baselines/manifest_only.yaml
+
+method:
+  name: manifest_only_obfuscapk_call_indirection_eval
+
+eval:
+  eval_only: true
+  output_name: manifest_only_obfuscapk_call_indirection_eval
+  checkpoint_path: results/tri_modal_robust/baseline_manifest_only/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: false
+  run_test: false
+  run_robust_test: false
+  extra_sets:
+    - name: manifest_only_obfuscapk_call_indirection
+      pt_dir: /root/autodl-tmp/pts_obfuscapk/call_indirection
+      csv: labels/obfuscapk_call_indirection.csv
+      allow_pt_superset: false
+      skip_if_empty: false

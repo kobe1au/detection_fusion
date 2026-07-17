@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:id="@id/layoutTitle" android:layout_width="fill_parent" android:layout_height="45.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <RelativeLayout android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="fill_parent">
+        <LinearLayout android:gravity="center_vertical" android:orientation="horizontal" android:id="@id/ll_left" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_alignParentLeft="true" android:layout_centerVertical="true">
+            <ImageView android:id="@id/iv_left" android:paddingLeft="10.0dip" android:paddingTop="10.0dip" android:paddingBottom="10.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/arrow_left" />
+            <TextView android:textSize="15.0sp" android:textColor="#ff333333" android:id="@id/tv_headback" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_toRightOf="@id/iv_left" />
+        </LinearLayout>
+        <TextView android:textSize="17.0sp" android:textColor="#ff333333" android:ellipsize="end" android:gravity="center" android:id="@id/tv_title" android:layout_width="wrap_content" android:layout_height="wrap_content" android:maxWidth="160.0dip" android:maxLines="1" android:layout_centerInParent="true" />
+        <ImageView android:id="@id/iv_informationCircle" android:visibility="gone" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginRight="14.0dip" android:src="@drawable/ziliaoquan_190701" android:layout_toLeftOf="@id/iv_right" android:layout_centerVertical="true" />
+        <ImageView android:id="@id/iv_right" android:padding="10.0dip" android:visibility="gone" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/collect" android:layout_alignParentRight="true" android:layout_centerVertical="true" />
+        <TextView android:textSize="12.0sp" android:textColor="#ff1376f8" android:gravity="center" android:id="@id/tv_right" android:paddingLeft="12.0dip" android:paddingTop="2.0dip" android:paddingRight="12.0dip" android:paddingBottom="2.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginRight="3.0dip" android:text="" android:layout_alignParentRight="true" android:layout_centerVertical="true" />
+        <LinearLayout android:gravity="center_vertical" android:orientation="horizontal" android:id="@id/ll_weFreeMode" android:paddingRight="12.0dip" android:visibility="gone" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_alignParentRight="true" android:layout_centerVertical="true">
+            <TextView android:textSize="6.0sp" android:textColor="#ffffffff" android:gravity="center" android:background="@drawable/bg_circle_blue" android:layout_width="10.0dip" android:layout_height="10.0dip" android:layout_marginRight="4.0dip" android:text="M" />
+            <TextView android:textSize="12.0sp" android:textColor="#ff1376f8" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="免费模板" />
+        </LinearLayout>
+        <TextView android:background="#ffe6e6e6" android:layout_width="fill_parent" android:layout_height="0.5dip" android:layout_alignParentBottom="true" />
+    </RelativeLayout>
+</LinearLayout>

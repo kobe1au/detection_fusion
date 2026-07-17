@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="930" height="540" viewBox="0 0 930 540">
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,4.5 L0,9 Z" fill="#222"/></marker>
+    <style>.box{fill:#fff;stroke:#222;stroke-width:1.2}.soft{fill:#f2f6fb;stroke:#4f7fbf;stroke-width:1.1}.group{fill:none;stroke:#666;stroke-width:1.1;stroke-dasharray:6 5}.line{stroke:#222;stroke-width:1.2;fill:none;marker-end:url(#arrow)}.title{font-family:"SimSun","Microsoft YaHei",Arial,sans-serif;font-size:18px;font-weight:bold}.txt{font-family:"SimSun","Microsoft YaHei",Arial,sans-serif;font-size:15px}.small{font-family:"SimSun","Microsoft YaHei",Arial,sans-serif;font-size:13px}.cap{font-family:"Times New Roman","SimSun",serif;font-size:14px}</style>
+  </defs>
+  <rect width="930" height="540" fill="#fff"/><text x="465" y="34" text-anchor="middle" class="title">面向模态冲突的可信证据融合总体框架</text>
+  <rect x="50" y="80" width="150" height="54" class="box"/><text x="125" y="103" text-anchor="middle" class="txt">API 分支</text><text x="125" y="124" text-anchor="middle" class="small">类别输出</text>
+  <rect x="50" y="190" width="150" height="54" class="box"/><text x="125" y="213" text-anchor="middle" class="txt">调用图分支</text><text x="125" y="234" text-anchor="middle" class="small">类别输出</text>
+  <rect x="50" y="300" width="150" height="54" class="box"/><text x="125" y="323" text-anchor="middle" class="txt">Manifest 分支</text><text x="125" y="344" text-anchor="middle" class="small">类别输出</text>
+  <rect x="255" y="65" width="175" height="310" class="group"/><text x="342" y="91" text-anchor="middle" class="txt">证据意见表示</text>
+  <rect x="285" y="112" width="115" height="42" class="soft"/><text x="342" y="138" text-anchor="middle" class="txt">ω_api</text>
+  <rect x="285" y="205" width="115" height="42" class="soft"/><text x="342" y="231" text-anchor="middle" class="txt">ω_graph</text>
+  <rect x="285" y="298" width="115" height="42" class="soft"/><text x="342" y="324" text-anchor="middle" class="txt">ω_man</text>
+  <rect x="500" y="92" width="175" height="80" class="box"/><text x="588" y="121" text-anchor="middle" class="txt">模态可信评分</text><text x="588" y="146" text-anchor="middle" class="small">T_api, T_graph, T_man</text>
+  <rect x="500" y="230" width="175" height="80" class="box"/><text x="588" y="259" text-anchor="middle" class="txt">证据调整</text><text x="588" y="284" text-anchor="middle" class="small">低可信证据转为不确定性</text>
+  <rect x="735" y="154" width="150" height="70" class="box"/><text x="810" y="183" text-anchor="middle" class="txt">冲突建模</text><text x="810" y="206" text-anchor="middle" class="small">原始冲突 κ</text>
+  <rect x="735" y="286" width="150" height="70" class="box"/><text x="810" y="315" text-anchor="middle" class="txt">三模态融合</text><text x="810" y="338" text-anchor="middle" class="small">Yager 规则</text>
+  <rect x="335" y="425" width="260" height="58" class="soft"/><text x="465" y="449" text-anchor="middle" class="txt">融合概率 p_f 与不确定性 u_f</text><text x="465" y="471" text-anchor="middle" class="small">供最终分类与拒识机制使用</text>
+  <line x1="200" y1="107" x2="285" y2="133" class="line"/><line x1="200" y1="217" x2="285" y2="226" class="line"/><line x1="200" y1="327" x2="285" y2="319" class="line"/><line x1="430" y1="226" x2="500" y2="270" class="line"/><line x1="588" y1="172" x2="588" y2="230" class="line"/><line x1="675" y1="270" x2="735" y2="321" class="line"/><line x1="675" y1="270" x2="735" y2="189" class="line"/><line x1="810" y1="224" x2="810" y2="286" class="line"/><line x1="735" y1="356" x2="595" y2="425" class="line"/>
+  <text x="465" y="504" text-anchor="middle" class="cap">图4-1 面向模态冲突的可信证据融合总体框架</text><text x="465" y="526" text-anchor="middle" class="cap">Figure 4-1 Overall Framework of Trustworthy Evidence Fusion for Modality Conflict</text>
+</svg>

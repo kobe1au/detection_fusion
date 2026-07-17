@@ -35,6 +35,7 @@ TRI_MODAL_FUSION_MODES = {
     "tri_modal_reliability_gate",
     "tri_modal_confidence_gate",
     "tri_modal_ours",
+    "tri_modal_quality_fusion",
     "discount_probability",
 }
 
@@ -42,6 +43,45 @@ TRI_MODAL_FUSION_MODES = {
 # ── fusion-mode dispatch helpers ──────────────────────────────────────
 # Each handler receives (model, batch_size, device, dtype, tensors, extra)
 # and returns (logits, gate_weights, extra).
+
+def quality_aware_logit_fusion(
+    logits_by_branch: list[torch.Tensor],
+    alive: torch.Tensor,
+    *,
+    temperature: float = 10.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """QMF-style detached energy weighting for a shared-label task.
+
+    Final logits follow the official QMF late-fusion core. The normalized
+    weights returned here are diagnostics only and do not replace QMF's
+    unnormalized energy-weighted decision rule.
+    """
+    if not logits_by_branch:
+        raise ValueError("quality_aware_logit_fusion requires at least one branch")
+    if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError("quality fusion temperature must be finite and positive")
+    logits = torch.stack(logits_by_branch, dim=1)
+    if alive.shape != logits.shape[:2]:
+        raise ValueError(
+            f"alive mask shape {tuple(alive.shape)} does not match logits {tuple(logits.shape[:2])}"
+        )
+    alive = alive.to(device=logits.device, dtype=logits.dtype).clamp(0.0, 1.0)
+    energy = torch.logsumexp(logits, dim=-1) / float(temperature)
+    quality = energy.detach() * alive
+    fused = (logits * quality.unsqueeze(-1)).sum(dim=1)
+
+    has_source = alive.sum(dim=-1, keepdim=True) > 0.0
+    masked_energy = energy.masked_fill(alive <= 0.0, torch.finfo(energy.dtype).min)
+    diagnostic_weights = torch.softmax(masked_energy, dim=-1) * alive
+    diagnostic_weights = diagnostic_weights / diagnostic_weights.sum(
+        dim=-1, keepdim=True
+    ).clamp_min(1.0e-8)
+    uniform = torch.full_like(diagnostic_weights, 1.0 / float(len(logits_by_branch)))
+    diagnostic_weights = torch.where(has_source, diagnostic_weights, uniform)
+    fallback = logits.mean(dim=1)
+    fused = torch.where(has_source, fused, fallback)
+    return fused, diagnostic_weights, energy
+
 
 def _fusion_single_api(_model, batch_size, device, dtype, tensors, extra):
     gate = torch.zeros((batch_size, 4), device=device, dtype=dtype)
@@ -79,6 +119,52 @@ def _fusion_tri_concat(model, batch_size, device, dtype, tensors, extra):
     return logits, gate, extra
 
 
+def _fusion_quality_aware(model, batch_size, device, dtype, tensors, extra):
+    """Adapt QMF energy-aware late fusion to the three APK modalities."""
+    evidence, diagnostics = build_evidence(
+        tensors["graph_data"],
+        tensors["api_logits"],
+        tensors["graph_logits"],
+        tensors["manifest_logits"],
+        tensors["joint_logits"],
+        tensors["api_emb"],
+        tensors["graph_emb"],
+        tensors["manifest_emb"],
+        use_consistency_evidence=False,
+        use_conflict_evidence=False,
+        use_perturbation_evidence=False,
+    )
+    extra.update(diagnostics)
+    extra["gate_evidence"] = evidence.detach()
+    alive = torch.stack(
+        [
+            evidence[:, EvidenceIndex.API_ALIVE],
+            evidence[:, EvidenceIndex.GRAPH_ALIVE],
+            evidence[:, EvidenceIndex.MANIFEST_ALIVE],
+        ],
+        dim=-1,
+    )
+    logits, weights3, energy = quality_aware_logit_fusion(
+        [
+            tensors["api_logits"],
+            tensors["graph_logits"],
+            tensors["manifest_logits"],
+        ],
+        alive,
+        temperature=model.quality_fusion_temperature,
+    )
+    gate = torch.cat(
+        [weights3.to(dtype=dtype), torch.zeros((batch_size, 1), device=device, dtype=dtype)],
+        dim=-1,
+    )
+    for index, name in enumerate(("api", "graph", "manifest")):
+        extra[f"qmf_energy_{name}"] = energy[:, index]
+        extra[f"fusion_weight_{name}"] = weights3[:, index]
+    extra["fusion_weight_joint"] = torch.zeros((batch_size,), device=device, dtype=dtype)
+    extra["gate_prior_enabled"] = False
+    return logits, gate, extra
+
+
 def _fusion_evidence_based(model, batch_size, device, dtype, tensors, extra):
     """Evidence-based gate fusion (fixed / reliability / confidence / learned)."""
     evidence, diagnostics = build_evidence(
@@ -99,7 +185,10 @@ def _fusion_evidence_based(model, batch_size, device, dtype, tensors, extra):
 
     mode = model.fusion_mode
     if mode == "tri_modal_fixed_gate":
-        gate_weights = torch.full((batch_size, 4), 0.25, device=device, dtype=dtype)
+        # Canonical three-modality late fusion.  The learned joint head is not a
+        # fourth source and must not double-count the same three embeddings.
+        gate_weights = torch.zeros((batch_size, 4), device=device, dtype=dtype)
+        gate_weights[:, :3] = 1.0 / 3.0
         extra["gate_prior_enabled"] = False
     elif mode == "tri_modal_reliability_gate":
         gate_weights = heuristic_reliability_gate(evidence).to(dtype=dtype)
@@ -156,6 +245,11 @@ def _fusion_discount_probability(model, batch_size, device, dtype, tensors, extr
         tensors["manifest_logits"],
         tensors["joint_logits"],
         evidence,
+        embeddings={
+            "api": tensors["api_emb"],
+            "graph": tensors["graph_emb"],
+            "manifest": tensors["manifest_emb"],
+        },
     )
     extra.update(fusion_outputs)
     extra["gate_prior_enabled"] = False
@@ -177,6 +271,7 @@ FUSION_DISPATCH: dict[str, callable] = {
     "tri_modal_reliability_gate": _fusion_evidence_based,
     "tri_modal_confidence_gate": _fusion_evidence_based,
     "tri_modal_ours": _fusion_evidence_based,
+    "tri_modal_quality_fusion": _fusion_quality_aware,
     "discount_probability": _fusion_discount_probability,
 }
 
@@ -406,6 +501,7 @@ class TriModalRobustModel(nn.Module):
         manifest_hidden_dim: int = 256,
         manifest_dropout: float = 0.1,
         joint_emb_dim: int = 128,
+        quality_fusion_temperature: float = 10.0,
         gate_hidden_dim: int = 128,
         gate_detach: bool = True,
         use_consistency_evidence: bool = True,
@@ -429,6 +525,9 @@ class TriModalRobustModel(nn.Module):
         self.manifest_in_dim = int(manifest_in_dim)
         self.manifest_emb_dim = int(manifest_emb_dim)
         self.joint_emb_dim = int(joint_emb_dim)
+        if not math.isfinite(float(quality_fusion_temperature)) or float(quality_fusion_temperature) <= 0.0:
+            raise ValueError("quality_fusion_temperature must be finite and positive")
+        self.quality_fusion_temperature = float(quality_fusion_temperature)
         self.gate_detach = bool(gate_detach)
         self.use_consistency_evidence = bool(use_consistency_evidence)
         self.use_conflict_evidence = bool(use_conflict_evidence)
@@ -501,6 +600,10 @@ class TriModalRobustModel(nn.Module):
     def calibration_parameters(self) -> list[nn.Parameter]:
         """Parameters fitted after model selection without changing encoders."""
         return self.discount_fusion.calibration_parameters()
+
+    def encoder_training_frozen_parameters(self) -> list[nn.Parameter]:
+        """Parameters that must remain untouched during encoder training."""
+        return self.discount_fusion.encoder_training_frozen_parameters()
 
     def set_calibration_active(self, enabled: bool) -> None:
         self.discount_fusion.set_calibration_active(enabled)

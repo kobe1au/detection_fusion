@@ -1,13 +1,20 @@
 defaults:
   - ../base_tri_modal_robust.yaml
 
+model:
+  fusion_mode: tri_modal_concat
+
 fusion:
-  mode: legacy_learned_gate
+  mode: model_dispatch
   use_reliability_discount: false
   use_support_discount: false
   use_conflict_discount: false
   use_confidence_proxy: false
   use_hard_alive_mask: false
+  branch_competence_prior:
+    enabled: false
+  visible_integrity_modifier:
+    enabled: false
   reliability_calibration:
     enabled: false
   probability_calibration:
@@ -15,11 +22,14 @@ fusion:
 
 calibration:
   enabled: false
+  # Keep checkpoint selection on the same validation subset as the proposed
+  # method even though these baselines do not fit post-hoc calibration.
   holdout_enabled: true
 
 selective_prediction:
   enabled: false
 
 loss:
-  reliability_weighted_aux: false
   branch_aux_weight: 0.0
+  integrity_weighted_aux: false
+  evidential_loss_weight: 0.0

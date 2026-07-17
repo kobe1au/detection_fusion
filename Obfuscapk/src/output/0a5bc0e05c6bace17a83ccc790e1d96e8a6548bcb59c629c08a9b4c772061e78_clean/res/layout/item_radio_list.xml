@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<top.limuyang2.shadowlayoutlib.ShadowLinearLayout android:gravity="center_vertical" android:orientation="horizontal" android:id="@id/rl_item_all" android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="91.0dip" android:layout_marginLeft="15.0dip" android:layout_marginTop="8.0dip" android:layout_marginRight="15.0dip" android:layout_marginBottom="8.0dip" app:l_radius="10.0dip" app:l_shadowAlpha="0.2" app:l_shadowElevation="3.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <ImageView android:id="@id/iv_radio_list" android:layout_width="60.0dip" android:layout_height="60.0dip" android:layout_marginLeft="18.0dip" android:src="@drawable/ic_quanbu_0505" />
+    <TextView android:textSize="16.0sp" android:textColor="#ff0e0e0e" android:gravity="center" android:id="@id/tv_radio_name" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="20.0dip" android:text="全部单词" />
+    <TextView android:textSize="20.0sp" android:textStyle="bold" android:textColor="#ff0e0e0e" android:gravity="right" android:id="@id/tv_radio_num" android:paddingRight="35.0dip" android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_marginLeft="25.0dip" android:text="3568" android:layout_weight="1.0" />
+    <ImageView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginRight="15.0dip" android:src="@drawable/ic_jiantou_0505" />
+</top.limuyang2.shadowlayoutlib.ShadowLinearLayout>

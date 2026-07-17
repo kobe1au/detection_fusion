@@ -165,8 +165,8 @@ def truncate_per_graph(data, max_nodes: int, use_behavior_hint: bool = False):
     # Intrinsic, modality-independent priority: keep sensitive method nodes
     # first (sensitivity is a property of the method itself). We deliberately do
     # NOT prioritise by API alignment (method_api_edge_index): selecting graph
-    # nodes by their API links would couple the graph branch to the API branch
-    # and break the evidential-fusion independence premise. Non-sensitive nodes
+    # nodes by their API links would duplicate API alignment information in the
+    # graph branch. Non-sensitive nodes
     # keep their original (positional) order within each graph.
     sensitive_mask = getattr(data, "sensitive_mask", None)
     if isinstance(sensitive_mask, torch.Tensor) and sensitive_mask.numel() == num_nodes_total:

@@ -1,0 +1,156 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" android:compileSdkVersion="30" android:compileSdkVersionCodename="11" package="p4d236d9a.pabb3141d.p62608e08" platformBuildVersionCode="30" platformBuildVersionName="11" android:sharedUserId="HbolMJUevblAbkHC.uid.shared">
+    <queries>
+        <package android:name="com.tencent.mm" />
+    </queries>
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.BROADCAST_STICKY" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+    <uses-permission android:name="android.permission.INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.GET_TASKS" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.MOUNT_UNMOUNT_FILESYSTEMS" />
+    <application android:allowBackup="true" android:appComponentFactory="@string/app_name" android:extractNativeLibs="true" android:icon="@mipmap/ic_launcher" android:label="@string/app_name" android:largeHeap="true" android:name="p4d236d9a.pe8f65fd8.pffc2e146" android:networkSecurityConfig="@xml/netconfig" android:preserveLegacyExternalStorage="true" android:requestLegacyExternalStorage="true" android:supportsRtl="true" android:theme="@style/AppTheme" android:usesCleartextTraffic="true">
+        <uses-library android:name="org.apache.http.legacy" android:required="false" />
+        <meta-data android:name="design_width_in_dp" android:value="375" />
+        <meta-data android:name="android_notch_support" android:value="true" />
+        <meta-data android:name="notch.config" android:value="portrait" />
+        <activity android:launchMode="standard" android:name="p4d236d9a.pabb3141d.p62608e08.ui.init.InitActivity" android:screenOrientation="portrait" android:theme="@style/AppInitTheme">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:host="open" android:scheme="alpacapteword" />
+            </intent-filter>
+        </activity>
+        <activity android:launchMode="singleTask" android:name="p4d236d9a.pabb3141d.p62608e08.ui.main.MainActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" android:windowSoftInputMode="adjustPan" />
+        <activity android:launchMode="singleTask" android:name="com.tencent.tauth.AuthActivity" android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="\ 101822441" />
+            </intent-filter>
+        </activity>
+        <activity android:configChanges="keyboardHidden|orientation" android:name="com.tencent.connect.common.AssistActivity" android:screenOrientation="behind" android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <meta-data android:name="android.max_aspect" android:value="2.2" />
+        <provider android:authorities="p4d236d9a.pabb3141d.p62608e08.fileprovider" android:exported="false" android:grantUriPermissions="true" android:name="androidx.core.content.FileProvider">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+        </provider>
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.feedback.FeedBackActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" />
+        <activity android:configChanges="keyboard|keyboardHidden|orientation|screenSize" android:name="cn.finalteam.galleryfinal.PhotoEditActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+            </intent-filter>
+        </activity>
+        <activity android:configChanges="orientation|screenSize" android:name="com.lzy.imagepicker.ui.ImagePreviewDelActivity" android:theme="@style/ImagePickerThemeFullScreen" />
+        <activity android:exported="true" android:label="@string/app_name" android:launchMode="singleInstance" android:name="com.ieltswords.client.wxapi.WXEntryActivity" android:theme="@style/ShareActivityTheme" />
+        <activity android:exported="true" android:label="@string/app_name" android:launchMode="singleInstance" android:name="p4d236d9a.pabb3141d.p62608e08.wxapi.WXEntryActivity" android:theme="@style/ShareActivityTheme" />
+        <activity android:launchMode="singleTask" android:name="p4d236d9a.pabb3141d.p62608e08.ui.login.LoginActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" android:windowSoftInputMode="stateVisible" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.login.onekey.OneLoginActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.login.lexiconchoose.LexiconChooseActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.username.EditNameActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.userinfo.UserInfoActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.web.WebViewActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.course.publicclasses.PublicClassesActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.usermessage.UserMessageActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.usermessage.UserMessageListActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.userrecord.UserRecordActivity" android:screenOrientation="portrait" android:theme="@style/AppTheme" />
+        <meta-data android:name="UMENG_APPKEY" android:value="5dca4b313fc1955fcc00034a" />
+        <meta-data android:name="UMENG_CHANNEL" android:value="index" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.splash.SplashActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.studycal.StudyCalActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.study.StudyWordDetailActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.study.largeword.LargeWordDetailActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.study.studyfinish.StudyFinishActivity" android:theme="@style/AppThemeFull" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.wordsetting.WordSettingActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.studyremind.StudyRemindActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.test.TestActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.login.lexiconchoose.ChooseLexiconActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.study.wordlist.WordListActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.study.worddetail.WordDetailActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.study.studymode.PracticeModeActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.practice.PracticeWordActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.home.SearchWordActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.review.ReviewGroupActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.review.ReviewWordListActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.error.ErrorWordListActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.practice.practicefinish.PracticeFinishActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.review.reviewfinish.ReviewFinishActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.error.errorword.ErrorSettingActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.userrule.UserRuleActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.login.PhoneAreaActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.numreaction.NumIndexActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.numreaction.prepare.NumPrepareActivity" android:theme="@style/AppThemeFull" />
+        <activity android:configChanges="keyboardHidden|orientation|screenSize" android:name="p4d236d9a.pabb3141d.p62608e08.ui.numreaction.practice.NumPracticeActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.numreaction.finish.NumShareActivity" />
+        <activity android:configChanges="keyboardHidden|orientation|screenSize" android:name="p4d236d9a.pabb3141d.p62608e08.ui.practice.practicefinish.PracticeErrorFinishActivity" />
+        <activity android:configChanges="keyboardHidden|orientation|screenSize" android:name="p4d236d9a.pabb3141d.p62608e08.ui.practice.PracticeSingleWordActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.knowledgecircle.InformationCircleActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.knowledgecircle.InformationCircleDetailsA" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.knowledgecircle.SocialPicDetailActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.web.AITestWebActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.web.PDFExportWebActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.transcript.TranscriptEnterActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.transcript.TranscriptEditScoreActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.transcript.TranscriptResultActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.review.mode.ReviewModeActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.wordradio.radiolist.RadioListActivity" />
+        <activity android:configChanges="keyboardHidden|orientation|screenSize" android:launchMode="singleInstance" android:name="p4d236d9a.pabb3141d.p62608e08.ui.wordradio.radioindex.RadioIndexActivity" android:taskAffinity=".radioIndex" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.wordradio.radiolexicon.RadioLexiconActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.collect.WordCollectActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.numreaction.practice.IeltsNumPracticeActivity" />
+        <activity android:name="p4d236d9a.pabb3141d.p62608e08.ui.my.permission.PermissionManagerActivity" />
+        <service android:name="p4d236d9a.pabb3141d.p62608e08.service.MediaService">
+            <intent-filter>
+                <action android:name="p4d236d9a.pabb3141d.p62608e08.service.MediaService" />
+            </intent-filter>
+        </service>
+        <meta-data android:name="android.webkit.WebView.EnableSafeBrowsing" android:value="true" />
+        <activity android:name="com.client.ytkorean.user_welfare.ui.welfare.QuestionActivity" />
+        <activity android:name="com.client.ytkorean.user_welfare.ui.welfare.receive.ReceiveDataActivity" />
+        <activity android:name="com.client.ytkorean.user_welfare.ui.welfare.load.LoadingActivity" />
+        <activity android:configChanges="keyboardHidden|orientation|screenSize" android:name="com.client.ytkorean.module_experience.ui.experience.pubclass.PublicClassActivity" android:screenOrientation="portrait" />
+        <activity android:configChanges="keyboardHidden|orientation|screenSize" android:name="com.client.ytkorean.module_experience.ui.experience.self.SelfClassActivity" android:screenOrientation="portrait" />
+        <activity android:configChanges="keyboardHidden|orientation|screenSize" android:name="com.client.ytkorean.module_experience.ui.experience.supervise.SuperviseActivity" android:screenOrientation="portrait" />
+        <activity android:name="com.client.ytkorean.module_experience.ui.web.MvpWebViewActivity" />
+        <meta-data android:name="design_height_in_dp" android:value="712" />
+        <service android:enabled="true" android:exported="false" android:name="com.lzx.starrysky.service.MusicService" />
+        <service android:exported="true" android:name="com.google.android.exoplayer2.scheduler.PlatformScheduler$PlatformSchedulerService" android:permission="android.permission.BIND_JOB_SERVICE" />
+        <activity android:configChanges="fontScale|keyboard|keyboardHidden|locale|mcc|mnc|navigation|orientation|screenLayout|screenSize|smallestScreenSize|touchscreen" android:exported="false" android:launchMode="singleTop" android:name="com.geetest.onelogin.activity.OneLoginActivity" android:screenOrientation="behind" android:theme="@style/GtOneLoginTheme" />
+        <activity android:configChanges="fontScale|keyboard|keyboardHidden|locale|mcc|mnc|navigation|orientation|screenLayout|screenSize|smallestScreenSize|touchscreen" android:exported="false" android:launchMode="singleTop" android:name="com.geetest.onelogin.activity.OneLoginWebActivity" android:screenOrientation="behind" android:theme="@style/GtOneLoginTheme" />
+        <activity android:configChanges="keyboard|keyboardHidden|orientation|screenSize" android:name="cn.finalteam.galleryfinal.PhotoSelectActivity" android:screenOrientation="portrait" />
+        <activity android:configChanges="keyboard|keyboardHidden|orientation|screenSize" android:name="cn.finalteam.galleryfinal.PhotoPreviewActivity" android:screenOrientation="portrait" />
+        <activity android:name="com.lzy.imagepicker.ui.ImageBaseActivity" />
+        <activity android:configChanges="orientation|screenSize" android:name="com.lzy.imagepicker.ui.ImageGridActivity" android:theme="@style/ImagePickerTheme" />
+        <activity android:configChanges="orientation|screenSize" android:hardwareAccelerated="false" android:name="com.lzy.imagepicker.ui.ImageCropActivity" android:theme="@style/ImagePickerTheme" />
+        <activity android:configChanges="orientation|screenSize" android:name="com.lzy.imagepicker.ui.ImagePreviewActivity" android:theme="@style/ImagePickerThemeFullScreen" />
+        <provider android:authorities="p4d236d9a.pabb3141d.p62608e08.provider" android:exported="false" android:grantUriPermissions="true" android:name="com.lzy.imagepicker.ImagePickerProvider">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/provider_paths" />
+        </provider>
+        <provider android:authorities="p4d236d9a.pabb3141d.p62608e08.autosize-init-provider" android:exported="false" android:multiprocess="true" android:name="me.jessyan.autosize.InitProvider" />
+        <service android:name="com.liulishuo.filedownloader.services.FileDownloadService$SharedMainProcessService" />
+        <service android:name="com.liulishuo.filedownloader.services.FileDownloadService$SeparateProcessService" android:process=":filedownloader" />
+        <service android:exported="false" android:name="androidx.room.MultiInstanceInvalidationService" />
+    </application>
+</manifest>

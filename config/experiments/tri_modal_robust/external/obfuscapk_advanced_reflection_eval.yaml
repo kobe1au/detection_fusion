@@ -1,0 +1,19 @@
+defaults:
+  - ../evidential_trusted_fusion.yaml
+
+method:
+  name: external_obfuscapk_advanced_reflection_eval
+
+eval:
+  eval_only: true
+  output_name: external_obfuscapk_advanced_reflection_eval
+  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: false
+  run_test: false
+  run_robust_test: false
+  extra_sets:
+    - name: obfuscapk_advanced_reflection
+      pt_dir: /root/autodl-tmp/pts_obfuscapk/advanced_reflection
+      csv: labels/obfuscapk_advanced_reflection.csv
+      allow_pt_superset: false
+      skip_if_empty: false

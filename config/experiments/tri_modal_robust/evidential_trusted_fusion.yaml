@@ -7,34 +7,97 @@ method:
 train:
   exp_name: evidential_trusted_fusion
 
-# Upgraded three-innovation pipeline:
-#   模态可用性、特征完整性、跨模态支持/冲突关系与分支预测确定性共同构成可靠性估计信号。
-#   I2  conflict-aware fusion     = subjective-logic trust discounting + Yager
-#   I3  class-conditional conformal selective rejection
 fusion:
-  combination: yager
-  evidence_activation: softplus
-  reliability_calibration:
+  # The global opinion router is the decision path during both encoder training
+  # and evaluation. It is refined on the independent calibration split after
+  # model selection; no classical combination rule is used as a hidden fallback.
+  combination: routed
+  routing:
     enabled: true
+    # Atomic switches keep the router ablation interpretable: learned residual
+    # routing, disagreement features, encoder-stage training, and post-hoc
+    # refinement can each be disabled without changing the opinion path.
+    mode: learned
+    use_disagreement: true
+    train_end_to_end: true
+    posthoc_refine: true
+    # Smooth gate initialization: close to the reliability prior while keeping
+    # usable gradients for both increasing and decreasing abstention mass.
+    initial_known_retention: 0.99
+    # Branch-correctness routing is complemented by the proper scoring loss of
+    # the final mixture. A single final temperature is then fitted on clean
+    # post-hoc calibration data; neither setting adds a tuned scalar weight.
+    use_fused_prediction_loss: true
+    target_loss_weight: 1.0
+    prediction_loss_weight: 1.0
+    final_temperature_scaling: true
+    acceptance_score_mode: product
+  branch_competence_prior:
+    enabled: false
+  # These factors belong to the linear-probability comparison path. The routed
+  # path consumes relation evidence through the calibrated reliability once;
+  # disagreement is handled jointly by the global router and unknown mass.
+  use_support_discount: false
+  use_conflict_discount: false
+  use_confidence_proxy: false
+  reliability_calibration:
+    # I1 combines observable branch quality with learned EDL certainty. Only
+    # API-Graph structural support is used as monotone relation evidence;
+    # Manifest-Code semantic relations remain diagnostic-only.
+    # Missing counterpart relations add no support bonus; they are not encoded
+    # as either observed conflict or artificial perfect agreement.
+    missing_relation_support: 0.0
+    # Joint is a dependent auxiliary representation, not a fourth evidence
+    # source, so it must not affect formal reliability fitting or early stopping.
+    branches: [api, graph, manifest]
     use_relation_evidence: true
-    use_evidential_uncertainty: false
-  # The evidential path does not use temperature scaling or the entropy/margin
-  # confidence proxy: EDL owns uncertainty, conformal owns rejection calibration.
+    use_evidential_uncertainty: true
+    # Align the clean calibration view's mean reliability with its observed
+    # branch accuracy. Degradation response is imposed separately below.
+    group_mean_alignment: true
+    # Use the fixed 4/4/2/5 feature superset for API/Graph/Manifest/Joint;
+    # feature ablations zero-mask slots instead of changing topology or RNG.
+    # This layout is intentionally incompatible with pre-change checkpoints,
+    # which must be retrained under the staged-checkpoint lifecycle.
+    use_model_visibility: true
+  visible_integrity_modifier:
+    enabled: true
+    # Parameter-free deployment modifier:
+    # M_m(x) = min(1, effective_integrity_m(x) / median_cal(effective_integrity_m)).
+    mode: relative_effective
   probability_calibration:
     enabled: false
     weight: 0.0
-  use_confidence_proxy: false
 
 loss:
+  # Observable integrity weights branch auxiliary supervision. This is not a
+  # fitted reliability probability and remains fixed in the no-I1 module run.
+  integrity_weighted_aux: true
   evidential_loss_weight: 0.05
-  evidential:
-    anneal_epochs: 10
-    evidence_activation: softplus
-    branches: [api, graph, manifest]
-    class_weight: balanced
+
+calibration:
+  # Degraded views supervise the post-hoc router only. Reliability calibrators
+  # use the clean view, while the explicit integrity modifier supplies the
+  # monotone degradation response.
+  perturb_strengths: [0.1, 0.3, 0.5, 0.7, 0.9]
+  epochs: 60
+  patience: 8
+
+# Fit the final binary decision boundary only on the post-hoc validation
+# subset. The disjoint decision-calibration subset then refits I3 using these
+# fixed predictions, so neither choice consults the test set.
+classification_threshold:
+  enabled: true
+  objective: macro_f1
+  min_malware_recall: 0.90
 
 selective_prediction:
   enabled: true
-  mode: conformal
-  class_conditional: true
-  target_coverage: 0.95
+  mode: risk_control
+  threshold_score: model_acceptance
+  risk_target: malware_fn_rate_after_rejection
+  risk_level: 0.05
+  # Fail explicitly when the calibration split is too small for the requested
+  # finite-sample malware-FN risk bound instead of silently returning a
+  # threshold with no feasible guarantee.
+  require_feasible: true

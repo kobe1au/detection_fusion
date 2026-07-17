@@ -1,0 +1,15 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i2_router_no_posthoc_refine
+
+train:
+  exp_name: i2_router_no_posthoc_refine
+
+fusion:
+  routing:
+    # Preserve the encoder-stage router and fit clean I1 correctness
+    # calibration, but do not update router parameters post hoc.
+    posthoc_refine: false
+

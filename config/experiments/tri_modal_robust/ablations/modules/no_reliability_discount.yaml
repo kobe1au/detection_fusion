@@ -2,28 +2,26 @@ defaults:
   - ../../evidential_trusted_fusion.yaml
 
 method:
-  name: mechanism_no_reliability_discount
+  name: module_no_reliability_discount
 
 train:
-  exp_name: mechanism_no_reliability_discount
+  exp_name: module_no_reliability_discount
 
 fusion:
-  opinion_source: evidential
-  combination: yager
-
+  # Keep I2's global router, but remove every sample-level reliability input
+  # supplied by I1. The router can still use branch opinions, availability,
+  # and cross-branch disagreement.
+  combination: routed
+  routing:
+    enabled: true
   use_reliability_discount: false
-
   branch_competence_prior:
     enabled: false
-
   visible_integrity_modifier:
     enabled: false
-
   reliability_calibration:
     enabled: false
-    use_relation_evidence: false
-    use_evidential_uncertainty: false
 
-loss:
-  evidential_loss_weight: 0.05
-  reliability_weighted_aux: false
+# Keep encoder supervision identical to the full method. Observable-integrity
+# auxiliary weighting is evaluated separately as an atomic training mechanism;
+# this module ablation removes only the I1 decision-time reliability pathway.

@@ -1,0 +1,19 @@
+defaults:
+  - ../baselines/api_graph_concat.yaml
+
+method:
+  name: api_graph_concat_obfuscapk_string_eval
+
+eval:
+  eval_only: true
+  output_name: api_graph_concat_obfuscapk_string_eval
+  checkpoint_path: results/tri_modal_robust/baseline_api_graph_concat/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: false
+  run_test: false
+  run_robust_test: false
+  extra_sets:
+    - name: api_graph_concat_obfuscapk_string
+      pt_dir: /root/autodl-tmp/pts_obfuscapk/string
+      csv: labels/obfuscapk_string.csv
+      allow_pt_superset: false
+      skip_if_empty: false

@@ -1,0 +1,16 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i1_no_learned_reliability_calibration
+
+train:
+  exp_name: i1_no_learned_reliability_calibration
+
+fusion:
+  # Preserve reliability-aware routing and the visibility modifier, but replace
+  # fitted branch-correctness probabilities with the raw intrinsic-integrity
+  # fallback implemented by the routed fusion path.
+  reliability_calibration:
+    enabled: false
+

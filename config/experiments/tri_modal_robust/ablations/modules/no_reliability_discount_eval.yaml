@@ -1,0 +1,13 @@
+defaults:
+  - no_reliability_discount.yaml
+
+method:
+  name: module_no_reliability_discount_eval
+
+eval:
+  eval_only: true
+  output_name: module_no_reliability_discount_eval
+  checkpoint_path: results/tri_modal_robust/module_no_reliability_discount/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: true
+  run_test: true
+  run_robust_test: true

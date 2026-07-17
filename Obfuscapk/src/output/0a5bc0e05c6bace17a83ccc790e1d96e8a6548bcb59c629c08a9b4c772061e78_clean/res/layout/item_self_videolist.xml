@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:id="@id/rl_item_all" android:paddingLeft="12.0dip" android:paddingTop="16.0dip" android:paddingBottom="16.0dip" android:layout_width="fill_parent" android:layout_height="wrap_content"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <RelativeLayout android:id="@id/rl_surfacePlot" android:layout_width="122.0dip" android:layout_height="70.0dip">
+        <ImageView android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/bofang_0519" android:layout_centerInParent="true" />
+        <LinearLayout android:orientation="horizontal" android:background="@drawable/redubg_190730" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_alignParentRight="true">
+            <ImageView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="15.0dip" android:layout_marginTop="2.0dip" android:src="@drawable/ic_fire_0515" />
+            <TextView android:textSize="8.0sp" android:textColor="#ffff4c4c" android:id="@id/tv_hotNumber" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="4.0dip" android:layout_marginTop="1.0dip" android:text="5533" />
+        </LinearLayout>
+    </RelativeLayout>
+    <LinearLayout android:orientation="vertical" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="22.0dip" android:layout_toRightOf="@id/rl_surfacePlot">
+        <TextView android:textSize="14.0sp" android:textStyle="bold" android:textColor="#ff333333" android:ellipsize="end" android:id="@id/tv_videoTitle" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="SST高频真题讲解Lesson1" android:maxLines="1" />
+        <TextView android:textSize="12.0sp" android:textColor="#ffcccccc" android:ellipsize="end" android:id="@id/tv_videoContent" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="8.0dip" android:text="《Reason of the season》" android:maxLines="1" />
+        <LinearLayout android:gravity="center_vertical" android:orientation="horizontal" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="15.0dip">
+            <ImageView android:id="@id/iv_deblocking" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/ic_lock_0515" />
+            <TextView android:textSize="12.0sp" android:textColor="#ff93c4f5" android:id="@id/tv_deblocking" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="6.0dip" android:text="解锁试听" />
+        </LinearLayout>
+    </LinearLayout>
+    <TextView android:textSize="12.0sp" android:textStyle="bold" android:textColor="#ff197dff" android:gravity="center" android:id="@id/tv_go_practice" android:background="@drawable/shape_self_go_pract" android:visibility="invisible" android:layout_width="60.0dip" android:layout_height="27.0dip" android:layout_marginRight="15.0dip" android:text="练真题" android:layout_alignParentRight="true" android:layout_centerVertical="true" />
+</RelativeLayout>

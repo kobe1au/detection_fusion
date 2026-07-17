@@ -10,7 +10,7 @@ from fusion.constants import QualityConstants
 from fusion.utils import clamp01, scalar_float
 
 
-OBSERVABLE_SCHEMA_VERSION = "observable-v1"
+OBSERVABLE_SCHEMA_VERSION = "observable-v2"
 
 OBSERVABLE_BOOL_FIELDS = (
     "api_parse_ok",
@@ -44,15 +44,28 @@ OBSERVABLE_RATIO_FIELDS = (
     "manifest_vocab_coverage",
 )
 
-OBSERVABLE_OPTIONAL_NUMERIC_FIELDS = (
+OBSERVABLE_PERSISTED_BUDGET_FIELDS = (
     "dex_parse_success_ratio",
+    "api_event_count_before_method_budget",
+    "api_event_count_after_method_budget",
+    "api_event_count_before_extractor_budget",
+    "api_event_count_after_extractor_budget",
+    "api_extractor_coverage",
+    "api_truncated_by_extractor_budget",
+)
+
+OBSERVABLE_OPTIONAL_NUMERIC_FIELDS = (
+    *OBSERVABLE_PERSISTED_BUDGET_FIELDS,
+    "api_runtime_encoder_coverage",
     "api_event_count_before_encoder_budget",
     "api_event_count_after_encoder_budget",
     "api_encoder_coverage",
+    "api_truncated_by_extractor_budget",
     "api_truncated_by_encoder_budget",
     "api_integrity_before_encoder_budget",
 
      # Graph encoder-budget observable fields.
+    "graph_feature_valid_ratio",
     "graph_encoder_coverage",
     "graph_truncated_by_encoder_budget",
     "graph_integrity_before_encoder_budget",
@@ -75,6 +88,7 @@ OBSERVABLE_REQUIRED_FIELDS = (
     *OBSERVABLE_BOOL_FIELDS,
     *OBSERVABLE_COUNT_FIELDS,
     *OBSERVABLE_RATIO_FIELDS,
+    *OBSERVABLE_PERSISTED_BUDGET_FIELDS,
     *OBSERVABLE_ERROR_FIELDS,
     "schema_version",
 )
@@ -162,12 +176,10 @@ def compute_api_integrity_v2(source: Any) -> float:
 
     Completeness reflects (a) a successful parse, (b) the survival of extracted
     API events through synthetic degradation, and (c) API-type coverage. It
-    deliberately does NOT penalise:
-      * the raw->extracted gap -- ``api_event_count_raw`` counts every invoke
-        seen, while only framework API events are kept by design, so raw >> kept
-        is normal and is NOT a parse failure; and
-      * runtime encoder-budget truncation -- tracked separately through
-        ``api_encoder_coverage``.
+    deliberately does not penalise method, DEX or runtime budget truncation.
+    Extraction and runtime limits are retained as separate diagnostics. The
+    formal model-visible modifier uses runtime encoder coverage only, so fixed
+    PT construction budgets are not mistaken for sample-specific degradation.
     Synthetic API dropout still reduces integrity through ``visible_retention``
     (kept events after perturbation relative to the post-budget event count).
     """
@@ -220,6 +232,7 @@ def compute_graph_integrity_v2(source: Any) -> float:
     count_valid = float(method_count <= 0 or nodes <= method_count)
     dex_ratio = clamp01(_number(source, "dex_parse_success_ratio", 1.0))
     edge_retention = clamp01(_number(source, "graph_edge_retention_ratio", 1.0))
+    feature_valid_ratio = clamp01(_number(source, "graph_feature_valid_ratio", 1.0))
     if nodes <= 0:
         return clamp01((0.85 + 0.10 * structure_valid + 0.05 * count_valid) * dex_ratio)
 
@@ -236,6 +249,7 @@ def compute_graph_integrity_v2(source: Any) -> float:
     anomaly_penalty = max(
         0.20 * max(severe_isolation, severe_fragmentation),
         0.35 * (1.0 - edge_retention),
+        0.35 * (1.0 - feature_valid_ratio),
     )
     base = 0.85 + 0.10 * structure_valid + 0.05 * count_valid
     return clamp01(dex_ratio * base * (1.0 - anomaly_penalty))
@@ -375,24 +389,77 @@ def refresh_observable_metadata(data: dict[str, Any]) -> None:
     data.setdefault("dex_file_count", 1)
     data.setdefault("dex_parse_success_ratio", 1.0)
     data.setdefault("class_count", 0)
-    extracted_before_budget = _count(data, "api_event_count_before_encoder_budget", kept)
-    extracted_before_budget = max(extracted_before_budget, kept)
+    stored_extractor_kept = _count(data, "api_event_count_kept", kept)
+    before_method_budget = _count(
+        data,
+        "api_event_count_before_method_budget",
+        _count(data, "api_event_count_raw", stored_extractor_kept),
+    )
+    after_method_budget = _count(
+        data,
+        "api_event_count_after_method_budget",
+        _count(data, "api_event_count_raw", stored_extractor_kept),
+    )
+    before_extractor_budget = _count(
+        data,
+        "api_event_count_before_extractor_budget",
+        after_method_budget,
+    )
+    after_extractor_budget = _count(
+        data,
+        "api_event_count_after_extractor_budget",
+        stored_extractor_kept,
+    )
+    before_method_budget = max(before_method_budget, after_method_budget, kept)
+    after_method_budget = max(min(after_method_budget, before_method_budget), kept)
+    before_extractor_budget = max(
+        min(before_extractor_budget, after_method_budget), after_extractor_budget, kept
+    )
+    after_extractor_budget = max(
+        min(after_extractor_budget, before_extractor_budget), kept
+    )
+
+    extracted_before_budget = _count(
+        data, "api_event_count_before_encoder_budget", after_extractor_budget
+    )
+    extracted_before_budget = max(
+        min(extracted_before_budget, after_extractor_budget), kept
+    )
     after_budget_default = min(extracted_before_budget, kept) if extracted_before_budget > 0 else kept
     after_budget = _count(data, "api_event_count_after_encoder_budget", after_budget_default)
-    after_budget = max(after_budget, kept)
-    raw = max(_count(data, "api_event_count_raw", extracted_before_budget), extracted_before_budget)
+    after_budget = max(min(after_budget, extracted_before_budget), kept)
+    raw = max(_count(data, "api_event_count_raw", before_extractor_budget), before_extractor_budget)
     data["api_event_count_kept"] = kept
+    data["api_event_count_before_method_budget"] = before_method_budget
+    data["api_event_count_after_method_budget"] = after_method_budget
+    data["api_event_count_before_extractor_budget"] = before_extractor_budget
+    data["api_event_count_after_extractor_budget"] = after_extractor_budget
     data["api_event_count_before_encoder_budget"] = extracted_before_budget
     data["api_event_count_after_encoder_budget"] = after_budget
     data["api_event_count_raw"] = raw
-    data["api_truncated"] = bool(extracted_before_budget < raw)
+    data["api_truncated"] = bool(after_extractor_budget < before_method_budget)
     data["api_truncation_ratio"] = (
-        clamp01(1.0 - extracted_before_budget / raw) if raw > 0 else 0.0
+        clamp01(1.0 - after_extractor_budget / before_method_budget)
+        if before_method_budget > 0
+        else 0.0
     )
-    data["api_encoder_coverage"] = (
+    data["api_extractor_coverage"] = (
+        clamp01(after_extractor_budget / before_method_budget)
+        if before_method_budget > 0
+        else 1.0
+    )
+    data["api_runtime_encoder_coverage"] = (
         clamp01(after_budget / extracted_before_budget)
         if extracted_before_budget > 0
         else 1.0
+    )
+    data["api_encoder_coverage"] = (
+        clamp01(after_budget / before_method_budget)
+        if before_method_budget > 0
+        else 1.0
+    )
+    data["api_truncated_by_extractor_budget"] = float(
+        before_method_budget > 0 and after_extractor_budget < before_method_budget
     )
     data["api_truncated_by_encoder_budget"] = float(
         extracted_before_budget > 0 and after_budget < extracted_before_budget
@@ -412,6 +479,22 @@ def refresh_observable_metadata(data: dict[str, Any]) -> None:
         nodes = int(x.size(0))
     else:
         nodes = 0
+    if isinstance(x, torch.Tensor) and x.ndim == 2 and x.size(0) > 0:
+        if isinstance(real_mask, torch.Tensor) and real_mask.numel() == x.size(0):
+            real_x = x[real_mask.view(-1).bool()]
+        else:
+            real_x = x[:nodes]
+        if real_x.numel() > 0:
+            finite_nonzero = torch.isfinite(real_x).all(dim=1) & (
+                real_x.abs().sum(dim=1) > 1.0e-8
+            )
+            data["graph_feature_valid_ratio"] = float(
+                finite_nonzero.float().mean().item()
+            )
+        else:
+            data["graph_feature_valid_ratio"] = 1.0
+    else:
+        data["graph_feature_valid_ratio"] = 1.0
     edge_index = data.get("edge_index")
     edges = int(edge_index.size(1)) if isinstance(edge_index, torch.Tensor) and edge_index.ndim == 2 else 0
     isolated, lcc = graph_structure_stats(edge_index, nodes)

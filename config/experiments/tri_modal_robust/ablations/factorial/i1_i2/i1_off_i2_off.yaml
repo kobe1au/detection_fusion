@@ -1,0 +1,26 @@
+defaults:
+  - ../../modules/no_reliability_discount.yaml
+
+method:
+  name: factorial_i1_off_i2_off
+
+train:
+  exp_name: factorial_i1_off_i2_off
+
+fusion:
+  combination: routed
+  routing:
+    enabled: true
+    mode: prior_only
+    train_end_to_end: false
+    posthoc_refine: false
+    use_fused_prediction_loss: false
+    target_loss_weight: 0.0
+    prediction_loss_weight: 0.0
+    final_temperature_scaling: true
+  branch_competence_prior:
+    enabled: false
+
+# Both I1's decision-time reliability pathway and I2's learned arbitration are
+# off; the same routed opinion representation, final temperature, branch
+# opinion training, and I3 remain fixed.

@@ -1,7 +1,6 @@
 defaults:
   - ../../evidential_trusted_fusion.yaml
 
-# Training ablation: EDL without class weighting (tests the imbalance guard).
 method:
   name: training_no_edl_class_weight
 
@@ -10,4 +9,4 @@ train:
 
 loss:
   evidential:
-    class_weight: null
+    class_weight: none

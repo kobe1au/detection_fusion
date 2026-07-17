@@ -100,9 +100,8 @@ def test_inactive_calibrator_fallback_features_use_configured_missing_support():
     )
 
     features = outputs["reliability_features_api"]
-    assert features[0, 2].item() == 0.75
-    assert features[0, 3].item() == 0.75
-    assert features[0, 4].item() == 0.75
+    assert features.shape[-1] == 2
+    assert features[0, 1].item() == 0.75
 
 
 def test_high_manifest_conflict_reduces_manifest_discount():
@@ -113,7 +112,7 @@ def test_high_manifest_conflict_reduces_manifest_discount():
 
 
 class _ConstantReliabilityCalibrator(nn.Module):
-    def forward(self, evidence: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, evidence: torch.Tensor, **_kwargs) -> dict[str, torch.Tensor]:
         value = torch.full(
             (evidence.size(0),),
             0.8,
@@ -208,11 +207,11 @@ def test_discount_detach_blocks_gradient_through_weights():
     assert evidence.grad is None
 
 
-def test_fallback_used_when_all_discounts_zero():
+def test_zero_weight_fallback_used_when_all_discounts_zero():
     evidence = _evidence(1)
     evidence[:, :4] = 0.0
     outputs = _run(evidence)
-    assert outputs["fallback_used"].item() == 1.0
+    assert outputs["zero_weight_fallback_used"].item() == 1.0
     assert torch.allclose(outputs["fusion_weights"], torch.full((1, 4), 0.25))
 
 
@@ -221,7 +220,7 @@ def test_fallback_preserves_missing_branch_zero_weight():
     evidence[:, :4] = 0.0
     evidence[:, EvidenceIndex.API_ALIVE] = 0.0
     outputs = _run(evidence)
-    assert outputs["fallback_used"].item() == 1.0
+    assert outputs["zero_weight_fallback_used"].item() == 1.0
     assert outputs["fusion_weight_api"].item() == 0.0
     assert torch.allclose(outputs["fusion_weights"].sum(dim=-1), torch.ones(1))
 
@@ -242,6 +241,43 @@ def test_reliability_discount_exponent_tempers_fusion_discount():
     assert torch.allclose(tempered["discount_api"], torch.tensor([0.5]))
     assert tempered["discount_api"].item() > strict["discount_api"].item()
     assert tempered["reliability_discount_exponent"].item() == 0.5
+
+
+def test_calibrated_correctness_probability_is_not_exponentiated_again():
+    evidence = _evidence(1)
+    common = {
+        "use_support_discount": False,
+        "use_conflict_discount": False,
+        "use_confidence_proxy": False,
+        "branch_competence_prior": {"enabled": False},
+        "visible_integrity_modifier": {"enabled": False},
+        "reliability_calibration": {
+            "enabled": True,
+            "branches": ["api", "graph", "manifest"],
+            "use_evidential_uncertainty": False,
+        },
+    }
+    for combination in ("linear", "dempster"):
+        fusion = DiscountProbabilityFusion(
+            {**common, "combination": combination, "linear_use_joint_branch": False}
+        )
+        fusion.set_calibration_active(True)
+        logits = _logits(1)
+        tempered = fusion(
+            *logits,
+            evidence,
+            config={"reliability_discount_exponent": 0.5},
+        )
+        strict = fusion(
+            *logits,
+            evidence,
+            config={"reliability_discount_exponent": 1.0},
+        )
+        assert torch.allclose(tempered["discount_api"], strict["discount_api"])
+        assert torch.allclose(tempered["discount_graph"], strict["discount_graph"])
+        assert torch.allclose(
+            tempered["discount_manifest"], strict["discount_manifest"]
+        )
 
 
 def test_reliability_can_drive_acceptance_without_fusion_discount():
@@ -314,7 +350,7 @@ def test_weight_sharpening_gamma_emphasizes_larger_discounts():
 def test_visible_integrity_modifier_scales_evidential_trust_after_reference():
     fusion = DiscountProbabilityFusion(
         {
-            "combination": "yager",
+            "combination": "dempster",
             "use_reliability_discount": False,
             "visible_integrity_modifier": {
                 "enabled": True,
@@ -332,8 +368,37 @@ def test_visible_integrity_modifier_scales_evidential_trust_after_reference():
 
     assert outputs["visible_integrity_modifier_active"].item() == 1.0
     assert torch.allclose(outputs["effective_api_integrity"], torch.tensor([0.25]))
-    assert torch.allclose(outputs["visible_modifier_api"], torch.tensor([0.25]))
-    assert torch.allclose(outputs["visible_modifier_factor_api"], torch.tensor([0.625]))
-    assert torch.allclose(outputs["discount_api"], torch.tensor([0.625]))
+    assert torch.allclose(outputs["visible_modifier_api"], torch.tensor([0.5]))
+    assert torch.allclose(outputs["visible_modifier_factor_api"], torch.tensor([0.75]))
+    assert torch.allclose(outputs["discount_api"], torch.tensor([0.75]))
     assert outputs["discount_graph"].item() == 1.0
     assert outputs["discount_manifest"].item() == 1.0
+
+
+def test_relative_effective_integrity_modifier_is_parameter_free():
+    fusion = DiscountProbabilityFusion(
+        {
+            "combination": "dempster",
+            "use_reliability_discount": False,
+            "visible_integrity_modifier": {
+                "enabled": True,
+                "mode": "relative_effective",
+                # Ignored in this mode by design.
+                "beta": 3.0,
+                "min_value": 0.9,
+            },
+        }
+    )
+    fusion.set_visible_integrity_reference([0.5, 1.0, 1.0])
+    evidence = _evidence(1)
+    evidence[:, EvidenceIndex.API_INTEGRITY] = 0.5
+    evidence[:, EvidenceIndex.API_ENCODER_COVERAGE] = 0.5
+
+    outputs = fusion(*_logits(1), evidence)
+
+    assert torch.allclose(outputs["effective_api_integrity"], torch.tensor([0.25]))
+    assert torch.allclose(outputs["visible_modifier_api"], torch.tensor([0.5]))
+    assert torch.allclose(outputs["visible_modifier_factor_api"], torch.tensor([0.5]))
+    assert torch.allclose(outputs["discount_api"], torch.tensor([0.5]))
+    assert outputs["visible_integrity_modifier_beta"].item() == 1.0
+    assert outputs["visible_integrity_modifier_min_value"].item() == 0.0

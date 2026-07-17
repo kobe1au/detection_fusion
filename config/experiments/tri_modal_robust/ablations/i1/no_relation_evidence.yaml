@@ -2,10 +2,10 @@ defaults:
   - ../../evidential_trusted_fusion.yaml
 
 method:
-  name: no_relation_evidence
+  name: i1_no_relation_evidence
 
 train:
-  exp_name: no_relation_evidence
+  exp_name: i1_no_relation_evidence
 
 fusion:
   reliability_calibration:

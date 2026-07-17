@@ -41,6 +41,52 @@ def _branch_alive_masks(evidence: torch.Tensor) -> dict[str, torch.Tensor]:
     }
 
 
+def build_routing_calibration_target(
+    outputs: dict,
+    labels: torch.Tensor,
+    evidence: torch.Tensor,
+) -> torch.Tensor:
+    """Allocate routing supervision between correct branches and unknown.
+
+    Each available correct branch receives ``1 / num_available`` mass. The
+    remaining mass is assigned to unknown, so the unknown target equals the
+    observed fraction of available branches that predicted incorrectly.
+    """
+    alive = _branch_alive_masks(evidence)
+    correct_available = []
+    available = []
+    for name in ("api", "graph", "manifest"):
+        branch_logits = outputs.get(f"{name}_logits_aux")
+        if not isinstance(branch_logits, torch.Tensor):
+            raise ValueError(
+                "routing calibration requires API, Graph, and Manifest logits"
+            )
+        branch_alive = alive[name].view(-1).float()
+        correct = branch_logits.detach().argmax(dim=-1).eq(labels.long()).float()
+        correct_available.append(correct * branch_alive)
+        available.append(branch_alive)
+
+    correct_stack = torch.stack(correct_available, dim=-1)
+    available_stack = torch.stack(available, dim=-1)
+    available_count = available_stack.sum(dim=-1, keepdim=True)
+    safe_available_count = available_count.clamp_min(1.0)
+    branch_target = correct_stack / safe_available_count
+    correct_fraction = correct_stack.sum(dim=-1, keepdim=True) / safe_available_count
+    unknown_target = 1.0 - correct_fraction
+    no_available = available_count <= 0.0
+    branch_target = torch.where(
+        no_available.expand_as(branch_target),
+        torch.zeros_like(branch_target),
+        branch_target,
+    )
+    unknown_target = torch.where(
+        no_available,
+        torch.ones_like(unknown_target),
+        unknown_target,
+    )
+    return torch.cat([branch_target, unknown_target], dim=-1)
+
+
 def compute_reliability_calibration_loss(
     outputs: dict,
     labels: torch.Tensor,
@@ -55,10 +101,23 @@ def compute_reliability_calibration_loss(
     loss_type = str(config.get("loss", "bce")).lower()
     if loss_type not in {"bce", "brier"}:
         raise ValueError("reliability_calibration.loss must be 'bce' or 'brier'")
+    configured_branches = config.get("branches", BRANCH_NAMES)
+    if not isinstance(configured_branches, (list, tuple)) or not configured_branches:
+        raise ValueError("reliability_calibration.branches must be a non-empty list")
+    branch_names = tuple(str(name).lower() for name in configured_branches)
+    invalid = [name for name in branch_names if name not in BRANCH_NAMES]
+    if invalid:
+        raise ValueError(
+            "reliability_calibration.branches contains unsupported branches: "
+            f"{invalid}"
+        )
+    if len(set(branch_names)) != len(branch_names):
+        raise ValueError("reliability_calibration.branches must not contain duplicates")
+    group_mean_alignment = bool(config.get("group_mean_alignment", False))
     losses = []
     diagnostics: dict[str, torch.Tensor] = {}
     ref = labels.new_zeros((), dtype=torch.float32)
-    for name in BRANCH_NAMES:
+    for name in branch_names:
         reliability = outputs.get(f"predicted_reliability_{name}")
         logits = outputs.get(f"{name}_logits_aux")
         if not isinstance(reliability, torch.Tensor) or not isinstance(logits, torch.Tensor):
@@ -76,13 +135,23 @@ def compute_reliability_calibration_loss(
                 + (1.0 - correctness) * torch.log1p(-reliability)
             )
         denom = weight.sum().clamp_min(1.0)
-        branch_loss = (per_sample * weight).sum() / denom
+        proper_loss = (per_sample * weight).sum() / denom
+        mean_reliability = (reliability * weight).sum() / denom
+        branch_accuracy = (correctness * weight).sum() / denom
+        mean_alignment_loss = (mean_reliability - branch_accuracy).square()
+        branch_loss = (
+            proper_loss + mean_alignment_loss
+            if group_mean_alignment
+            else proper_loss
+        )
         losses.append(branch_loss)
         diagnostics[f"reliability_loss_{name}"] = branch_loss.detach()
-        diagnostics[f"mean_predicted_reliability_{name}"] = (
-            (reliability.detach() * weight).sum() / denom
+        diagnostics[f"reliability_proper_loss_{name}"] = proper_loss.detach()
+        diagnostics[f"reliability_mean_alignment_loss_{name}"] = (
+            mean_alignment_loss.detach()
         )
-        diagnostics[f"branch_accuracy_{name}"] = (correctness * weight).sum() / denom
+        diagnostics[f"mean_predicted_reliability_{name}"] = mean_reliability.detach()
+        diagnostics[f"branch_accuracy_{name}"] = branch_accuracy.detach()
     total = torch.stack(losses).mean() if losses else ref
     diagnostics["reliability_calibration_loss"] = total.detach()
     return total, diagnostics
@@ -122,30 +191,126 @@ def compute_posthoc_calibration_loss(
     labels: torch.Tensor,
     evidence: torch.Tensor,
     config: dict | None = None,
+    *,
+    reliability_branches: tuple[str, ...] | list[str] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Objective used after model selection to fit calibration-only parameters."""
     config = config or {}
-    reliability_cfg = config.get("reliability_calibration", {}) or {}
+    reliability_cfg = dict(config.get("reliability_calibration", {}) or {})
+    if reliability_branches is not None:
+        reliability_cfg["branches"] = list(reliability_branches)
     probability_cfg = config.get("probability_calibration", {}) or {}
+    routing_cfg = config.get("routing", {}) or {}
+    routing_posthoc_refine = bool(routing_cfg.get("posthoc_refine", True))
     reliability_weight = float(reliability_cfg.get("weight", 1.0))
     probability_weight = float(probability_cfg.get("weight", 1.0))
+    routing_weight = (
+        float(routing_cfg.get("calibration_weight", 1.0))
+        if bool(routing_cfg.get("enabled", False)) and routing_posthoc_refine
+        else 0.0
+    )
+    routing_target_weight = float(routing_cfg.get("target_loss_weight", 1.0))
+    routing_prediction_weight = float(
+        routing_cfg.get(
+            "prediction_loss_weight",
+            1.0 if bool(routing_cfg.get("use_fused_prediction_loss", False)) else 0.0,
+        )
+    )
     for name, value in (
         ("reliability_calibration.weight", reliability_weight),
         ("probability_calibration.weight", probability_weight),
+        ("routing.calibration_weight", routing_weight),
+        ("routing.target_loss_weight", routing_target_weight),
+        ("routing.prediction_loss_weight", routing_prediction_weight),
     ):
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"fusion.{name} must be finite and non-negative")
-    reliability_loss, reliability_diag = compute_reliability_calibration_loss(
-        outputs, labels, evidence, reliability_cfg
+    if (
+        routing_weight > 0.0
+        and routing_target_weight == 0.0
+        and routing_prediction_weight == 0.0
+    ):
+        raise ValueError(
+            "post-hoc routing requires a positive target_loss_weight or "
+            "prediction_loss_weight"
+        )
+    if (
+        routing_weight > 0.0
+        and str(routing_cfg.get("mode", "learned")).lower() == "known_only"
+        and routing_target_weight > 0.0
+    ):
+        raise ValueError(
+            "routing.mode=known_only cannot fit targets that reserve mass for "
+            "the unknown outcome; set target_loss_weight=0 and use a positive "
+            "prediction_loss_weight"
+        )
+    zero = labels.new_zeros((), dtype=torch.float32)
+    if reliability_weight > 0.0:
+        reliability_loss, reliability_diag = compute_reliability_calibration_loss(
+            outputs, labels, evidence, reliability_cfg
+        )
+    else:
+        reliability_loss = zero
+        reliability_diag = {
+            "reliability_calibration_loss": zero.detach(),
+        }
+    if probability_weight > 0.0:
+        probability_loss, probability_diag = compute_probability_calibration_loss(
+            outputs, labels, evidence
+        )
+    else:
+        probability_loss = zero
+        probability_diag = {
+            "probability_calibration_loss": zero.detach(),
+        }
+    routing_active = outputs.get("routing_active")
+    routing_weights = outputs.get("routing_weights")
+    if (
+        routing_weight > 0.0
+        and routing_target_weight > 0.0
+        and isinstance(routing_active, torch.Tensor)
+        and bool((routing_active.detach().float().max() > 0.0).item())
+        and isinstance(routing_weights, torch.Tensor)
+    ):
+        routing_target = build_routing_calibration_target(outputs, labels, evidence)
+        routing_loss = -(
+            routing_target
+            * routing_weights.float().clamp_min(1.0e-6).log()
+        ).sum(dim=-1).mean()
+    else:
+        routing_loss = zero
+    routing_prediction_loss = zero
+    final_log_prob = outputs.get("final_logits")
+    if (
+        routing_weight > 0.0
+        and routing_prediction_weight > 0.0
+        and isinstance(routing_active, torch.Tensor)
+        and bool((routing_active.detach().float().max() > 0.0).item())
+        and isinstance(final_log_prob, torch.Tensor)
+    ):
+        routing_prediction_loss = F.nll_loss(
+            final_log_prob.float(), labels.long()
+        )
+    total = (
+        reliability_weight * reliability_loss
+        + probability_weight * probability_loss
+        + routing_weight
+        * (
+            routing_target_weight * routing_loss
+            + routing_prediction_weight * routing_prediction_loss
+        )
     )
-    probability_loss, probability_diag = compute_probability_calibration_loss(
-        outputs, labels, evidence
-    )
-    total = reliability_weight * reliability_loss + probability_weight * probability_loss
     diagnostics = {
         "calibration_loss": float(total.detach().item()),
         "reliability_calibration_loss": float(reliability_loss.detach().item()),
         "probability_calibration_loss": float(probability_loss.detach().item()),
+        "routing_calibration_loss": float(routing_loss.detach().item()),
+        "routing_prediction_loss": float(
+            routing_prediction_loss.detach().item()
+        ),
+        "routing_target_loss_weight": routing_target_weight,
+        "routing_prediction_loss_weight": routing_prediction_weight,
+        "routing_posthoc_refine_enabled": float(routing_posthoc_refine),
     }
     for source in (reliability_diag, probability_diag):
         for key, value in source.items():
@@ -171,24 +336,28 @@ def _weighted_cross_entropy(
     return weighted * (denom > 0).to(dtype=weighted.dtype)
 
 
-def compute_reliability_weighted_aux_loss(
+def compute_integrity_weighted_aux_loss(
     outputs: dict,
     labels: torch.Tensor,
     evidence: torch.Tensor,
     config: dict | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Weight branch auxiliary supervision by observable input integrity."""
     config = config or {}
     ref = next((outputs.get(key) for key in BRANCH_AUX_KEYS if isinstance(outputs.get(key), torch.Tensor)), None)
     if not isinstance(ref, torch.Tensor):
         raise ValueError("outputs does not contain branch auxiliary logits")
     if not isinstance(evidence, torch.Tensor) or evidence.ndim != 2 or evidence.size(-1) < EvidenceIndex.BASE_DIM:
-        raise ValueError("reliability-weighted auxiliary loss requires observable evidence")
+        raise ValueError("integrity-weighted auxiliary loss requires observable evidence")
 
     min_weight = float(config.get("min_aux_weight", 0.2))
     if not 0.0 <= min_weight <= 1.0:
         raise ValueError("loss.min_aux_weight must be within [0, 1]")
     detach = bool(config.get("detach_reliability_for_aux", True))
     label_smoothing = float(config.get("label_smoothing", 0.0))
+    configured_branch_weights = config.get("branch_aux_weights") or {}
+    if not isinstance(configured_branch_weights, dict):
+        raise ValueError("loss.branch_aux_weights must be a mapping")
     api_integrity = _evidence_column(evidence, EvidenceIndex.API_INTEGRITY, detach)
     graph_integrity = _evidence_column(evidence, EvidenceIndex.GRAPH_INTEGRITY, detach)
     manifest_integrity = _evidence_column(evidence, EvidenceIndex.MANIFEST_INTEGRITY, detach)
@@ -212,9 +381,14 @@ def compute_reliability_weighted_aux_loss(
     for key in BRANCH_AUX_KEYS:
         branch = BRANCH_AUX_NAMES[key]
         logits = outputs.get(key)
-        weight = branch_weight[branch]
+        configured_weight = float(configured_branch_weights.get(branch, 1.0))
+        if not math.isfinite(configured_weight) or configured_weight < 0.0:
+            raise ValueError(
+                f"loss.branch_aux_weights.{branch} must be finite and non-negative"
+            )
+        weight = branch_weight[branch] * configured_weight
         diagnostics[f"aux_weight_{branch}"] = weight
-        if isinstance(logits, torch.Tensor) and logits.shape == ref.shape:
+        if configured_weight > 0.0 and isinstance(logits, torch.Tensor) and logits.shape == ref.shape:
             losses.append(_weighted_cross_entropy(logits, labels, weight, label_smoothing))
             active_flags.append((weight.sum() > 0).to(dtype=ref.dtype))
     if losses:
@@ -226,8 +400,20 @@ def compute_reliability_weighted_aux_loss(
         total = ref.sum() * 0.0
         active_branch_count = ref.new_zeros(())
     diagnostics["aux_active_branch_count"] = active_branch_count
+    diagnostics["integrity_weighted_aux_loss"] = total.detach()
+    # Backward-compatible diagnostic consumed by existing result collectors.
     diagnostics["reliability_weighted_aux_loss"] = total.detach()
     return total, diagnostics
+
+
+def compute_reliability_weighted_aux_loss(
+    outputs: dict,
+    labels: torch.Tensor,
+    evidence: torch.Tensor,
+    config: dict | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Backward-compatible alias for :func:`compute_integrity_weighted_aux_loss`."""
+    return compute_integrity_weighted_aux_loss(outputs, labels, evidence, config)
 
 
 def compute_robust_loss(
@@ -238,7 +424,8 @@ def compute_robust_loss(
     *,
     evidence: torch.Tensor | None = None,
     epoch: int = 0,
-) -> tuple[torch.Tensor, dict[str, float]]:
+    materialize_diagnostics: bool = True,
+) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
     """Robust objective with independently attributable auxiliary terms."""
     extra = extra or {}
     loss_cfg = loss_cfg or {}
@@ -289,10 +476,18 @@ def compute_robust_loss(
     if not isinstance(branch_weights, dict):
         branch_weights = {}
     aux_diagnostics: dict[str, torch.Tensor] = {}
-    if bool(loss_cfg.get("reliability_weighted_aux", False)):
+    legacy_integrity_aux = loss_cfg.get("reliability_weighted_aux")
+    use_integrity_weighted_aux = (
+        bool(legacy_integrity_aux)
+        if legacy_integrity_aux is not None
+        else bool(loss_cfg.get("integrity_weighted_aux", False))
+    )
+    if use_integrity_weighted_aux:
         if not isinstance(evidence, torch.Tensor):
-            raise ValueError("loss.reliability_weighted_aux=true requires observable evidence")
-        branch_loss, aux_diagnostics = compute_reliability_weighted_aux_loss(
+            raise ValueError(
+                "integrity-weighted auxiliary supervision requires observable evidence"
+            )
+        branch_loss, aux_diagnostics = compute_integrity_weighted_aux_loss(
             extra, labels, evidence, loss_cfg
         )
     else:
@@ -335,7 +530,7 @@ def compute_robust_loss(
         )
         calibration_diagnostics.update(probability_diag)
 
-    # I1 evidential (EDL) objective: Bayes-risk + annealed KL on each branch's
+    # EDL opinion objective: Bayes-risk + annealed KL on each branch's
     # Dirichlet evidence head. The KL coefficient ramps from 0 to 1 over
     # ``evidential.anneal_epochs`` so clean accuracy is not destroyed early.
     evidential_total = logits.new_tensor(0.0)
@@ -381,6 +576,7 @@ def compute_robust_loss(
             else None
         )
         edl_losses = []
+        edl_active_flags = []
         for key in BRANCH_AUX_KEYS:
             branch_name = BRANCH_AUX_NAMES[key]
             if branch_name not in edl_branches:
@@ -395,8 +591,6 @@ def compute_robust_loss(
                     if weight is None
                     else weight * class_weight_per_sample
                 )
-            if weight is not None and not bool((weight.sum() > 0).item()):
-                continue
             branch_edl = evidential_loss(
                 aux_logits,
                 labels,
@@ -405,9 +599,18 @@ def compute_robust_loss(
                 sample_weight=weight,
             )
             edl_losses.append(branch_edl)
+            edl_active_flags.append(
+                logits.new_ones(())
+                if weight is None
+                else (weight.sum() > 0).to(dtype=logits.dtype)
+            )
             evidential_diagnostics[f"evidential_loss_{branch_name}"] = branch_edl.detach()
         if edl_losses:
-            evidential_total = torch.stack(edl_losses).mean()
+            edl_values = torch.stack(edl_losses)
+            edl_active = torch.stack(edl_active_flags)
+            evidential_total = (
+                (edl_values * edl_active).sum() / edl_active.sum().clamp_min(1.0)
+            )
         evidential_diagnostics["evidential_anneal_coef"] = logits.new_tensor(anneal_coef)
         evidential_diagnostics["evidential_loss"] = evidential_total.detach()
 
@@ -418,20 +621,25 @@ def compute_robust_loss(
         + probability_calibration_weight * probability_calibration
         + evidential_loss_weight * evidential_total
     )
-    parts = {
-        "loss": float(total.detach().item()),
-        "ce": float(ce.detach().item()),
-        "branch_aux": float(branch_loss.detach().item()),
+    parts: dict[str, float | torch.Tensor] = {
+        "loss": total.detach(),
+        "ce": ce.detach(),
+        "branch_aux": branch_loss.detach(),
         "branch_aux_weight": branch_aux_weight,
-        "reliability_calibration": float(reliability_calibration.detach().item()),
+        "reliability_calibration": reliability_calibration.detach(),
         "reliability_calibration_weight": reliability_calibration_weight,
-        "probability_calibration": float(probability_calibration.detach().item()),
+        "probability_calibration": probability_calibration.detach(),
         "probability_calibration_weight": probability_calibration_weight,
-        "evidential_loss": float(evidential_total.detach().item()),
+        "evidential_loss": evidential_total.detach(),
         "evidential_loss_weight": evidential_loss_weight,
     }
     for source in (aux_diagnostics, calibration_diagnostics, evidential_diagnostics):
         for key, value in source.items():
             if isinstance(value, torch.Tensor) and value.numel() == 1:
-                parts[key] = float(value.detach().item())
+                parts[key] = value.detach()
+    if materialize_diagnostics:
+        parts = {
+            key: float(value.item()) if isinstance(value, torch.Tensor) else float(value)
+            for key, value in parts.items()
+        }
     return total, parts

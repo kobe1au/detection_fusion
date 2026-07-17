@@ -1,0 +1,33 @@
+defaults:
+  - ../../base_tri_modal_robust.yaml
+
+model:
+  fusion_mode: discount_probability
+
+fusion:
+  mode: discount_probability
+  use_reliability_discount: false
+  use_support_discount: false
+  use_conflict_discount: false
+  use_confidence_proxy: false
+  use_hard_alive_mask: true
+  branch_competence_prior:
+    enabled: false
+  visible_integrity_modifier:
+    enabled: false
+  reliability_calibration:
+    enabled: false
+  probability_calibration:
+    enabled: false
+
+calibration:
+  enabled: false
+  holdout_enabled: true
+
+selective_prediction:
+  enabled: false
+
+loss:
+  branch_aux_weight: 0.25
+  integrity_weighted_aux: false
+  evidential_loss_weight: 0.05

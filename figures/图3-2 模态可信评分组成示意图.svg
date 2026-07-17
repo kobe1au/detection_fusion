@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="620" viewBox="0 0 1120 620">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#333333"/>
+    </marker>
+    <style>
+      text { font-family: "Microsoft YaHei", "SimSun", Arial, sans-serif; fill: #222222; }
+      .title { font-size: 26px; font-weight: 700; }
+      .box-title { font-size: 18px; font-weight: 700; }
+      .box-text { font-size: 15px; }
+      .formula { font-size: 20px; font-weight: 700; }
+      .small { font-size: 13px; fill: #555555; }
+      .box { fill: #ffffff; stroke: #333333; stroke-width: 1.5; rx: 12; }
+      .prior { fill: #e9f3ff; stroke: #4f88c6; }
+      .sample { fill: #f3ecff; stroke: #8560b8; }
+      .visible { fill: #ecf7ef; stroke: #5a9b69; }
+      .alive { fill: #fff3e4; stroke: #d28a29; }
+      .combine { fill: #fff7df; stroke: #c49a2c; }
+      .output { fill: #fff0f0; stroke: #c45a5a; }
+      .arrow { stroke: #333333; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+      .line { stroke: #333333; stroke-width: 1.8; fill: none; }
+    </style>
+  </defs>
+
+  <rect x="18" y="18" width="1084" height="584" fill="#ffffff" stroke="#dddddd" stroke-width="1"/>
+  <text x="560" y="58" class="title" text-anchor="middle">模态可信评分组成示意图</text>
+
+  <rect x="70" y="95" width="255" height="90" class="box prior"/>
+  <text x="197.5" y="128" class="box-title" text-anchor="middle">分支整体能力 C_m</text>
+  <text x="197.5" y="157" class="box-text" text-anchor="middle">校准集上的分支判别能力</text>
+
+  <rect x="70" y="225" width="255" height="90" class="box sample"/>
+  <text x="197.5" y="258" class="box-title" text-anchor="middle">样本级可靠性 R_m(x)</text>
+  <text x="197.5" y="287" class="box-text" text-anchor="middle">由可观测证据单调校准</text>
+
+  <rect x="70" y="355" width="255" height="90" class="box visible"/>
+  <text x="197.5" y="388" class="box-title" text-anchor="middle">可见性修正 M_m(x)</text>
+  <text x="197.5" y="417" class="box-text" text-anchor="middle">当前样本实际可见信息比例</text>
+
+  <rect x="70" y="485" width="255" height="70" class="box alive"/>
+  <text x="197.5" y="526" class="box-title" text-anchor="middle">模态可用性 a_m(x)</text>
+
+  <rect x="455" y="235" width="220" height="150" class="box combine"/>
+  <text x="565" y="278" class="box-title" text-anchor="middle">乘性组合</text>
+  <text x="565" y="318" class="formula" text-anchor="middle">T_m(x)=C_m·R_m(x)·M_m(x)·a_m(x)</text>
+  <text x="565" y="354" class="small" text-anchor="middle">任一环节明显不可靠时，最终可信评分降低</text>
+
+  <rect x="805" y="235" width="235" height="150" class="box output"/>
+  <text x="922.5" y="278" class="box-title" text-anchor="middle">最终模态可信评分</text>
+  <text x="922.5" y="316" class="formula" text-anchor="middle">T_api, T_graph, T_man</text>
+  <text x="922.5" y="352" class="box-text" text-anchor="middle">用于证据折扣融合</text>
+
+  <path d="M 325 140 H 390 V 310 H 455" class="arrow"/>
+  <path d="M 325 270 H 390 V 310 H 455" class="arrow"/>
+  <path d="M 325 400 H 390 V 310 H 455" class="arrow"/>
+  <path d="M 325 520 H 390 V 310 H 455" class="arrow"/>
+  <path d="M 675 310 H 805" class="arrow"/>
+
+  <text x="560" y="565" class="small" text-anchor="middle">C_m 表示数据集级分支能力；R_m(x)、M_m(x)、a_m(x) 表示样本级可信证据</text>
+</svg>

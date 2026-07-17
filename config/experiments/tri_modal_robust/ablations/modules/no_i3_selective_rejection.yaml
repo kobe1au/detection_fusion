@@ -1,8 +1,6 @@
 defaults:
   - ../../evidential_trusted_fusion.yaml
 
-# I3 OFF:
-# Full-coverage prediction. No conformal abstention / rejection.
 method:
   name: module_no_i3_selective_rejection
 
@@ -11,3 +9,17 @@ train:
 
 selective_prediction:
   enabled: false
+
+# I1+I2 is evaluated as a conventional forced classifier.  The validation-fit
+# operating threshold belongs to the risk-control stage and is disabled here so
+# this ablation uses the protocol-neutral 0.5 decision boundary.
+classification_threshold:
+  enabled: false
+
+eval:
+  eval_only: true
+  output_name: module_no_i3_selective_rejection
+  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: false
+  run_test: true
+  run_robust_test: true

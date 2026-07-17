@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:gravity="center_vertical" android:orientation="horizontal" android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <cn.finalteam.galleryfinal.widget.GFImageView android:id="@id/iv_cover" android:layout_width="68.0dip" android:layout_height="68.0dip" android:layout_margin="8.0dip" android:src="@drawable/ic_gf_default_photo" android:scaleType="centerCrop" />
+    <LinearLayout android:gravity="center_vertical" android:orientation="vertical" android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_weight="1.0">
+        <TextView android:textSize="18.0sp" android:textColor="@android:color/black" android:id="@id/tv_folder_name" android:layout_width="fill_parent" android:layout_height="wrap_content" android:text="@string/all_photo" />
+        <TextView android:textSize="14.0sp" android:textColor="#ffd2d2d7" android:id="@id/tv_photo_count" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginTop="4.0dip" />
+    </LinearLayout>
+    <ImageView android:id="@id/iv_folder_check" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="8.0dip" android:layout_marginRight="8.0dip" android:src="@drawable/ic_gf_done" />
+</LinearLayout>

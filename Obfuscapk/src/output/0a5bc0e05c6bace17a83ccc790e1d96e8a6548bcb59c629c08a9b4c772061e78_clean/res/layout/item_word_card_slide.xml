@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<top.limuyang2.shadowlayoutlib.ShadowRelativeLayout android:id="@id/rl_practice_word" android:background="@drawable/bg_drag" android:layout_width="fill_parent" android:layout_height="fill_parent" app:l_shadowAlpha="0.4" app:l_shadowElevation="5.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <TextView android:id="@id/tv_top" android:background="@drawable/bg_drag_top" android:layout_width="50.0dip" android:layout_height="5.0dip" android:layout_marginTop="14.0dip" android:layout_marginBottom="10.0dip" android:layout_centerHorizontal="true" />
+    <p4d236d9a.pabb3141d.p62608e08.widgets.practiceview.WordDetailView android:id="@id/wv_word" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_below="@id/tv_top" />
+    <ImageView android:id="@id/iv_word_collect_top" android:padding="10.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="35.0dip" android:layout_marginRight="5.0dip" android:src="@drawable/shoucang_grey_191218" android:layout_alignParentRight="true" />
+</top.limuyang2.shadowlayoutlib.ShadowRelativeLayout>

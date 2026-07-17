@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:background="#fff5f6fa" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <RelativeLayout android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="45.0dip">
+        <ImageView android:id="@id/iv_left" android:paddingLeft="10.0dip" android:paddingTop="10.0dip" android:paddingRight="15.0dip" android:paddingBottom="10.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/arrow_left" android:layout_alignParentLeft="true" android:layout_centerVertical="true" />
+        <TextView android:textSize="15.0sp" android:textColor="@android:color/white" android:id="@id/tv_headback" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_toRightOf="@id/iv_left" android:layout_centerVertical="true" />
+        <LinearLayout android:gravity="center_vertical" android:orientation="horizontal" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_centerInParent="true">
+            <ImageView android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/luckyleaf_small20190701" />
+            <TextView android:textSize="18.0sp" android:textStyle="bold" android:textColor="#ff333333" android:ellipsize="end" android:id="@id/tv_title" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="6.0dip" android:text="资料圈" android:maxLength="20" />
+        </LinearLayout>
+        <TextView android:textSize="10.0sp" android:textColor="#ff333333" android:gravity="center" android:id="@id/tv_right" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginRight="12.0dip" android:text="9555人用过" android:layout_alignParentRight="true" android:layout_centerVertical="true" />
+        <TextView android:background="#ffe6e6e6" android:layout_width="fill_parent" android:layout_height="1.0dip" android:layout_alignParentBottom="true" />
+    </RelativeLayout>
+    <TextView android:textSize="14.0sp" android:textColor="#ff333333" android:id="@id/tv_introduce" android:background="#ffffffff" android:padding="14.0dip" android:layout_width="fill_parent" android:layout_height="wrap_content" android:text="·羊驼资料圈定期更新新版资料 \n·包含近期首发资料\n·长期备考资料\n·网页、APP、小程序对应功能练习配对资料" android:lineSpacingExtra="6.0dip" />
+    <com.dreamliner.rvhelper.OptimumRecyclerView android:id="@id/optimum_rv" android:paddingLeft="6.0dip" android:paddingRight="10.0dip" android:layout_width="fill_parent" android:layout_height="fill_parent" app:rvhelp_loading="false" />
+</LinearLayout>

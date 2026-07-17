@@ -95,6 +95,21 @@ def test_metrics_mark_auc_and_ap_undefined_for_single_class():
     assert metrics["ap"] != metrics["ap"]
 
 
+def test_probability_calibration_is_independent_of_operating_threshold():
+    metrics = _metrics(
+        labels=[0, 1],
+        probs=[0.4, 0.4],
+        # A tuned operating threshold can label the second sample malware even
+        # though benign remains the maximum-probability class.
+        preds=[0, 1],
+    )
+
+    assert metrics["acc"] == pytest.approx(1.0)
+    assert metrics["mean_confidence"] == pytest.approx(0.6)
+    assert metrics["ece_10"] == pytest.approx(0.1)
+    assert metrics["confidence_accuracy_gap"] == pytest.approx(0.1)
+
+
 def test_metric_serialization_converts_nonfinite_values_to_null():
     cleaned = _json_compatible(
         {"nan": float("nan"), "nested": [float("inf"), 1.0]}
@@ -248,7 +263,7 @@ def test_posthoc_calibration_requires_discount_probability_fusion():
                 "train": {"device": "cpu"},
                 "data": {},
                 "model": {"fusion_mode": "tri_modal_ours"},
-                "fusion": {"mode": "legacy_learned_gate"},
+                "fusion": {"mode": "model_dispatch"},
                 "calibration": {"enabled": True},
                 "eval": {"run_test": False, "run_robust_test": False},
             }
@@ -779,6 +794,11 @@ def test_multidex_api_limit_is_sample_level_and_preserves_alignment(tmp_path: Pa
     assert graph.method_api_edge_index[1].tolist() == [0, 1, 2]
     assert graph.method_api_edge_index[0].tolist() == [0, 1, 2]
     assert graph.graph_semantic_category_counts.sum().item() == 3.0
+    assert graph.api_event_count_before_encoder_budget.item() == pytest.approx(4.0)
+    assert graph.api_event_count_after_encoder_budget.item() == pytest.approx(3.0)
+    assert graph.api_runtime_encoder_coverage.item() == pytest.approx(0.75)
+    assert graph.api_encoder_coverage.item() == pytest.approx(0.75)
+    assert graph.api_truncated_by_encoder_budget.item() == pytest.approx(1.0)
 
 
 def test_manifest_perturbation_uses_payload_vocab_dims(tmp_path: Path):

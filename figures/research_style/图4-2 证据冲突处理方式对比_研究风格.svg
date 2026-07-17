@@ -1,0 +1,232 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="960"
+   height="470"
+   viewBox="0 0 960 470"
+   version="1.1"
+   id="svg14"
+   sodipodi:docname="图4-2 证据冲突处理方式对比_研究风格.svg"
+   inkscape:version="1.4.4 (dcaf3e7, 2026-05-05)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview14"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="1.8191489"
+     inkscape:cx="402.66082"
+     inkscape:cy="245.99415"
+     inkscape:window-width="1920"
+     inkscape:window-height="1057"
+     inkscape:window-x="-8"
+     inkscape:window-y="177"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg14" />
+  <defs
+     id="defs1">
+    <marker
+       id="arrow"
+       markerWidth="8"
+       markerHeight="8"
+       refX="7"
+       refY="4"
+       orient="auto"
+       markerUnits="strokeWidth">
+      <path
+         d="M0,0 L8,4 L0,8 Z"
+         fill="#333"
+         id="path1" />
+    </marker>
+    <style
+       id="style1">.title{font-family:&quot;SimSun&quot;,&quot;Microsoft YaHei&quot;,Arial,sans-serif;font-size:19px;font-weight:bold}.txt{font-family:&quot;SimSun&quot;,&quot;Microsoft YaHei&quot;,Arial,sans-serif;font-size:14px}.small{font-family:&quot;SimSun&quot;,&quot;Microsoft YaHei&quot;,Arial,sans-serif;font-size:12px}.math{font-family:&quot;Times New Roman&quot;,&quot;SimSun&quot;,serif;font-size:15px}.cap{font-family:&quot;Times New Roman&quot;,&quot;SimSun&quot;,serif;font-size:14px}.box{fill:#fff;stroke:#333;stroke-width:1.1}.soft{fill:#f2f6fb;stroke:#4f7fbf;stroke-width:1.1}.orange{fill:#fff3df;stroke:#d6953a;stroke-width:1.1}.red{fill:#fdecec;stroke:#c96d6d;stroke-width:1.1}.line{stroke:#333;stroke-width:1.1;fill:none;marker-end:url(#arrow)}.dash{stroke:#666;stroke-width:1;stroke-dasharray:6 5;fill:none}</style>
+  </defs>
+  <rect
+     width="960"
+     height="470"
+     fill="#fff"
+     id="rect1" />
+  <text
+     x="480"
+     y="34"
+     text-anchor="middle"
+     class="title"
+     id="text1" />
+  <rect
+     x="48"
+     y="72"
+     width="385"
+     height="300"
+     rx="8"
+     class="dash"
+     id="rect2" />
+  <text
+     x="240"
+     y="100"
+     text-anchor="middle"
+     class="txt"
+     id="text2">Dempster归一化</text>
+  <rect
+     x="86"
+     y="145"
+     width="115"
+     height="48"
+     class="box"
+     id="rect3" />
+  <text
+     x="144"
+     y="174"
+     text-anchor="middle"
+     class="txt"
+     id="text3">模态证据</text>
+  <rect
+     x="86"
+     y="245"
+     width="115"
+     height="48"
+     class="box"
+     id="rect4" />
+  <text
+     x="144"
+     y="274"
+     text-anchor="middle"
+     class="txt"
+     id="text4">冲突部分 </text>
+  <rect
+     x="266.5965"
+     y="190"
+     width="125"
+     height="58"
+     class="orange"
+     id="rect5" />
+  <text
+     x="322"
+     y="214"
+     text-anchor="middle"
+     class="txt"
+     id="text5">重新归一化</text>
+  <text
+     x="322"
+     y="236"
+     text-anchor="middle"
+     class="small"
+     id="text6">可能提高置信度</text>
+  <line
+     x1="201"
+     y1="169"
+     x2="260"
+     y2="210"
+     class="line"
+     id="line6" />
+  <line
+     x1="201"
+     y1="269"
+     x2="260"
+     y2="230"
+     class="line"
+     id="line7" />
+  <rect
+     x="515"
+     y="72"
+     width="397"
+     height="300"
+     rx="8"
+     class="dash"
+     id="rect7" />
+  <text
+     x="714"
+     y="100"
+     text-anchor="middle"
+     class="txt"
+     id="text7">Yager冲突保留</text>
+  <rect
+     x="550"
+     y="135"
+     width="120"
+     height="48"
+     class="box"
+     id="rect8" />
+  <text
+     x="610"
+     y="164"
+     text-anchor="middle"
+     class="txt"
+     id="text8">一致证据</text>
+  <rect
+     x="550"
+     y="235"
+     width="120"
+     height="48"
+     class="red"
+     id="rect9" />
+  <text
+     x="610"
+     y="264"
+     text-anchor="middle"
+     class="txt"
+     id="text9">冲突部分 </text>
+  <rect
+     x="740"
+     y="122"
+     width="125"
+     height="58"
+     class="soft"
+     id="rect10" />
+  <text
+     x="802"
+     y="146"
+     text-anchor="middle"
+     class="txt"
+     id="text10">类别支持度</text>
+  <rect
+     x="740"
+     y="242"
+     width="125"
+     height="58"
+     class="soft"
+     id="rect11" />
+  <text
+     x="802"
+     y="266"
+     text-anchor="middle"
+     class="txt"
+     id="text11">融合不确定性</text>
+  <line
+     x1="670"
+     y1="159"
+     x2="740"
+     y2="151"
+     class="line"
+     id="line11" />
+  <line
+     x1="670"
+     y1="259"
+     x2="740"
+     y2="271"
+     class="line"
+     id="line12" />
+  <text
+     x="240"
+     y="405"
+     text-anchor="middle"
+     class="cap"
+     id="text12">（a）冲突可能被并入类别判断</text>
+  <text
+     x="714"
+     y="405"
+     text-anchor="middle"
+     class="cap"
+     id="text13">（b）冲突保留为不确定性</text>
+  <text
+     x="482.74854"
+     y="436.90057"
+     text-anchor="middle"
+     class="cap"
+     id="text14" />
+</svg>

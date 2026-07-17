@@ -1,0 +1,21 @@
+defaults:
+  - ../../seeds/seed_42.yaml
+
+method:
+  name: i3_model_acceptance_threshold_eval
+
+selective_prediction:
+  # Same acceptance statistic as the proposed risk-control rule, but choose a
+  # conventional coverage threshold rather than enforce malware-FN risk.
+  enabled: true
+  mode: threshold
+  threshold_score: model_acceptance
+  target_coverage: 0.90
+
+eval:
+  eval_only: true
+  output_name: i3_model_acceptance_threshold_eval
+  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: true
+  run_test: true
+  run_robust_test: true

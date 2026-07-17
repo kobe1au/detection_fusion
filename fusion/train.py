@@ -9,11 +9,13 @@ import logging
 import math
 import os
 import random
+import shutil
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from sklearn.metrics import (
     accuracy_score,
@@ -25,7 +27,12 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from fusion.losses import compute_posthoc_calibration_loss, compute_robust_loss
+from fusion.losses import (
+    compute_probability_calibration_loss,
+    compute_posthoc_calibration_loss,
+    compute_reliability_calibration_loss,
+    compute_robust_loss,
+)
 from fusion.dataset import (
     RobustTriModalDataset,
     prepare_robust_batch,
@@ -33,8 +40,9 @@ from fusion.dataset import (
 )
 from fusion.model import TriModalRobustModel
 from fusion.perturbations import EVAL_PERTURB_TYPES
+from fusion.reliability_calibration import BRANCH_NAMES
 from fusion.utils import build_grad_scaler, get_amp_context
-from fusion.constants import TriModalConfigDefaults
+from fusion.constants import EvidenceIndex, TriModalConfigDefaults
 
 
 logger = logging.getLogger("tri_modal_robust")
@@ -61,14 +69,29 @@ class EmptyExtraEvalSetError(RuntimeError):
     """Raised when an optional external eval set has no usable samples."""
 
 
+CHECKPOINT_STAGE_ENCODER_SELECTED = "encoder_selected"
+CHECKPOINT_STAGE_PIPELINE_FITTED = "pipeline_fitted"
+CHECKPOINT_STAGES = frozenset(
+    {
+        CHECKPOINT_STAGE_ENCODER_SELECTED,
+        CHECKPOINT_STAGE_PIPELINE_FITTED,
+    }
+)
+
+
 GATE_DIAGNOSTIC_KEYS = (
     "api_integrity",
     "api_encoder_coverage",
+    "api_total_pipeline_coverage",
+    "api_extractor_coverage",
+    "api_runtime_encoder_coverage",
     "effective_api_integrity",
+    "api_truncated_by_extractor_budget",
     "api_truncated_by_encoder_budget",
     "api_integrity_before_encoder_budget",
     "graph_integrity",
     "graph_encoder_coverage",
+    "graph_feature_valid_ratio",
     "effective_graph_integrity",
     "graph_truncated_by_encoder_budget",
     "graph_integrity_before_encoder_budget",
@@ -107,6 +130,9 @@ GATE_DIAGNOSTIC_KEYS = (
     "fusion_weight_graph",
     "fusion_weight_manifest",
     "fusion_weight_joint",
+    "qmf_energy_api",
+    "qmf_energy_graph",
+    "qmf_energy_manifest",
     "entropy_api",
     "entropy_graph",
     "entropy_manifest",
@@ -119,7 +145,7 @@ GATE_DIAGNOSTIC_KEYS = (
     "uncertainty_proxy_graph",
     "uncertainty_proxy_manifest",
     "uncertainty_proxy_joint",
-    "fallback_used",
+    "zero_weight_fallback_used",
     "predicted_reliability_api",
     "predicted_reliability_graph",
     "predicted_reliability_manifest",
@@ -156,7 +182,34 @@ GATE_DIAGNOSTIC_KEYS = (
     "total_reliability",
     "final_uncertainty_proxy",
     "effective_conflict",
+    "raw_conflict",
+    "predictive_conflict",
+    "predictive_conflict_max",
+    "routing_active",
+    "routing_weight_api",
+    "routing_weight_graph",
+    "routing_weight_manifest",
+    "routing_weight_joint",
+    "routing_weight_unknown",
+    "routing_known_mass",
+    "routing_prior_known_mass",
+    "routing_prior_unknown_mass",
+    "routing_reliability_prior_known_mass",
+    "routing_known_retention",
+    "routing_mean_disagreement",
+    "routing_disagreement_feature_active",
+    "routing_common_scale_reliability_active",
+    "routing_mode_learned",
+    "routing_mode_prior_only",
+    "routing_mode_known_only",
+    "routing_train_end_to_end",
+    "routing_posthoc_refine",
+    "final_temperature",
     "acceptance_score",
+    "acceptance_score_unknown_only",
+    "acceptance_score_fused_certainty",
+    "acceptance_score_conflict_only",
+    "acceptance_score_product",
     "calibration_active",
     "gate_uses_perturbation_evidence",
     "explicit_relation_factors_active",
@@ -343,13 +396,10 @@ def _checkpoint_semantic_signature(cfg: dict) -> dict[str, Any]:
     fusion_cfg = copy.deepcopy(cfg.get("fusion", {}) or {})
     # Acceptance aggregation changes rejection ranking only, not model state.
     fusion_cfg.pop("acceptance_aggregation", None)
-    selective_cfg = cfg.get("selective_prediction", {}) or {}
     return {
         "model": copy.deepcopy(cfg.get("model", {}) or {}),
         "fusion": fusion_cfg,
         "calibration": copy.deepcopy(cfg.get("calibration", {}) or {}),
-        # Coverage changes only the validation-fitted rejection threshold.
-        "selective_prediction": {"enabled": bool(selective_cfg.get("enabled", False))},
         "data": {
             key: copy.deepcopy(data_cfg.get(key))
             for key in (
@@ -382,6 +432,281 @@ def validate_eval_checkpoint_config(
             "Use the checkpoint's training config and override only eval paths/settings, or set "
             "eval.allow_checkpoint_config_mismatch=true for an explicitly labelled compatibility audit."
         )
+
+
+def validate_checkpoint_implementation(
+    checkpoint: dict[str, Any],
+    *,
+    allow_mismatch: bool = False,
+) -> None:
+    """Reject checkpoints produced by a different decision implementation."""
+    if allow_mismatch:
+        return
+    saved = str(checkpoint.get("method_implementation_sha256", ""))
+    current = _method_implementation_sha256()
+    if not saved:
+        raise ValueError(
+            "Evaluation checkpoint predates implementation fingerprinting. "
+            "Retrain it with the current code, or set "
+            "eval.allow_checkpoint_config_mismatch=true only for an explicitly "
+            "labelled compatibility audit."
+        )
+    if saved != current:
+        raise ValueError(
+            "Evaluation checkpoint was produced by a different model/fusion "
+            "implementation. Retrain it with the current code, or set "
+            "eval.allow_checkpoint_config_mismatch=true only for an explicitly "
+            "labelled compatibility audit."
+        )
+
+
+def validate_checkpoint_stage(
+    checkpoint: dict[str, Any],
+    *,
+    expected: str | None = None,
+    checkpoint_path: str | Path | None = None,
+) -> str:
+    """Validate the explicit lifecycle stage attached to a checkpoint."""
+    location = f" {checkpoint_path}" if checkpoint_path is not None else ""
+    stage = str(checkpoint.get("checkpoint_stage", "")).strip().lower()
+    if stage not in CHECKPOINT_STAGES:
+        raise ValueError(
+            f"Checkpoint{location} is missing a valid checkpoint_stage; "
+            f"expected one of {sorted(CHECKPOINT_STAGES)}. Retrain the model "
+            "with staged checkpointing instead of reusing an ambiguous checkpoint."
+        )
+    if expected is not None and stage != expected:
+        if expected not in CHECKPOINT_STAGES:
+            raise ValueError(f"Unknown expected checkpoint stage: {expected!r}")
+        raise ValueError(
+            f"Checkpoint{location} has checkpoint_stage={stage!r}, "
+            f"but this operation requires {expected!r}."
+        )
+    return stage
+
+
+def _load_eval_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    refit_posthoc_calibration: bool,
+    map_location: Any,
+) -> tuple[Path, dict[str, Any]]:
+    """Load the only checkpoint stage valid for the requested eval lifecycle.
+
+    Ordinary evaluation consumes a pipeline-fitted artifact. A post-hoc refit
+    consumes the encoder-selected artifact so that the jointly trained router
+    is preserved while none of the previous post-hoc labels are inherited.
+    A pipeline checkpoint may link to that artifact for config compatibility.
+    """
+    requested_path = Path(checkpoint_path)
+    requested_checkpoint = torch.load(
+        requested_path, map_location=map_location, weights_only=True
+    )
+    requested_stage = validate_checkpoint_stage(
+        requested_checkpoint, checkpoint_path=requested_path
+    )
+    if not refit_posthoc_calibration:
+        validate_checkpoint_stage(
+            requested_checkpoint,
+            expected=CHECKPOINT_STAGE_PIPELINE_FITTED,
+            checkpoint_path=requested_path,
+        )
+        return requested_path, requested_checkpoint
+
+    if requested_stage == CHECKPOINT_STAGE_ENCODER_SELECTED:
+        return requested_path, requested_checkpoint
+
+    encoder_reference = requested_checkpoint.get("encoder_checkpoint_path")
+    if not str(encoder_reference or "").strip():
+        raise ValueError(
+            f"Pipeline checkpoint {requested_path} does not link to its "
+            "encoder-selected checkpoint; post-hoc refitting cannot safely "
+            "reconstruct the training lifecycle."
+        )
+    encoder_path = Path(str(encoder_reference))
+    if not encoder_path.is_absolute():
+        encoder_path = requested_path.parent / encoder_path
+    if not encoder_path.exists():
+        raise FileNotFoundError(
+            "Encoder-selected checkpoint linked by the pipeline artifact was "
+            f"not found: {encoder_path}"
+        )
+    expected_encoder_sha256 = str(
+        requested_checkpoint.get("encoder_checkpoint_sha256", "")
+    ).strip().lower()
+    if expected_encoder_sha256:
+        actual_encoder_sha256 = _file_sha256(encoder_path)
+        if actual_encoder_sha256 != expected_encoder_sha256:
+            raise ValueError(
+                "Encoder-selected checkpoint hash does not match the pipeline "
+                f"artifact: {encoder_path}"
+            )
+    encoder_checkpoint = torch.load(
+        encoder_path, map_location=map_location, weights_only=True
+    )
+    validate_checkpoint_stage(
+        encoder_checkpoint,
+        expected=CHECKPOINT_STAGE_ENCODER_SELECTED,
+        checkpoint_path=encoder_path,
+    )
+    return encoder_path, encoder_checkpoint
+
+
+def _resolve_refit_decision_calibration(eval_cfg: dict | None) -> bool:
+    """Resolve the decision-calibration refit flag and its legacy alias."""
+    eval_cfg = eval_cfg or {}
+    current_key = "refit_decision_calibration"
+    legacy_key = "refit_rejection_threshold"
+    has_current = current_key in eval_cfg
+    has_legacy = legacy_key in eval_cfg
+    current = bool(eval_cfg.get(current_key, False))
+    legacy = bool(eval_cfg.get(legacy_key, False))
+    if has_current and has_legacy and current != legacy:
+        raise ValueError(
+            f"eval.{current_key} and legacy eval.{legacy_key} disagree; "
+            "set only the new key or give both the same value."
+        )
+    return current if has_current else legacy
+
+
+def _decision_calibration_signature(cfg: dict) -> dict[str, Any]:
+    """Canonicalize every setting that changes fitted decision artifacts."""
+    classification_cfg = cfg.get("classification_threshold", {}) or {}
+    classification_enabled = bool(classification_cfg.get("enabled", False))
+    classification = {
+        "enabled": classification_enabled,
+        "objective": (
+            str(classification_cfg.get("objective", "macro_f1")).lower()
+            if classification_enabled
+            else "disabled"
+        ),
+        "min_malware_recall": (
+            float(classification_cfg.get("min_malware_recall", 0.0))
+            if classification_enabled
+            else None
+        ),
+    }
+
+    selective_cfg = cfg.get("selective_prediction", {}) or {}
+    selective_enabled = bool(selective_cfg.get("enabled", False))
+    mode = (
+        str(selective_cfg.get("mode", "threshold")).lower()
+        if selective_enabled
+        else "disabled"
+    )
+    selective: dict[str, Any] = {
+        "enabled": selective_enabled,
+        "mode": mode,
+        "score_type": (
+            _selective_score_type(selective_cfg)
+            if selective_enabled
+            else "disabled"
+        ),
+    }
+    if selective_enabled and selective["score_type"] == "model_acceptance":
+        fusion_cfg = cfg.get("fusion", {}) or {}
+        if str(fusion_cfg.get("combination", "linear")).lower() == "routed":
+            routing_cfg = fusion_cfg.get("routing", {}) or {}
+            score_definition = str(
+                routing_cfg.get("acceptance_score_mode", "product")
+            ).lower()
+            if score_definition == "current_product":
+                score_definition = "product"
+            selective["model_acceptance_definition"] = (
+                f"routed:{score_definition}"
+            )
+        else:
+            selective["model_acceptance_definition"] = "fusion:" + str(
+                fusion_cfg.get("acceptance_aggregation", "product")
+            ).lower()
+    if selective_enabled and mode == "risk_control":
+        risk_target = str(
+            selective_cfg.get(
+                "risk_target", "malware_fn_rate_after_rejection"
+            )
+        ).lower()
+        if risk_target == "accepted_malware_false_negative":
+            risk_target = "malware_fn_rate_after_rejection"
+        selective.update(
+            {
+                "risk_level": float(selective_cfg.get("risk_level", 0.05)),
+                "risk_target": risk_target,
+                "min_calibration_malware": int(
+                    selective_cfg.get("min_calibration_malware", 1)
+                ),
+                "require_feasible": bool(
+                    selective_cfg.get("require_feasible", False)
+                ),
+            }
+        )
+    elif selective_enabled and mode == "conformal":
+        target_coverage = float(
+            selective_cfg.get("target_coverage", 0.9)
+        )
+        selective.update(
+            {
+                "alpha": float(
+                    selective_cfg.get("alpha", 1.0 - target_coverage)
+                ),
+                "class_conditional": bool(
+                    selective_cfg.get("class_conditional", True)
+                ),
+                "use_raw_conflict": bool(
+                    selective_cfg.get("use_raw_conflict", False)
+                ),
+            }
+        )
+    elif selective_enabled:
+        selective["target_coverage"] = float(
+            selective_cfg.get("target_coverage", 0.9)
+        )
+    return {"classification": classification, "selective": selective}
+
+
+def validate_checkpoint_decision_signature(
+    current_cfg: dict,
+    checkpoint: dict[str, Any],
+    *,
+    refit_decision_calibration: bool,
+) -> None:
+    """Prevent fitted thresholds from being reused under different semantics."""
+    if refit_decision_calibration:
+        return
+    current = _decision_calibration_signature(current_cfg)
+    classification_is_used = bool(
+        current["classification"]["enabled"]
+        or current["selective"]["enabled"]
+    )
+    selective_is_used = bool(current["selective"]["enabled"])
+    if not classification_is_used and not selective_is_used:
+        return
+    saved = checkpoint.get("decision_calibration_signature")
+    if not isinstance(saved, dict):
+        raise ValueError(
+            "Pipeline checkpoint has no decision_calibration_signature; "
+            "retrain it or set eval.refit_decision_calibration=true"
+        )
+    if (
+        classification_is_used
+        and current["classification"] != saved.get("classification")
+    ):
+        raise ValueError(
+            "Classification-threshold settings differ from the fitted "
+            "checkpoint artifact; set eval.refit_decision_calibration=true"
+        )
+    if selective_is_used and current["selective"] != saved.get("selective"):
+        raise ValueError(
+            "Selective-decision settings differ from the fitted checkpoint "
+            "artifact; set eval.refit_decision_calibration=true"
+        )
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _dataset_common_kwargs(
@@ -486,7 +811,13 @@ def build_dataset(cfg: dict, split: str, is_train: bool, perturb_type: str | Non
     )
 
 
-def build_loader(cfg: dict, dataset, is_train: bool):
+def build_loader(
+    cfg: dict,
+    dataset,
+    is_train: bool,
+    *,
+    persistent_workers_override: bool | None = None,
+):
     train_cfg = cfg["train"]
     worker_key = "num_workers" if is_train else "eval_num_workers"
     workers = int(train_cfg.get(worker_key, train_cfg.get("num_workers", 0)))
@@ -497,13 +828,16 @@ def build_loader(cfg: dict, dataset, is_train: bool):
             "forcing pin_memory=false. Set train.allow_pyg_pin_memory=true to override."
         )
         pin_memory = False
+    persistent_workers = bool(train_cfg.get("persistent_workers", False))
+    if persistent_workers_override is not None:
+        persistent_workers = bool(persistent_workers_override)
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": int(train_cfg.get("batch_size" if is_train else "eval_batch_size", train_cfg.get("batch_size", 32))),
         "shuffle": is_train,
         "num_workers": workers,
         "pin_memory": pin_memory,
-        "persistent_workers": bool(train_cfg.get("persistent_workers", False)) and workers > 0,
+        "persistent_workers": persistent_workers and workers > 0,
         "collate_fn": robust_collate_fn,
     }
     if workers > 0 and train_cfg.get("prefetch_factor") is not None:
@@ -518,7 +852,7 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
     """Deterministically separate checkpoint selection from calibration.
 
     Package/sample groups remain intact while a deterministic greedy assignment
-    keeps both halves close to the full validation label distribution.
+    keeps both halves close to the full validation year-label distribution.
     """
     calibration_cfg = cfg.get("calibration", {}) or {}
     fraction = float(calibration_cfg.get("validation_fraction", 0.5))
@@ -544,6 +878,12 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
                 "Validation dataset must expose sample_labels for stratified calibration split"
             )
     labels = [int(label) for label in labels]
+    years = list(getattr(dataset, "sample_years", []))
+    if len(years) != size:
+        # Synthetic/legacy datasets without year metadata retain the previous
+        # label-stratified behavior through a single sentinel year.
+        years = [0] * size
+    years = [int(year) for year in years]
 
     group_to_indices: dict[str, list[int]] = {}
     for index, group in enumerate(groups):
@@ -554,11 +894,22 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
         )
 
     label_values = sorted(set(labels))
+    year_values = sorted(set(years))
+    strata = list(zip(years, labels))
+    stratum_values = sorted(set(strata))
     total_label_counts = {
         label: sum(int(value == label) for value in labels) for label in label_values
     }
-    target_label_counts = {
-        label: float(total_label_counts[label]) * fraction for label in label_values
+    total_year_counts = {
+        year: sum(int(value == year) for value in years) for year in year_values
+    }
+    total_stratum_counts = {
+        stratum: sum(int(value == stratum) for value in strata)
+        for stratum in stratum_values
+    }
+    target_stratum_counts = {
+        stratum: float(total_stratum_counts[stratum]) * fraction
+        for stratum in stratum_values
     }
     target_calibration_size = min(size - 1, max(1, int(round(size * fraction))))
     ranked_groups = sorted(
@@ -566,29 +917,32 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
         key=lambda group: hashlib.sha256(f"{seed}:{group}".encode("utf-8")).hexdigest(),
     )
     rank = {group: index for index, group in enumerate(ranked_groups)}
-    group_label_counts: dict[str, dict[int, int]] = {}
+    group_stratum_counts: dict[str, dict[tuple[int, int], int]] = {}
     for group, indices in group_to_indices.items():
-        group_label_counts[group] = {
-            label: sum(int(labels[index] == label) for index in indices)
-            for label in label_values
+        group_stratum_counts[group] = {
+            stratum: sum(int(strata[index] == stratum) for index in indices)
+            for stratum in stratum_values
         }
 
-    def split_error(candidate_size: int, candidate_counts: dict[int, int]) -> float:
+    def split_error(
+        candidate_size: int,
+        candidate_counts: dict[tuple[int, int], int],
+    ) -> float:
         size_error = abs(candidate_size - target_calibration_size) / max(size, 1)
-        label_error = sum(
-            abs(candidate_counts[label] - target_label_counts[label])
-            / max(total_label_counts[label], 1)
-            for label in label_values
+        stratum_error = sum(
+            abs(candidate_counts[stratum] - target_stratum_counts[stratum])
+            / max(total_stratum_counts[stratum], 1)
+            for stratum in stratum_values
         )
-        return size_error + label_error
+        return size_error + stratum_error
 
     remaining = set(ranked_groups)
     calibration_groups: list[str] = []
     calibration_indices: list[int] = []
-    calibration_label_counts = {label: 0 for label in label_values}
+    calibration_stratum_counts = {stratum: 0 for stratum in stratum_values}
     while remaining:
         current_size = len(calibration_indices)
-        current_error = split_error(current_size, calibration_label_counts)
+        current_error = split_error(current_size, calibration_stratum_counts)
         candidates = []
         for group in remaining:
             indices = group_to_indices[group]
@@ -596,9 +950,9 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
             if new_size >= size:
                 continue
             new_counts = {
-                label: calibration_label_counts[label]
-                + group_label_counts[group][label]
-                for label in label_values
+                stratum: calibration_stratum_counts[stratum]
+                + group_stratum_counts[group][stratum]
+                for stratum in stratum_values
             }
             candidates.append(
                 (split_error(new_size, new_counts), rank[group], group, new_counts)
@@ -610,7 +964,7 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
             break
         calibration_groups.append(best_group)
         calibration_indices.extend(group_to_indices[best_group])
-        calibration_label_counts = best_counts
+        calibration_stratum_counts = best_counts
         remaining.remove(best_group)
 
     calibration_indices = sorted(calibration_indices)
@@ -622,6 +976,32 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
     selection_label_counts = {
         label: sum(int(labels[index] == label) for index in selection_indices)
         for label in label_values
+    }
+    calibration_label_counts = {
+        label: sum(int(labels[index] == label) for index in calibration_indices)
+        for label in label_values
+    }
+    selection_year_counts = {
+        year: sum(int(years[index] == year) for index in selection_indices)
+        for year in year_values
+    }
+    calibration_year_counts = {
+        year: sum(int(years[index] == year) for index in calibration_indices)
+        for year in year_values
+    }
+    selection_year_label_counts = {
+        f"{year}:{label}": sum(
+            int(years[index] == year and labels[index] == label)
+            for index in selection_indices
+        )
+        for year, label in stratum_values
+    }
+    calibration_year_label_counts = {
+        f"{year}:{label}": sum(
+            int(years[index] == year and labels[index] == label)
+            for index in calibration_indices
+        )
+        for year, label in stratum_values
     }
     return (
         Subset(dataset, selection_indices),
@@ -635,8 +1015,100 @@ def split_validation_dataset(cfg: dict, dataset) -> tuple[Subset, Subset, dict[s
             "num_calibration_groups": len(calibration_groups),
             "selection_label_counts": selection_label_counts,
             "calibration_label_counts": calibration_label_counts,
+            "selection_year_counts": selection_year_counts,
+            "calibration_year_counts": calibration_year_counts,
+            "selection_year_label_counts": selection_year_label_counts,
+            "calibration_year_label_counts": calibration_year_label_counts,
             "selection_indices": selection_indices,
             "calibration_indices": calibration_indices,
+        },
+    )
+
+
+def split_posthoc_conformal_dataset(
+    cfg: dict,
+    dataset,
+    holdout_indices: list[int],
+) -> tuple[Subset, Subset, dict[str, Any]]:
+    """Split validation holdout into model-fitting and decision-calibration subsets.
+
+    The final subset must remain untouched by reliability calibration,
+    visibility-reference fitting, routing, and classification-threshold
+    selection. Reusing it in those label-dependent steps would invalidate the
+    held-out calibration argument used by conformal and risk-control rules.
+    """
+    calibration_cfg = cfg.get("calibration", {}) or {}
+    fraction = float(calibration_cfg.get("conformal_fraction", 0.5))
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("calibration.conformal_fraction must be within (0, 1)")
+    original_indices = [int(index) for index in holdout_indices]
+    if len(original_indices) < 4:
+        raise ValueError(
+            "Validation holdout needs at least four samples for disjoint "
+            "post-hoc and conformal calibration"
+        )
+
+    class HoldoutView:
+        def __init__(self):
+            all_sids = list(getattr(dataset, "sample_sids", []))
+            all_groups = list(getattr(dataset, "sample_groups", []))
+            all_labels = list(getattr(dataset, "sample_labels", []))
+            all_years = list(getattr(dataset, "sample_years", []))
+            if not (
+                len(all_sids) == len(dataset)
+                and len(all_groups) == len(dataset)
+                and len(all_labels) == len(dataset)
+            ):
+                raise ValueError(
+                    "Validation dataset must expose sample_sids, sample_groups and "
+                    "sample_labels for three-way calibration splitting"
+                )
+            self.sample_sids = [all_sids[index] for index in original_indices]
+            self.sample_groups = [all_groups[index] for index in original_indices]
+            self.sample_labels = [int(all_labels[index]) for index in original_indices]
+            self.sample_years = (
+                [int(all_years[index]) for index in original_indices]
+                if len(all_years) == len(dataset)
+                else [0] * len(original_indices)
+            )
+
+        def __len__(self):
+            return len(original_indices)
+
+        def __getitem__(self, index):
+            return dataset[original_indices[index]]
+
+    inner_cfg = copy.deepcopy(cfg)
+    inner_cfg.setdefault("calibration", {})["validation_fraction"] = fraction
+    inner_cfg["calibration"]["split_seed"] = int(
+        calibration_cfg.get("split_seed", cfg.get("train", {}).get("seed", 42))
+    ) + 104729
+    posthoc_local, conformal_local, inner_meta = split_validation_dataset(
+        inner_cfg, HoldoutView()
+    )
+    posthoc_indices = [original_indices[index] for index in posthoc_local.indices]
+    conformal_indices = [original_indices[index] for index in conformal_local.indices]
+    if set(posthoc_indices) & set(conformal_indices):
+        raise RuntimeError("Post-hoc and conformal calibration subsets overlap")
+    return (
+        Subset(dataset, posthoc_indices),
+        Subset(dataset, conformal_indices),
+        {
+            "conformal_fraction": fraction,
+            "num_posthoc_calibration": len(posthoc_indices),
+            "num_conformal_calibration": len(conformal_indices),
+            "posthoc_calibration_indices": posthoc_indices,
+            "conformal_calibration_indices": conformal_indices,
+            "posthoc_label_counts": inner_meta["selection_label_counts"],
+            "conformal_label_counts": inner_meta["calibration_label_counts"],
+            "posthoc_year_counts": inner_meta["selection_year_counts"],
+            "conformal_year_counts": inner_meta["calibration_year_counts"],
+            "posthoc_year_label_counts": inner_meta[
+                "selection_year_label_counts"
+            ],
+            "conformal_year_label_counts": inner_meta[
+                "calibration_year_label_counts"
+            ],
         },
     )
 
@@ -725,6 +1197,121 @@ def build_robust_val_loaders(
     return out
 
 
+RELIABILITY_CALIBRATION_PERTURBATIONS = {
+    "api_degraded": ("api",),
+    "graph_degraded": ("graph",),
+    "manifest_degraded": ("manifest",),
+    "all_degraded": ("api", "graph", "manifest"),
+}
+RELIABILITY_CALIBRATION_MISSING = (
+    "api_missing",
+    "graph_missing",
+    "manifest_missing",
+)
+
+# Training logs only consume this small subset. Keeping the other diagnostics
+# on the evaluation path avoids synchronizing dozens of GPU tensors per batch.
+TRAIN_LOG_DIAGNOSTIC_KEYS = tuple(
+    key
+    for key in GATE_DIAGNOSTIC_KEYS
+    if key.startswith(
+        ("discount_", "fusion_weight_", "entropy_", "margin_", "uncertainty_proxy_")
+    )
+    or key == "zero_weight_fallback_used"
+)
+
+
+def reliability_calibration_scenarios(cfg: dict) -> list[dict[str, Any]]:
+    """Build transformed post-hoc views used by the global opinion router.
+
+    These views are built only from the post-hoc calibration subset. They never
+    touch checkpoint selection or the disjoint decision-calibration subset.
+    Branch-correctness reliability is fitted on clean rows only; transformed
+    views teach the router how to allocate mass under degraded and missing
+    modalities. ``reliability_branches`` is retained as scenario provenance for
+    summaries and compatibility with existing experiment records.
+    """
+    robust_cfg = cfg.get("robust", {}) or {}
+    calibration_cfg = cfg.get("calibration", {}) or {}
+    strengths = sorted(
+        {
+            float(value)
+            for value in (
+                calibration_cfg.get("perturb_strengths")
+                or robust_cfg.get("perturb_strengths")
+                or []
+            )
+            if math.isfinite(float(value)) and 0.0 < float(value) <= 1.0
+        }
+    )
+    graded = [
+        {
+            "name": f"calibration_{perturb_type}_s{strength:g}",
+            "perturb_type": perturb_type,
+            "scenario_group": perturb_type,
+            "strength": strength,
+            "reliability_branches": list(branches),
+        }
+        for perturb_type, branches in RELIABILITY_CALIBRATION_PERTURBATIONS.items()
+        for strength in strengths
+    ]
+    missing = [
+        {
+            "name": f"calibration_{perturb_type}",
+            "perturb_type": perturb_type,
+            "scenario_group": "missing",
+            "strength": 1.0,
+            # Missing views train the router's unknown outcome. The absent
+            # branch has no correctness target, while the surviving branch
+            # logits are unchanged and must not be counted as extra clean
+            # reliability observations.
+            "reliability_branches": [],
+        }
+        for perturb_type in RELIABILITY_CALIBRATION_MISSING
+    ]
+    return [*graded, *missing]
+
+
+def build_reliability_calibration_loaders(
+    cfg: dict,
+    subset_indices: list[int] | None,
+) -> list[dict[str, Any]]:
+    """Build deterministic degraded views of the post-hoc calibration subset."""
+    out: list[dict[str, Any]] = []
+    for item in reliability_calibration_scenarios(cfg):
+        dataset = build_dataset(
+            cfg,
+            "val",
+            is_train=False,
+            perturb_type=item["perturb_type"],
+            perturb_strength=item["strength"],
+        )
+        if subset_indices is not None:
+            dataset = Subset(dataset, subset_indices)
+        # These loaders are consumed once while caching frozen branch outputs.
+        # Keeping workers alive for every degraded view would accumulate worker
+        # processes and file descriptors across all calibration scenarios.
+        loader = build_loader(
+            cfg,
+            dataset,
+            is_train=False,
+            persistent_workers_override=False,
+        )
+        out.append({**item, "loader": loader})
+    return out
+
+
+def uses_routing_calibration_scenarios(cfg: dict) -> bool:
+    """Return whether post-hoc fitting consumes transformed modality views."""
+    fusion_cfg = cfg.get("fusion", {}) or {}
+    routing_cfg = fusion_cfg.get("routing", {}) or {}
+    return bool(
+        str(fusion_cfg.get("combination", "linear")).lower() == "routed"
+        and routing_cfg.get("enabled", False)
+        and routing_cfg.get("posthoc_refine", True)
+    )
+
+
 @torch.no_grad()
 def evaluate_robust_validation(
     model,
@@ -733,6 +1320,8 @@ def evaluate_robust_validation(
     use_amp: bool,
     cfg: dict,
     selective_threshold: float | None = None,
+    selective_score_type: str = "max_probability",
+    classification_threshold: float = 0.5,
 ) -> dict[str, dict[str, float]]:
     results: dict[str, dict[str, float]] = {}
     for item in loaders:
@@ -745,6 +1334,8 @@ def evaluate_robust_validation(
             f"val_{name}",
             dump_rows=False,
             selective_threshold=selective_threshold,
+            selective_score_type=selective_score_type,
+            classification_threshold=classification_threshold,
         )
         enforce_failed_ratio(metrics, cfg, f"val_{name}")
         results[name] = metrics
@@ -812,23 +1403,28 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
     configured_fusion_mode = str(fusion_cfg.get("mode", "")).lower()
     if configured_fusion_mode == "discount_probability":
         fusion_mode = "discount_probability"
-    elif configured_fusion_mode not in {"", "legacy_learned_gate"}:
+    elif configured_fusion_mode not in {"", "model_dispatch"}:
         raise ValueError(f"Unsupported fusion.mode: {configured_fusion_mode}")
 
-    # Independence guardrail: evidential combination treats API, Graph and
-    # Manifest as independent class-evidence sources. Cross-modal relation
-    # evidence is allowed because it is used only to calibrate source reliability
-    # / trust discounting, not as an additional opinion or class evidence source.
+    # Input-duplication guardrail: Graph may be structurally selected around API
+    # methods, but fine-grained API behavior hints must not be copied directly
+    # into graph node features when the branches are treated as distinct views.
     combination = str(fusion_cfg.get("combination", "linear")).lower()
-    if combination in {"yager", "dempster", "cumulative"}:
+    if combination in {
+        "routed",
+        "dempster",
+        "cumulative",
+        "log_pool",
+        "ecml_style",
+    }:
         coupling = []
         if bool(graph_cfg.get("use_behavior_hint", False)):
             coupling.append("model.graph_encoder.use_behavior_hint")
         if coupling:
             raise ValueError(
-                f"fusion.combination={combination} assumes independent modality evidence, "
-                f"but these settings couple modalities at the input level: {coupling}. "
-                "Disable them, or use fusion.combination=linear for a coupled legacy pipeline."
+                f"fusion.combination={combination} requires non-duplicated branch inputs, "
+                f"but these settings copy cross-modal hints into a branch: {coupling}. "
+                "Disable them, or use fusion.combination=linear for a coupled comparison pipeline."
             )
 
     return TriModalRobustModel(
@@ -856,6 +1452,7 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
         manifest_hidden_dim=int(manifest_cfg.get("hidden_dim", 256)),
         manifest_dropout=float(manifest_cfg.get("dropout", 0.1)),
         joint_emb_dim=int(model_cfg.get("joint_emb_dim", 128)),
+        quality_fusion_temperature=float(model_cfg.get("quality_fusion_temperature", 10.0)),
         gate_hidden_dim=int(gate_cfg.get("hidden_dim", 128)),
         gate_detach=bool(gate_cfg.get("detach", True)),
         use_consistency_evidence=bool(gate_cfg.get("use_consistency_evidence", True)),
@@ -889,7 +1486,12 @@ def _metrics(labels: list[int], probs: list[float], preds: list[int]) -> dict[st
     p = np.asarray(probs, dtype=np.float64)
     pred_arr = np.asarray(preds, dtype=np.int64)
     confidence = np.maximum(p, 1.0 - p)
-    correct = (pred_arr == y.astype(np.int64)).astype(np.float64)
+    # Probability calibration is a property of the predictive distribution,
+    # independent of a downstream operating threshold selected for malware
+    # recall.  Pair max-class confidence with max-class correctness so ECE
+    # remains comparable between fixed-0.5 and threshold-tuned evaluations.
+    probability_pred = (p >= 0.5).astype(np.int64)
+    correct = (probability_pred == y.astype(np.int64)).astype(np.float64)
     brier = float(np.mean((p - y) ** 2))
     ece = 0.0
     for lo, hi in zip(np.linspace(0.0, 1.0, 11)[:-1], np.linspace(0.0, 1.0, 11)[1:]):
@@ -990,6 +1592,9 @@ def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, 
         reliability_values: list[float] = []
         correctness_values: list[float] = []
         for row in rows:
+            alive = _finite_row_float(row, f"{branch}_alive")
+            if alive is not None and alive < 0.5:
+                continue
             reliability = _finite_row_float(row, f"predicted_reliability_{branch}")
             correctness = _finite_row_float(row, f"{branch}_correct")
             if reliability is None or correctness is None:
@@ -997,11 +1602,9 @@ def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, 
             reliability_values.append(min(1.0, max(0.0, reliability)))
             correctness_values.append(1.0 if correctness >= 0.5 else 0.0)
         count = len(reliability_values)
-        out[f"{branch}_reliability_count"] = count
         if count == 0:
-            out[f"{branch}_reliability_auc_defined"] = 0
-            out[f"{branch}_reliability_ap_defined"] = 0
             continue
+        out[f"{branch}_reliability_count"] = count
         reliability_arr = np.asarray(reliability_values, dtype=np.float64)
         correctness_arr = np.asarray(correctness_values, dtype=np.float64)
         out[f"{branch}_reliability_brier"] = float(
@@ -1085,7 +1688,18 @@ def estimate_branch_competence_prior(
         else:
             scores[branch] = float(f1_score(labels, preds, average="macro", zero_division=0))
 
-    max_score = max(scores.values()) if scores else 0.0
+    fusion_cfg = cfg.get("fusion", {}) or {}
+    combination = str(fusion_cfg.get("combination", "linear")).lower()
+    if combination != "linear":
+        normalization_branches = ("api", "graph", "manifest")
+    elif bool(fusion_cfg.get("linear_use_joint_branch", True)):
+        normalization_branches = tuple(BRANCH_EVAL_LOGIT_KEYS)
+    else:
+        normalization_branches = ("api", "graph", "manifest")
+    max_score = max(
+        (scores[name] for name in normalization_branches if name in scores),
+        default=0.0,
+    )
     prior: dict[str, float] = {}
     for branch, score in scores.items():
         value = score
@@ -1100,6 +1714,7 @@ def estimate_branch_competence_prior(
         "min_value": min_value,
         "scores": scores,
         "counts": counts,
+        "normalization_branches": list(normalization_branches),
         "prior": prior,
         "values": values,
     }
@@ -1119,13 +1734,23 @@ def estimate_model_visible_integrity_reference(
     rows: list[dict[str, Any]],
     cfg: dict,
 ) -> dict[str, Any]:
-    """Fit clean calibration references for model-visible evidence integrity."""
+    """Fit clean calibration references for the configured integrity modifier."""
     modifier_cfg = (cfg.get("fusion", {}) or {}).get("visible_integrity_modifier", {}) or {}
     if not bool(modifier_cfg.get("enabled", False)):
         return {"enabled": False}
     min_reference = float(modifier_cfg.get("min_reference", 1.0e-6))
-    beta = float(modifier_cfg.get("beta", 1.0))
-    min_value = float(modifier_cfg.get("min_value", 0.5))
+    mode = str(modifier_cfg.get("mode", "bounded_visibility")).lower()
+    if mode not in {"bounded_visibility", "relative_effective"}:
+        raise ValueError(
+            "fusion.visible_integrity_modifier.mode must be "
+            "'bounded_visibility' or 'relative_effective'"
+        )
+    if mode == "relative_effective":
+        beta = 1.0
+        min_value = 0.0
+    else:
+        beta = float(modifier_cfg.get("beta", 1.0))
+        min_value = float(modifier_cfg.get("min_value", 0.5))
     if not math.isfinite(min_reference) or not 0.0 < min_reference <= 1.0:
         raise ValueError("fusion.visible_integrity_modifier.min_reference must be within (0, 1]")
     if not math.isfinite(beta) or beta <= 0.0:
@@ -1133,22 +1758,30 @@ def estimate_model_visible_integrity_reference(
     if not math.isfinite(min_value) or not 0.0 <= min_value <= 1.0:
         raise ValueError("fusion.visible_integrity_modifier.min_value must be within [0, 1]")
 
-    def _effective_value(row: dict[str, Any], branch: str) -> float | None:
-        direct = _finite_row_float(row, f"effective_{branch}_integrity")
-        if direct is not None:
-            return min(1.0, max(0.0, direct))
-        integrity = _finite_row_float(row, f"{branch}_integrity")
-        if integrity is None:
-            return None
-        if branch == "api":
-            coverage = _finite_row_float(row, "api_encoder_coverage")
+    def _reference_value(row: dict[str, Any], branch: str) -> float | None:
+        if mode == "relative_effective":
+            value = _finite_row_float(row, f"effective_{branch}_integrity")
+            if value is None:
+                integrity = _finite_row_float(row, f"{branch}_integrity")
+                if integrity is None:
+                    return None
+                coverage = (
+                    _finite_row_float(row, f"{branch}_encoder_coverage")
+                    if branch in {"api", "graph"}
+                    else 1.0
+                )
+                if coverage is None:
+                    return None
+                value = integrity * coverage
+        elif branch == "api":
+            value = _finite_row_float(row, "api_encoder_coverage")
         elif branch == "graph":
-            coverage = _finite_row_float(row, "graph_encoder_coverage")
+            value = _finite_row_float(row, "graph_encoder_coverage")
         else:
-            coverage = 1.0
-        if coverage is None:
-            coverage = 1.0
-        return min(1.0, max(0.0, integrity * coverage))
+            value = 1.0
+        if value is None:
+            return None
+        return min(1.0, max(0.0, value))
 
     references: dict[str, float] = {}
     counts: dict[str, int] = {}
@@ -1156,7 +1789,7 @@ def estimate_model_visible_integrity_reference(
         values = [
             value
             for row in rows
-            if (value := _effective_value(row, branch)) is not None and math.isfinite(value)
+            if (value := _reference_value(row, branch)) is not None and math.isfinite(value)
         ]
         counts[branch] = len(values)
         if not values:
@@ -1165,7 +1798,12 @@ def estimate_model_visible_integrity_reference(
         references[branch] = float(min(1.0, max(min_reference, float(np.median(values)))))
     return {
         "enabled": True,
-        "metric": "median_clean_effective_integrity",
+        "mode": mode,
+        "metric": (
+            "median_clean_effective_integrity"
+            if mode == "relative_effective"
+            else "median_clean_encoder_coverage"
+        ),
         "beta": beta,
         "min_value": min_value,
         "min_reference": min_reference,
@@ -1183,6 +1821,7 @@ def apply_model_visible_integrity_reference(model, summary: dict[str, Any]) -> N
         reference = summary.get("reference") or {}
         values = [reference[name] for name in ("api", "graph", "manifest")]
     model.discount_fusion.set_visible_integrity_reference(values, enabled=True)
+
 
 def _selective_metrics(
     labels: list[int],
@@ -1256,12 +1895,111 @@ def _selective_ranking_metrics(
     return {"aurc": float(cumulative_risk.mean())}
 
 
+def fit_malware_classification_threshold(
+    rows: list[dict[str, Any]], config: dict | None = None
+) -> dict[str, Any] | None:
+    """Fit a binary decision threshold without consulting the test set.
+
+    The threshold maximizes calibration-set macro-F1 subject to a minimum
+    malware recall. It is fitted before the disjoint decision-calibration
+    subset is used for selective risk control.
+    """
+    config = config or {}
+    if not bool(config.get("enabled", False)):
+        return None
+    objective = str(config.get("objective", "macro_f1")).strip().lower()
+    if objective != "macro_f1":
+        raise ValueError("classification_threshold.objective currently supports only 'macro_f1'")
+    min_malware_recall = float(config.get("min_malware_recall", 0.90))
+    if not 0.0 <= min_malware_recall <= 1.0:
+        raise ValueError(
+            "classification_threshold.min_malware_recall must be within [0, 1]"
+        )
+
+    valid: list[tuple[float, int]] = []
+    for row in rows:
+        probability = _finite_row_float(row, "prob_malware")
+        try:
+            label = int(row["label"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if probability is not None and label in {0, 1}:
+            valid.append((float(probability), label))
+    if not valid:
+        raise ValueError("Classification-threshold fitting requires finite probabilities")
+    labels = np.asarray([label for _probability, label in valid], dtype=np.int64)
+    present_labels = set(int(label) for label in labels.tolist())
+    if present_labels != {0, 1}:
+        raise ValueError(
+            "Classification-threshold fitting requires both benign and malware samples"
+        )
+
+    unique_probabilities = sorted({probability for probability, _label in valid})
+    candidates = [unique_probabilities[0]]
+    candidates.extend(
+        (left + right) / 2.0
+        for left, right in zip(unique_probabilities[:-1], unique_probabilities[1:])
+    )
+    candidates.append(math.nextafter(unique_probabilities[-1], float("inf")))
+    probabilities = np.asarray(
+        [probability for probability, _label in valid], dtype=np.float64
+    )
+
+    best: dict[str, Any] | None = None
+    best_key: tuple[float, float, float, float] | None = None
+    for threshold in candidates:
+        predictions = (probabilities >= float(threshold)).astype(np.int64)
+        malware_recall = float(
+            recall_score(labels, predictions, pos_label=1, zero_division=0)
+        )
+        if malware_recall + 1e-12 < min_malware_recall:
+            continue
+        macro_f1 = float(
+            f1_score(labels, predictions, average="macro", zero_division=0)
+        )
+        accuracy = float(accuracy_score(labels, predictions))
+        # The first two terms encode the declared objective and constraint.
+        # Remaining terms make exact ties deterministic without a test-set choice.
+        key = (macro_f1, malware_recall, -abs(float(threshold) - 0.5), -float(threshold))
+        if best_key is None or key > best_key:
+            best_key = key
+            best = {
+                "threshold": float(threshold),
+                "macro_f1": macro_f1,
+                "malware_recall": malware_recall,
+                "accuracy": accuracy,
+            }
+    if best is None:
+        raise RuntimeError(
+            "No classification threshold satisfies the malware-recall constraint"
+        )
+
+    fixed_predictions = (probabilities >= 0.5).astype(np.int64)
+    return {
+        "enabled": True,
+        "objective": objective,
+        "min_malware_recall": min_malware_recall,
+        "calibration_split": "val_posthoc_calibration",
+        "num_calibration": int(len(valid)),
+        "num_calibration_benign": int((labels == 0).sum()),
+        "num_calibration_malware": int((labels == 1).sum()),
+        "num_candidates": int(len(candidates)),
+        "fixed_0_5_macro_f1": float(
+            f1_score(labels, fixed_predictions, average="macro", zero_division=0)
+        ),
+        "fixed_0_5_malware_recall": float(
+            recall_score(labels, fixed_predictions, pos_label=1, zero_division=0)
+        ),
+        **best,
+    }
+
+
 def fit_rejection_threshold(rows: list[dict[str, Any]], config: dict | None = None) -> float | None:
     """Choose an acceptance threshold on validation data for target coverage."""
     config = config or {}
     if not bool(config.get("enabled", False)):
         return None
-    if str(config.get("mode", "threshold")).lower() == "conformal":
+    if str(config.get("mode", "threshold")).lower() in {"conformal", "risk_control"}:
         return None
     target_coverage = float(config.get("target_coverage", 0.9))
     if not 0.0 < target_coverage <= 1.0:
@@ -1298,12 +2036,57 @@ def _selective_metrics_from_rows(
     )
 
 
-# I3: class-conditional (Mondrian) conformal selective prediction
-# Replaces the heuristic coverage threshold with split-conformal calibration so
-# the abstention has a finite-sample guarantee: on exchangeable data,
-# P(true label in prediction set | label = c) >= 1 - alpha. This abstains on
-# low-evidence / high-conflict degraded samples rather than forcing a confident
-# decision. Note the guarantee is on coverage, NOT a bound on the rejection rate.
+def _selective_score_type(config: dict | None = None) -> str:
+    config = config or {}
+    mode = str(config.get("mode", "threshold")).lower()
+    if mode == "conformal":
+        score_type = "max_probability"
+    elif mode == "risk_control":
+        score_type = str(config.get("threshold_score", "model_acceptance")).lower()
+    else:
+        score_type = str(config.get("threshold_score", "max_probability")).lower()
+    allowed = {"max_probability", "evidential_certainty", "model_acceptance"}
+    if score_type not in allowed:
+        raise ValueError(
+            "selective_prediction.threshold_score must be one of "
+            f"{sorted(allowed)}, got {score_type!r}"
+        )
+    return score_type
+
+
+def _batch_selective_score(
+    prob_malware: torch.Tensor,
+    extra: dict[str, Any],
+    score_type: str,
+    classification_threshold: float = 0.5,
+) -> torch.Tensor:
+    """Return a larger-is-safer score for thresholding and AURC."""
+    score_type = str(score_type).lower()
+    if score_type == "max_probability":
+        predicted_malware = prob_malware >= float(classification_threshold)
+        return torch.where(
+            predicted_malware,
+            prob_malware,
+            1.0 - prob_malware,
+        ).clamp(0.0, 1.0)
+    if score_type == "evidential_certainty":
+        uncertainty = extra.get("fused_uncertainty")
+        if not isinstance(uncertainty, torch.Tensor):
+            raise ValueError(
+                "evidential_certainty threshold requires fused_uncertainty"
+            )
+        return (1.0 - uncertainty.float().view(-1)).clamp(0.0, 1.0)
+    if score_type == "model_acceptance":
+        acceptance = extra.get("acceptance_score")
+        if not isinstance(acceptance, torch.Tensor):
+            raise ValueError("model_acceptance threshold requires acceptance_score")
+        return acceptance.float().view(-1).clamp(0.0, 1.0)
+    raise ValueError(f"Unsupported selective score type: {score_type}")
+
+
+# Selective-decision baselines and calibrated decision rules. Conformal modes
+# control prediction-set coverage; the risk-control mode bounds its declared
+# malware false-negative loss. Acceptance rate is not guaranteed by either.
 
 def _conformal_quantile(scores: list[float], alpha: float) -> float:
     finite = sorted(float(s) for s in scores if s is not None and math.isfinite(float(s)))
@@ -1316,6 +2099,27 @@ def _conformal_quantile(scores: list[float], alpha: float) -> float:
     if rank < 1:
         rank = 1
     return float(finite[rank - 1])
+
+
+def _row_raw_conflict(row: dict[str, Any]) -> float:
+    for key in ("raw_conflict", "raw_conflict_mass", "effective_conflict"):
+        value = _finite_row_float(row, key)
+        if value is not None:
+            return min(1.0, max(0.0, float(value)))
+    return 0.0
+
+
+def _conformal_nonconformity(
+    p1: float,
+    label: int,
+    raw_conflict: float = 0.0,
+    *,
+    use_raw_conflict: bool = False,
+) -> float:
+    base = (1.0 - p1) if int(label) == 1 else p1
+    if use_raw_conflict:
+        base += min(1.0, max(0.0, float(raw_conflict)))
+    return float(base)
 
 
 def fit_conformal_thresholds(
@@ -1332,6 +2136,7 @@ def fit_conformal_thresholds(
     if not 0.0 < alpha < 1.0:
         raise ValueError("conformal selective_prediction.alpha must be within (0, 1)")
     class_conditional = bool(config.get("class_conditional", True))
+    use_raw_conflict = bool(config.get("use_raw_conflict", False))
     scores: dict[int, list[float]] = {0: [], 1: []}
     for row in rows:
         prob = row.get("prob_malware")
@@ -1340,10 +2145,16 @@ def fit_conformal_thresholds(
             continue
         p1 = float(prob)
         label = int(label)
-        # Nonconformity of the TRUE class, computed identically to the
-        # prediction-set test below (malware: 1 - p1, benign: p1) so calibration
-        # and inference scores match exactly and avoid float knife-edges.
-        nonconformity = (1.0 - p1) if label == 1 else p1
+        # Nonconformity of the true class, computed identically to the
+        # prediction-set test below. Probability-only and raw-conflict-augmented
+        # scores are separate conformal baselines; the main method uses the
+        # disjoint malware false-negative risk-control rule below.
+        nonconformity = _conformal_nonconformity(
+            p1,
+            label,
+            _row_raw_conflict(row),
+            use_raw_conflict=use_raw_conflict,
+        )
         scores.setdefault(label, []).append(nonconformity)
     if class_conditional:
         q_benign = _conformal_quantile(scores.get(0, []), alpha)
@@ -1355,6 +2166,7 @@ def fit_conformal_thresholds(
         "mode": "conformal",
         "alpha": alpha,
         "class_conditional": class_conditional,
+        "use_raw_conflict": use_raw_conflict,
         "q_benign": q_benign,
         "q_malware": q_malware,
         "num_calibration": int(len(scores.get(0, [])) + len(scores.get(1, []))),
@@ -1366,12 +2178,23 @@ def _uses_conformal_selective(config: dict | None = None) -> bool:
     return bool(config.get("enabled", False)) and str(config.get("mode", "threshold")).lower() == "conformal"
 
 
-def _conformal_prediction_set(p1: float, thresholds: dict[str, Any]) -> tuple[bool, bool]:
+def _conformal_prediction_set(
+    p1: float,
+    thresholds: dict[str, Any],
+    raw_conflict: float = 0.0,
+) -> tuple[bool, bool]:
     """Return (include_benign, include_malware) for the conformal prediction set."""
     q_benign = float(thresholds.get("q_benign", float("inf")))
     q_malware = float(thresholds.get("q_malware", float("inf")))
-    include_malware = (1.0 - p1) <= q_malware  # nonconformity of class malware
-    include_benign = p1 <= q_benign            # nonconformity of class benign
+    use_raw_conflict = bool(thresholds.get("use_raw_conflict", False))
+    include_malware = (
+        _conformal_nonconformity(p1, 1, raw_conflict, use_raw_conflict=use_raw_conflict)
+        <= q_malware
+    )
+    include_benign = (
+        _conformal_nonconformity(p1, 0, raw_conflict, use_raw_conflict=use_raw_conflict)
+        <= q_benign
+    )
     return bool(include_benign), bool(include_malware)
 
 
@@ -1391,11 +2214,19 @@ def conformal_selective_metrics(
     true_in_set = {0: 0, 1: 0}        # empirical conformal coverage check
     accepted_errors = 0
     malware_fn_accepted = 0           # accepted samples that are malware but predicted benign
+    empty_sets = 0
+    ambiguous_sets = 0
     for row in valid:
         p1 = float(row["prob_malware"])
         y = int(row["label"])
-        include_benign, include_malware = _conformal_prediction_set(p1, thresholds)
+        include_benign, include_malware = _conformal_prediction_set(
+            p1,
+            thresholds,
+            _row_raw_conflict(row),
+        )
         size = int(include_benign) + int(include_malware)
+        empty_sets += int(size == 0)
+        ambiguous_sets += int(size == 2)
         is_accept = size == 1
         pred = 1 if (include_malware and not include_benign) else 0
         per_class_total[y] = per_class_total.get(y, 0) + 1
@@ -1419,14 +2250,23 @@ def conformal_selective_metrics(
         # the actual guaranteed quantity.
         "conformal_acceptance_rate": _ratio(accepted, n),
         "conformal_rejection_rate": _ratio(n - accepted, n),
+        "conformal_empty_set_rate": _ratio(empty_sets, n),
+        "conformal_ambiguous_set_rate": _ratio(ambiguous_sets, n),
         "conformal_benign_acceptance_rate": _ratio(per_class_accepted[0], per_class_total[0]),
         "conformal_malware_acceptance_rate": _ratio(per_class_accepted[1], per_class_total[1]),
         "conformal_malware_rejection_rate": (
             None if per_class_total[1] == 0
             else 1.0 - (per_class_accepted[1] / per_class_total[1])
         ),
-        # Malware missed despite being accepted -- the dangerous failure mode.
+        # Compatibility metric: accepted false negatives divided by all malware.
         "conformal_malware_fn_after_rejection": _ratio(malware_fn_accepted, per_class_total[1]),
+        # Operational false-negative rate among malware samples that were
+        # actually accepted for automatic classification.
+        "conformal_accepted_malware_fn_rate": _ratio(
+            malware_fn_accepted, per_class_accepted[1]
+        ),
+        "conformal_malware_fn_count": int(malware_fn_accepted),
+        "conformal_accepted_malware_count": int(per_class_accepted[1]),
         "conformal_selective_risk": _ratio(accepted_errors, accepted),
         "conformal_selective_acc": (None if accepted == 0 else 1.0 - accepted_errors / accepted),
         # TRUE conformal coverage: P(true label in prediction set | label = c).
@@ -1435,8 +2275,213 @@ def conformal_selective_metrics(
         "conformal_empirical_coverage_malware": _ratio(true_in_set[1], per_class_total[1]),
         "conformal_num_accepted": int(accepted),
         "conformal_num_rejected": int(n - accepted),
+        "conformal_num_empty_sets": int(empty_sets),
+        "conformal_num_ambiguous_sets": int(ambiguous_sets),
     }
     return out
+
+
+def _uses_risk_control_selective(config: dict | None = None) -> bool:
+    config = config or {}
+    return bool(config.get("enabled", False)) and str(
+        config.get("mode", "threshold")
+    ).lower() == "risk_control"
+
+
+def fit_risk_control_thresholds(
+    rows: list[dict[str, Any]], config: dict | None = None
+) -> dict[str, Any] | None:
+    """Maximize automatic acceptance under a corrected malware-FN risk bound.
+
+    The bounded loss is one only when a malware sample is both accepted and
+    predicted benign. Following conformal risk-control calibration, the finite
+    sample correction is ``(errors + 1) / (n_malware + 1)``.
+    """
+    config = config or {}
+    if not _uses_risk_control_selective(config):
+        return None
+    risk_level = float(config.get("risk_level", 0.05))
+    if not 0.0 < risk_level < 1.0:
+        raise ValueError("selective_prediction.risk_level must be within (0, 1)")
+    require_feasible = bool(config.get("require_feasible", False))
+    minimum_malware_raw = config.get("min_calibration_malware", 1)
+    try:
+        minimum_malware = int(minimum_malware_raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "selective_prediction.min_calibration_malware must be a positive integer"
+        ) from exc
+    if (
+        isinstance(minimum_malware_raw, bool)
+        or minimum_malware < 1
+        or float(minimum_malware_raw) != float(minimum_malware)
+    ):
+        raise ValueError(
+            "selective_prediction.min_calibration_malware must be a positive integer"
+        )
+    minimum_malware_for_feasibility = max(
+        1, math.ceil(1.0 / risk_level) - 1
+    )
+    risk_target = str(
+        config.get("risk_target", "malware_fn_rate_after_rejection")
+    ).lower()
+    # Read legacy experiment files, but always emit the denominator-explicit
+    # canonical name. The bounded risk is FN among all malware, not FN among
+    # only the accepted malware samples.
+    if risk_target == "accepted_malware_false_negative":
+        risk_target = "malware_fn_rate_after_rejection"
+    if risk_target != "malware_fn_rate_after_rejection":
+        raise ValueError(
+            "selective_prediction.risk_target currently supports only "
+            "'malware_fn_rate_after_rejection'"
+        )
+
+    valid: list[tuple[float, int, int]] = []
+    for row in rows:
+        score = _finite_row_float(row, "acceptance_score")
+        try:
+            label = int(row["label"])
+            pred = int(row["pred"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if score is not None:
+            valid.append((float(score), label, pred))
+    if not valid:
+        raise ValueError("Risk-control calibration requires finite acceptance scores")
+
+    malware_count = sum(label == 1 for _score, label, _pred in valid)
+    if malware_count == 0:
+        raise ValueError("Risk-control calibration requires at least one malware sample")
+    if malware_count < minimum_malware:
+        raise ValueError(
+            "Risk-control calibration has "
+            f"{malware_count} malware samples, fewer than configured "
+            f"min_calibration_malware={minimum_malware}"
+        )
+    if malware_count < minimum_malware_for_feasibility:
+        message = (
+            "Risk-control calibration needs at least "
+            f"{minimum_malware_for_feasibility} malware samples for the finite-sample "
+            f"corrected bound to be feasible at risk_level={risk_level}; "
+            f"received {malware_count}"
+        )
+        if require_feasible:
+            raise ValueError(message)
+        logger.warning(message)
+
+    scores = sorted({score for score, _label, _pred in valid})
+    reject_all_threshold = math.nextafter(max(scores), float("inf"))
+    candidates = scores + [reject_all_threshold]
+    best: dict[str, Any] | None = None
+    for threshold in candidates:
+        accepted = [item for item in valid if item[0] >= threshold]
+        false_negatives = sum(
+            label == 1 and pred == 0 for _score, label, pred in accepted
+        )
+        corrected_risk = (false_negatives + 1.0) / (malware_count + 1.0)
+        if corrected_risk > risk_level:
+            continue
+        candidate = {
+            "threshold": float(threshold),
+            "num_accepted": int(len(accepted)),
+            "malware_false_negatives": int(false_negatives),
+            "empirical_risk": float(false_negatives / malware_count),
+            "corrected_risk": float(corrected_risk),
+        }
+        if best is None or candidate["num_accepted"] > best["num_accepted"]:
+            best = candidate
+
+    feasible = best is not None
+    if best is None:
+        if require_feasible:
+            raise RuntimeError(
+                "No risk-control threshold satisfies the finite-sample corrected "
+                "risk bound while selective_prediction.require_feasible=true"
+            )
+        best = {
+            "threshold": float(reject_all_threshold),
+            "num_accepted": 0,
+            "malware_false_negatives": 0,
+            "empirical_risk": 0.0,
+            "corrected_risk": float(1.0 / (malware_count + 1.0)),
+        }
+    return {
+        "mode": "risk_control",
+        "risk_target": risk_target,
+        "risk_level": risk_level,
+        "score_type": str(config.get("threshold_score", "model_acceptance")),
+        "num_calibration": int(len(valid)),
+        "num_calibration_malware": int(malware_count),
+        "min_calibration_malware": int(minimum_malware),
+        "minimum_malware_for_feasibility": int(
+            minimum_malware_for_feasibility
+        ),
+        "require_feasible": bool(require_feasible),
+        "guarantee_type": "expected_crc",
+        "feasible": bool(feasible),
+        **best,
+    }
+
+
+def risk_control_selective_metrics(
+    rows: list[dict[str, Any]], thresholds: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Evaluate automatic decisions made by a fitted risk-control threshold."""
+    if not thresholds:
+        return {}
+    threshold = float(thresholds["threshold"])
+    valid = []
+    for row in rows:
+        score = _finite_row_float(row, "acceptance_score")
+        try:
+            label = int(row["label"])
+            pred = int(row["pred"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if score is not None:
+            valid.append((float(score), label, pred))
+    if not valid:
+        return {}
+
+    accepted = [item for item in valid if item[0] >= threshold]
+    accepted_errors = sum(label != pred for _score, label, pred in accepted)
+    malware_count = sum(label == 1 for _score, label, _pred in valid)
+    accepted_malware = sum(label == 1 for _score, label, _pred in accepted)
+    malware_false_negatives = sum(
+        label == 1 and pred == 0 for _score, label, pred in accepted
+    )
+
+    def _ratio(num: int, den: int) -> float | None:
+        return float(num) / float(den) if den > 0 else None
+
+    empirical_risk = _ratio(malware_false_negatives, malware_count)
+    risk_level = float(thresholds.get("risk_level", 0.0))
+    return {
+        "risk_control_threshold": threshold,
+        "risk_control_risk_level": risk_level,
+        "risk_control_risk_target": str(thresholds.get("risk_target", "")),
+        "risk_control_calibration_feasible": bool(thresholds.get("feasible", False)),
+        "risk_control_calibration_corrected_risk": float(
+            thresholds.get("corrected_risk", 0.0)
+        ),
+        "risk_control_acceptance_rate": _ratio(len(accepted), len(valid)),
+        "risk_control_rejection_rate": _ratio(len(valid) - len(accepted), len(valid)),
+        "risk_control_selective_risk": _ratio(accepted_errors, len(accepted)),
+        "risk_control_selective_acc": (
+            None if not accepted else 1.0 - accepted_errors / len(accepted)
+        ),
+        "risk_control_malware_fn_rate_after_rejection": empirical_risk,
+        "risk_control_accepted_malware_fn_rate": _ratio(
+            malware_false_negatives, accepted_malware
+        ),
+        "risk_control_malware_fn_count": int(malware_false_negatives),
+        "risk_control_accepted_malware_count": int(accepted_malware),
+        "risk_control_num_accepted": int(len(accepted)),
+        "risk_control_num_rejected": int(len(valid) - len(accepted)),
+        "risk_control_target_met_empirically": (
+            None if empirical_risk is None else bool(empirical_risk <= risk_level)
+        ),
+    }
 
 
 @torch.no_grad()
@@ -1448,11 +2493,14 @@ def evaluate(
     split_name: str,
     dump_rows: bool = False,
     selective_threshold: float | None = None,
+    selective_score_type: str = "max_probability",
+    classification_threshold: float = 0.5,
 ):
     model.eval()
     labels_all: list[int] = []
     probs_all: list[float] = []
     preds_all: list[int] = []
+    fixed_preds_all: list[int] = []
     acceptance_all: list[float] = []
     rows: list[dict[str, Any]] = []
     num_failed = 0
@@ -1467,13 +2515,20 @@ def evaluate(
         with get_amp_context(device, use_amp):
             logits, extra = model(graph, return_features=False)
         prob = torch.softmax(logits.float(), dim=-1)[:, 1]
-        pred = logits.argmax(dim=-1)
+        pred_fixed = (prob >= 0.5).long()
+        pred = (prob >= float(classification_threshold)).long()
         labels_all.extend(labels.detach().cpu().long().tolist())
         probs_all.extend(prob.detach().cpu().tolist())
         preds_all.extend(pred.detach().cpu().long().tolist())
-        acceptance = extra.get("acceptance_score")
-        if isinstance(acceptance, torch.Tensor):
-            acceptance_all.extend(acceptance.detach().float().cpu().view(-1).tolist())
+        fixed_preds_all.extend(pred_fixed.detach().cpu().long().tolist())
+        model_acceptance = extra.get("acceptance_score")
+        acceptance = _batch_selective_score(
+            prob,
+            extra,
+            selective_score_type,
+            classification_threshold=classification_threshold,
+        )
+        acceptance_all.extend(acceptance.detach().float().cpu().view(-1).tolist())
         for key in GATE_DIAGNOSTIC_KEYS:
             value = extra.get(key)
             if isinstance(value, torch.Tensor):
@@ -1492,16 +2547,22 @@ def evaluate(
                     "label": int(labels[i].detach().cpu().item()),
                     "prob_malware": float(prob[i].detach().cpu().item()),
                     "pred": int(pred[i].detach().cpu().item()),
+                    "pred_fixed_0_5": int(pred_fixed[i].detach().cpu().item()),
+                    "classification_threshold": float(classification_threshold),
                     "final_confidence": float(torch.softmax(logits.float(), dim=-1)[i].max().detach().cpu().item()),
                     "correct": int(pred[i].detach().cpu().item() == labels[i].detach().cpu().item()),
+                    "correct_fixed_0_5": int(
+                        pred_fixed[i].detach().cpu().item()
+                        == labels[i].detach().cpu().item()
+                    ),
                     "year": int(batch.get("years")[i].detach().cpu().item()) if batch.get("years") is not None else 0,
                 }
                 row.update(_branch_prediction_row(extra, labels, i))
-                if isinstance(acceptance, torch.Tensor) and acceptance.numel() > i:
-                    acceptance_i = float(acceptance.view(-1)[i].detach().cpu().item())
-                    row["acceptance_score"] = acceptance_i
-                    if selective_threshold is not None:
-                        row["rejected"] = int(acceptance_i < selective_threshold)
+                acceptance_i = float(acceptance.view(-1)[i].detach().cpu().item())
+                if isinstance(model_acceptance, torch.Tensor) and model_acceptance.numel() > i:
+                    row["model_acceptance_score"] = float(
+                        model_acceptance.view(-1)[i].detach().cpu().item()
+                    )
                 for row_key, batch_key in (
                     ("api_aug_type", "api_aug_types"),
                     ("graph_aug_type", "graph_aug_types"),
@@ -1523,9 +2584,26 @@ def evaluate(
                         value = quality.get(key)
                     if isinstance(value, torch.Tensor) and value.numel() > i:
                         row[key] = float(value.view(-1)[i].detach().cpu().item())
+                # GATE_DIAGNOSTIC_KEYS contains the model's internal acceptance
+                # diagnostic. Keep the experiment-selected score under the
+                # canonical column used for threshold fitting and subset cuts.
+                row["acceptance_score"] = acceptance_i
+                row["selective_score_type"] = str(selective_score_type)
+                if selective_threshold is not None:
+                    row["rejected"] = int(acceptance_i < selective_threshold)
                 rows.append(row)
 
     metrics = _metrics(labels_all, probs_all, preds_all)
+    fixed_metrics = _metrics(labels_all, probs_all, fixed_preds_all)
+    metrics.update(
+        {
+            "classification_threshold": float(classification_threshold),
+            "fixed_0_5_acc": fixed_metrics["acc"],
+            "fixed_0_5_macro_f1": fixed_metrics["macro_f1"],
+            "fixed_0_5_f1_pos": fixed_metrics["f1_pos"],
+            "fixed_0_5_recall_pos": fixed_metrics["recall_pos"],
+        }
+    )
     metrics["num_failed"] = int(num_failed)
     metrics["num_eval"] = int(len(labels_all))
     if len(acceptance_all) == len(labels_all):
@@ -1546,6 +2624,73 @@ def evaluate(
     return metrics, rows
 
 
+def _fit_routed_final_temperature(
+    log_temperature: torch.nn.Parameter,
+    raw_log_prob: torch.Tensor,
+    temperature_labels: torch.Tensor,
+) -> dict[str, Any]:
+    """Fit the final scalar temperature without changing its freeze policy."""
+    if log_temperature.numel() != 1:
+        raise ValueError("Routed final-temperature fitting requires one scalar")
+    with torch.no_grad():
+        log_temperature.zero_()
+        nll_before = float(F.nll_loss(raw_log_prob, temperature_labels).item())
+
+    previous_requires_grad = bool(log_temperature.requires_grad)
+    try:
+        # Encoder training intentionally freezes post-hoc-only parameters. LBFGS
+        # still needs this scalar to require gradients during its own stage.
+        log_temperature.requires_grad_(True)
+        temperature_optimizer = torch.optim.LBFGS(
+            [log_temperature],
+            lr=1.0,
+            max_iter=50,
+            line_search_fn="strong_wolfe",
+        )
+
+        def _temperature_closure() -> torch.Tensor:
+            temperature_optimizer.zero_grad(set_to_none=True)
+            calibrated = F.log_softmax(
+                raw_log_prob / log_temperature.exp(),
+                dim=-1,
+            )
+            objective = F.nll_loss(calibrated, temperature_labels)
+            if not bool(torch.isfinite(objective.detach()).item()):
+                raise FloatingPointError(
+                    "Non-finite routed final-temperature objective"
+                )
+            objective.backward()
+            return objective
+
+        temperature_optimizer.step(_temperature_closure)
+    finally:
+        log_temperature.grad = None
+        log_temperature.requires_grad_(previous_requires_grad)
+
+    with torch.no_grad():
+        fitted_temperature = float(log_temperature.exp().item())
+        calibrated = F.log_softmax(
+            raw_log_prob / log_temperature.exp(),
+            dim=-1,
+        )
+        nll_after = float(F.nll_loss(calibrated, temperature_labels).item())
+        if nll_after > nll_before + 1.0e-8:
+            # Temperature scaling is calibration-only. Retain identity when
+            # numerical optimization does not improve its fitting objective.
+            log_temperature.zero_()
+            fitted_temperature = 1.0
+            nll_after = nll_before
+    if not math.isfinite(fitted_temperature) or fitted_temperature <= 0.0:
+        raise RuntimeError("Routed final temperature is non-finite or non-positive")
+    return {
+        "enabled": True,
+        "temperature": fitted_temperature,
+        "num_clean_samples": int(temperature_labels.numel()),
+        "nll_before": nll_before,
+        "nll_after": nll_after,
+    }
+
+
 def fit_posthoc_calibration(
     model,
     loaders: list,
@@ -1553,7 +2698,7 @@ def fit_posthoc_calibration(
     use_amp: bool,
     cfg: dict,
 ) -> dict[str, Any]:
-    """Fit only monotonic reliability and temperature parameters on validation."""
+    """Fit reliability, routing, and optional temperature parameters post hoc."""
     calibration_cfg = cfg.get("calibration", {}) or {}
     if not bool(calibration_cfg.get("enabled", False)):
         return {"enabled": False}
@@ -1575,78 +2720,569 @@ def fit_posthoc_calibration(
         raise ValueError("calibration.patience must be non-negative")
     if not math.isfinite(min_delta) or min_delta < 0.0:
         raise ValueError("calibration.min_delta must be finite and non-negative")
-    optimizer = torch.optim.Adam(
-        parameters,
-        lr=float(calibration_cfg.get("lr", 1.0e-3)),
-        weight_decay=float(calibration_cfg.get("weight_decay", 0.0)),
-    )
+
+    def _scenario_group(item: dict[str, Any], name: str, index: int) -> str:
+        explicit = item.get("scenario_group")
+        if explicit:
+            return str(explicit).lower()
+        perturb_type = item.get("perturb_type")
+        if perturb_type:
+            perturb_name = str(perturb_type).lower()
+            return "missing" if perturb_name.endswith("_missing") else perturb_name
+        return "clean" if index == 0 or name == "clean" else "other"
+
+    calibration_sources: list[dict[str, Any]] = []
+    for loader_index, item in enumerate(loaders):
+        if isinstance(item, dict):
+            loader = item.get("loader")
+            if loader is None:
+                raise ValueError("calibration source is missing its loader")
+            source_name = str(item.get("name") or f"calibration_{loader_index}")
+            configured_branches = (
+                item["reliability_branches"]
+                if "reliability_branches" in item
+                else ("api", "graph", "manifest")
+            )
+            source = {
+                "loader": loader,
+                "name": source_name,
+                "scenario_group": _scenario_group(
+                    item, source_name, loader_index
+                ),
+                "reliability_branches": tuple(
+                    str(name).lower()
+                    for name in configured_branches
+                ),
+            }
+        else:
+            source = {
+                "loader": item,
+                "name": "clean" if loader_index == 0 else f"calibration_{loader_index}",
+                "scenario_group": "clean" if loader_index == 0 else "other",
+                "reliability_branches": ("api", "graph", "manifest"),
+            }
+        calibration_sources.append(source)
+
+    # Cache the frozen encoders' branch logits and observable evidence once.
+    # Calibration then optimizes only the small decision module instead of
+    # repeating the API Transformer and GNN forward pass for every epoch.
+    cached_batches: list[dict[str, Any]] = []
+    model.eval()
+    with torch.no_grad():
+        for loader_index, source in enumerate(calibration_sources):
+            loader = source["loader"]
+            for batch in tqdm(loader, desc="cache calibration", leave=False):
+                graph, labels, _, _quality, _failed = prepare_robust_batch(batch, device)
+                if graph is None:
+                    continue
+                with get_amp_context(device, use_amp):
+                    _logits, extra = model(graph, return_features=False)
+                evidence = extra.get("gate_evidence")
+                branch_logits = {
+                    name: extra.get(f"{name}_logits_aux")
+                    for name in ("api", "graph", "manifest", "joint")
+                }
+                if not isinstance(evidence, torch.Tensor) or any(
+                    not isinstance(value, torch.Tensor) for value in branch_logits.values()
+                ):
+                    raise RuntimeError(
+                        "Post-hoc calibration cache requires observable evidence and all branch logits"
+                    )
+                cached_batches.append(
+                    {
+                        "labels": labels.detach(),
+                        "evidence": evidence.detach().float(),
+                        "loader_index": int(loader_index),
+                        "scenario_name": source["name"],
+                        "scenario_group": source["scenario_group"],
+                        "reliability_branches": source["reliability_branches"],
+                        "branch_logits": {
+                            name: value.detach().float()
+                            for name, value in branch_logits.items()
+                        },
+                    }
+                )
+    if not cached_batches:
+        raise RuntimeError("Post-hoc calibration received no valid batches")
+    num_encoder_batches_cached = len(cached_batches)
+    merged_cached_batches: list[dict[str, Any]] = []
+    for loader_index, source in enumerate(calibration_sources):
+        source_batches = [
+            item for item in cached_batches if item["loader_index"] == loader_index
+        ]
+        if not source_batches:
+            continue
+        merged_cached_batches.append(
+            {
+                "labels": torch.cat(
+                    [item["labels"] for item in source_batches], dim=0
+                ),
+                "evidence": torch.cat(
+                    [item["evidence"] for item in source_batches], dim=0
+                ),
+                "loader_index": loader_index,
+                "scenario_name": source["name"],
+                "scenario_group": source["scenario_group"],
+                "reliability_branches": source["reliability_branches"],
+                "branch_logits": {
+                    name: torch.cat(
+                        [item["branch_logits"][name] for item in source_batches],
+                        dim=0,
+                    )
+                    for name in ("api", "graph", "manifest", "joint")
+                },
+            }
+        )
+    cached_batches = merged_cached_batches
+
+    # The routed path consumes the integrity modifier during calibration. Fit
+    # its reference from the clean loader before optimizing the router.
+    routing_visible_reference: list[float] | None = None
+    routing_visible_reference_mode: str | None = None
+    routing_visible_reference_count = 0
+    modifier_cfg = ((cfg.get("fusion", {}) or {}).get("visible_integrity_modifier", {}) or {})
+    discount_fusion = getattr(model, "discount_fusion", None)
+    if (
+        bool(modifier_cfg.get("enabled", False))
+        and str(getattr(discount_fusion, "combination", "")) == "routed"
+    ):
+        min_reference = float(modifier_cfg.get("min_reference", 1.0e-6))
+        if not math.isfinite(min_reference) or not 0.0 < min_reference <= 1.0:
+            raise ValueError(
+                "fusion.visible_integrity_modifier.min_reference must be within (0, 1]"
+            )
+        mode = str(modifier_cfg.get("mode", "bounded_visibility")).lower()
+        if mode not in {"bounded_visibility", "relative_effective"}:
+            raise ValueError(
+                "fusion.visible_integrity_modifier.mode must be "
+                "'bounded_visibility' or 'relative_effective'"
+            )
+        clean_evidence = [
+            item["evidence"] for item in cached_batches if item["loader_index"] == 0
+        ]
+        if clean_evidence:
+            merged = torch.cat(clean_evidence, dim=0)
+            routing_visible_reference_count = int(merged.size(0))
+
+            def _evidence_column(index: int) -> torch.Tensor:
+                if merged.size(-1) <= index:
+                    return torch.ones(merged.size(0), device=merged.device)
+                return merged[:, index].float().clamp(0.0, 1.0)
+
+            def _median(values: torch.Tensor) -> float:
+                values = values[torch.isfinite(values)]
+                value = (
+                    float(torch.quantile(values, 0.5).item())
+                    if values.numel()
+                    else 1.0
+                )
+                return min(1.0, max(min_reference, value))
+
+            if mode == "relative_effective":
+                routing_visible_reference = [
+                    _median(
+                        _evidence_column(EvidenceIndex.API_INTEGRITY)
+                        * _evidence_column(EvidenceIndex.API_ENCODER_COVERAGE)
+                    ),
+                    _median(
+                        _evidence_column(EvidenceIndex.GRAPH_INTEGRITY)
+                        * _evidence_column(EvidenceIndex.GRAPH_ENCODER_COVERAGE)
+                    ),
+                    _median(_evidence_column(EvidenceIndex.MANIFEST_INTEGRITY)),
+                ]
+            else:
+                routing_visible_reference = [
+                    _median(_evidence_column(EvidenceIndex.API_ENCODER_COVERAGE)),
+                    _median(_evidence_column(EvidenceIndex.GRAPH_ENCODER_COVERAGE)),
+                    1.0,
+                ]
+            routing_visible_reference_mode = mode
+            discount_fusion.set_visible_integrity_reference(
+                routing_visible_reference, enabled=True
+            )
+
     model.set_calibration_active(True)
     previous_requires_grad = {id(param): param.requires_grad for param in model.parameters()}
-    calibration_ids = {id(param) for param in parameters}
-    for param in model.parameters():
-        param.requires_grad_(id(param) in calibration_ids)
+    learning_rate = float(calibration_cfg.get("lr", 1.0e-3))
+    weight_decay = float(calibration_cfg.get("weight_decay", 0.0))
+    grad_clip = float(calibration_cfg.get("grad_clip", 5.0))
 
-    epoch_losses: list[float] = []
-    total_steps = 0
-    best_loss = float("inf")
-    best_epoch = 0
-    best_parameters: list[torch.Tensor] | None = None
-    stale_epochs = 0
-    stopped_early = False
-    try:
-        model.eval()
+    def _set_trainable(stage_parameters: list[torch.nn.Parameter]) -> None:
+        trainable_ids = {id(param) for param in stage_parameters}
+        for param in model.parameters():
+            param.requires_grad_(id(param) in trainable_ids)
+
+    def _forward_cached(cached: dict[str, Any]) -> dict[str, torch.Tensor]:
+        branch_logits = cached["branch_logits"]
+        evidence = cached["evidence"]
+        outputs = model.discount_fusion(
+            branch_logits["api"],
+            branch_logits["graph"],
+            branch_logits["manifest"],
+            branch_logits["joint"],
+            evidence,
+        )
+        outputs.update(
+            {
+                f"{name}_logits_aux": value
+                for name, value in branch_logits.items()
+            }
+        )
+        outputs["gate_evidence"] = evidence
+        return outputs
+
+    def _mean_cached_loss(
+        items: list[dict[str, Any]],
+        loss_fn,
+    ) -> torch.Tensor:
+        if not items:
+            raise RuntimeError("Calibration objective group contains no scenarios")
+        values = [loss_fn(item) for item in items]
+        return torch.stack(values).mean()
+
+    def _balanced_group_loss(
+        group: dict[str, Any],
+        loss_fn,
+    ) -> torch.Tensor:
+        clean_loss = _mean_cached_loss(group["clean"], loss_fn)
+        scenario_items = group.get("scenario") or []
+        if not scenario_items:
+            return clean_loss
+        scenario_loss = _mean_cached_loss(scenario_items, loss_fn)
+        # Clean and one degradation family form the two equally important
+        # deployment conditions. Averaging them prevents a large perturbation
+        # grid from changing the implicit deployment prior.
+        return 0.5 * (clean_loss + scenario_loss)
+
+    def _optimize_stage(
+        stage_name: str,
+        stage_parameters: list[torch.nn.Parameter],
+        objective_groups: list[dict[str, Any]],
+        objective_fn,
+    ) -> dict[str, Any]:
+        if not stage_parameters or not objective_groups:
+            return {
+                "enabled": False,
+                "name": stage_name,
+                "epochs_ran": 0,
+                "best_epoch": 0,
+                "stopped_early": False,
+                "losses": [],
+                "final_loss": None,
+                "total_steps": 0,
+                "objective_groups": [],
+            }
+        optimizer = torch.optim.Adam(
+            stage_parameters,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+        _set_trainable(stage_parameters)
+        epoch_losses: list[float] = []
+        total_steps = 0
+        best_loss = float("inf")
+        best_epoch = 0
+        best_parameters: list[torch.Tensor] | None = None
+        stale_epochs = 0
+        stopped_early = False
         for epoch in range(1, epochs + 1):
             total = 0.0
             steps = 0
-            for loader in loaders:
-                for batch in tqdm(loader, desc=f"calibrate {epoch}", leave=False):
-                    graph, labels, _, _quality, _failed = prepare_robust_batch(batch, device)
-                    if graph is None:
-                        continue
-                    optimizer.zero_grad(set_to_none=True)
-                    with get_amp_context(device, use_amp):
-                        _logits, extra = model(graph, return_features=False)
-                    loss, _parts = compute_posthoc_calibration_loss(
-                        extra,
-                        labels,
-                        extra.get("gate_evidence"),
-                        cfg.get("fusion", {}) or {},
+            for group in objective_groups:
+                optimizer.zero_grad(set_to_none=True)
+                loss = objective_fn(group)
+                if not bool(torch.isfinite(loss.detach()).all().item()):
+                    raise FloatingPointError(
+                        f"Non-finite {stage_name} loss at "
+                        f"epoch={epoch} step={steps + 1}"
                     )
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        parameters, float(calibration_cfg.get("grad_clip", 5.0))
-                    )
-                    optimizer.step()
-                    total += float(loss.detach().item())
-                    steps += 1
-                    total_steps += 1
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(stage_parameters, grad_clip)
+                optimizer.step()
+                total += float(loss.detach().item())
+                steps += 1
+                total_steps += 1
             epoch_loss = total / max(steps, 1)
             epoch_losses.append(epoch_loss)
-            logger.info("posthoc_calibration epoch=%s loss=%.6f", epoch, epoch_loss)
+            logger.info(
+                "posthoc_calibration stage=%s epoch=%s loss=%.6f",
+                stage_name,
+                epoch,
+                epoch_loss,
+            )
             if steps > 0 and epoch_loss < best_loss - min_delta:
                 best_loss = epoch_loss
                 best_epoch = epoch
-                best_parameters = [param.detach().clone() for param in parameters]
+                best_parameters = [
+                    param.detach().clone() for param in stage_parameters
+                ]
                 stale_epochs = 0
             else:
                 stale_epochs += 1
                 if patience > 0 and stale_epochs >= patience:
                     stopped_early = True
                     break
+        if total_steps == 0 or best_parameters is None:
+            raise RuntimeError(
+                f"Post-hoc calibration stage {stage_name} produced no valid step"
+            )
+        with torch.no_grad():
+            for parameter, best_value in zip(stage_parameters, best_parameters):
+                parameter.copy_(best_value)
+        return {
+            "enabled": True,
+            "name": stage_name,
+            "epochs_ran": len(epoch_losses),
+            "best_epoch": best_epoch,
+            "stopped_early": stopped_early,
+            "losses": epoch_losses,
+            "final_loss": best_loss,
+            "total_steps": total_steps,
+            "objective_groups": [str(group["name"]) for group in objective_groups],
+        }
+
+    clean_cached = [
+        item for item in cached_batches if item["scenario_group"] == "clean"
+    ]
+    if not clean_cached:
+        raise RuntimeError("Post-hoc calibration requires a clean calibration source")
+    nonclean_by_group: dict[str, list[dict[str, Any]]] = {}
+    for item in cached_batches:
+        group_name = str(item["scenario_group"])
+        if group_name != "clean":
+            nonclean_by_group.setdefault(group_name, []).append(item)
+
+    reliability_parameters = (
+        list(discount_fusion.reliability_calibration_parameters())
+        if discount_fusion is not None
+        and hasattr(discount_fusion, "reliability_calibration_parameters")
+        else []
+    )
+    probability_parameters = (
+        list(discount_fusion.probability_calibration_parameters())
+        if discount_fusion is not None
+        and hasattr(discount_fusion, "probability_calibration_parameters")
+        else []
+    )
+    routing_parameters = (
+        list(discount_fusion.routing_calibration_parameters())
+        if discount_fusion is not None
+        and hasattr(discount_fusion, "routing_calibration_parameters")
+        else []
+    )
+    stage_summaries: dict[str, Any] = {}
+    try:
+        model.eval()
+        final_temperature_parameters = (
+            discount_fusion.final_temperature_parameters()
+            if discount_fusion is not None
+            and hasattr(discount_fusion, "final_temperature_parameters")
+            else []
+        )
+        with torch.no_grad():
+            for parameter in final_temperature_parameters:
+                parameter.zero_()
+
+        if reliability_parameters:
+            reliability_cfg = dict(
+                ((cfg.get("fusion", {}) or {}).get("reliability_calibration", {}) or {})
+            )
+            # Estimate each branch's base correctness on the natural clean
+            # distribution. Deployment degradation is handled separately by
+            # the explicit relative-effective-integrity modifier and router.
+            reliability_branches = tuple(
+                str(name).lower()
+                for name in getattr(
+                    discount_fusion,
+                    "reliability_calibration_branches",
+                    ("api", "graph", "manifest"),
+                )
+            )
+            reliability_groups = [
+                {
+                    "name": f"{branch}:clean",
+                    "branch": branch,
+                    "clean": clean_cached,
+                    "scenario": [],
+                }
+                for branch in reliability_branches
+            ]
+
+            def _reliability_objective(group: dict[str, Any]) -> torch.Tensor:
+                branch_cfg = {**reliability_cfg, "branches": [group["branch"]]}
+
+                def _loss(cached: dict[str, Any]) -> torch.Tensor:
+                    outputs = _forward_cached(cached)
+                    loss, _ = compute_reliability_calibration_loss(
+                        outputs,
+                        cached["labels"],
+                        cached["evidence"],
+                        branch_cfg,
+                    )
+                    return loss
+
+                return _balanced_group_loss(group, _loss)
+
+            stage_summaries["reliability"] = _optimize_stage(
+                "reliability",
+                reliability_parameters,
+                reliability_groups,
+                _reliability_objective,
+            )
+
+        if probability_parameters:
+            probability_groups = [
+                {
+                    "name": "probability:clean",
+                    "clean": clean_cached,
+                    "scenario": [],
+                }
+            ]
+
+            def _probability_objective(group: dict[str, Any]) -> torch.Tensor:
+                def _loss(cached: dict[str, Any]) -> torch.Tensor:
+                    outputs = _forward_cached(cached)
+                    loss, _ = compute_probability_calibration_loss(
+                        outputs,
+                        cached["labels"],
+                        cached["evidence"],
+                    )
+                    return loss
+
+                return _balanced_group_loss(group, _loss)
+
+            stage_summaries["probability"] = _optimize_stage(
+                "probability",
+                probability_parameters,
+                probability_groups,
+                _probability_objective,
+            )
+
+        if routing_parameters:
+            routing_cfg = copy.deepcopy(cfg.get("fusion", {}) or {})
+            routing_cfg.setdefault("reliability_calibration", {})["weight"] = 0.0
+            routing_cfg.setdefault("probability_calibration", {})["weight"] = 0.0
+            routing_groups = [
+                {
+                    "name": f"router:{group_name}",
+                    "clean": clean_cached,
+                    "scenario": items,
+                }
+                for group_name, items in sorted(nonclean_by_group.items())
+            ]
+            if not routing_groups:
+                routing_groups = [
+                    {
+                        "name": "router:clean",
+                        "clean": clean_cached,
+                        "scenario": [],
+                    }
+                ]
+
+            def _routing_objective(group: dict[str, Any]) -> torch.Tensor:
+                def _loss(cached: dict[str, Any]) -> torch.Tensor:
+                    outputs = _forward_cached(cached)
+                    loss, _ = compute_posthoc_calibration_loss(
+                        outputs,
+                        cached["labels"],
+                        cached["evidence"],
+                        routing_cfg,
+                        reliability_branches=cached["reliability_branches"],
+                    )
+                    return loss
+
+                return _balanced_group_loss(group, _loss)
+
+            stage_summaries["routing"] = _optimize_stage(
+                "routing",
+                routing_parameters,
+                routing_groups,
+                _routing_objective,
+            )
+
+        handled_parameter_ids = {
+            id(parameter)
+            for stage_parameters in (
+                reliability_parameters,
+                probability_parameters,
+                routing_parameters,
+            )
+            for parameter in stage_parameters
+        }
+        unhandled_parameters = [
+            parameter
+            for parameter in parameters
+            if id(parameter) not in handled_parameter_ids
+        ]
+        if unhandled_parameters:
+            raise RuntimeError(
+                "Post-hoc calibration contains parameters that are not assigned "
+                "to reliability, probability, or routing stages"
+            )
     finally:
         for param in model.parameters():
             param.requires_grad_(previous_requires_grad[id(param)])
-    if total_steps == 0:
+
+    enabled_stages = [
+        summary for summary in stage_summaries.values() if summary.get("enabled")
+    ]
+    if not enabled_stages:
         model.set_calibration_active(False)
-        raise RuntimeError(
-            "Post-hoc calibration received no valid batches; refusing to use unfitted "
-            "reliability and temperature parameters"
+        raise RuntimeError("Post-hoc calibration did not run any optimization stage")
+    epoch_losses = list(enabled_stages[-1]["losses"])
+    total_steps = int(sum(stage["total_steps"] for stage in enabled_stages))
+    best_loss = float(enabled_stages[-1]["final_loss"])
+    aggregate_final_loss = float(
+        sum(float(stage["final_loss"]) for stage in enabled_stages)
+    )
+    best_epoch = int(enabled_stages[-1]["best_epoch"])
+    stopped_early = bool(any(stage["stopped_early"] for stage in enabled_stages))
+
+    final_temperature_summary: dict[str, Any] = {"enabled": False}
+    final_temperature_parameters = (
+        discount_fusion.final_temperature_parameters()
+        if discount_fusion is not None
+        and hasattr(discount_fusion, "final_temperature_parameters")
+        else []
+    )
+    if final_temperature_parameters:
+        # Fit one scalar only on the clean post-hoc subset (loader 0). The
+        # reported clean probabilities must not be calibrated on synthetic
+        # degradation scenarios.
+        clean_log_probs: list[torch.Tensor] = []
+        clean_labels: list[torch.Tensor] = []
+        with torch.no_grad():
+            for cached in cached_batches:
+                if int(cached["loader_index"]) != 0:
+                    continue
+                branch_logits = cached["branch_logits"]
+                routed = model.discount_fusion(
+                    branch_logits["api"],
+                    branch_logits["graph"],
+                    branch_logits["manifest"],
+                    branch_logits["joint"],
+                    cached["evidence"],
+                )
+                raw_log_prob = routed.get("uncalibrated_final_log_prob")
+                if not isinstance(raw_log_prob, torch.Tensor):
+                    raise RuntimeError(
+                        "Routed final-temperature calibration requires "
+                        "uncalibrated_final_log_prob"
+                    )
+                clean_log_probs.append(raw_log_prob.detach().float())
+                clean_labels.append(cached["labels"].detach().long())
+        if not clean_log_probs:
+            raise RuntimeError(
+                "Routed final-temperature calibration received no clean samples"
+            )
+        raw_log_prob = torch.cat(clean_log_probs, dim=0)
+        temperature_labels = torch.cat(clean_labels, dim=0)
+        log_temperature = final_temperature_parameters[0]
+        final_temperature_summary = _fit_routed_final_temperature(
+            log_temperature,
+            raw_log_prob,
+            temperature_labels,
         )
-    if best_parameters is None:
-        raise RuntimeError("Post-hoc calibration did not produce a valid optimization state")
-    with torch.no_grad():
-        for parameter, best_value in zip(parameters, best_parameters):
-            parameter.copy_(best_value)
     temperatures = {}
     for name in ("api", "graph", "manifest", "joint"):
         if model.discount_fusion.temperature_parameters is not None:
@@ -1655,15 +3291,39 @@ def fit_posthoc_calibration(
                     model.discount_fusion.temperature_parameters[name].detach()
                 ) + 1.0e-4).cpu().item()
             )
+    if bool(final_temperature_summary.get("enabled", False)):
+        temperatures["final"] = float(final_temperature_summary["temperature"])
     return {
         "enabled": True,
+        "strategy": "staged_scenario_balanced",
         "epochs": epochs,
         "epochs_ran": len(epoch_losses),
         "best_epoch": best_epoch,
         "stopped_early": stopped_early,
         "losses": epoch_losses,
         "final_loss": best_loss,
+        "aggregate_final_loss": aggregate_final_loss,
+        "total_optimization_steps": total_steps,
+        "stages": stage_summaries,
+        "num_input_loaders": len(calibration_sources),
+        "calibration_sources": [
+            {
+                "name": source["name"],
+                "scenario_group": source["scenario_group"],
+                "reliability_branches": list(source["reliability_branches"]),
+            }
+            for source in calibration_sources
+        ],
+        "num_cached_batches": len(cached_batches),
+        "num_encoder_batches_cached": num_encoder_batches_cached,
+        "num_cached_samples": int(
+            sum(int(item["labels"].numel()) for item in cached_batches)
+        ),
+        "routing_visible_reference": routing_visible_reference,
+        "routing_visible_reference_mode": routing_visible_reference_mode,
+        "routing_visible_reference_count": routing_visible_reference_count,
         "temperatures": temperatures,
+        "final_temperature": final_temperature_summary,
     }
 
 
@@ -1674,9 +3334,9 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
     loss_cfg = dict(cfg.get("loss", {}))
     loss_cfg["label_smoothing"] = float(cfg["train"].get("label_smoothing", loss_cfg.get("label_smoothing", 0.0)))
     optimizer.zero_grad(set_to_none=True)
-    total_loss = 0.0
-    loss_part_sums: dict[str, float] = {}
-    diagnostic_sums: dict[str, float] = {}
+    total_loss: torch.Tensor | None = None
+    loss_part_sums: dict[str, torch.Tensor] = {}
+    diagnostic_sums: dict[str, torch.Tensor] = {}
     diagnostic_counts: dict[str, int] = {}
     steps = 0
     failed_seen = 0
@@ -1697,19 +3357,44 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
                 loss_cfg,
                 evidence=extra.get("gate_evidence"),
                 epoch=epoch,
+                materialize_diagnostics=False,
             )
             loss = loss / max(grad_accum, 1)
-        for key in GATE_DIAGNOSTIC_KEYS:
+        if not bool(torch.isfinite(loss.detach()).all().item()):
+            diagnostic_parts = {}
+            for key, value in parts.items():
+                if isinstance(value, torch.Tensor) and value.numel() == 1:
+                    diagnostic_parts[key] = float(value.detach().item())
+                elif isinstance(value, (int, float)):
+                    diagnostic_parts[key] = float(value)
+            raise FloatingPointError(
+                f"Non-finite training loss at epoch={epoch} step={steps + 1}; "
+                f"loss_parts={diagnostic_parts}"
+            )
+        for key in TRAIN_LOG_DIAGNOSTIC_KEYS:
             value = extra.get(key)
             if isinstance(value, torch.Tensor):
                 finite = value.detach().float().view(-1)
                 finite = finite[torch.isfinite(finite)]
                 if finite.numel() > 0:
-                    diagnostic_sums[key] = diagnostic_sums.get(key, 0.0) + float(finite.sum().cpu().item())
+                    value_sum = finite.sum()
+                    if key in diagnostic_sums:
+                        diagnostic_sums[key] = diagnostic_sums[key] + value_sum
+                    else:
+                        diagnostic_sums[key] = value_sum
                     diagnostic_counts[key] = diagnostic_counts.get(key, 0) + int(finite.numel())
         for key, value in parts.items():
-            if isinstance(value, (int, float)) and math.isfinite(float(value)):
-                loss_part_sums[key] = loss_part_sums.get(key, 0.0) + float(value)
+            if key not in {"loss", "ce", "branch_aux", "branch_aux_weight"}:
+                continue
+            value_tensor = (
+                value.detach()
+                if isinstance(value, torch.Tensor)
+                else loss.detach().new_tensor(float(value))
+            )
+            if key in loss_part_sums:
+                loss_part_sums[key] = loss_part_sums[key] + value_tensor
+            else:
+                loss_part_sums[key] = value_tensor
         steps += 1
         scaler.scale(loss).backward()
         if steps % grad_accum == 0:
@@ -1718,7 +3403,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-        total_loss += float(loss.detach().item()) * max(grad_accum, 1)
+        unscaled_loss = loss.detach() * max(grad_accum, 1)
+        total_loss = unscaled_loss if total_loss is None else total_loss + unscaled_loss
 
     if steps > 0 and steps % grad_accum != 0:
         scaler.unscale_(optimizer)
@@ -1732,7 +3418,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
             "train_loss_parts epoch=%s %s",
             epoch,
             " ".join(
-                f"{key}={value / steps:.4f}"
+                f"{key}={float((value / steps).item()):.4f}"
                 for key, value in sorted(loss_part_sums.items())
                 if key in {"loss", "ce", "branch_aux", "branch_aux_weight"}
             ),
@@ -1741,13 +3427,15 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch: int):
             "train_fusion_diagnostics epoch=%s %s",
             epoch,
             " ".join(
-                f"mean_{key}={value / max(diagnostic_counts.get(key, 0), 1):.4f}"
+                f"mean_{key}={float((value / max(diagnostic_counts.get(key, 0), 1)).item()):.4f}"
                 for key, value in sorted(diagnostic_sums.items())
                 if key.startswith(("discount_", "fusion_weight_", "entropy_", "margin_", "uncertainty_proxy_"))
-                or key == "fallback_used"
+                or key == "zero_weight_fallback_used"
             ),
         )
-    return total_loss / max(steps, 1)
+    if total_loss is None:
+        return 0.0
+    return float((total_loss / max(steps, 1)).item())
 
 
 def write_gate_dump(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1759,6 +3447,84 @@ def write_gate_dump(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def build_risk_coverage_curve(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build exact threshold-achievable risk/coverage operating points by split."""
+    grouped: dict[str, list[tuple[float, int, int]]] = {}
+    for row in rows:
+        score = _finite_row_float(row, "acceptance_score")
+        try:
+            label = int(row["label"])
+            pred = int(row["pred"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if score is None or label not in {0, 1} or pred not in {0, 1}:
+            continue
+        split = str(row.get("split") or "unknown")
+        grouped.setdefault(split, []).append((float(score), label, pred))
+
+    curve: list[dict[str, Any]] = []
+    for split, items in sorted(grouped.items()):
+        items.sort(key=lambda item: item[0], reverse=True)
+        total = len(items)
+        total_malware = sum(label == 1 for _score, label, _pred in items)
+        tp = fp = tn = fn = 0
+        accepted = 0
+        index = 0
+        while index < total:
+            threshold = items[index][0]
+            while index < total and items[index][0] == threshold:
+                _score, label, pred = items[index]
+                accepted += 1
+                if label == 1 and pred == 1:
+                    tp += 1
+                elif label == 1 and pred == 0:
+                    fn += 1
+                elif label == 0 and pred == 1:
+                    fp += 1
+                else:
+                    tn += 1
+                index += 1
+
+            errors = fp + fn
+            accepted_malware = tp + fn
+            f1_malware_den = 2 * tp + fp + fn
+            f1_benign_den = 2 * tn + fp + fn
+            f1_malware = 2 * tp / f1_malware_den if f1_malware_den else 0.0
+            f1_benign = 2 * tn / f1_benign_den if f1_benign_den else 0.0
+            curve.append(
+                {
+                    "split": split,
+                    "acceptance_threshold": float(threshold),
+                    "num_total": int(total),
+                    "num_accepted": int(accepted),
+                    "coverage": float(accepted / total),
+                    "selective_risk": float(errors / accepted),
+                    "selective_accuracy": float(1.0 - errors / accepted),
+                    "selective_macro_f1": float((f1_benign + f1_malware) / 2.0),
+                    "malware_fn_rate_after_rejection": (
+                        float(fn / total_malware) if total_malware else None
+                    ),
+                    "accepted_malware_fn_rate": (
+                        float(fn / accepted_malware) if accepted_malware else None
+                    ),
+                }
+            )
+    return curve
+
+
+def write_risk_coverage_curve(path: Path, rows: list[dict[str, Any]]) -> int:
+    curve = build_risk_coverage_curve(rows)
+    if not curve:
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(curve[0].keys())
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(curve)
+    return len(curve)
 
 
 def _normalize_extra_eval_sets(raw_sets: Any) -> list[dict[str, Any]]:
@@ -1780,11 +3546,21 @@ def _normalize_extra_eval_sets(raw_sets: Any) -> list[dict[str, Any]]:
 
 
 def _extra_eval_paths(cfg: dict, item: dict[str, Any]) -> tuple[str, str]:
-    root = str(item.get("root", cfg.get("data", {}).get("root", "")) or "")
-    pt_value = item.get("pt_dir") or item.get("test_pt_dir")
+    data_cfg = cfg.get("data", {}) or {}
+    root = str(item.get("root", data_cfg.get("root", "")) or "")
+    # Curated subsets of the ordinary test split should inherit the configured
+    # test PT pool. External datasets can still override this with item.pt_dir.
+    pt_value = (
+        item.get("pt_dir")
+        or item.get("test_pt_dir")
+        or data_cfg.get("test_pt_dir")
+    )
     csv_value = item.get("csv") or item.get("csv_path") or item.get("test_csv")
     if not pt_value:
-        raise ValueError(f"extra eval set {item.get('name', '<unnamed>')} is missing pt_dir")
+        raise ValueError(
+            f"extra eval set {item.get('name', '<unnamed>')} is missing pt_dir "
+            "and data.test_pt_dir is not configured"
+        )
     if not csv_value:
         raise ValueError(f"extra eval set {item.get('name', '<unnamed>')} is missing csv")
     return resolve(root, pt_value), resolve(root, csv_value)
@@ -1800,6 +3576,280 @@ def _json_compatible(value: Any) -> Any:
     if isinstance(value, np.integer):
         return int(value)
     return value
+
+
+_RUN_SPECIFIC_CONFIG_KEYS = {
+    "seed",
+    "exp_name",
+    "output_dir",
+    "out_dir",
+    "output_name",
+    "checkpoint_path",
+    "resume_checkpoint",
+    "device",
+    "num_workers",
+    "eval_num_workers",
+    "root",
+    "train_pt_dir",
+    "val_pt_dir",
+    "test_pt_dir",
+    "multiprocessing_sharing_strategy",
+    "prefetch_factor",
+    "persistent_workers",
+    "pin_memory",
+}
+
+_METHOD_IMPLEMENTATION_FILES = (
+    "constants.py",
+    "dataset.py",
+    "evidence.py",
+    "gates.py",
+    "graph_encoders.py",
+    "manifest_features.py",
+    "perturbations.py",
+    "pt_schema.py",
+    "quality.py",
+    "reliability_calibration.py",
+    "semantic_categories.py",
+    "evidential.py",
+    "opinion_router.py",
+    "discount_fusion.py",
+    "model.py",
+    "losses.py",
+    "train.py",
+    "utils.py",
+)
+
+
+def _method_protocol_config(value: Any) -> Any:
+    """Remove run-location fields while retaining method/protocol choices."""
+    if isinstance(value, dict):
+        return {
+            key: _method_protocol_config(item)
+            for key, item in value.items()
+            if key not in _RUN_SPECIFIC_CONFIG_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_method_protocol_config(item) for item in value]
+    return _json_compatible(value)
+
+
+def _method_implementation_sha256() -> str:
+    """Fingerprint the model, fusion, loss, and evaluation implementation."""
+    source_dir = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in _METHOD_IMPLEMENTATION_FILES:
+        path = source_dir / name
+        source = path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(source.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def build_run_identity(cfg: dict, experiment_name: str, seed: int) -> dict[str, Any]:
+    """Record the resolved method identity beside every summary.
+
+    Result directories can outlive later YAML edits. A stable fingerprint and
+    the decision-critical switches prevent stale summaries from being mistaken
+    for results produced by the current method definition.
+    """
+    normalized = _json_compatible(cfg)
+    serialized = yaml.safe_dump(
+        normalized,
+        sort_keys=True,
+        allow_unicode=True,
+    ).encode("utf-8")
+    protocol_config = _method_protocol_config(normalized)
+    if isinstance(protocol_config, dict):
+        # Seed wrappers use distinct display names for the same method.
+        protocol_config.pop("method", None)
+    protocol_serialized = yaml.safe_dump(
+        protocol_config,
+        sort_keys=True,
+        allow_unicode=True,
+    ).encode("utf-8")
+    fusion_cfg = cfg.get("fusion", {}) or {}
+    reliability_cfg = fusion_cfg.get("reliability_calibration", {}) or {}
+    routing_cfg = fusion_cfg.get("routing", {}) or {}
+    calibration_cfg = cfg.get("calibration", {}) or {}
+    eval_cfg = cfg.get("eval", {}) or {}
+    selective_cfg = cfg.get("selective_prediction", {}) or {}
+    classification_cfg = cfg.get("classification_threshold", {}) or {}
+    loss_cfg = cfg.get("loss", {}) or {}
+    reliability_enabled = bool(reliability_cfg.get("enabled", False))
+    combination_rule = str(fusion_cfg.get("combination", "linear")).lower()
+    routing_enabled = bool(
+        combination_rule == "routed" and routing_cfg.get("enabled", False)
+    )
+    routing_target_loss_weight = float(
+        routing_cfg.get("target_loss_weight", 1.0)
+    )
+    routing_prediction_loss_weight = float(
+        routing_cfg.get(
+            "prediction_loss_weight",
+            1.0
+            if bool(routing_cfg.get("use_fused_prediction_loss", False))
+            else 0.0,
+        )
+    )
+    routing_acceptance_mode = str(
+        routing_cfg.get("acceptance_score_mode", "product")
+    ).lower()
+    if routing_acceptance_mode == "current_product":
+        routing_acceptance_mode = "product"
+    use_reliability_discount = bool(
+        fusion_cfg.get("use_reliability_discount", True)
+    )
+    visible_modifier_enabled = bool(
+        (fusion_cfg.get("visible_integrity_modifier", {}) or {}).get(
+            "enabled", False
+        )
+    )
+    legacy_integrity_aux = loss_cfg.get("reliability_weighted_aux")
+    integrity_weighted_aux_enabled = (
+        bool(legacy_integrity_aux)
+        if legacy_integrity_aux is not None
+        else bool(loss_cfg.get("integrity_weighted_aux", False))
+    )
+    selective_enabled = bool(selective_cfg.get("enabled", False))
+    classification_enabled = bool(classification_cfg.get("enabled", False))
+    selective_mode = (
+        str(selective_cfg.get("mode", "threshold")).lower()
+        if selective_enabled
+        else "disabled"
+    )
+    return {
+        "method_name": str((cfg.get("method", {}) or {}).get("name", experiment_name)),
+        "experiment_name": str(experiment_name),
+        "seed": int(seed),
+        "resolved_config_sha256": hashlib.sha256(serialized).hexdigest(),
+        "method_protocol_sha256": hashlib.sha256(protocol_serialized).hexdigest(),
+        "method_implementation_sha256": _method_implementation_sha256(),
+        "model_fusion_mode": str((cfg.get("model", {}) or {}).get("fusion_mode", "")),
+        "combination_rule": combination_rule,
+        "global_opinion_routing_enabled": routing_enabled,
+        "routing_mode": (
+            str(routing_cfg.get("mode", "learned")).lower()
+            if routing_enabled
+            else "disabled"
+        ),
+        "routing_disagreement_enabled": bool(
+            routing_enabled and routing_cfg.get("use_disagreement", True)
+        ),
+        "routing_target_loss_weight": (
+            routing_target_loss_weight if routing_enabled else None
+        ),
+        "routing_prediction_loss_weight": (
+            routing_prediction_loss_weight if routing_enabled else None
+        ),
+        "routing_acceptance_score_mode": (
+            routing_acceptance_mode if routing_enabled else "disabled"
+        ),
+        "routing_initial_known_retention": (
+            float(routing_cfg.get("initial_known_retention", 0.99))
+            if routing_enabled
+            else None
+        ),
+        "routing_posthoc_fused_prediction_loss_enabled": bool(
+            routing_enabled and routing_prediction_loss_weight > 0.0
+        ),
+        "routed_final_temperature_enabled": bool(
+            routing_enabled
+            and routing_cfg.get("final_temperature_scaling", False)
+        ),
+        "routed_final_temperature_override": (
+            None
+            if eval_cfg.get("final_temperature_override") is None
+            else float(eval_cfg["final_temperature_override"])
+        ),
+        "reliability_calibration_enabled": reliability_enabled,
+        "reliability_use_enabled": use_reliability_discount,
+        "visible_integrity_modifier_enabled": visible_modifier_enabled,
+        "integrity_weighted_aux_enabled": integrity_weighted_aux_enabled,
+        "reliability_calibration_branches": (
+            list(reliability_cfg.get("branches", BRANCH_NAMES))
+            if reliability_enabled
+            else []
+        ),
+        "router_trained_end_to_end": bool(
+            routing_enabled and routing_cfg.get("train_end_to_end", True)
+        ),
+        "router_posthoc_refinement_enabled": bool(
+            routing_enabled
+            and calibration_cfg.get("enabled", False)
+            and routing_cfg.get("posthoc_refine", True)
+        ),
+        "router_encoder_training_reliability_source": (
+            "observable_integrity"
+            if routing_enabled and use_reliability_discount
+            else ("neutral_constant" if routing_enabled else "disabled")
+        ),
+        "router_posthoc_reliability_source": (
+            "calibrated_branch_correctness"
+            if routing_enabled
+            and use_reliability_discount
+            and reliability_enabled
+            else (
+                "observable_integrity"
+                if routing_enabled and use_reliability_discount
+                else ("neutral_constant" if routing_enabled else "disabled")
+            )
+        ),
+        "relation_evidence_enabled": bool(
+            reliability_enabled
+            and reliability_cfg.get("use_relation_evidence", False)
+        ),
+        "evidential_certainty_enabled": bool(
+            reliability_enabled
+            and reliability_cfg.get("use_evidential_uncertainty", False)
+        ),
+        "model_visibility_reliability_enabled": bool(
+            reliability_enabled and reliability_cfg.get("use_model_visibility", False)
+        ),
+        "classification_threshold_enabled": classification_enabled,
+        "classification_threshold_objective": (
+            str(classification_cfg.get("objective", "macro_f1"))
+            if classification_enabled
+            else "disabled"
+        ),
+        "classification_min_malware_recall": (
+            float(classification_cfg.get("min_malware_recall", 0.0))
+            if classification_enabled
+            else None
+        ),
+        "selective_prediction_enabled": selective_enabled,
+        "selective_prediction_mode": selective_mode,
+        "selective_score_type": (
+            _selective_score_type(selective_cfg) if selective_enabled else "disabled"
+        ),
+        "target_coverage": (
+            float(selective_cfg.get("target_coverage", 1.0))
+            if selective_enabled and selective_mode in {"threshold", "conformal"}
+            else None
+        ),
+        "risk_control_level": (
+            float(selective_cfg.get("risk_level", 0.0))
+            if selective_enabled and selective_mode == "risk_control"
+            else None
+        ),
+        "risk_control_require_feasible": bool(
+            selective_enabled
+            and selective_mode == "risk_control"
+            and selective_cfg.get("require_feasible", False)
+        ),
+        "risk_control_min_calibration_malware": (
+            int(selective_cfg.get("min_calibration_malware", 1))
+            if selective_enabled and selective_mode == "risk_control"
+            else None
+        ),
+        "conformal_uses_raw_conflict": bool(
+            selective_enabled
+            and selective_mode == "conformal"
+            and selective_cfg.get("use_raw_conflict", False)
+        ),
+    }
 
 
 def _write_metrics_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1831,10 +3881,32 @@ def run(cfg: dict) -> dict[str, Any]:
     run_test = bool(eval_cfg.get("run_test", True))
     run_robust_test = bool(eval_cfg.get("run_robust_test", True))
     eval_only = bool(eval_cfg.get("eval_only", False))
-    refit_rejection_threshold = bool(eval_cfg.get("refit_rejection_threshold", False))
+    refit_posthoc_calibration = bool(
+        eval_cfg.get("refit_posthoc_calibration", False)
+    )
+    refit_decision_calibration = _resolve_refit_decision_calibration(eval_cfg)
+    final_temperature_override_raw = eval_cfg.get("final_temperature_override")
+    final_temperature_override = (
+        None
+        if final_temperature_override_raw is None
+        else float(final_temperature_override_raw)
+    )
+    extra_eval_sets = _normalize_extra_eval_sets(eval_cfg.get("extra_sets"))
+    pure_external_eval_only = (
+        eval_only
+        and not refit_posthoc_calibration
+        and not refit_decision_calibration
+        and not run_test
+        and bool(extra_eval_sets)
+    )
     tuning_mode = bool(train_cfg.get("tuning_mode", False))
     calibration_enabled = bool((cfg.get("calibration", {}) or {}).get("enabled", False))
+    classification_cfg = cfg.get("classification_threshold", {}) or {}
+    classification_threshold_enabled = bool(classification_cfg.get("enabled", False))
     selective_enabled = bool((cfg.get("selective_prediction", {}) or {}).get("enabled", False))
+    selective_score_type = _selective_score_type(
+        cfg.get("selective_prediction", {}) or {}
+    )
     configured_fusion_mode = str((cfg.get("fusion", {}) or {}).get("mode", "")).lower()
     model_fusion_mode = str((cfg.get("model", {}) or {}).get("fusion_mode", "")).lower()
     discount_probability_mode = (
@@ -1856,7 +3928,7 @@ def run(cfg: dict) -> dict[str, Any]:
     if tuning_mode:
         if run_test or run_robust_test:
             raise ValueError("train.tuning_mode=true forbids test evaluation")
-        if _normalize_extra_eval_sets(eval_cfg.get("extra_sets")):
+        if extra_eval_sets:
             raise ValueError("train.tuning_mode=true forbids eval.extra_sets")
         if not bool((eval_cfg.get("robust_val", {}) or {}).get("enabled", False)):
             raise ValueError("train.tuning_mode=true requires eval.robust_val.enabled=true")
@@ -1878,75 +3950,290 @@ def run(cfg: dict) -> dict[str, Any]:
             raise ValueError("eval.eval_only=true is incompatible with train.tuning_mode=true")
         if not str(eval_cfg.get("checkpoint_path") or "").strip():
             raise ValueError("eval.eval_only=true requires eval.checkpoint_path")
-
-    validate_split_partitions(cfg, include_test=run_test)
-    val_ds = build_dataset(cfg, "val", is_train=False)
-    holdout_enabled = bool((cfg.get("calibration", {}) or {}).get("holdout_enabled", False))
-    needs_validation_holdout = calibration_enabled or selective_enabled or holdout_enabled
-    if needs_validation_holdout:
-        val_selection_ds, val_calibration_ds, validation_split = split_validation_dataset(cfg, val_ds)
-        selection_indices = list(validation_split["selection_indices"])
-        calibration_indices = list(validation_split["calibration_indices"])
     else:
-        val_selection_ds = val_ds
-        val_calibration_ds = val_ds
-        selection_indices = None
-        calibration_indices = None
-        validation_split = {
-            "split_seed": None,
-            "validation_fraction": 1.0,
-            "num_selection": len(val_ds),
-            "num_calibration": len(val_ds),
-            "selection_indices": None,
-            "calibration_indices": None,
-        }
-    validation_split_summary = {
-        key: value
-        for key, value in validation_split.items()
-        if key not in {"selection_indices", "calibration_indices"}
-    }
-    val_loader = build_loader(cfg, val_selection_ds, is_train=False)
-    val_calibration_loader = build_loader(cfg, val_calibration_ds, is_train=False)
+        if refit_posthoc_calibration:
+            raise ValueError(
+                "eval.refit_posthoc_calibration=true requires eval.eval_only=true"
+            )
+        if refit_decision_calibration:
+            raise ValueError(
+                "eval.refit_decision_calibration=true requires eval.eval_only=true"
+            )
+    if final_temperature_override is not None:
+        if not eval_only:
+            raise ValueError(
+                "eval.final_temperature_override requires eval.eval_only=true"
+            )
+        if refit_posthoc_calibration:
+            raise ValueError(
+                "eval.final_temperature_override isolates the fitted temperature "
+                "and is incompatible with eval.refit_posthoc_calibration=true"
+            )
+        if (
+            not math.isfinite(final_temperature_override)
+            or final_temperature_override <= 0.0
+        ):
+            raise ValueError(
+                "eval.final_temperature_override must be finite and positive"
+            )
+    if refit_posthoc_calibration:
+        if not calibration_enabled:
+            raise ValueError(
+                "eval.refit_posthoc_calibration=true requires calibration.enabled=true"
+            )
+        if (
+            classification_threshold_enabled or selective_enabled
+        ) and not refit_decision_calibration:
+            raise ValueError(
+                "Post-hoc refitting changes predictions and therefore requires "
+                "eval.refit_decision_calibration=true when classification "
+                "thresholding or selective prediction is enabled "
+                "(legacy alias: eval.refit_rejection_threshold)"
+            )
+
     train_ds = None
     train_loader = None
-    if not eval_only:
+    val_loader = None
+    val_posthoc_calibration_loader = None
+    val_conformal_calibration_loader = None
+    robust_val_loaders: list[dict[str, Any]] = []
+    robust_calibration_loaders: list[dict[str, Any]] = []
+    validation_split_summary: dict[str, Any] = {
+        "split_seed": None,
+        "validation_fraction": None,
+        "num_selection": 0,
+        "num_calibration": 0,
+        "num_posthoc_calibration": 0,
+        "num_conformal_calibration": 0,
+        "external_eval_only": bool(pure_external_eval_only),
+    }
+    prebuilt_extra_eval_sets: list[dict[str, Any]] = []
+
+    if pure_external_eval_only:
+        for idx, extra in enumerate(extra_eval_sets):
+            name = str(extra.get("name") or f"extra_{idx}")
+            pt_dir, csv_path = _extra_eval_paths(cfg, extra)
+            perturb_type = extra.get("perturb_type")
+            perturb_strength = float(extra.get("perturb_strength", 0.0))
+            try:
+                extra_ds = build_dataset_from_paths(
+                    cfg,
+                    pt_dir=pt_dir,
+                    csv_path=csv_path,
+                    is_train=False,
+                    perturb_type=str(perturb_type) if perturb_type else None,
+                    perturb_strength=perturb_strength,
+                    dataset_overrides={
+                        "allow_pt_superset": bool(extra.get("allow_pt_superset", True)),
+                        "strict_split_integrity": bool(extra.get("strict_split_integrity", True)),
+                    },
+                )
+            except EmptyExtraEvalSetError as exc:
+                if bool(extra.get("skip_if_empty", True)):
+                    prebuilt_extra_eval_sets.append(
+                        {
+                            "name": name,
+                            "extra": extra,
+                            "pt_dir": pt_dir,
+                            "csv_path": csv_path,
+                            "dataset": None,
+                            "skipped": True,
+                            "skip_reason": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    continue
+                raise
+            prebuilt_extra_eval_sets.append(
+                {
+                    "name": name,
+                    "extra": extra,
+                    "pt_dir": pt_dir,
+                    "csv_path": csv_path,
+                    "dataset": extra_ds,
+                    "skipped": False,
+                    "perturb_type": perturb_type,
+                    "perturb_strength": perturb_strength,
+                }
+            )
+        first_extra_ds = next(
+            (item["dataset"] for item in prebuilt_extra_eval_sets if item.get("dataset") is not None),
+            None,
+        )
+        if first_extra_ds is None:
+            raise RuntimeError("eval.extra_sets did not provide any loadable external dataset")
+        feature_dim = int(first_extra_ds.feature_dim)
+    else:
+        validate_split_partitions(cfg, include_test=run_test)
+        val_ds = build_dataset(cfg, "val", is_train=False)
+        holdout_enabled = bool((cfg.get("calibration", {}) or {}).get("holdout_enabled", False))
+        needs_validation_holdout = (
+            calibration_enabled
+            or classification_threshold_enabled
+            or selective_enabled
+            or holdout_enabled
+        )
+        if needs_validation_holdout:
+            val_selection_ds, val_holdout_ds, validation_split = split_validation_dataset(cfg, val_ds)
+            selection_indices = list(validation_split["selection_indices"])
+            calibration_indices = list(validation_split["calibration_indices"])
+            # Every selective method receives the same decision-calibration
+            # sample budget. This also keeps threshold baselines from reusing
+            # rows that fitted post-hoc model parameters.
+            needs_decision_calibration_split = (
+                classification_threshold_enabled or selective_enabled
+            )
+            if needs_decision_calibration_split:
+                (
+                    val_posthoc_calibration_ds,
+                    val_conformal_calibration_ds,
+                    conformal_split,
+                ) = split_posthoc_conformal_dataset(cfg, val_ds, calibration_indices)
+                validation_split.update(conformal_split)
+                posthoc_calibration_indices = list(
+                    conformal_split["posthoc_calibration_indices"]
+                )
+            else:
+                val_posthoc_calibration_ds = val_holdout_ds
+                val_conformal_calibration_ds = val_holdout_ds
+                posthoc_calibration_indices = calibration_indices
+                validation_split.update(
+                    {
+                        "num_posthoc_calibration": len(calibration_indices),
+                        "num_conformal_calibration": (
+                            len(calibration_indices)
+                            if _uses_conformal_selective(cfg.get("selective_prediction", {}) or {})
+                            else 0
+                        ),
+                        "posthoc_calibration_indices": calibration_indices,
+                        "conformal_calibration_indices": calibration_indices,
+                    }
+                )
+        else:
+            val_selection_ds = val_ds
+            val_posthoc_calibration_ds = val_ds
+            val_conformal_calibration_ds = val_ds
+            selection_indices = None
+            calibration_indices = None
+            posthoc_calibration_indices = None
+            validation_split = {
+                "split_seed": None,
+                "validation_fraction": 1.0,
+                "num_selection": len(val_ds),
+                "num_calibration": len(val_ds),
+                "num_posthoc_calibration": len(val_ds),
+                "num_conformal_calibration": 0,
+                "selection_indices": None,
+                "calibration_indices": None,
+                "posthoc_calibration_indices": None,
+                "conformal_calibration_indices": None,
+            }
+        validation_split_summary = {
+            key: value
+            for key, value in validation_split.items()
+            if key not in {
+                "selection_indices",
+                "calibration_indices",
+                "posthoc_calibration_indices",
+                "conformal_calibration_indices",
+            }
+        }
+        val_loader = build_loader(cfg, val_selection_ds, is_train=False)
+        val_posthoc_calibration_loader = build_loader(
+            cfg, val_posthoc_calibration_ds, is_train=False
+        )
+        val_conformal_calibration_loader = build_loader(
+            cfg, val_conformal_calibration_ds, is_train=False
+        )
+        if not eval_only:
+            train_ds = build_dataset(cfg, "train", is_train=True)
+            train_loader = build_loader(cfg, train_ds, is_train=True)
+        robust_val_loaders = build_robust_val_loaders(cfg, selection_indices)
+        robust_calibration_loaders = (
+            build_reliability_calibration_loaders(cfg, posthoc_calibration_indices)
+            if calibration_enabled
+            and (not eval_only or refit_posthoc_calibration)
+            and uses_routing_calibration_scenarios(cfg)
+            else []
+        )
+        feature_dim = train_ds.feature_dim if train_ds is not None else val_ds.feature_dim
+    if not eval_only and train_ds is None:
         train_ds = build_dataset(cfg, "train", is_train=True)
         train_loader = build_loader(cfg, train_ds, is_train=True)
-    robust_val_loaders = build_robust_val_loaders(cfg, selection_indices)
-    robust_calibration_loaders = (
-        build_robust_val_loaders(cfg, calibration_indices)
-        if calibration_enabled
-        and bool((cfg.get("calibration", {}) or {}).get("include_robust_val", True))
-        else []
-    )
     test_loader = None
     if run_test:
         test_ds = build_dataset(cfg, "test", is_train=False)
         test_loader = build_loader(cfg, test_ds, is_train=False)
 
-    feature_dim = train_ds.feature_dim if train_ds is not None else val_ds.feature_dim
     model = build_model(cfg, feature_dim).to(device)
+    source_checkpoint_path: Path | None = None
+    requested_checkpoint_path: Path | None = None
 
     exp_name = str(train_cfg.get("exp_name", "tri_modal_robust"))
     if eval_only:
         exp_name = str(eval_cfg.get("output_name") or f"{exp_name}_eval_only")
     out_dir = Path(data_cfg.get("out_dir", "experiments")) / exp_name / str(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
+    encoder_checkpoint_path = out_dir / "best_encoder_selected.pt"
+    pipeline_checkpoint_path = out_dir / "best_tri_modal_robust.pt"
     with open(out_dir / "resolved_config.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
     if eval_only:
-        best_path = Path(str(eval_cfg["checkpoint_path"]))
-        if not best_path.is_absolute():
-            best_path = Path.cwd() / best_path
-        if not best_path.exists():
-            raise FileNotFoundError(f"Evaluation checkpoint not found: {best_path}")
-        ckpt = torch.load(best_path, map_location=device, weights_only=True)
+        requested_checkpoint_path = Path(str(eval_cfg["checkpoint_path"]))
+        if not requested_checkpoint_path.is_absolute():
+            requested_checkpoint_path = Path.cwd() / requested_checkpoint_path
+        if not requested_checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Evaluation checkpoint not found: {requested_checkpoint_path}"
+            )
+        best_path, ckpt = _load_eval_checkpoint(
+            requested_checkpoint_path,
+            refit_posthoc_calibration=refit_posthoc_calibration,
+            map_location=device,
+        )
+        source_checkpoint_path = best_path
+        if requested_checkpoint_path != best_path:
+            logger.info(
+                "posthoc_refit_resolved_encoder_checkpoint requested=%s encoder=%s",
+                requested_checkpoint_path,
+                best_path,
+            )
+        allow_checkpoint_mismatch = bool(
+            eval_cfg.get("allow_checkpoint_config_mismatch", False)
+        )
         validate_eval_checkpoint_config(
             cfg,
             ckpt.get("cfg"),
-            allow_mismatch=bool(eval_cfg.get("allow_checkpoint_config_mismatch", False)),
+            allow_mismatch=allow_checkpoint_mismatch,
+        )
+        validate_checkpoint_implementation(
+            ckpt,
+            allow_mismatch=allow_checkpoint_mismatch,
+        )
+        validate_checkpoint_decision_signature(
+            cfg,
+            ckpt,
+            refit_decision_calibration=refit_decision_calibration,
         )
         model.load_state_dict(ckpt["model"])
+        if final_temperature_override is not None:
+            discount_fusion = getattr(model, "discount_fusion", None)
+            parameters = (
+                discount_fusion.final_temperature_parameters()
+                if discount_fusion is not None
+                and hasattr(discount_fusion, "final_temperature_parameters")
+                else []
+            )
+            if len(parameters) != 1:
+                raise ValueError(
+                    "eval.final_temperature_override requires a checkpoint model "
+                    "with routed final-temperature scaling enabled"
+                )
+            with torch.no_grad():
+                parameters[0].fill_(math.log(final_temperature_override))
+            logger.info(
+                "eval_final_temperature_override=%.6f",
+                final_temperature_override,
+            )
         branch_competence_summary = dict(ckpt.get("branch_competence_prior") or {"enabled": False})
         apply_branch_competence_prior(model, branch_competence_summary)
         if (
@@ -1961,6 +4248,7 @@ def run(cfg: dict) -> dict[str, Any]:
         if (
             bool(((cfg.get("fusion", {}) or {}).get("visible_integrity_modifier", {}) or {}).get("enabled", False))
             and not bool(visible_integrity_summary.get("enabled", False))
+            and not refit_posthoc_calibration
         ):
             logger.warning(
                 "fusion.visible_integrity_modifier.enabled=true but checkpoint has no fitted reference; using neutral modifiers"
@@ -1969,11 +4257,54 @@ def run(cfg: dict) -> dict[str, Any]:
         best_val_f1 = float((ckpt.get("val") or {}).get("macro_f1", -1.0))
         checkpoint_metric_name = str(ckpt.get("checkpoint_metric", "loaded_checkpoint"))
         calibration_summary = dict(ckpt.get("calibration") or {"enabled": False})
+        if final_temperature_override is not None:
+            original_final_temperature = dict(
+                calibration_summary.get("final_temperature") or {}
+            )
+            calibration_summary["final_temperature"] = {
+                "enabled": True,
+                "overridden_for_ablation": True,
+                "temperature": float(final_temperature_override),
+                "source_temperature": original_final_temperature.get("temperature"),
+            }
+            temperatures = dict(calibration_summary.get("temperatures") or {})
+            temperatures["final"] = float(final_temperature_override)
+            calibration_summary["temperatures"] = temperatures
+        classification_threshold_summary = ckpt.get("classification_threshold")
+        if classification_threshold_enabled:
+            if classification_threshold_summary is None and not refit_decision_calibration:
+                raise ValueError(
+                    "Classification-threshold eval-only mode requires a fitted "
+                    "classification_threshold in the checkpoint or "
+                    "eval.refit_decision_calibration=true"
+                )
+            classification_threshold = float(
+                (classification_threshold_summary or {}).get("threshold", 0.5)
+            )
+        else:
+            classification_threshold_summary = None
+            classification_threshold = 0.5
         selective_cfg = cfg.get("selective_prediction", {}) or {}
         rejection_threshold = ckpt.get("rejection_threshold")
         conformal_thresholds = ckpt.get("conformal_thresholds")
-        if bool(selective_cfg.get("enabled", False)) and not refit_rejection_threshold:
-            if _uses_conformal_selective(selective_cfg):
+        risk_control_thresholds = ckpt.get("risk_control_thresholds")
+        if bool(selective_cfg.get("enabled", False)) and not refit_decision_calibration:
+            if _uses_risk_control_selective(selective_cfg):
+                if risk_control_thresholds is None:
+                    raise ValueError(
+                        "Risk-control eval-only mode requires risk_control_thresholds "
+                        "saved in the checkpoint"
+                    )
+                if (
+                    bool(selective_cfg.get("require_feasible", False))
+                    and not bool(risk_control_thresholds.get("feasible", False))
+                ):
+                    raise ValueError(
+                        "Risk-control checkpoint threshold is marked infeasible "
+                        "while selective_prediction.require_feasible=true; "
+                        "set eval.refit_decision_calibration=true"
+                    )
+            elif _uses_conformal_selective(selective_cfg):
                 if conformal_thresholds is None:
                     raise ValueError(
                         "Conformal eval-only mode requires conformal_thresholds saved in the checkpoint"
@@ -1985,11 +4316,105 @@ def run(cfg: dict) -> dict[str, Any]:
         rejection_threshold = (
             float(rejection_threshold) if rejection_threshold is not None else None
         )
+        if not bool(selective_cfg.get("enabled", False)):
+            # A full-coverage ablation must not silently inherit and report the
+            # source checkpoint's rejection decisions.
+            rejection_threshold = None
+            conformal_thresholds = None
+            risk_control_thresholds = None
+        if refit_posthoc_calibration:
+            if val_posthoc_calibration_loader is None:
+                raise RuntimeError(
+                    "Post-hoc refitting requires the validation calibration loader"
+                )
+            calibration_loaders = [
+                {
+                    "name": "clean",
+                    "loader": val_posthoc_calibration_loader,
+                    "reliability_branches": ["api", "graph", "manifest"],
+                },
+                *robust_calibration_loaders,
+            ]
+            calibration_summary = fit_posthoc_calibration(
+                model,
+                calibration_loaders,
+                device,
+                use_amp,
+                cfg,
+            )
+            routing_reference = calibration_summary.get(
+                "routing_visible_reference"
+            )
+            if routing_reference is not None:
+                modifier_cfg = (
+                    (cfg.get("fusion", {}) or {}).get(
+                        "visible_integrity_modifier", {}
+                    )
+                    or {}
+                )
+                reference_mode = str(
+                    calibration_summary.get("routing_visible_reference_mode")
+                    or modifier_cfg.get("mode", "bounded_visibility")
+                ).lower()
+                reference_names = ("api", "graph", "manifest")
+                reference = {
+                    name: float(value)
+                    for name, value in zip(reference_names, routing_reference)
+                }
+                reference_count = int(
+                    calibration_summary.get("routing_visible_reference_count", 0)
+                )
+                visible_integrity_summary = {
+                    "enabled": True,
+                    "mode": reference_mode,
+                    "metric": (
+                        "median_clean_effective_integrity"
+                        if reference_mode == "relative_effective"
+                        else "median_clean_encoder_coverage"
+                    ),
+                    "beta": 1.0
+                    if reference_mode == "relative_effective"
+                    else float(modifier_cfg.get("beta", 1.0)),
+                    "min_value": 0.0
+                    if reference_mode == "relative_effective"
+                    else float(modifier_cfg.get("min_value", 0.5)),
+                    "min_reference": float(
+                        modifier_cfg.get("min_reference", 1.0e-6)
+                    ),
+                    "counts": {
+                        name: reference_count for name in reference_names
+                    },
+                    "reference": reference,
+                    "values": [reference[name] for name in reference_names],
+                    "source": "posthoc_clean_cache",
+                }
+            if bool(calibration_summary.get("enabled", False)):
+                calibration_summary["degradation_scenarios"] = [
+                    {
+                        "name": str(item["name"]),
+                        "perturb_type": str(item["perturb_type"]),
+                        "strength": float(item["strength"]),
+                        "reliability_branches": list(
+                            item["reliability_branches"]
+                        ),
+                    }
+                    for item in robust_calibration_loaders
+                ]
+            classification_threshold_summary = None
+            classification_threshold = 0.5
+            rejection_threshold = None
+            conformal_thresholds = None
+            risk_control_thresholds = None
         logger.info("eval-only mode loaded checkpoint: %s", best_path)
     else:
         assert train_loader is not None
         model.set_calibration_active(False)
-        for parameter in model.calibration_parameters():
+        posthoc_only_parameters = (
+            model.encoder_training_frozen_parameters()
+            if hasattr(model, "encoder_training_frozen_parameters")
+            else model.calibration_parameters()
+        )
+        for parameter in posthoc_only_parameters:
             parameter.requires_grad_(False)
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -2005,17 +4430,33 @@ def run(cfg: dict) -> dict[str, Any]:
         best_score = -1.0
         best_val_f1 = -1.0
         checkpoint_metric_name = ""
-        best_path = out_dir / "best_tri_modal_robust.pt"
+        best_path = encoder_checkpoint_path
+        saved_checkpoint_this_run = False
         patience = int(train_cfg.get("patience", 10))
         stale = 0
         run_epoch_robust_val = checkpoint_requires_robust_validation(cfg)
 
         for epoch in range(1, int(train_cfg.get("epochs", 1)) + 1):
             train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg, epoch)
-            val_metrics, _ = evaluate(model, val_loader, device, use_amp, "val", dump_rows=False)
+            val_metrics, _ = evaluate(
+                model,
+                val_loader,
+                device,
+                use_amp,
+                "val",
+                dump_rows=False,
+                selective_score_type=selective_score_type,
+            )
             enforce_failed_ratio(val_metrics, cfg, "val")
             val_robust_metrics = (
-                evaluate_robust_validation(model, robust_val_loaders, device, use_amp, cfg)
+                evaluate_robust_validation(
+                    model,
+                    robust_val_loaders,
+                    device,
+                    use_amp,
+                    cfg,
+                    selective_score_type=selective_score_type,
+                )
                 if run_epoch_robust_val
                 else {}
             )
@@ -2025,6 +4466,10 @@ def run(cfg: dict) -> dict[str, Any]:
                 val_robust_metrics,
                 robust_val_loaders,
             )
+            if not math.isfinite(float(score)):
+                raise FloatingPointError(
+                    f"Non-finite checkpoint score at epoch={epoch}: {score}"
+                )
             scheduler.step()
             logger.info(
                 "epoch=%s train_loss=%.4f val_macro_f1=%.4f val_auc=%.4f val_acc=%.4f checkpoint_score=%.4f",
@@ -2047,20 +4492,38 @@ def run(cfg: dict) -> dict[str, Any]:
                         "val_robust": val_robust_metrics,
                         "checkpoint_score": score,
                         "checkpoint_metric": checkpoint_metric_name,
+                        "method_implementation_sha256": _method_implementation_sha256(),
+                        "checkpoint_stage": CHECKPOINT_STAGE_ENCODER_SELECTED,
                         "epoch": epoch,
                     },
                     best_path,
                 )
+                saved_checkpoint_this_run = True
             else:
                 stale += 1
                 if stale >= patience:
                     break
 
-        if best_path.exists():
-            ckpt = torch.load(best_path, map_location=device, weights_only=True)
-            model.load_state_dict(ckpt["model"])
-        calibration_loaders = [val_calibration_loader]
-        calibration_loaders.extend(item["loader"] for item in robust_calibration_loaders)
+        if not saved_checkpoint_this_run:
+            raise RuntimeError(
+                "Training completed without writing a checkpoint in this run; "
+                "refusing to load a potentially stale best.pt"
+            )
+        ckpt = torch.load(best_path, map_location=device, weights_only=True)
+        validate_checkpoint_stage(
+            ckpt,
+            expected=CHECKPOINT_STAGE_ENCODER_SELECTED,
+            checkpoint_path=best_path,
+        )
+        model.load_state_dict(ckpt["model"])
+        calibration_loaders = [
+            {
+                "name": "clean",
+                "loader": val_posthoc_calibration_loader,
+                "reliability_branches": ["api", "graph", "manifest"],
+            },
+            *robust_calibration_loaders,
+        ]
         calibration_summary = fit_posthoc_calibration(
             model,
             calibration_loaders,
@@ -2068,109 +4531,240 @@ def run(cfg: dict) -> dict[str, Any]:
             use_amp,
             cfg,
         )
+        if bool(calibration_summary.get("enabled", False)):
+            calibration_summary["degradation_scenarios"] = [
+                {
+                    "name": str(item["name"]),
+                    "perturb_type": str(item["perturb_type"]),
+                    "strength": float(item["strength"]),
+                    "reliability_branches": list(item["reliability_branches"]),
+                }
+                for item in robust_calibration_loaders
+            ]
         rejection_threshold = None
+        conformal_thresholds = None
+        risk_control_thresholds = None
+        classification_threshold_summary = None
+        classification_threshold = 0.5
 
-    val_calibration_metrics, val_calibration_rows = evaluate(
-        model,
-        val_calibration_loader,
-        device,
-        use_amp,
-        "val_calibration",
-        dump_rows=True,
-    )
-    enforce_failed_ratio(val_calibration_metrics, cfg, "val_calibration")
-    if not eval_only:
-        branch_competence_summary = estimate_branch_competence_prior(
-            val_calibration_rows,
-            cfg,
+    if pure_external_eval_only:
+        val_calibration_metrics: dict[str, Any] = {}
+        val_calibration_rows: list[dict[str, Any]] = []
+        val_conformal_metrics: dict[str, Any] = {}
+        val_conformal_rows: list[dict[str, Any]] = []
+        val_metrics: dict[str, Any] = {}
+        val_rows: list[dict[str, Any]] = []
+        val_robust_results: dict[str, Any] = {}
+    else:
+        if (
+            val_posthoc_calibration_loader is None
+            or val_conformal_calibration_loader is None
+            or val_loader is None
+        ):
+            raise RuntimeError("Internal error: validation loaders are required outside pure external eval-only mode")
+        val_calibration_metrics, val_calibration_rows = evaluate(
+            model,
+            val_posthoc_calibration_loader,
+            device,
+            use_amp,
+            "val_posthoc_calibration",
+            dump_rows=True,
+            selective_score_type=selective_score_type,
+            classification_threshold=classification_threshold,
         )
-        apply_branch_competence_prior(model, branch_competence_summary)
-        if bool(branch_competence_summary.get("enabled", False)):
-            logger.info(
-                "branch_competence_prior %s",
-                " ".join(
-                    f"{name}={value:.4f}"
-                    for name, value in branch_competence_summary["prior"].items()
-                ),
+        enforce_failed_ratio(val_calibration_metrics, cfg, "val_posthoc_calibration")
+        if not eval_only or refit_posthoc_calibration:
+            branch_competence_summary = estimate_branch_competence_prior(
+                val_calibration_rows,
+                cfg,
             )
+            apply_branch_competence_prior(model, branch_competence_summary)
+            if bool(branch_competence_summary.get("enabled", False)):
+                logger.info(
+                    "branch_competence_prior %s",
+                    " ".join(
+                        f"{name}={value:.4f}"
+                        for name, value in branch_competence_summary["prior"].items()
+                    ),
+                )
+                val_calibration_metrics, val_calibration_rows = evaluate(
+                    model,
+                    val_posthoc_calibration_loader,
+                    device,
+                    use_amp,
+                    "val_posthoc_calibration",
+                    dump_rows=True,
+                    selective_score_type=selective_score_type,
+                    classification_threshold=classification_threshold,
+                )
+                enforce_failed_ratio(val_calibration_metrics, cfg, "val_posthoc_calibration")
+        if not eval_only:
+            visible_integrity_summary = estimate_model_visible_integrity_reference(
+                val_calibration_rows,
+                cfg,
+            )
+            apply_model_visible_integrity_reference(model, visible_integrity_summary)
+            if bool(visible_integrity_summary.get("enabled", False)):
+                logger.info(
+                    "model_visible_integrity_reference %s",
+                    " ".join(
+                        f"{name}={value:.4f}"
+                        for name, value in visible_integrity_summary["reference"].items()
+                    ),
+                )
+                val_calibration_metrics, val_calibration_rows = evaluate(
+                    model,
+                    val_posthoc_calibration_loader,
+                    device,
+                    use_amp,
+                    "val_posthoc_calibration",
+                    dump_rows=True,
+                    selective_score_type=selective_score_type,
+                    classification_threshold=classification_threshold,
+                )
+                enforce_failed_ratio(val_calibration_metrics, cfg, "val_posthoc_calibration")
+        if classification_threshold_enabled and (
+            not eval_only or refit_decision_calibration
+        ):
+            classification_threshold_summary = fit_malware_classification_threshold(
+                val_calibration_rows, classification_cfg
+            )
+            if classification_threshold_summary is None:
+                raise RuntimeError("Enabled classification-threshold fitting returned no result")
+            classification_threshold = float(
+                classification_threshold_summary["threshold"]
+            )
+            logger.info(
+                "classification_threshold=%.6f calibration_macro_f1=%.4f "
+                "calibration_malware_recall=%.4f",
+                classification_threshold,
+                classification_threshold_summary["macro_f1"],
+                classification_threshold_summary["malware_recall"],
+            )
+            # Keep the reported post-hoc metrics and row predictions consistent
+            # with the now-fixed decision rule used by risk calibration.
             val_calibration_metrics, val_calibration_rows = evaluate(
                 model,
-                val_calibration_loader,
+                val_posthoc_calibration_loader,
                 device,
                 use_amp,
-                "val_calibration",
+                "val_posthoc_calibration",
                 dump_rows=True,
+                selective_score_type=selective_score_type,
+                classification_threshold=classification_threshold,
             )
-            enforce_failed_ratio(val_calibration_metrics, cfg, "val_calibration")
-    if not eval_only:
-        visible_integrity_summary = estimate_model_visible_integrity_reference(
-            val_calibration_rows,
-            cfg,
-        )
-        apply_model_visible_integrity_reference(model, visible_integrity_summary)
-        if bool(visible_integrity_summary.get("enabled", False)):
-            logger.info(
-                "model_visible_integrity_reference %s",
-                " ".join(
-                    f"{name}={value:.4f}"
-                    for name, value in visible_integrity_summary["reference"].items()
-                ),
+            enforce_failed_ratio(
+                val_calibration_metrics, cfg, "val_posthoc_calibration"
             )
-            val_calibration_metrics, val_calibration_rows = evaluate(
-                model,
-                val_calibration_loader,
-                device,
-                use_amp,
-                "val_calibration",
-                dump_rows=True,
+        val_conformal_metrics, val_conformal_rows = evaluate(
+            model,
+            val_conformal_calibration_loader,
+            device,
+            use_amp,
+            "val_conformal_calibration",
+            dump_rows=True,
+            selective_score_type=selective_score_type,
+            classification_threshold=classification_threshold,
+        )
+        enforce_failed_ratio(val_conformal_metrics, cfg, "val_conformal_calibration")
+        if not eval_only or refit_decision_calibration:
+            rejection_threshold = fit_rejection_threshold(
+                val_conformal_rows, cfg.get("selective_prediction", {}) or {}
             )
-            enforce_failed_ratio(val_calibration_metrics, cfg, "val_calibration")
-    if not eval_only or refit_rejection_threshold:
-        rejection_threshold = fit_rejection_threshold(
-            val_calibration_rows, cfg.get("selective_prediction", {}) or {}
-        )
-        conformal_thresholds = fit_conformal_thresholds(
-            val_calibration_rows, cfg.get("selective_prediction", {}) or {}
-        )
-        if not eval_only and best_path.exists():
-            ckpt = torch.load(best_path, map_location="cpu", weights_only=True)
+            conformal_thresholds = fit_conformal_thresholds(
+                val_conformal_rows, cfg.get("selective_prediction", {}) or {}
+            )
+            risk_control_thresholds = fit_risk_control_thresholds(
+                val_conformal_rows, cfg.get("selective_prediction", {}) or {}
+            )
+        if (not eval_only or refit_posthoc_calibration) and best_path.exists():
+            checkpoint_source = (
+                source_checkpoint_path
+                if eval_only and source_checkpoint_path is not None
+                else best_path
+            )
+            ckpt = torch.load(
+                checkpoint_source, map_location="cpu", weights_only=True
+            )
+            validate_checkpoint_stage(
+                ckpt,
+                expected=CHECKPOINT_STAGE_ENCODER_SELECTED,
+                checkpoint_path=checkpoint_source,
+            )
             ckpt["model"] = model.state_dict()
+            ckpt["cfg"] = cfg
+            ckpt["method_implementation_sha256"] = (
+                _method_implementation_sha256()
+            )
+            ckpt["checkpoint_stage"] = CHECKPOINT_STAGE_PIPELINE_FITTED
+            portable_encoder_path = (
+                pipeline_checkpoint_path.parent / "best_encoder_selected.pt"
+            )
+            if (
+                Path(checkpoint_source).resolve()
+                != portable_encoder_path.resolve()
+            ):
+                shutil.copy2(checkpoint_source, portable_encoder_path)
+            ckpt["encoder_checkpoint_path"] = portable_encoder_path.name
+            ckpt["encoder_checkpoint_sha256"] = _file_sha256(
+                portable_encoder_path
+            )
             ckpt["calibration"] = calibration_summary
             ckpt["branch_competence_prior"] = branch_competence_summary
             ckpt["model_visible_integrity_reference"] = visible_integrity_summary
+            ckpt["classification_threshold"] = classification_threshold_summary
             if rejection_threshold is not None:
                 ckpt["rejection_threshold"] = rejection_threshold
             else:
                 ckpt.pop("rejection_threshold", None)
             ckpt["conformal_thresholds"] = conformal_thresholds
+            ckpt["risk_control_thresholds"] = risk_control_thresholds
+            ckpt["decision_calibration_signature"] = (
+                _decision_calibration_signature(cfg)
+            )
             ckpt["validation_split"] = validation_split_summary
+            if eval_only:
+                ckpt["source_checkpoint_path"] = str(checkpoint_source)
+            best_path = pipeline_checkpoint_path
             torch.save(ckpt, best_path)
-    val_calibration_metrics.update(
-        _selective_metrics_from_rows(val_calibration_rows, rejection_threshold)
-    )
-    val_calibration_metrics.update(
-        conformal_selective_metrics(val_calibration_rows, conformal_thresholds)
-    )
+        val_conformal_metrics.update(
+            _selective_metrics_from_rows(val_conformal_rows, rejection_threshold)
+        )
+        val_conformal_metrics.update(
+            conformal_selective_metrics(val_conformal_rows, conformal_thresholds)
+        )
+        val_conformal_metrics.update(
+            risk_control_selective_metrics(
+                val_conformal_rows, risk_control_thresholds
+            )
+        )
 
-    val_metrics, val_rows = evaluate(
-        model,
-        val_loader,
-        device,
-        use_amp,
-        "val_selection",
-        dump_rows=True,
-        selective_threshold=rejection_threshold,
-    )
-    enforce_failed_ratio(val_metrics, cfg, "val_selection")
-    val_metrics.update(conformal_selective_metrics(val_rows, conformal_thresholds))
-    val_robust_results = evaluate_robust_validation(
-        model,
-        robust_val_loaders,
-        device,
-        use_amp,
-        cfg,
-        selective_threshold=rejection_threshold,
-    )
+        val_metrics, val_rows = evaluate(
+            model,
+            val_loader,
+            device,
+            use_amp,
+            "val_selection",
+            dump_rows=True,
+            selective_threshold=rejection_threshold,
+            selective_score_type=selective_score_type,
+            classification_threshold=classification_threshold,
+        )
+        enforce_failed_ratio(val_metrics, cfg, "val_selection")
+        val_metrics.update(conformal_selective_metrics(val_rows, conformal_thresholds))
+        val_metrics.update(
+            risk_control_selective_metrics(val_rows, risk_control_thresholds)
+        )
+        val_robust_results = evaluate_robust_validation(
+            model,
+            robust_val_loaders,
+            device,
+            use_amp,
+            cfg,
+            selective_threshold=rejection_threshold,
+            selective_score_type=selective_score_type,
+            classification_threshold=classification_threshold,
+        )
 
     test_metrics: dict[str, Any] = {}
     test_rows: list[dict[str, Any]] = []
@@ -2185,11 +4779,16 @@ def run(cfg: dict) -> dict[str, Any]:
             "test_clean",
             dump_rows=True,
             selective_threshold=rejection_threshold,
+            selective_score_type=selective_score_type,
+            classification_threshold=classification_threshold,
         )
         enforce_failed_ratio(test_metrics, cfg, "test_clean")
         # Conformal selective metrics on clean test (test_rows is still clean
         # here -- robust rows are appended only inside the loop below).
         test_metrics.update(conformal_selective_metrics(test_rows, conformal_thresholds))
+        test_metrics.update(
+            risk_control_selective_metrics(test_rows, risk_control_thresholds)
+        )
         if run_robust_test:
             perturb_tests = list(eval_cfg.get("perturb_tests", ["clean"]))
             if eval_cfg.get("perturb_strengths") is not None:
@@ -2217,44 +4816,86 @@ def run(cfg: dict) -> dict[str, Any]:
                         f"test_{result_key}",
                         dump_rows=True,
                         selective_threshold=rejection_threshold,
+                        selective_score_type=selective_score_type,
+                        classification_threshold=classification_threshold,
                     )
                     enforce_failed_ratio(metrics, cfg, f"test_{result_key}")
                     metrics.update(conformal_selective_metrics(rows, conformal_thresholds))
+                    metrics.update(
+                        risk_control_selective_metrics(rows, risk_control_thresholds)
+                    )
                     robust_results[result_key] = metrics
                     test_rows.extend(rows)
 
-    all_rows = val_rows + val_calibration_rows + test_rows
+    # Preserve all three disjoint validation roles in the audit dump. In
+    # particular, val_conformal_rows are the exact rows used to fit I3.
+    all_rows = (
+        val_rows
+        + val_calibration_rows
+        + val_conformal_rows
+        + test_rows
+    )
 
     extra_results = {}
     extra_rows: list[dict[str, Any]] = []
-    for idx, extra in enumerate(_normalize_extra_eval_sets(eval_cfg.get("extra_sets"))):
-        name = str(extra.get("name") or f"extra_{idx}")
-        pt_dir, csv_path = _extra_eval_paths(cfg, extra)
-        perturb_type = extra.get("perturb_type")
-        perturb_strength = float(extra.get("perturb_strength", 0.0))
-        try:
-            extra_ds = build_dataset_from_paths(
-                cfg,
-                pt_dir=pt_dir,
-                csv_path=csv_path,
-                is_train=False,
-                perturb_type=str(perturb_type) if perturb_type else None,
-                perturb_strength=perturb_strength,
-                dataset_overrides={
-                    "allow_pt_superset": bool(extra.get("allow_pt_superset", True)),
-                    "strict_split_integrity": bool(extra.get("strict_split_integrity", True)),
-                },
-            )
-        except EmptyExtraEvalSetError as exc:
+    extra_iter = prebuilt_extra_eval_sets if pure_external_eval_only else [
+        {"extra": extra, "name": str(extra.get("name") or f"extra_{idx}")}
+        for idx, extra in enumerate(extra_eval_sets)
+    ]
+    for item in extra_iter:
+        extra = item["extra"]
+        name = str(item.get("name") or extra.get("name") or "extra")
+        if item.get("skipped"):
+            extra_results[name] = {
+                "skipped": True,
+                "reason": str(item.get("skip_reason") or ""),
+                "pt_dir": str(item.get("pt_dir") or ""),
+                "csv": str(item.get("csv_path") or ""),
+            }
+            continue
+        if item.get("dataset") is not None:
+            extra_ds = item["dataset"]
+            pt_dir = item["pt_dir"]
+            csv_path = item["csv_path"]
+            perturb_type = item.get("perturb_type")
+            perturb_strength = float(item.get("perturb_strength", 0.0))
+        else:
+            pt_dir, csv_path = _extra_eval_paths(cfg, extra)
+            perturb_type = extra.get("perturb_type")
+            perturb_strength = float(extra.get("perturb_strength", 0.0))
+            try:
+                extra_ds = build_dataset_from_paths(
+                    cfg,
+                    pt_dir=pt_dir,
+                    csv_path=csv_path,
+                    is_train=False,
+                    perturb_type=str(perturb_type) if perturb_type else None,
+                    perturb_strength=perturb_strength,
+                    dataset_overrides={
+                        "allow_pt_superset": bool(extra.get("allow_pt_superset", True)),
+                        "strict_split_integrity": bool(extra.get("strict_split_integrity", True)),
+                    },
+                )
+            except EmptyExtraEvalSetError as exc:
+                if bool(extra.get("skip_if_empty", True)):
+                    extra_results[name] = {
+                        "skipped": True,
+                        "reason": f"{type(exc).__name__}: {exc}",
+                        "pt_dir": str(pt_dir),
+                        "csv": str(csv_path),
+                    }
+                    continue
+                raise
+        if extra_ds is None:
             if bool(extra.get("skip_if_empty", True)):
                 extra_results[name] = {
                     "skipped": True,
-                    "reason": f"{type(exc).__name__}: {exc}",
+                    "reason": "Empty extra dataset",
                     "pt_dir": str(pt_dir),
                     "csv": str(csv_path),
                 }
                 continue
-            raise
+            raise RuntimeError(f"Extra eval set {name} did not produce a dataset")
         extra_loader = build_loader(cfg, extra_ds, is_train=False)
         split_name = str(extra.get("split_name") or name)
         metrics, rows = evaluate(
@@ -2265,9 +4906,12 @@ def run(cfg: dict) -> dict[str, Any]:
             split_name,
             dump_rows=True,
             selective_threshold=rejection_threshold,
+            selective_score_type=selective_score_type,
+            classification_threshold=classification_threshold,
         )
         enforce_failed_ratio(metrics, cfg, split_name, max_failed_ratio=extra.get("max_failed_ratio"))
         metrics.update(conformal_selective_metrics(rows, conformal_thresholds))
+        metrics.update(risk_control_selective_metrics(rows, risk_control_thresholds))
         metrics = {
             **metrics,
             "pt_dir": str(pt_dir),
@@ -2282,6 +4926,14 @@ def run(cfg: dict) -> dict[str, Any]:
 
     write_gate_dump(out_dir / "gate_diagnostics.csv", all_rows)
     write_gate_dump(out_dir / "gate_diagnostics_extra_eval.csv", extra_rows)
+    risk_coverage_path = out_dir / "risk_coverage_curve.csv"
+    extra_risk_coverage_path = out_dir / "risk_coverage_curve_extra_eval.csv"
+    risk_coverage_points = write_risk_coverage_curve(
+        risk_coverage_path, test_rows
+    )
+    extra_risk_coverage_points = write_risk_coverage_curve(
+        extra_risk_coverage_path, extra_rows
+    )
     if extra_results:
         _write_metrics_json(out_dir / "metrics_extra_eval.json", extra_results)
     tuning_robust_composite_score = None
@@ -2295,25 +4947,53 @@ def run(cfg: dict) -> dict[str, Any]:
             robust_val_loaders,
         )
     summary = {
+        "run_identity": build_run_identity(cfg, exp_name, seed),
         "eval_only": eval_only,
+        "refit_posthoc_calibration": refit_posthoc_calibration,
+        "refit_decision_calibration": refit_decision_calibration,
+        # Retain the old summary key while configs migrate to the clearer name.
+        "refit_rejection_threshold": refit_decision_calibration,
+        "requested_checkpoint_path": (
+            str(requested_checkpoint_path)
+            if requested_checkpoint_path is not None
+            else None
+        ),
+        "source_checkpoint_path": (
+            str(source_checkpoint_path) if source_checkpoint_path is not None else None
+        ),
         "checkpoint_path": str(best_path),
+        "checkpoint_stage": CHECKPOINT_STAGE_PIPELINE_FITTED,
         "best_checkpoint_score": best_score,
         "best_val_f1": best_val_f1,
         "best_val_macro_f1": best_val_f1,
         "checkpoint_metric": checkpoint_metric_name,
         "tuning_robust_composite_score": tuning_robust_composite_score,
         "calibration": calibration_summary,
+        "classification_threshold": classification_threshold_summary,
         "branch_competence_prior": branch_competence_summary,
         "model_visible_integrity_reference": visible_integrity_summary,
         "conformal_thresholds": conformal_thresholds,
+        "risk_control_thresholds": risk_control_thresholds,
         "val": val_metrics,
         "val_selection": val_metrics,
         "val_calibration": val_calibration_metrics,
+        "val_posthoc_calibration": val_calibration_metrics,
+        "val_conformal_calibration": val_conformal_metrics,
         "validation_split": validation_split_summary,
         "val_robust": val_robust_results,
         "test": test_metrics,
         "robust": robust_results,
         "extra_eval": extra_results,
+        "risk_coverage_curves": {
+            "test_path": str(risk_coverage_path) if risk_coverage_points else None,
+            "test_points": int(risk_coverage_points),
+            "extra_eval_path": (
+                str(extra_risk_coverage_path)
+                if extra_risk_coverage_points
+                else None
+            ),
+            "extra_eval_points": int(extra_risk_coverage_points),
+        },
     }
     if rejection_threshold is not None:
         summary["rejection_threshold"] = rejection_threshold

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:id="@id/rl_item_all" android:layout_width="fill_parent" android:layout_height="wrap_content"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <LinearLayout android:gravity="center_vertical" android:orientation="horizontal" android:layout_width="fill_parent" android:layout_height="45.0dip">
+        <TextView android:textSize="18.0sp" android:textColor="#ff303030" android:gravity="center" android:id="@id/tv_play_word" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="viewpoint" />
+        <TextView android:textSize="14.0sp" android:textColor="#ffcecece" android:ellipsize="end" android:gravity="left" android:id="@id/tv_play_trans" android:paddingLeft="15.0dip" android:layout_width="0.0dip" android:layout_height="wrap_content" android:text="n.观点，意见，角度，视角..." android:maxLines="1" android:layout_weight="1.0" />
+        <ImageView android:id="@id/iv_playing" android:layout_width="20.0dip" android:layout_height="20.0dip" android:layout_marginRight="5.0dip" android:src="@drawable/ic_yinyue1" />
+    </LinearLayout>
+    <TextView android:background="#fff0f0f0" android:layout_width="fill_parent" android:layout_height="0.5dip" />
+</LinearLayout>

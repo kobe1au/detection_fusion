@@ -1,0 +1,21 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i2_combination_ecml_style
+
+train:
+  exp_name: i2_combination_ecml_style
+
+fusion:
+  # ECML-style conflictive opinion aggregation baseline.
+  # This is an adapted conflictive multi-view rule, not a strict ECML
+  # reproduction with the original ECML objective.
+  combination: ecml_style
+  routing:
+    enabled: false
+    use_fused_prediction_loss: false
+    final_temperature_scaling: false
+  branch_competence_prior:
+    # Keep I1 identical to the main method; only the fusion rule changes.
+    enabled: false

@@ -1,0 +1,13 @@
+defaults:
+  - _evidential_base.yaml
+
+method:
+  name: ecml_style_adapted
+
+train:
+  exp_name: ecml_style_adapted
+
+fusion:
+  # ECML-style adaptation without the proposed observable trust mechanism.
+  combination: ecml_style
+

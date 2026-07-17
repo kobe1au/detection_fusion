@@ -1,6 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -12,21 +14,19 @@ os.chdir(ROOT)
 
 PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
 CONFIG_DIR = Path("config/experiments/tri_modal_robust")
+NATURAL_SUBSET_DIR = Path("labels/natural_subsets")
+NATURAL_SUBSET_SCHEMA_VERSION = 3
+NATURAL_SUBSET_FILES = (
+    "test_api_low_effective_integrity.csv",
+    "test_api_graph_low_support.csv",
+    "test_predictive_high_conflict.csv",
+    "test_low_acceptance.csv",
+)
 
-# Main method of the thesis: the evidential trusted-fusion pipeline
-# (I1 模态质量与跨模态关系感知可靠性估计，I2 Yager 冲突感知融合，I3 conformal 拒识).
-#
-# The runnable "final" entry is seed_42 rather than the bare template, because
-# decision-only configs (I3 coverage variants and external evals) reuse the
-# seed-42 checkpoint path. Keeping seed_42 first makes one-shot paper groups
-# executable from a clean results directory.
+# Paper method: I1 calibrated branch-correctness reliability, I2 global opinion
+# routing with an explicit unknown mass, and I3 malware-FN risk control.
 FINAL_TEMPLATE = "evidential_trusted_fusion.yaml"
 PRIMARY_SEED = "seeds/seed_42.yaml"
-FINAL = PRIMARY_SEED
-
-# The previous lean linear discount-fusion method, kept as a strong prior-method
-# baseline (no EDL, no subjective-logic combination, no conformal).
-PRIOR_METHOD = "observable_reliability_discount_fusion.yaml"
 
 BASELINES = [
     "baselines/api_only.yaml",
@@ -35,78 +35,249 @@ BASELINES = [
     "baselines/api_graph_concat.yaml",
     "baselines/tri_modal_concat.yaml",
     "baselines/fixed_logit_fusion.yaml",
-    PRIOR_METHOD,
 ]
 
-# Remove a whole innovation from the main method.
+TRUSTED_FUSION_BASELINES = [
+    "baselines/trusted/tmc_style.yaml",
+    "baselines/trusted/qmf_style.yaml",
+    "baselines/trusted/ecml_style.yaml",
+]
+
+NATURAL_SUBSET_OURS_EVAL = [
+    "natural_subsets/ours_eval.yaml",
+]
+
+NATURAL_SUBSET_BASELINE_EVAL = [
+    "natural_subsets/api_only_eval.yaml",
+    "natural_subsets/graph_only_eval.yaml",
+    "natural_subsets/manifest_only_eval.yaml",
+    "natural_subsets/api_graph_concat_eval.yaml",
+    "natural_subsets/tri_modal_concat_eval.yaml",
+    "natural_subsets/fixed_logit_fusion_eval.yaml",
+]
+
+NATURAL_SUBSET_I2_EVAL = [
+    "natural_subsets/dempster_eval.yaml",
+    "natural_subsets/cumulative_eval.yaml",
+    "natural_subsets/log_pool_eval.yaml",
+    "natural_subsets/ecml_style_eval.yaml",
+]
+
+NATURAL_SUBSET_TRUSTED_EVAL = [
+    "natural_subsets/tmc_style_eval.yaml",
+    "natural_subsets/qmf_style_eval.yaml",
+    "natural_subsets/ecml_adapted_eval.yaml",
+]
+
+NATURAL_SUBSET_EVAL = [
+    *NATURAL_SUBSET_OURS_EVAL,
+    *NATURAL_SUBSET_BASELINE_EVAL,
+    *NATURAL_SUBSET_I2_EVAL,
+    *NATURAL_SUBSET_TRUSTED_EVAL,
+]
+
 MODULE_ABLATIONS = [
-    "ablations/modules/no_i1_uncertainty_modeling.yaml",
-    "ablations/modules/no_i2_conflict_aware_fusion.yaml",
+    "ablations/modules/no_reliability_discount.yaml",
+    "ablations/i2/router_prior_only.yaml",
     "ablations/modules/no_i3_selective_rejection.yaml",
 ]
 
-# Vary the mechanism within each innovation.
-I1_ABLATIONS = [
-    "ablations/i1/no_edl_reliability_source.yaml",
+I1_ATOMIC_ABLATIONS = [
     "ablations/i1/no_relation_evidence.yaml",
+    "ablations/i1/observable_only_reliability.yaml",
+    "ablations/i1/no_model_visibility_feature.yaml",
+    "ablations/i1/no_visibility_modifier.yaml",
+    "ablations/i1/no_learned_reliability_calibration.yaml",
+    "ablations/i1/no_integrity_weighted_aux.yaml",
 ]
-I2_ABLATIONS = [
+
+I2_ROUTER_ATOMIC_ABLATIONS = [
+    "ablations/i2/router_prior_only.yaml",
+    "ablations/i2/router_known_only.yaml",
+    "ablations/i2/router_no_disagreement.yaml",
+    "ablations/i2/router_no_encoder_training.yaml",
+    "ablations/i2/router_no_posthoc_refine.yaml",
+]
+
+I2_RULE_ABLATIONS = [
     "ablations/i2/combination_dempster.yaml",
     "ablations/i2/combination_cumulative.yaml",
     "ablations/i2/combination_log_pool.yaml",
+    "ablations/i2/combination_ecml_style.yaml",
 ]
-I3_ABLATIONS = [
+
+I2_MECHANISM_ABLATIONS = [
+    *I2_ROUTER_ATOMIC_ABLATIONS,
+    *I2_RULE_ABLATIONS,
+]
+
+I3_MECHANISM_ABLATIONS = [
+    "ablations/i3/class_conditional_conformal.yaml",
     "ablations/i3/marginal_conformal.yaml",
+    "ablations/i3/conflict_augmented_conformal.yaml",
     "ablations/i3/threshold_rejection.yaml",
+    "ablations/i3/uncertainty_threshold.yaml",
+    "ablations/i3/model_acceptance_threshold.yaml",
 ]
-MECHANISM_ABLATIONS = [*I1_ABLATIONS, *I2_ABLATIONS, *I3_ABLATIONS]
+
+MECHANISM_ABLATIONS = [
+    *I1_ATOMIC_ABLATIONS,
+    *I2_MECHANISM_ABLATIONS,
+    *I3_MECHANISM_ABLATIONS,
+]
+
+I1_I2_FACTORIAL = [
+    PRIMARY_SEED,
+    "ablations/modules/no_reliability_discount.yaml",
+    "ablations/i2/router_prior_only.yaml",
+    "ablations/factorial/i1_i2/i1_off_i2_off.yaml",
+]
+
+I3_FACTORIAL = [
+    # The primary seed is the on/on cell. Reuse its fitted pipeline rather than
+    # pulling an appendix sensitivity config into the paper ablation plan.
+    PRIMARY_SEED,
+    "ablations/factorial/i3/classification_off_risk_on.yaml",
+    "ablations/factorial/i3/classification_on_risk_off.yaml",
+    "ablations/modules/no_i3_selective_rejection.yaml",
+]
+
+FACTORIAL_ABLATIONS = [
+    *I1_I2_FACTORIAL,
+    # The complete method is the on/on cell of both matrices; execute it once.
+    *I3_FACTORIAL[1:],
+]
+
+FACTORIAL_REMAINING = [
+    *I1_I2_FACTORIAL[1:],
+    *I3_FACTORIAL[1:],
+]
 
 TRAINING_ABLATIONS = [
     "ablations/training/no_train_augmentation.yaml",
     "ablations/training/no_branch_auxiliary.yaml",
+    "ablations/training/no_edl_supervision.yaml",
     "ablations/training/no_edl_class_weight.yaml",
 ]
 
-SENSITIVITY = [
-    "sensitivity/i1/evidential_weight_0_05.yaml",
-    "sensitivity/i1/evidential_weight_0_2.yaml",
-    "sensitivity/i1/anneal_epochs_5.yaml",
-    "sensitivity/i1/anneal_epochs_20.yaml",
-    "sensitivity/i1/reliability_hidden_dim_8.yaml",
-    "sensitivity/i1/reliability_hidden_dim_32.yaml",
-    "sensitivity/i1/visible_modifier_beta_0_5.yaml",
-    "sensitivity/i1/visible_modifier_beta_2_0.yaml",
-    "sensitivity/i1/visible_modifier_min_0_3.yaml",
-    "sensitivity/i1/visible_modifier_min_0_7.yaml",
-    "sensitivity/i2/reliability_exponent_0_25.yaml",
-    "sensitivity/i2/reliability_exponent_1_0.yaml",
-    "sensitivity/i3/coverage_90.yaml",
-    "sensitivity/i3/coverage_99.yaml",
-]
-
 EXTERNAL_EVAL = [
-    "external/obfuscapk_rename_eval.yaml",
-    "external/obfuscapk_code_eval.yaml",
-    "external/obfuscapk_encryption_eval.yaml",
+    "external/obfuscapk_nop_eval.yaml",
+    "external/obfuscapk_goto_eval.yaml",
+    "external/obfuscapk_method_rename_eval.yaml",
+    "external/obfuscapk_string_eval.yaml",
     "external/obfuscapk_combined_eval.yaml",
-]
-NO_EDL = [
-    # "ablations/edl/edl_loss_0.03.yaml",
-    # "ablations/edl/edl_loss_0.05.yaml",
-    "ablations/edl/no_discount.yaml",
-    "ablations/edl/no_edl_certain.yaml",
-    "ablations/edl/no_edl_certain_with_reliability.yaml",
+    "external/obfuscapk_advanced_reflection_eval.yaml",
+    "external/obfuscapk_call_indirection_eval.yaml",
+    "external/obfuscapk_mixed_api_graph_manifest_eval.yaml",
 ]
 
-FINAL_V2 = [
-    # "final_v2/seed_42_0.03.yaml",
-    "final_v2/seed_42_0.05.yaml"
+GRAPH_ONLY_OBFUSCAPK_EVAL = [
+    "graph_only_obfuscapk/obfuscapk_nop_eval.yaml",
+    "graph_only_obfuscapk/obfuscapk_goto_eval.yaml",
+    "graph_only_obfuscapk/obfuscapk_method_rename_eval.yaml",
+    "graph_only_obfuscapk/obfuscapk_string_eval.yaml",
+    "graph_only_obfuscapk/obfuscapk_combined_eval.yaml",
+    "graph_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "graph_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "graph_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
 ]
 
-FINAL_V2_FULL_ROBUST_EVAL = [
-    "final_v2_eval/seed_42_0.03_eval.yaml",
-    "final_v2_eval/seed_42_0.05_eval.yaml",
-    "final_v2_eval/seed_42_0.1_eval.yaml",
+API_ONLY_OBFUSCAPK_EVAL = [
+    "api_only_obfuscapk/obfuscapk_nop_eval.yaml",
+    "api_only_obfuscapk/obfuscapk_goto_eval.yaml",
+    "api_only_obfuscapk/obfuscapk_method_rename_eval.yaml",
+    "api_only_obfuscapk/obfuscapk_string_eval.yaml",
+    "api_only_obfuscapk/obfuscapk_combined_eval.yaml",
+    "api_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "api_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "api_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+]
+
+MANIFEST_ONLY_OBFUSCAPK_EVAL = [
+    "manifest_only_obfuscapk/obfuscapk_nop_eval.yaml",
+    "manifest_only_obfuscapk/obfuscapk_goto_eval.yaml",
+    "manifest_only_obfuscapk/obfuscapk_method_rename_eval.yaml",
+    "manifest_only_obfuscapk/obfuscapk_string_eval.yaml",
+    "manifest_only_obfuscapk/obfuscapk_combined_eval.yaml",
+    "manifest_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "manifest_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "manifest_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+]
+
+API_GRAPH_CONCAT_OBFUSCAPK_EVAL = [
+    "api_graph_concat_obfuscapk/obfuscapk_nop_eval.yaml",
+    "api_graph_concat_obfuscapk/obfuscapk_goto_eval.yaml",
+    "api_graph_concat_obfuscapk/obfuscapk_method_rename_eval.yaml",
+    "api_graph_concat_obfuscapk/obfuscapk_string_eval.yaml",
+    "api_graph_concat_obfuscapk/obfuscapk_combined_eval.yaml",
+    "api_graph_concat_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "api_graph_concat_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "api_graph_concat_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+]
+
+TRI_MODAL_CONCAT_OBFUSCAPK_EVAL = [
+    "tri_modal_concat_obfuscapk/obfuscapk_nop_eval.yaml",
+    "tri_modal_concat_obfuscapk/obfuscapk_goto_eval.yaml",
+    "tri_modal_concat_obfuscapk/obfuscapk_method_rename_eval.yaml",
+    "tri_modal_concat_obfuscapk/obfuscapk_string_eval.yaml",
+    "tri_modal_concat_obfuscapk/obfuscapk_combined_eval.yaml",
+    "tri_modal_concat_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "tri_modal_concat_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "tri_modal_concat_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+]
+
+FIXED_LOGIT_FUSION_OBFUSCAPK_EVAL = [
+    "fixed_logit_fusion_obfuscapk/obfuscapk_nop_eval.yaml",
+    "fixed_logit_fusion_obfuscapk/obfuscapk_goto_eval.yaml",
+    "fixed_logit_fusion_obfuscapk/obfuscapk_method_rename_eval.yaml",
+    "fixed_logit_fusion_obfuscapk/obfuscapk_string_eval.yaml",
+    "fixed_logit_fusion_obfuscapk/obfuscapk_combined_eval.yaml",
+    "fixed_logit_fusion_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "fixed_logit_fusion_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "fixed_logit_fusion_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+]
+
+BASELINE_OBFUSCAPK_EVAL = [
+    *API_ONLY_OBFUSCAPK_EVAL,
+    *GRAPH_ONLY_OBFUSCAPK_EVAL,
+    *MANIFEST_ONLY_OBFUSCAPK_EVAL,
+    *API_GRAPH_CONCAT_OBFUSCAPK_EVAL,
+    *TRI_MODAL_CONCAT_OBFUSCAPK_EVAL,
+    *FIXED_LOGIT_FUSION_OBFUSCAPK_EVAL,
+]
+
+EXTERNAL_OBFUSCAPK_NEW_EVAL = [
+    "external/obfuscapk_advanced_reflection_eval.yaml",
+    "external/obfuscapk_call_indirection_eval.yaml",
+    "external/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+]
+
+BASELINE_OBFUSCAPK_NEW_EVAL = [
+    "api_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "api_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "api_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+    "graph_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "graph_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "graph_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+    "manifest_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "manifest_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "manifest_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+    "api_graph_concat_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "api_graph_concat_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "api_graph_concat_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+    "tri_modal_concat_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "tri_modal_concat_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "tri_modal_concat_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+    "fixed_logit_fusion_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
+    "fixed_logit_fusion_obfuscapk/obfuscapk_call_indirection_eval.yaml",
+    "fixed_logit_fusion_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
+]
+
+APPENDIX_SENSITIVITY = [
+    "appendix/edl_weight_0_10.yaml",
+    "appendix/risk_level_0_03_eval.yaml",
+    "appendix/risk_level_0_05_eval.yaml",
+    "appendix/risk_level_0_10_eval.yaml",
 ]
 
 SEEDS = [
@@ -116,76 +287,146 @@ SEEDS = [
 ]
 
 ALIASES = {
-    "final": FINAL,
-    "evidential": FINAL,
-    "evidential_template": FINAL_TEMPLATE,
-    "prior": PRIOR_METHOD,
-    "linear": PRIOR_METHOD,
+    "final": PRIMARY_SEED,
+    "evidential": PRIMARY_SEED,
+    "template": FINAL_TEMPLATE,
     "api": "baselines/api_only.yaml",
     "graph": "baselines/graph_only.yaml",
     "manifest": "baselines/manifest_only.yaml",
     "concat": "baselines/tri_modal_concat.yaml",
     "late": "baselines/fixed_logit_fusion.yaml",
-    "no_i1": "ablations/modules/no_i1_uncertainty_modeling.yaml",
-    "no_i2": "ablations/modules/no_i2_conflict_aware_fusion.yaml",
+    "no_i1": "ablations/modules/no_reliability_discount.yaml",
+    "no_i2": "ablations/i2/router_prior_only.yaml",
+    "no_i2_cumulative": "ablations/i2/combination_cumulative.yaml",
+    "no_i2_linear": "ablations/modules/no_i2_conflict_aware_fusion.yaml",
     "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
-    "no_reliability_discount": "ablations/modules/no_reliability_discount.yaml",
-    "no_edl_rel": "ablations/i1/no_edl_reliability_source.yaml",
     "no_relation": "ablations/i1/no_relation_evidence.yaml",
+    "observable_only": "ablations/i1/observable_only_reliability.yaml",
+    "no_model_visibility": "ablations/i1/no_model_visibility_feature.yaml",
+    "no_visibility_modifier": "ablations/i1/no_visibility_modifier.yaml",
+    "no_learned_reliability": "ablations/i1/no_learned_reliability_calibration.yaml",
+    "no_integrity_aux": "ablations/i1/no_integrity_weighted_aux.yaml",
     "dempster": "ablations/i2/combination_dempster.yaml",
     "cumulative": "ablations/i2/combination_cumulative.yaml",
     "log_pool": "ablations/i2/combination_log_pool.yaml",
+    "ecml_style": "ablations/i2/combination_ecml_style.yaml",
+    "router_prior_only": "ablations/i2/router_prior_only.yaml",
+    "router_known_only": "ablations/i2/router_known_only.yaml",
+    "router_no_disagreement": "ablations/i2/router_no_disagreement.yaml",
+    "router_no_encoder_training": "ablations/i2/router_no_encoder_training.yaml",
+    "router_no_posthoc_refine": "ablations/i2/router_no_posthoc_refine.yaml",
+    "class_conditional_conformal": "ablations/i3/class_conditional_conformal.yaml",
     "marginal_conformal": "ablations/i3/marginal_conformal.yaml",
+    "conflict_conformal": "ablations/i3/conflict_augmented_conformal.yaml",
     "threshold_rejection": "ablations/i3/threshold_rejection.yaml",
-    "visible_beta_0_5": "sensitivity/i1/visible_modifier_beta_0_5.yaml",
-    "visible_beta_2_0": "sensitivity/i1/visible_modifier_beta_2_0.yaml",
-    "visible_min_0_3": "sensitivity/i1/visible_modifier_min_0_3.yaml",
-    "visible_min_0_7": "sensitivity/i1/visible_modifier_min_0_7.yaml",
+    "uncertainty_threshold": "ablations/i3/uncertainty_threshold.yaml",
+    "acceptance_threshold": "ablations/i3/model_acceptance_threshold.yaml",
+    "i1_on_i2_on": PRIMARY_SEED,
+    "i1_off_i2_on": "ablations/modules/no_reliability_discount.yaml",
+    "i1_on_i2_off": "ablations/i2/router_prior_only.yaml",
+    "i1_off_i2_off": "ablations/factorial/i1_i2/i1_off_i2_off.yaml",
+    "classification_on_risk_on": PRIMARY_SEED,
+    "classification_off_risk_on": "ablations/factorial/i3/classification_off_risk_on.yaml",
+    "classification_on_risk_off": "ablations/factorial/i3/classification_on_risk_off.yaml",
+    "classification_off_risk_off": "ablations/modules/no_i3_selective_rejection.yaml",
+    "risk_03": "appendix/risk_level_0_03_eval.yaml",
+    "risk_05": "appendix/risk_level_0_05_eval.yaml",
+    "posthoc_pilot": "appendix/refit_seed_42_posthoc.yaml",
+    "refit_seed_42": "appendix/refit_seed_42_posthoc.yaml",
+    "tmc_style": "baselines/trusted/tmc_style.yaml",
+    "qmf_style": "baselines/trusted/qmf_style.yaml",
+    "ecml_adapted": "baselines/trusted/ecml_style.yaml",
+    "no_edl_supervision": "ablations/training/no_edl_supervision.yaml",
+    "natural_ours": "natural_subsets/ours_eval.yaml",
+    "natural_dempster": "natural_subsets/dempster_eval.yaml",
+    "natural_cumulative": "natural_subsets/cumulative_eval.yaml",
+    "natural_log_pool": "natural_subsets/log_pool_eval.yaml",
+    "natural_ecml_style": "natural_subsets/ecml_style_eval.yaml",
+    "natural_tmc_style": "natural_subsets/tmc_style_eval.yaml",
+    "natural_qmf_style": "natural_subsets/qmf_style_eval.yaml",
+    "natural_ecml_adapted": "natural_subsets/ecml_adapted_eval.yaml",
+    "temp_eval": "seeds/temperature_scaling_false_eval.yaml",
 }
 
 GROUPS = {
-    "main": [FINAL, *BASELINES],
+    "main": [PRIMARY_SEED, *BASELINES],
     "baselines": BASELINES,
+    "trusted_baselines": TRUSTED_FUSION_BASELINES,
+    "recent_baselines": TRUSTED_FUSION_BASELINES,
+    "natural_subset": NATURAL_SUBSET_EVAL,
+    "natural_subsets": NATURAL_SUBSET_EVAL,
+    "natural_subset_ours": NATURAL_SUBSET_OURS_EVAL,
+    "natural_subset_baselines": NATURAL_SUBSET_BASELINE_EVAL,
+    "natural_subset_i2": NATURAL_SUBSET_I2_EVAL,
+    "natural_i2": NATURAL_SUBSET_I2_EVAL,
+    "natural_subset_trusted": NATURAL_SUBSET_TRUSTED_EVAL,
+    "natural_trusted": NATURAL_SUBSET_TRUSTED_EVAL,
     "module": MODULE_ABLATIONS,
     "mechanism": MECHANISM_ABLATIONS,
-    "final_v2": FINAL_V2,
-    "final_v2_full_robust_eval": FINAL_V2_FULL_ROBUST_EVAL,
-    "no_edl": NO_EDL,
-    "i1": I1_ABLATIONS,
-    "i2": I2_ABLATIONS,
-    "i3": [PRIMARY_SEED, *I3_ABLATIONS],
+    "i1_atomic": I1_ATOMIC_ABLATIONS,
+    "i2_atomic": I2_ROUTER_ATOMIC_ABLATIONS,
+    "i2_rules": I2_RULE_ABLATIONS,
+    "i2_mechanism": I2_MECHANISM_ABLATIONS,
+    "i3_mechanism": I3_MECHANISM_ABLATIONS,
+    "i1_i2_2x2": I1_I2_FACTORIAL,
+    "i1_i2_factorial": I1_I2_FACTORIAL,
+    "i3_2x2": I3_FACTORIAL,
+    "i3_factorial": I3_FACTORIAL,
+    "factorial": FACTORIAL_ABLATIONS,
+    "factorial_remaining": FACTORIAL_REMAINING,
     "training_ablation": TRAINING_ABLATIONS,
-    "sensitivity": SENSITIVITY,
-    "sensitivity_with_seed": [PRIMARY_SEED, *SENSITIVITY],
-    "external": [PRIMARY_SEED, *EXTERNAL_EVAL],
-    "obfuscapk": [PRIMARY_SEED, *EXTERNAL_EVAL],
+    "external": EXTERNAL_EVAL,
+    "obfuscapk": EXTERNAL_EVAL,
+    "external_new": EXTERNAL_OBFUSCAPK_NEW_EVAL,
+    "obfuscapk_new": EXTERNAL_OBFUSCAPK_NEW_EVAL,
+    "api_only_obfuscapk": API_ONLY_OBFUSCAPK_EVAL,
+    "api_obfuscapk": API_ONLY_OBFUSCAPK_EVAL,
+    "graph_only_obfuscapk": GRAPH_ONLY_OBFUSCAPK_EVAL,
+    "graph_obfuscapk": GRAPH_ONLY_OBFUSCAPK_EVAL,
+    "manifest_only_obfuscapk": MANIFEST_ONLY_OBFUSCAPK_EVAL,
+    "manifest_obfuscapk": MANIFEST_ONLY_OBFUSCAPK_EVAL,
+    "api_graph_concat_obfuscapk": API_GRAPH_CONCAT_OBFUSCAPK_EVAL,
+    "tri_modal_concat_obfuscapk": TRI_MODAL_CONCAT_OBFUSCAPK_EVAL,
+    "concat_obfuscapk": TRI_MODAL_CONCAT_OBFUSCAPK_EVAL,
+    "fixed_logit_fusion_obfuscapk": FIXED_LOGIT_FUSION_OBFUSCAPK_EVAL,
+    "late_fusion_obfuscapk": FIXED_LOGIT_FUSION_OBFUSCAPK_EVAL,
+    "baseline_obfuscapk": BASELINE_OBFUSCAPK_EVAL,
+    "baselines_obfuscapk": BASELINE_OBFUSCAPK_EVAL,
+    "baseline_obfuscapk_new": BASELINE_OBFUSCAPK_NEW_EVAL,
+    "baselines_obfuscapk_new": BASELINE_OBFUSCAPK_NEW_EVAL,
     "seed": SEEDS,
     "full": SEEDS,
-    # Paper plans (evidential method is the protagonist).
-    "paper_main": [*SEEDS, *BASELINES],
+    "appendix": APPENDIX_SENSITIVITY,
+    "appendix_sensitivity": APPENDIX_SENSITIVITY,
+    "paper_main": [*SEEDS, *BASELINES, *TRUSTED_FUSION_BASELINES],
     "paper_ablation": [
         PRIMARY_SEED,
         *MODULE_ABLATIONS,
         *MECHANISM_ABLATIONS,
-        *TRAINING_ABLATIONS,
+        *FACTORIAL_ABLATIONS,
     ],
     "paper_external": [PRIMARY_SEED, *EXTERNAL_EVAL],
     "paper_evidential": [
         *SEEDS,
         *BASELINES,
+        *TRUSTED_FUSION_BASELINES,
         *MODULE_ABLATIONS,
         *MECHANISM_ABLATIONS,
+        *FACTORIAL_ABLATIONS,
     ],
+    "paper_natural": NATURAL_SUBSET_EVAL,
     "paper_evidential_all": [
         *SEEDS,
         *BASELINES,
+        *TRUSTED_FUSION_BASELINES,
         *MODULE_ABLATIONS,
         *MECHANISM_ABLATIONS,
+        *FACTORIAL_ABLATIONS,
         *TRAINING_ABLATIONS,
-        *SENSITIVITY,
         *EXTERNAL_EVAL,
     ],
 }
+
 
 def available_configs() -> dict[str, Path]:
     configs: dict[str, Path] = {}
@@ -196,7 +437,7 @@ def available_configs() -> dict[str, Path]:
         relative = path.relative_to(CONFIG_DIR)
         if any(part.startswith(".") for part in relative.parts):
             continue
-        if path.name == "base_tri_modal_robust.yaml" or path.stem.startswith("_"):
+        if path.name in {"base_tri_modal_robust.yaml", "debug_fast.yaml"} or path.stem.startswith("_"):
             continue
         key = relative.with_suffix("").as_posix()
         configs[key] = path
@@ -254,8 +495,90 @@ def resolve_target_specs(targets: list[str]) -> list[Path]:
     return resolved
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_natural_subset_artifacts(root: Path = ROOT) -> None:
+    subset_dir = root / NATURAL_SUBSET_DIR
+    manifest_path = subset_dir / "subset_manifest.json"
+    rebuild = (
+        "Rebuild them with scripts/build_natural_subset_csvs.py from the "
+        "current seed-42 gate_diagnostics.csv before running natural subsets."
+    )
+    if not manifest_path.is_file():
+        raise RuntimeError(f"Natural-subset manifest is missing: {manifest_path}. {rebuild}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Natural-subset manifest is unreadable: {manifest_path}. {rebuild}") from exc
+    if int(manifest.get("schema_version", -1)) != NATURAL_SUBSET_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Natural-subset manifest uses an obsolete schema "
+            f"({manifest.get('schema_version')!r}); expected "
+            f"{NATURAL_SUBSET_SCHEMA_VERSION}. {rebuild}"
+        )
+    missing = [
+        str(subset_dir / name)
+        for name in NATURAL_SUBSET_FILES
+        if not (subset_dir / name).is_file()
+    ]
+    if missing:
+        raise RuntimeError(f"Natural-subset CSVs are incomplete: {missing}. {rebuild}")
+
+    for path_key, hash_key in (
+        ("diagnostics", "diagnostics_sha256"),
+        ("test_csv", "test_csv_sha256"),
+    ):
+        source = Path(str(manifest.get(path_key, "")))
+        if not source.is_absolute():
+            source = root / source
+        expected_hash = str(manifest.get(hash_key, ""))
+        if not source.is_file() or len(expected_hash) != 64 or _sha256(source) != expected_hash:
+            raise RuntimeError(
+                f"Natural-subset source changed or is unavailable: {source}. {rebuild}"
+            )
+
+    subset_records = manifest.get("subsets")
+    if not isinstance(subset_records, list):
+        raise RuntimeError(
+            f"Natural-subset manifest has no output provenance. {rebuild}"
+        )
+    output_hashes: dict[str, str] = {}
+    for record in subset_records:
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                f"Natural-subset manifest has malformed output provenance. {rebuild}"
+            )
+        name = Path(str(record.get("csv", ""))).name
+        if not name or name in output_hashes:
+            raise RuntimeError(
+                f"Natural-subset manifest has duplicate or unnamed outputs. {rebuild}"
+            )
+        output_hashes[name] = str(record.get("csv_sha256", ""))
+    expected_outputs = set(NATURAL_SUBSET_FILES)
+    if set(output_hashes) != expected_outputs:
+        raise RuntimeError(
+            "Natural-subset manifest output set does not match the experiment "
+            f"protocol: found={sorted(output_hashes)}, "
+            f"expected={sorted(expected_outputs)}. {rebuild}"
+        )
+    for name, expected_hash in output_hashes.items():
+        output_path = subset_dir / name
+        if len(expected_hash) != 64 or _sha256(output_path) != expected_hash:
+            raise RuntimeError(
+                f"Natural-subset CSV changed after generation: {output_path}. {rebuild}"
+            )
+
+
 def run_config(config_path: Path, extra_configs: list[Path] | None = None) -> None:
     extra_configs = list(extra_configs or [])
+    if "natural_subsets" in config_path.parts:
+        validate_natural_subset_artifacts()
     suffix = f" + {' + '.join(str(path) for path in extra_configs)}" if extra_configs else ""
     print(f"==> Running {config_path}{suffix}", flush=True)
     subprocess.run(

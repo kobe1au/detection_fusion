@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -31,6 +32,11 @@ ATTENTION_KEYS = (
 )
 
 SELECTIVE_KEYS = (
+    "classification_threshold",
+    "fixed_0_5_acc",
+    "fixed_0_5_macro_f1",
+    "fixed_0_5_f1_pos",
+    "fixed_0_5_recall_pos",
     "coverage",
     "selective_metrics_defined",
     "selective_risk",
@@ -47,11 +53,52 @@ SELECTIVE_KEYS = (
     "ap",
     "ece_10",
     "brier",
+    "conformal_alpha",
+    "conformal_class_conditional",
+    "conformal_acceptance_rate",
+    "conformal_rejection_rate",
+    "conformal_empty_set_rate",
+    "conformal_ambiguous_set_rate",
+    "conformal_benign_acceptance_rate",
+    "conformal_malware_acceptance_rate",
+    "conformal_malware_rejection_rate",
+    "conformal_malware_fn_after_rejection",
+    "conformal_accepted_malware_fn_rate",
+    "conformal_malware_fn_count",
+    "conformal_accepted_malware_count",
+    "conformal_selective_risk",
+    "conformal_selective_acc",
+    "conformal_empirical_coverage_benign",
+    "conformal_empirical_coverage_malware",
+    "risk_control_threshold",
+    "risk_control_risk_level",
+    "risk_control_acceptance_rate",
+    "risk_control_rejection_rate",
+    "risk_control_selective_risk",
+    "risk_control_selective_acc",
+    "risk_control_malware_fn_rate_after_rejection",
+    "risk_control_accepted_malware_fn_rate",
+    "risk_control_malware_fn_count",
+    "risk_control_accepted_malware_count",
+    "risk_control_num_accepted",
+    "risk_control_num_rejected",
+    "risk_control_target_met_empirically",
 )
 
-AGGREGATE_GROUP_COLUMNS = ("method", "section", "scenario")
+AGGREGATE_GROUP_COLUMNS = (
+    "method",
+    "method_protocol_sha256",
+    "method_implementation_sha256",
+    "section",
+    "scenario",
+)
 
 DEFAULT_AGGREGATE_METRICS = {
+    "classification_threshold",
+    "fixed_0_5_acc",
+    "fixed_0_5_macro_f1",
+    "fixed_0_5_f1_pos",
+    "fixed_0_5_recall_pos",
     "acc",
     "f1",
     "macro_f1",
@@ -70,6 +117,35 @@ DEFAULT_AGGREGATE_METRICS = {
     "acceptance_score_p10",
     "acceptance_score_p50",
     "acceptance_score_p90",
+    "conformal_alpha",
+    "conformal_acceptance_rate",
+    "conformal_rejection_rate",
+    "conformal_empty_set_rate",
+    "conformal_ambiguous_set_rate",
+    "conformal_benign_acceptance_rate",
+    "conformal_malware_acceptance_rate",
+    "conformal_malware_rejection_rate",
+    "conformal_malware_fn_after_rejection",
+    "conformal_accepted_malware_fn_rate",
+    "conformal_malware_fn_count",
+    "conformal_accepted_malware_count",
+    "conformal_selective_risk",
+    "conformal_selective_acc",
+    "conformal_empirical_coverage_benign",
+    "conformal_empirical_coverage_malware",
+    "risk_control_threshold",
+    "risk_control_risk_level",
+    "risk_control_acceptance_rate",
+    "risk_control_rejection_rate",
+    "risk_control_selective_risk",
+    "risk_control_selective_acc",
+    "risk_control_malware_fn_rate_after_rejection",
+    "risk_control_accepted_malware_fn_rate",
+    "risk_control_malware_fn_count",
+    "risk_control_accepted_malware_count",
+    "risk_control_num_accepted",
+    "risk_control_num_rejected",
+    "risk_control_target_met_empirically",
     "mean_semantic_attention_entropy",
     "mean_cross_modal_attention",
     "semantic_residual_gate",
@@ -97,6 +173,9 @@ NON_METRIC_COLUMNS = {
     "seed",
     "run_dir",
     "summary_path",
+    "resolved_config_sha256",
+    "method_protocol_sha256",
+    "method_implementation_sha256",
     "section",
     "scenario",
     "pt_dir",
@@ -121,7 +200,39 @@ def _safe_load_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def _run_identity(summary_path: Path, results_root: Path) -> dict[str, str]:
+def _run_identity(
+    summary_path: Path,
+    results_root: Path,
+    summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    embedded = (summary or {}).get("run_identity") or {}
+    if isinstance(embedded, dict) and embedded.get("experiment_name"):
+        experiment = str(embedded["experiment_name"])
+        identity: dict[str, Any] = {
+            "experiment": experiment,
+            "method": _method_name(
+                str(embedded.get("method_name") or _method_name(experiment))
+            ),
+            "seed": str(embedded.get("seed", "")),
+            "run_dir": str(summary_path.parent),
+            "summary_path": str(summary_path),
+        }
+        for key, value in embedded.items():
+            if key not in {"experiment_name", "method_name", "seed"} and isinstance(
+                value, SCALAR_TYPES
+            ):
+                identity[str(key)] = value
+        return identity
+    if summary_path.name.startswith("summary_"):
+        experiment = summary_path.stem[len("summary_") :]
+        seed_match = re.search(r"(?:^|_)seed_(\d+)(?:_|$)", experiment)
+        return {
+            "experiment": experiment,
+            "method": _method_name(experiment),
+            "seed": seed_match.group(1) if seed_match else "",
+            "run_dir": str(summary_path.parent),
+            "summary_path": str(summary_path),
+        }
     try:
         rel = summary_path.parent.relative_to(results_root)
         parts = rel.parts
@@ -175,12 +286,35 @@ def _add_metric_row(
     )
 
 
-def _summary_metric_rows(summary_path: Path, results_root: Path) -> list[dict[str, Any]]:
-    summary = _safe_load_yaml(summary_path)
-    identity = _run_identity(summary_path, results_root)
+def _summary_metric_rows(
+    summary_path: Path,
+    results_root: Path,
+    summary: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    summary = summary if summary is not None else _safe_load_yaml(summary_path)
+    identity = _run_identity(summary_path, results_root, summary)
     rows: list[dict[str, Any]] = []
-    for section in ("val_selection", "val_calibration", "test"):
-        _add_metric_row(rows, identity, section, section, summary.get(section))
+    _add_metric_row(
+        rows, identity, "val_selection", "val_selection", summary.get("val_selection")
+    )
+    posthoc_metrics = summary.get("val_posthoc_calibration")
+    if posthoc_metrics is None:
+        posthoc_metrics = summary.get("val_calibration")
+    _add_metric_row(
+        rows,
+        identity,
+        "val_posthoc_calibration",
+        "val_posthoc_calibration",
+        posthoc_metrics,
+    )
+    _add_metric_row(
+        rows,
+        identity,
+        "val_conformal_calibration",
+        "val_conformal_calibration",
+        summary.get("val_conformal_calibration"),
+    )
+    _add_metric_row(rows, identity, "test", "test", summary.get("test"))
     for section in ("val_robust", "robust"):
         nested = summary.get(section) or {}
         if not isinstance(nested, dict):
@@ -199,10 +333,22 @@ def _summary_metric_rows(summary_path: Path, results_root: Path) -> list[dict[st
 
 
 def collect_metric_rows(results_root: Path) -> pd.DataFrame:
-    summary_paths = sorted(results_root.rglob("summary.yaml"))
+    summary_paths = sorted(
+        set(results_root.rglob("summary.yaml"))
+        | set(results_root.rglob("summary_*.yaml"))
+    )
     rows: list[dict[str, Any]] = []
+    seen_payloads: set[str] = set()
     for path in summary_paths:
-        rows.extend(_summary_metric_rows(path, results_root))
+        summary = _safe_load_yaml(path)
+        payload = yaml.safe_dump(summary, sort_keys=True, allow_unicode=True).encode("utf-8")
+        fingerprint = hashlib.sha256(payload).hexdigest()
+        # Users often copy a run's nested summary.yaml to results/summary_*.yaml.
+        # Count the run once even when both files are retained for convenience.
+        if fingerprint in seen_payloads:
+            continue
+        seen_payloads.add(fingerprint)
+        rows.extend(_summary_metric_rows(path, results_root, summary))
     return pd.DataFrame.from_records(rows)
 
 
@@ -304,7 +450,7 @@ def _filter_methods(aggregate: pd.DataFrame, prefixes: tuple[str, ...], extras: 
     if aggregate.empty or "method" not in aggregate.columns:
         return pd.DataFrame()
     methods = aggregate["method"].astype(str)
-    mask = methods.isin({"observable_reliability_discount_fusion", "final", *extras})
+    mask = methods.isin({"final", *extras})
     for prefix in prefixes:
         mask |= methods.str.startswith(prefix)
     return aggregate[mask].copy()
@@ -342,7 +488,7 @@ def main() -> None:
         _filter_methods(
             aggregate,
             ("i3_",),
-            extras=("module_no_i3_discount_rejection",),
+            extras=("module_no_i3_selective_rejection",),
         ),
         out_dir / "aggregate_i3_ablation.csv",
     )
@@ -351,7 +497,26 @@ def main() -> None:
     _write_csv(_selected_columns(metrics, SELECTIVE_KEYS), out_dir / "i3_selective_results.csv")
     run_index_columns = [
         key
-        for key in ("experiment", "seed", "run_dir", "summary_path")
+        for key in (
+            "experiment",
+            "method",
+            "seed",
+            "method_protocol_sha256",
+            "method_implementation_sha256",
+            "resolved_config_sha256",
+            "model_fusion_mode",
+            "combination_rule",
+            "evidential_certainty_enabled",
+            "classification_threshold_enabled",
+            "classification_threshold_objective",
+            "classification_min_malware_recall",
+            "selective_prediction_mode",
+            "risk_control_level",
+            "target_coverage",
+            "conformal_uses_raw_conflict",
+            "run_dir",
+            "summary_path",
+        )
         if key in metrics.columns
     ]
     run_index = metrics[run_index_columns].drop_duplicates() if run_index_columns else pd.DataFrame()

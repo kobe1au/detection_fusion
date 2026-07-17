@@ -1,0 +1,22 @@
+defaults:
+  - ../evidential_trusted_fusion.yaml
+
+method:
+  name: temperature_scaling_false_eval
+eval:
+  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
+  eval_only: true
+  refit_posthoc_calibration: false
+  # Keep the checkpoint architecture and fitted router unchanged, but replace
+  # its fitted scalar temperature with the identity transform T=1.
+  final_temperature_override: 1.0
+  # This eval-only override was added after the source checkpoint was written;
+  # the model/fusion state itself is intentionally reused unchanged.
+  allow_checkpoint_config_mismatch: true
+  # The temperature override changes class probabilities, so both downstream
+  # decision thresholds must be refitted on their original calibration splits.
+  refit_rejection_threshold: true
+
+train:
+  exp_name: temperature_scaling_false_eval
+  seed: 42

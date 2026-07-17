@@ -1,0 +1,26 @@
+# config/extract_obfuscapk_generated.yaml
+data:
+  split_dirs:
+    nop: "D:/obf_final_out/nop"
+    goto: "D:/obf_final_out/goto"
+    method_rename: "D:/obf_final_out/method_rename"
+    string: "D:/obf_final_out/string"
+  out_root: "D:/pts_obfuscapk"
+  out_dirs:
+    nop: "D:/pts_obfuscapk/nop"
+    goto: "D:/pts_obfuscapk/goto"
+    method_rename: "D:/pts_obfuscapk/method_rename"
+    string: "D:/pts_obfuscapk/string"
+  splits: [nop, goto, method_rename, string]
+
+manifest:
+  vocab_path: "D:/code/detection_fusion_copy/config/manifest_vocab.yaml"
+  rebuild_vocab: false
+  allow_empty_vocab: true
+
+execution:
+  workers: 8
+  resume: true
+  fail_on_error: false
+  allow_empty_splits: true
+  failed_json: "D:/pts_obfuscapk/failed_obfuscapk_generated.json"

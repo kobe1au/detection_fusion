@@ -177,11 +177,26 @@ def build_evidence(
     evidence_manifest_conflict = manifest_conflict if use_conflict_evidence else torch.zeros_like(manifest_conflict)
     evidence_code_conflict = code_conflict if use_conflict_evidence else torch.zeros_like(code_conflict)
 
-    api_encoder_coverage = scalar_attr(
+    api_total_pipeline_coverage = scalar_attr(
         graph_data, "api_encoder_coverage", batch_size, device, dtype, 1.0
     )
+    api_extractor_coverage = scalar_attr(
+        graph_data, "api_extractor_coverage", batch_size, device, dtype, 1.0
+    )
+    api_runtime_encoder_coverage = scalar_attr(
+        graph_data, "api_runtime_encoder_coverage", batch_size, device, dtype, 1.0
+    )
+    # Reliability should describe what the model receives from the already
+    # constructed PT representation. Fixed per-method/per-DEX extraction
+    # budgets are representation design choices, not sample-specific encoder
+    # failures. Keep their combined ratio for diagnostics, while the formal
+    # visibility modifier consumes only the runtime encoder coverage.
+    api_encoder_coverage = api_runtime_encoder_coverage
     graph_encoder_coverage = scalar_attr(
         graph_data, "graph_encoder_coverage", batch_size, device, dtype, 1.0
+    )
+    graph_feature_valid_ratio = scalar_attr(
+        graph_data, "graph_feature_valid_ratio", batch_size, device, dtype, 1.0
     )
     evidence = None
     if not diagnostics_only:
@@ -219,6 +234,14 @@ def build_evidence(
         dtype,
         0.0,
     )
+    api_extractor_truncated = scalar_attr(
+        graph_data,
+        "api_truncated_by_extractor_budget",
+        batch_size,
+        device,
+        dtype,
+        0.0,
+    )
     api_integrity_before_budget = scalar_attr(
         graph_data,
         "api_integrity_before_encoder_budget",
@@ -246,11 +269,16 @@ def build_evidence(
     diagnostics = {
         "api_integrity": api_integrity.detach().view(batch_size),
         "api_encoder_coverage": api_encoder_coverage.detach().view(batch_size),
+        "api_total_pipeline_coverage": api_total_pipeline_coverage.detach().view(batch_size),
+        "api_extractor_coverage": api_extractor_coverage.detach().view(batch_size),
+        "api_runtime_encoder_coverage": api_runtime_encoder_coverage.detach().view(batch_size),
         "effective_api_integrity": (api_integrity * api_encoder_coverage).detach().view(batch_size),
+        "api_truncated_by_extractor_budget": api_extractor_truncated.detach().view(batch_size),
         "api_truncated_by_encoder_budget": api_truncated.detach().view(batch_size),
         "api_integrity_before_encoder_budget": api_integrity_before_budget.detach().view(batch_size),
         "graph_integrity": graph_integrity.detach().view(batch_size),
         "graph_encoder_coverage": graph_encoder_coverage.detach().view(batch_size),
+        "graph_feature_valid_ratio": graph_feature_valid_ratio.detach().view(batch_size),
         "effective_graph_integrity": (graph_integrity * graph_encoder_coverage).detach().view(batch_size),
         "graph_truncated_by_encoder_budget": graph_truncated.detach().view(batch_size),
         "graph_integrity_before_encoder_budget": graph_integrity_before_budget.detach().view(batch_size),

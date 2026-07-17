@@ -1,0 +1,16 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: training_no_edl_supervision
+
+train:
+  exp_name: training_no_edl_supervision
+
+loss:
+  evidential_loss_weight: 0.0
+
+fusion:
+  reliability_calibration:
+    # Without EDL supervision the certainty head is not a meaningful I1 source.
+    use_evidential_uncertainty: false

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:clipChildren="false" android:layout_width="fill_parent" android:layout_height="wrap_content"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <RelativeLayout android:background="#ffffffff" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="18.0dip" android:layout_marginTop="7.0dip">
+        <TextView android:background="#ff454a77" android:layout_width="1.0dip" android:layout_height="12.0dip" android:layout_marginLeft="15.0dip" android:layout_centerVertical="true" />
+        <TextView android:textSize="12.0sp" android:textStyle="bold" android:textColor="#ff454a77" android:id="@id/live_sign" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="28.0dip" android:text="免费直播课" android:layout_centerVertical="true" />
+    </RelativeLayout>
+    <p4d236d9a.pabb3141d.p62608e08.widgets.CustomViewPager android:id="@id/vp_topbannner" android:clipChildren="false" android:layout_width="fill_parent" android:layout_height="163.0dip" android:layout_marginTop="5.0dip" android:overScrollMode="never" />
+    <RelativeLayout android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginTop="5.0dip" android:layout_marginBottom="5.0dip">
+        <TextView android:background="#ff454a77" android:visibility="gone" android:layout_width="1.0dip" android:layout_height="12.0dip" android:layout_marginLeft="15.0dip" android:layout_centerVertical="true" />
+        <TextView android:textSize="18.0sp" android:textStyle="bold" android:textColor="#ff333333" android:id="@id/course_sign" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="18.0dip" android:text="定制学习" android:layout_centerVertical="true" />
+    </RelativeLayout>
+    <p4d236d9a.pabb3141d.p62608e08.widgets.CustomViewPager android:id="@id/vp_midbannner" android:clipChildren="false" android:layout_width="fill_parent" android:layout_height="125.0dip" android:layout_marginLeft="12.0dip" android:layout_marginTop="10.0dip" android:overScrollMode="never" />
+    <RelativeLayout android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginTop="5.0dip" android:layout_marginBottom="5.0dip">
+        <TextView android:background="#ff454a77" android:visibility="gone" android:layout_width="1.0dip" android:layout_height="12.0dip" android:layout_marginLeft="15.0dip" android:layout_centerVertical="true" />
+        <TextView android:textSize="18.0sp" android:textStyle="bold" android:textColor="#ff333333" android:id="@id/public_sign" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="18.0dip" android:text="公开课" android:layout_centerVertical="true" />
+    </RelativeLayout>
+</LinearLayout>

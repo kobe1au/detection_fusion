@@ -2,8 +2,9 @@
 
 The evidential fusion (I2) treats API / Graph / Manifest as independent evidence
 sources. These tests pin that the budget truncation of one modality does not
-depend on another modality's fields, and that switches which would couple them
-are rejected for the evidential combination rules.
+depend on another modality's fields. Observable relation evidence is allowed as
+I1 metadata, while switches that feed one modality's features into another
+encoder are rejected for evidential combination rules.
 """
 
 import pytest
@@ -105,14 +106,14 @@ def _cfg(combination, *, relation_evidence=False, behavior_hint=False):
     }
 
 
-def test_build_model_rejects_relation_evidence_under_evidential_combination():
-    with pytest.raises(ValueError, match="couple modalities"):
-        build_model(_cfg("yager", relation_evidence=True), feature_dim=515)
+def test_build_model_allows_observable_relation_evidence_under_evidential_combination():
+    model = build_model(_cfg("dempster", relation_evidence=True), feature_dim=515)
+    assert model is not None
 
 
 def test_build_model_rejects_behavior_hint_under_evidential_combination():
-    with pytest.raises(ValueError, match="couple modalities"):
-        build_model(_cfg("yager", behavior_hint=True), feature_dim=515)
+    with pytest.raises(ValueError, match="non-duplicated branch inputs"):
+        build_model(_cfg("dempster", behavior_hint=True), feature_dim=515)
 
 
 def test_build_model_allows_coupling_switches_under_linear_combination():

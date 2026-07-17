@@ -513,34 +513,27 @@ def should_keep_api(
 
 
 def select_api_events(events: List[ApiEvent], max_events: int) -> List[ApiEvent]:
+    """Select a bounded, order-preserving API sequence.
+
+    Sensitive calls are retained first because they carry direct security
+    semantics.  The remaining budget is filled from the non-sensitive prefix.
+    Unlike the former evenly-spaced selector, this never creates artificial
+    local adjacency by striding through a long event stream.
+    """
     if max_events <= 0 or len(events) <= max_events:
         return events
 
     sensitive_idx = [i for i, e in enumerate(events) if e.sensitive]
-    semantic_idx = [
-        i for i, e in enumerate(events)
-        if e.category_id != API_CATEGORY_TO_ID["other"] and not e.sensitive
-    ]
-
     sensitive_set = set(sensitive_idx)
-    semantic_set = set(semantic_idx)
-    other_idx = [
-        i for i, _ in enumerate(events)
-        if i not in sensitive_set and i not in semantic_set
-    ]
-
-    chosen: List[int] = []
-    for pool in (sensitive_idx, semantic_idx, other_idx):
-        if len(chosen) >= max_events:
-            break
-        remain = max_events - len(chosen)
-        if len(pool) <= remain:
-            chosen.extend(pool)
-        elif remain > 0:
-            pos = np.linspace(0, len(pool) - 1, num=remain, dtype=np.int64)
-            chosen.extend([pool[int(i)] for i in pos])
-
-    chosen = sorted(set(chosen))[:max_events]
+    if len(sensitive_idx) >= max_events:
+        chosen = sensitive_idx[:max_events]
+    else:
+        non_sensitive_idx = [
+            i for i in range(len(events)) if i not in sensitive_set
+        ]
+        remaining = max_events - len(sensitive_idx)
+        chosen = sensitive_idx + non_sensitive_idx[:remaining]
+    chosen = sorted(chosen)
     return [events[i] for i in chosen]
 
 
@@ -582,6 +575,12 @@ def _empty_dex_result(
             "api_parse_error": "",
             "api_event_count_raw": 0,
             "api_event_count_kept": 0,
+            "api_event_count_before_method_budget": 0,
+            "api_event_count_after_method_budget": 0,
+            "api_event_count_before_extractor_budget": 0,
+            "api_event_count_after_extractor_budget": 0,
+            "api_extractor_coverage": 1.0,
+            "api_truncated_by_extractor_budget": 0.0,
             "api_truncated": False,
             "api_truncation_ratio": 0.0,
             "api_known_type_count": 0,
@@ -728,6 +727,7 @@ def build_graph_api_for_dex(
     sensitive_seed: Set[int] = set()
     method_names: List[str] = []
     events_by_method: List[List[ApiEvent]] = []
+    raw_event_counts_by_method: List[int] = []
 
     for idx, (ma, m) in enumerate(zip(ma_list, method_list)):
         emb, span, is_sensitive = build_method_local_cfg_embedding(
@@ -754,6 +754,7 @@ def build_graph_api_for_dex(
                 )
             )
 
+        raw_event_counts_by_method.append(len(cur_events))
         if max_api_events_per_method > 0 and len(cur_events) > max_api_events_per_method:
             cur_events = select_api_events(cur_events, max_api_events_per_method)
 
@@ -847,6 +848,9 @@ def build_graph_api_for_dex(
 
     api_source_indices = range(m_all) if scope == "all_methods" else kept_sorted
 
+    num_api_events_before_method_budget = sum(
+        raw_event_counts_by_method[old_idx] for old_idx in api_source_indices
+    )
     api_events: List[ApiEvent] = []
     for old_idx in api_source_indices:
         api_events.extend(events_by_method[old_idx])
@@ -932,10 +936,22 @@ def build_graph_api_for_dex(
             "api_parse_error": "",
             "api_event_count_raw": int(num_api_events_raw),
             "api_event_count_kept": int(num_api_events_kept),
-            "api_truncated": bool(num_api_events_raw > num_api_events_kept),
+            "api_event_count_before_method_budget": int(num_api_events_before_method_budget),
+            "api_event_count_after_method_budget": int(num_api_events_raw),
+            "api_event_count_before_extractor_budget": int(num_api_events_raw),
+            "api_event_count_after_extractor_budget": int(num_api_events_kept),
+            "api_extractor_coverage": (
+                float(num_api_events_kept / num_api_events_before_method_budget)
+                if num_api_events_before_method_budget > 0
+                else 1.0
+            ),
+            "api_truncated_by_extractor_budget": float(
+                num_api_events_kept < num_api_events_before_method_budget
+            ),
+            "api_truncated": bool(num_api_events_before_method_budget > num_api_events_kept),
             "api_truncation_ratio": (
-                float(1.0 - num_api_events_kept / num_api_events_raw)
-                if num_api_events_raw > 0
+                float(1.0 - num_api_events_kept / num_api_events_before_method_budget)
+                if num_api_events_before_method_budget > 0
                 else 0.0
             ),
             "api_known_type_count": known_type_count,
@@ -979,7 +995,9 @@ def build_graph_api_for_dex(
             "api": {
                 "num_api_events_raw": int(num_api_events_raw),
                 "num_api_events": int(num_api_events_kept),
-                "api_truncated": bool(num_api_events_raw > num_api_events_kept),
+                "num_api_events_before_method_budget": int(num_api_events_before_method_budget),
+                "num_api_events_after_method_budget": int(num_api_events_raw),
+                "api_truncated": bool(num_api_events_before_method_budget > num_api_events_kept),
                 "num_api_events_in_graph": int(num_api_events_in_graph),
                 "api_in_graph_ratio": float(api_in_graph_ratio),
                 "num_unique_api_tokens": int(len(unique_tokens)),
@@ -1107,6 +1125,22 @@ def process_apk(
         ]
         raw_api = sum(int(meta.get("api_event_count_raw", 0)) for meta in observable_parts)
         kept_api = sum(int(meta.get("api_event_count_kept", 0)) for meta in observable_parts)
+        before_method_api = sum(
+            int(meta.get("api_event_count_before_method_budget", meta.get("api_event_count_raw", 0)))
+            for meta in observable_parts
+        )
+        after_method_api = sum(
+            int(meta.get("api_event_count_after_method_budget", meta.get("api_event_count_raw", 0)))
+            for meta in observable_parts
+        )
+        before_extractor_api = sum(
+            int(meta.get("api_event_count_before_extractor_budget", meta.get("api_event_count_raw", 0)))
+            for meta in observable_parts
+        )
+        after_extractor_api = sum(
+            int(meta.get("api_event_count_after_extractor_budget", meta.get("api_event_count_kept", 0)))
+            for meta in observable_parts
+        )
         known_api = sum(int(meta.get("api_known_type_count", 0)) for meta in observable_parts)
         graph_nodes = sum(int(meta.get("graph_node_count_raw", 0)) for meta in observable_parts)
         graph_edges = sum(int(meta.get("graph_edge_count_raw", 0)) for meta in observable_parts)
@@ -1117,8 +1151,24 @@ def process_apk(
             "api_parse_error": "; ".join(dex_errors),
             "api_event_count_raw": raw_api,
             "api_event_count_kept": kept_api,
-            "api_truncated": kept_api < raw_api,
-            "api_truncation_ratio": float(1.0 - kept_api / raw_api) if raw_api > 0 else 0.0,
+            "api_event_count_before_method_budget": before_method_api,
+            "api_event_count_after_method_budget": after_method_api,
+            "api_event_count_before_extractor_budget": before_extractor_api,
+            "api_event_count_after_extractor_budget": after_extractor_api,
+            "api_extractor_coverage": (
+                float(after_extractor_api / before_method_api)
+                if before_method_api > 0
+                else 1.0
+            ),
+            "api_truncated_by_extractor_budget": float(
+                after_extractor_api < before_method_api
+            ),
+            "api_truncated": after_extractor_api < before_method_api,
+            "api_truncation_ratio": (
+                float(1.0 - after_extractor_api / before_method_api)
+                if before_method_api > 0
+                else 0.0
+            ),
             "api_known_type_count": known_api,
             "api_unknown_type_count": max(0, kept_api - known_api),
             "dex_parse_ok": bool(results),

@@ -1,5 +1,8 @@
 log_level: INFO
 
+# Stable architecture and method defaults live in fusion/constants.py.
+# This file keeps only dataset paths and training budget knobs that usually
+# change across machines or experiment phases.
 data:
   root: ""
   train_pt_dir: D:/pts_robust/train
@@ -11,7 +14,6 @@ data:
   out_dir: results/tri_modal_robust
 
 train:
-  exp_name: base_tri_modal_robust
   seed: 42
   epochs: 60
   patience: 8
@@ -20,51 +22,4 @@ train:
   num_workers: 8
   eval_num_workers: 4
   lr: 0.0003
-
-# I1: observable reliability estimation.
-fusion:
-  use_reliability_discount: true
-  reliability_discount_exponent: 0.5
-  branch_competence_prior:
-    enabled: true
-    metric: macro_f1
-    normalization: best
-    min_value: 0.5
-  visible_integrity_modifier:
-    enabled: true
-    beta: 1.0
-    min_value: 0.5
-    min_reference: 1.0e-6
-  weight_sharpening_gamma: 1.0
-  reliability_calibration:
-    enabled: true
-    hidden_dim: 16
-
-  # I2: probability-level discount fusion.
-  use_support_discount: true
-  use_conflict_discount: true
-  use_confidence_proxy: true
-  use_hard_alive_mask: true
-  support_factor:
-    manifest_support_base: 0.5
-    code_anchor_base: 0.5
-  conflict_factor:
-    min_value: 0.05
-
-  # I3: selective decision score aggregation.
-  acceptance_aggregation: product
-
-loss:
-  branch_aux_weight: 0.25
-  reliability_weighted_aux: true
-
-selective_prediction:
-  enabled: true
-  target_coverage: 0.95
-
-robust:
-  train_aug: true
-
-eval:
-  run_test: true
-  run_robust_test: true
+  weight_decay: 0.01

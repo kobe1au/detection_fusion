@@ -1,0 +1,19 @@
+defaults:
+  - ../baselines/fixed_logit_fusion.yaml
+
+method:
+  name: fixed_logit_fusion_obfuscapk_combined_eval
+
+eval:
+  eval_only: true
+  output_name: fixed_logit_fusion_obfuscapk_combined_eval
+  checkpoint_path: results/tri_modal_robust/baseline_fixed_logit_fusion/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: false
+  run_test: false
+  run_robust_test: false
+  extra_sets:
+    - name: fixed_logit_fusion_obfuscapk_combined
+      pt_dir: /root/autodl-tmp/pts_obfuscapk/combined
+      csv: labels/obfuscapk_combined.csv
+      allow_pt_superset: false
+      skip_if_empty: false

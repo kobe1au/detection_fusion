@@ -1,0 +1,18 @@
+defaults:
+  - ../../seeds/seed_42.yaml
+
+method:
+  name: i3_conflict_augmented_conformal_eval
+
+selective_prediction:
+  mode: conformal
+  class_conditional: true
+  use_raw_conflict: true
+
+eval:
+  eval_only: true
+  output_name: i3_conflict_augmented_conformal_eval
+  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
+  refit_rejection_threshold: true
+  run_test: true
+  run_robust_test: true

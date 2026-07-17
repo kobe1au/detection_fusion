@@ -1,0 +1,80 @@
+# Build Obfuscapk external-evaluation PTs with the same schema as the formal
+# training PTs.  Do not use extract_obfuscapk_generated.yaml for paper results:
+# that older config produced API length 1024, empty manifest vocab dimensions,
+# and graph feature dim 515, while the formal training PTs use API length 2048,
+# manifest dims 128/64/32, and graph feature dim 519.
+
+data:
+  split_dirs:
+    clean: "D:/obf_final_out/clean"
+    nop: "D:/obf_final_out/nop"
+    goto: "D:/obf_final_out/goto"
+    method_rename: "D:/obf_final_out/rename"
+    string: "D:/obf_final_out/string"
+    combined: "D:/obf_final_out/mixed_light"
+    advanced_reflection: "D:/obf_final_out/advanced_reflection"
+    call_indirection: "D:/obf_final_out/call_indirection"
+    mixed_api_graph_manifest: "D:/obf_final_out/mixed_api_graph_manifest"
+  out_root: "D:/pts_obfuscapk"
+  out_dirs:
+    clean: "D:/pts_obfuscapk/clean"
+    nop: "D:/pts_obfuscapk/nop"
+    goto: "D:/pts_obfuscapk/goto"
+    method_rename: "D:/pts_obfuscapk/method_rename"
+    string: "D:/pts_obfuscapk/string"
+    combined: "D:/pts_obfuscapk/combined"
+    advanced_reflection: "D:/pts_obfuscapk/advanced_reflection"
+    call_indirection: "D:/pts_obfuscapk/call_indirection"
+    mixed_api_graph_manifest: "D:/pts_obfuscapk/mixed_api_graph_manifest"
+  splits:
+    - clean
+    - nop
+    - goto
+    - method_rename
+    - string
+    - combined
+    - advanced_reflection
+    - call_indirection
+    - mixed_api_graph_manifest
+
+hyperparameters:
+  vocab_size: 256
+
+graph:
+  sensitive_hops: 1
+  use_behavior_hints: true
+  max_methods_per_dex: 4096
+  fallback_max_methods: 512
+  fallback_policy: api_rich
+
+api:
+  num_hash_buckets: 8192
+  max_events_per_dex: 2048
+  max_events_per_method: 32
+  event_scope: all_methods
+  framework_only: true
+  include_descriptor: false
+
+manifest:
+  # Must be the train-only manifest vocabulary used to build the formal
+  # training PTs. Do not rebuild it from obfuscated APKs.
+  vocab_path: "D:/code/detection_fusion_copy/config/manifest_vocab.yaml"
+  rebuild_vocab: false
+  allow_empty_vocab: false
+  manifest_dim: 256
+  max_permissions: 128
+  max_intents: 64
+  max_features: 32
+  save_manifest_jsonl: true
+  manifest_jsonl_dir: "D:/pts_obfuscapk/_manifest_jsonl"
+
+storage:
+  keep_method_names: false
+  keep_api_tokens: false
+
+execution:
+  workers: 8
+  resume: false
+  fail_on_error: false
+  allow_empty_splits: false
+  failed_json: "D:/pts_obfuscapk/failed_obfuscapk_aligned.json"

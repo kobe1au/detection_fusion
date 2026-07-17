@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.cardview.widget.CardView android:id="@id/layout_content" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginLeft="15.0dip" android:layout_marginRight="15.0dip" android:layout_marginBottom="10.0dip" app:cardBackgroundColor="#fff7f9fc" app:cardCornerRadius="8.0dip" app:cardElevation="0.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <FrameLayout android:layout_width="fill_parent" android:layout_height="wrap_content">
+        <LinearLayout android:orientation="vertical" android:layout_width="fill_parent" android:layout_height="wrap_content">
+            <LinearLayout android:gravity="center_vertical" android:orientation="horizontal" android:layout_width="wrap_content" android:layout_height="30.0dip">
+                <androidx.appcompat.widget.AppCompatTextView android:textSize="14.0sp" android:textColor="@color/white" android:gravity="center_vertical" android:id="@id/tv_title" android:background="@drawable/shape_transcrip_result_title_bg" android:paddingLeft="8.0dip" android:paddingRight="8.0dip" android:layout_width="wrap_content" android:layout_height="fill_parent" android:maxWidth="280.0dip" app:autoSizeMaxTextSize="14.0sp" app:autoSizeMinTextSize="6.0sp" app:autoSizeStepGranularity="2.0sp" app:autoSizeTextType="uniform" />
+                <ImageView android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/pic_title" />
+            </LinearLayout>
+            <TextView android:textSize="14.0sp" android:textColor="#ff333333" android:id="@id/tv_content" android:padding="10.0dip" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginBottom="7.0dip" android:lineSpacingMultiplier="1.3" />
+        </LinearLayout>
+        <LinearLayout android:gravity="center" android:orientation="vertical" android:id="@id/ll_lock" android:background="#80000000" android:visibility="gone" android:layout_width="fill_parent" android:layout_height="fill_parent">
+            <ImageView android:visibility="visible" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/icon_lock" android:scaleType="centerInside" />
+            <TextView android:textSize="13.0sp" android:textColor="@color/white" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="10.0dip" android:text="获取完整成绩单分析" />
+        </LinearLayout>
+    </FrameLayout>
+</androidx.cardview.widget.CardView>

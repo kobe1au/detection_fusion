@@ -1,12 +1,18 @@
 defaults:
   - ../../evidential_trusted_fusion.yaml
 
-# I2 mechanism: Product-of-experts / log opinion pool. No subjective-logic conflict handling; a simpler probabilistic-pooling baseline for I2.
 method:
-  name: ablation_combination_log_pool
+  name: i2_combination_log_pool
 
 train:
-  exp_name: ablation_combination_log_pool
+  exp_name: i2_combination_log_pool
 
 fusion:
   combination: log_pool
+  routing:
+    enabled: false
+    use_fused_prediction_loss: false
+    final_temperature_scaling: false
+  branch_competence_prior:
+    # Keep I1 identical to the main method; only the fusion rule changes.
+    enabled: false

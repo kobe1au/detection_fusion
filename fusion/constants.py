@@ -145,7 +145,6 @@ class TriModalConfigDefaults:
             "detach_confidence_proxy": True,
             "use_confidence_proxy": True,
             "use_reliability_discount": True,
-            "reliability_discount_exponent": 0.5,
             "branch_competence_prior": {
                 "enabled": True,
                 "metric": "macro_f1",
@@ -154,6 +153,7 @@ class TriModalConfigDefaults:
             },
             "visible_integrity_modifier": {
                 "enabled": True,
+                "mode": "bounded_visibility",
                 "beta": 1.0,
                 "min_value": 0.5,
                 "min_reference": 1.0e-6,
@@ -178,9 +178,23 @@ class TriModalConfigDefaults:
                 "hidden_dim": 16,
                 "missing_relation_support": 0.0,
                 "use_relation_evidence": True,
+                "use_evidential_uncertainty": True,
                 "apply_alive_mask": True,
                 "loss": "bce",
                 "weight": 1.0,
+            },
+            "routing": {
+                "enabled": False,
+                "mode": "learned",
+                "hidden_dim": 16,
+                "calibration_weight": 1.0,
+                "use_disagreement": True,
+                "train_end_to_end": True,
+                "posthoc_refine": True,
+                "initial_known_retention": 0.99,
+                "use_fused_prediction_loss": False,
+                "final_temperature_scaling": False,
+                "acceptance_score_mode": "product",
             },
             "probability_calibration": {
                 "enabled": True,
@@ -196,15 +210,33 @@ class TriModalConfigDefaults:
         },
         "loss": {
             "branch_aux_weight": 0.25,
-            "reliability_weighted_aux": True,
+            "branch_aux_weights": {
+                "api": 1.0,
+                "graph": 1.0,
+                "manifest": 1.0,
+                "joint": 0.0,
+            },
+            # The auxiliary branch loss is weighted by observable integrity,
+            # not by the fitted branch-correctness calibrator.  Keep the old
+            # name as an explicit nullable compatibility alias; consumers
+            # should prefer it only when a legacy config sets a non-null value.
+            "integrity_weighted_aux": True,
+            "reliability_weighted_aux": None,
             "min_aux_weight": 0.2,
             "detach_reliability_for_aux": True,
             "reliability_calibration_weight": 0.0,
             "probability_calibration_weight": 0.0,
+            "evidential": {
+                "anneal_epochs": 10,
+                "evidence_activation": "softplus",
+                "branches": ["api", "graph", "manifest"],
+                "class_weight": "balanced",
+            },
         },
         "calibration": {
             "enabled": True,
             "validation_fraction": 0.5,
+            "conformal_fraction": 0.5,
             "split_seed": 42,
             "stratified_group_split": True,
             "epochs": 30,
@@ -213,11 +245,21 @@ class TriModalConfigDefaults:
             "lr": 0.001,
             "weight_decay": 0.0,
             "grad_clip": 5.0,
-            "include_robust_val": False,
+        },
+        "classification_threshold": {
+            "enabled": False,
+            "objective": "macro_f1",
+            "min_malware_recall": 0.90,
         },
         "selective_prediction": {
             "enabled": True,
-            "target_coverage": 0.95,
+            "mode": "conformal",
+            "threshold_score": "max_probability",
+            "class_conditional": True,
+            "target_coverage": 0.90,
+            "use_raw_conflict": False,
+            "min_calibration_malware": 1,
+            "require_feasible": False,
         },
         "robust": {
             "train_aug": True,

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:layout_width="fill_parent" android:layout_height="wrap_content"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <TextView android:textSize="17.0sp" android:textStyle="bold" android:textColor="#ff1a1a1a" android:id="@id/mLeft" android:background="@drawable/bg_question_left" android:paddingLeft="15.0dip" android:paddingTop="20.0dip" android:paddingRight="30.0dip" android:paddingBottom="20.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="20.0dip" android:layout_marginTop="20.0dip" android:layout_marginRight="40.0dip" android:text="考考你对韩语的了解程度呀" />
+    <TextView android:textSize="17.0sp" android:textStyle="bold" android:textColor="#ffffffff" android:id="@id/mRight" android:background="@drawable/bg_question_right" android:paddingLeft="15.0dip" android:paddingTop="20.0dip" android:paddingRight="30.0dip" android:paddingBottom="20.0dip" android:visibility="gone" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="40.0dip" android:layout_marginTop="40.0dip" android:layout_marginRight="20.0dip" android:text="考考你对韩语的了解程度呀" android:layout_below="@id/mLeft" android:layout_alignParentRight="true" />
+</RelativeLayout>

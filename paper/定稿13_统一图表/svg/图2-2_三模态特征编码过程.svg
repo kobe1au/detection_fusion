@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720">
+<defs>
+<marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+<path d="M0,0 L9,3.5 L0,7 Z" fill="#333333"/>
+</marker>
+</defs>
+<rect width="100%" height="100%" fill="#FFFFFF"/>
+<text x="190" y="65" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">输入模态</text>
+<text x="580" y="65" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">初始表示</text>
+<text x="970" y="65" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">编码器</text>
+<text x="1360" y="65" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">模态表示</text>
+<rect x="30" y="80" width="320" height="130" rx="8" fill="#EAF4E5" stroke="#333333" stroke-width="2"/>
+<text x="190.0" y="153.84" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">API调用序列</text>
+<rect x="420" y="80" width="320" height="130" rx="8" fill="#FFFFFF" stroke="#333333" stroke-width="2"/>
+<text x="580.0" y="153.84" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">词向量与位置编码</text>
+<rect x="810" y="80" width="320" height="130" rx="8" fill="#FFFFFF" stroke="#333333" stroke-width="2"/>
+<text x="970.0" y="153.84" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">Transformer编码</text>
+<rect x="1200" y="80" width="320" height="130" rx="8" fill="#EAF4E5" stroke="#333333" stroke-width="2"/>
+<text x="1360.0" y="135.0" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">行为序列表示</text>
+<text x="1360.0" y="176.0" text-anchor="middle" font-family="'Times New Roman', serif" font-size="26" font-style="italic" fill="#111111">z<tspan baseline-shift="sub" font-size="18">api</tspan></text>
+<line x1="350" y1="145" x2="410" y2="145" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="740" y1="145" x2="800" y2="145" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="1130" y1="145" x2="1190" y2="145" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="30" y="290" width="320" height="130" rx="8" fill="#E8F0FA" stroke="#333333" stroke-width="2"/>
+<text x="190.0" y="363.84" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">程序调用图</text>
+<rect x="420" y="290" width="320" height="130" rx="8" fill="#FFFFFF" stroke="#333333" stroke-width="2"/>
+<text x="580.0" y="363.84" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">节点特征映射</text>
+<rect x="810" y="290" width="320" height="130" rx="8" fill="#FFFFFF" stroke="#333333" stroke-width="2"/>
+<text x="970.0" y="363.84" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">GATv2编码</text>
+<rect x="1200" y="290" width="320" height="130" rx="8" fill="#E8F0FA" stroke="#333333" stroke-width="2"/>
+<text x="1360.0" y="345.0" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">程序结构表示</text>
+<text x="1360.0" y="386.0" text-anchor="middle" font-family="'Times New Roman', serif" font-size="26" font-style="italic" fill="#111111">z<tspan baseline-shift="sub" font-size="18">graph</tspan></text>
+<line x1="350" y1="355" x2="410" y2="355" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="740" y1="355" x2="800" y2="355" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="1130" y1="355" x2="1190" y2="355" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="30" y="500" width="320" height="130" rx="8" fill="#FFF1DF" stroke="#333333" stroke-width="2"/>
+<text x="190.0" y="573.84" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">Manifest特征</text>
+<rect x="420" y="500" width="320" height="130" rx="8" fill="#FFFFFF" stroke="#333333" stroke-width="2"/>
+<text x="580.0" y="573.84" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">特征映射</text>
+<rect x="810" y="500" width="320" height="130" rx="8" fill="#FFFFFF" stroke="#333333" stroke-width="2"/>
+<text x="970.0" y="573.84" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">多层感知机编码</text>
+<rect x="1200" y="500" width="320" height="130" rx="8" fill="#FFF1DF" stroke="#333333" stroke-width="2"/>
+<text x="1360.0" y="555.0" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="26" font-weight="600" fill="#111111">应用声明表示</text>
+<text x="1360.0" y="596.0" text-anchor="middle" font-family="'Times New Roman', serif" font-size="26" font-style="italic" fill="#111111">z<tspan baseline-shift="sub" font-size="18">man</tspan></text>
+<line x1="350" y1="565" x2="410" y2="565" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="740" y1="565" x2="800" y2="565" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="1130" y1="565" x2="1190" y2="565" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+</svg>

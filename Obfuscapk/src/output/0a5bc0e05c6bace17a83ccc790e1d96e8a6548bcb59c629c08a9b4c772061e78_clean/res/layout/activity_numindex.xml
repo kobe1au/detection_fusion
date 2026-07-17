@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView android:orientation="vertical" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <LinearLayout android:orientation="vertical" android:layout_width="fill_parent" android:layout_height="fill_parent">
+        <RelativeLayout android:layout_width="fill_parent" android:layout_height="wrap_content">
+            <ImageView android:layout_width="fill_parent" android:layout_height="wrap_content" android:src="@drawable/neiyebj_0302" android:scaleType="centerCrop" />
+            <ImageView android:id="@id/iv_close" android:padding="20.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="25.0dip" android:src="@drawable/close_20200302" />
+            <ImageView android:id="@id/iv_help" android:padding="20.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="25.0dip" android:src="@drawable/ic_zhidao" android:layout_alignParentRight="true" />
+            <ImageView android:id="@id/iv_num_pic" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="25.0dip" android:layout_marginRight="20.0dip" android:src="@drawable/fengm_0302" android:layout_below="@id/iv_close" android:layout_alignParentRight="true" />
+            <TextView android:textSize="25.0sp" android:textColor="#ffffffff" android:gravity="left" android:id="@id/tv_num_title" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="20.0dip" android:layout_marginTop="22.0dip" android:text="数字反应训练" android:includeFontPadding="false" android:layout_below="@id/iv_close" />
+            <TextView android:textSize="14.0sp" android:textColor="#ffffffff" android:gravity="left" android:id="@id/tv_num_content" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="20.0dip" android:layout_marginTop="11.0dip" android:layout_marginRight="20.0dip" android:text="作用：通过对不同类型的英文数字 快速反应出该数字的正确英文读法" android:layout_toLeftOf="@id/iv_num_pic" android:layout_below="@id/tv_num_title" android:lineSpacingExtra="4.0dip" />
+            <TextView android:textSize="14.0sp" android:textColor="#ffffffff" android:gravity="left" android:id="@id/tv_num_people" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="20.0dip" android:layout_marginTop="22.0dip" android:text="111232 人已练习" android:drawableLeft="@drawable/ic_ren_0302" android:drawablePadding="3.0dip" android:layout_below="@id/tv_num_content" />
+        </RelativeLayout>
+        <RelativeLayout android:layout_width="fill_parent" android:layout_height="wrap_content">
+            <TextView android:textSize="14.0sp" android:textColor="#ff747474" android:gravity="left" android:id="@id/tv_star_cl" android:paddingLeft="20.0dip" android:paddingTop="22.0dip" android:paddingBottom="6.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="累计获得:" />
+            <TextView android:textSize="14.0sp" android:textColor="#ff747474" android:gravity="left" android:id="@id/tv_star_num" android:paddingTop="22.0dip" android:paddingBottom="6.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="4.0dip" android:text="x56" android:drawableLeft="@drawable/xingxing_huode_0302" android:drawablePadding="5.0dip" android:layout_toRightOf="@id/tv_star_cl" />
+            <androidx.recyclerview.widget.RecyclerView android:id="@id/rv_num_list" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_below="@id/tv_star_cl" android:nestedScrollingEnabled="false" />
+        </RelativeLayout>
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>

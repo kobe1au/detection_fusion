@@ -1,0 +1,18 @@
+defaults:
+  - ../seeds/seed_42.yaml
+
+method:
+  name: refit_seed_42_posthoc
+
+eval:
+  eval_only: true
+  output_name: refit_seed_42_posthoc
+  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
+  # The encoder and branch heads are reused. Only calibration parameters,
+  # routing parameters, the final temperature, and decision thresholds are fit.
+  refit_posthoc_calibration: true
+  refit_decision_calibration: true
+  # The pipeline checkpoint must be produced by the current staged lifecycle;
+  # it carries a portable, hash-verified link to best_encoder_selected.pt.
+  run_test: true
+  run_robust_test: true

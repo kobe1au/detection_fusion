@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:orientation="horizontal" android:layout_width="fill_parent" android:layout_height="190.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <ImageView android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginLeft="5.0dip" android:layout_marginRight="5.0dip" android:src="@drawable/shujia_191203" android:adjustViewBounds="true" android:layout_alignParentBottom="true" />
+    <LinearLayout android:orientation="horizontal" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_marginLeft="20.0dip" android:layout_marginRight="10.0dip">
+        <RelativeLayout android:id="@id/rl_lexicon1_all" android:layout_width="0.0dip" android:layout_height="fill_parent" android:layout_weight="1.0">
+            <ImageView android:id="@id/iv_shadow1" android:visibility="invisible" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginBottom="15.0dip" android:src="@drawable/shadow_191203" android:adjustViewBounds="true" android:layout_alignParentBottom="true" />
+            <top.limuyang2.shadowlayoutlib.ShadowRelativeLayout android:id="@id/rl_lexicon1" android:visibility="invisible" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_marginTop="8.0dip" android:layout_marginRight="10.0dip" android:layout_marginBottom="30.0dip" app:l_radius="3.0dip">
+                <ImageView android:id="@id/iv_lexicon1" android:background="#ffcccccc" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_margin="1.0dip" android:scaleType="fitXY" android:adjustViewBounds="true" />
+            </top.limuyang2.shadowlayoutlib.ShadowRelativeLayout>
+            <ImageView android:id="@id/iv_select1" android:visibility="invisible" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/lainxi_ture_191126" android:layout_alignParentRight="true" />
+        </RelativeLayout>
+        <RelativeLayout android:id="@id/rl_lexicon2_all" android:layout_width="0.0dip" android:layout_height="fill_parent" android:layout_weight="1.0">
+            <ImageView android:id="@id/iv_shadow2" android:visibility="invisible" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginBottom="15.0dip" android:src="@drawable/shadow_191203" android:adjustViewBounds="true" android:layout_alignParentBottom="true" />
+            <top.limuyang2.shadowlayoutlib.ShadowRelativeLayout android:id="@id/rl_lexicon2" android:visibility="invisible" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_marginTop="8.0dip" android:layout_marginRight="10.0dip" android:layout_marginBottom="30.0dip" app:l_radius="3.0dip">
+                <ImageView android:id="@id/iv_lexicon2" android:background="#ffcccccc" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_margin="1.0dip" android:scaleType="fitXY" android:adjustViewBounds="true" />
+            </top.limuyang2.shadowlayoutlib.ShadowRelativeLayout>
+            <ImageView android:id="@id/iv_select2" android:visibility="invisible" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/lainxi_ture_191126" android:layout_alignParentRight="true" />
+        </RelativeLayout>
+        <RelativeLayout android:id="@id/rl_lexicon3_all" android:layout_width="0.0dip" android:layout_height="fill_parent" android:layout_weight="1.0">
+            <ImageView android:id="@id/iv_shadow3" android:visibility="invisible" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginBottom="15.0dip" android:src="@drawable/shadow_191203" android:adjustViewBounds="true" android:layout_alignParentBottom="true" />
+            <top.limuyang2.shadowlayoutlib.ShadowRelativeLayout android:id="@id/rl_lexicon3" android:visibility="invisible" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_marginTop="8.0dip" android:layout_marginRight="10.0dip" android:layout_marginBottom="30.0dip" app:l_radius="3.0dip">
+                <ImageView android:id="@id/iv_lexicon3" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_margin="1.0dip" android:scaleType="fitXY" android:adjustViewBounds="true" />
+            </top.limuyang2.shadowlayoutlib.ShadowRelativeLayout>
+            <ImageView android:id="@id/iv_select3" android:visibility="invisible" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/lainxi_ture_191126" android:layout_alignParentRight="true" />
+        </RelativeLayout>
+    </LinearLayout>
+</RelativeLayout>

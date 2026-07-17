@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:orientation="vertical" android:id="@id/rl_back" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <LinearLayout android:gravity="center_horizontal" android:orientation="vertical" android:background="@drawable/shape_popup_copy_wx_bg" android:paddingLeft="18.0dip" android:paddingTop="23.0dip" android:paddingRight="18.0dip" android:paddingBottom="20.0dip" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_alignParentBottom="true">
+        <TextView android:textSize="16.0sp" android:textStyle="bold" android:textColor="#ff333333" android:gravity="center" android:id="@id/tv_poptitle" android:visibility="gone" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        <ImageView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="10.0dip" android:src="@drawable/biaoti_191116" />
+        <TextView android:textSize="14.0sp" android:textColor="#ff808080" android:gravity="center" android:id="@id/tv_content" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="12.0dip" android:text="关注置顶后联系咨询师，还可领取更多福利\n公众号：" android:lineSpacingExtra="7.0dip" />
+        <TextView android:textSize="18.0sp" android:textStyle="bold" android:textColor="@color/white" android:gravity="center" android:id="@id/tv_copy" android:background="@drawable/shape_popup_copy_wx_btn_bg" android:layout_width="270.0dip" android:layout_height="40.0dip" android:layout_marginTop="20.0dip" android:text="复制公众号去添加" />
+    </LinearLayout>
+</RelativeLayout>

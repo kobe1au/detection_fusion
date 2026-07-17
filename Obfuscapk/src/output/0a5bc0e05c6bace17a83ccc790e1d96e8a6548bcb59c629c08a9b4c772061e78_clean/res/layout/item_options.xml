@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<top.limuyang2.shadowlayoutlib.ShadowRelativeLayout android:id="@id/rl_option" android:background="#fff7f8fc" android:layout_width="fill_parent" android:layout_height="55.0dip" android:layout_marginLeft="30.0dip" android:layout_marginRight="30.0dip" android:layout_marginBottom="20.0dip" app:l_radius="7.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <TextView android:textSize="15.0sp" android:textColor="#ff1ecb9a" android:ellipsize="end" android:gravity="center|left" android:id="@id/tv_option" android:layout_width="fill_parent" android:layout_height="fill_parent" android:layout_marginLeft="25.0dip" android:layout_marginRight="55.0dip" android:text="sddsdsdsds" android:maxLines="2" android:layout_centerVertical="true" />
+    <ImageView android:id="@id/iv_option_status" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginRight="17.0dip" android:src="@drawable/lainxi_ture_191126" android:layout_alignParentRight="true" android:layout_centerVertical="true" />
+</top.limuyang2.shadowlayoutlib.ShadowRelativeLayout>

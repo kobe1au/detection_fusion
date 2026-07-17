@@ -32,6 +32,7 @@ from fusion.train import (
     select_device,
     set_seed,
     apply_branch_competence_prior,
+    apply_model_visible_integrity_reference,
 )
 
 
@@ -260,6 +261,8 @@ def _load_checkpoint_model(cfg: dict, checkpoint_path: Path, device: torch.devic
     model.load_state_dict(ckpt["model"])
     branch_competence_summary = dict(ckpt.get("branch_competence_prior") or {"enabled": False})
     apply_branch_competence_prior(model, branch_competence_summary)
+    visible_integrity_summary = dict(ckpt.get("model_visible_integrity_reference") or {"enabled": False})
+    apply_model_visible_integrity_reference(model, visible_integrity_summary)
     model.eval()
     return model, model_cfg, ckpt
 

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <include layout="@layout/include_head" />
+    <TextView android:textSize="23.0sp" android:textStyle="bold" android:textColor="#ff363636" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="15.0dip" android:layout_marginTop="20.0dip" android:layout_marginBottom="20.0dip" android:text="我的词库" android:includeFontPadding="false" />
+    <androidx.recyclerview.widget.RecyclerView android:id="@id/rv_lexicon_list" android:layout_width="fill_parent" android:layout_height="fill_parent" />
+</LinearLayout>

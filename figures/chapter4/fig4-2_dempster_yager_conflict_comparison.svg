@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="800" viewBox="0 0 1400 800">
+  <defs>
+    <style>
+      .box { fill: #ffffff; stroke: #222222; stroke-width: 1.7; }
+      .headbox { fill: #f1f1f1; stroke: #222222; stroke-width: 1.7; }
+      .sharedbox { fill: #fafafa; stroke: #222222; stroke-width: 1.7; }
+      .arrow { fill: none; stroke: #222222; stroke-width: 1.8; marker-end: url(#arrow); }
+      .line { fill: none; stroke: #222222; stroke-width: 1.8; }
+      .head { font: 600 25px "SimSun", "Microsoft YaHei", serif; fill: #111111; }
+      .body { font: 22px "SimSun", "Microsoft YaHei", serif; fill: #111111; }
+      .small { font: 20px "SimSun", "Microsoft YaHei", serif; fill: #222222; }
+      .math { font: italic 23px "Cambria Math", "Times New Roman", serif; fill: #111111; }
+      .note { font: 20px "SimSun", "Microsoft YaHei", serif; fill: #333333; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#222222"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1400" height="800" fill="#ffffff"/>
+
+  <!-- Shared evidence and intersection -->
+  <rect x="355" y="35" width="690" height="82" rx="3" class="sharedbox"/>
+  <text x="700" y="69" text-anchor="middle" class="head">可信度折扣后的三模态意见</text>
+  <text x="700" y="99" text-anchor="middle" class="math">ω̃<tspan baseline-shift="sub" font-size="16">api</tspan>，ω̃<tspan baseline-shift="sub" font-size="16">graph</tspan>，ω̃<tspan baseline-shift="sub" font-size="16">man</tspan></text>
+
+  <path d="M700 117 V157" class="arrow"/>
+  <rect x="430" y="158" width="540" height="100" rx="3" class="sharedbox"/>
+  <text x="700" y="193" text-anchor="middle" class="head">三模态交集运算</text>
+  <text x="700" y="229" text-anchor="middle" class="body">类别交集支持　共同不确定部分　组合前冲突</text>
+  <text x="700" y="252" text-anchor="middle" class="math">b<tspan baseline-shift="super" font-size="16">∩</tspan><tspan baseline-shift="sub" font-size="16">k</tspan>　　　 u<tspan baseline-shift="super" font-size="16">∩</tspan>　　　 κ</text>
+
+  <!-- Symmetric split -->
+  <path d="M700 258 V305 H360 V345" class="arrow"/>
+  <path d="M700 305 H1040 V345" class="arrow"/>
+  <circle cx="700" cy="305" r="3.5" fill="#222222"/>
+
+  <!-- Dempster branch -->
+  <rect x="90" y="346" width="540" height="62" rx="2" class="headbox"/>
+  <text x="360" y="386" text-anchor="middle" class="head">Dempster规则</text>
+
+  <path d="M360 408 V442" class="arrow"/>
+  <rect x="90" y="443" width="540" height="145" rx="2" class="box"/>
+  <text x="360" y="480" text-anchor="middle" class="body">归一化非冲突证据</text>
+  <text x="360" y="522" text-anchor="middle" class="math">b<tspan baseline-shift="super" font-size="16">D</tspan><tspan baseline-shift="sub" font-size="16">k</tspan> = b<tspan baseline-shift="super" font-size="16">∩</tspan><tspan baseline-shift="sub" font-size="16">k</tspan> / (1 − κ)</text>
+  <text x="360" y="558" text-anchor="middle" class="math">u<tspan baseline-shift="super" font-size="16">D</tspan> = u<tspan baseline-shift="super" font-size="16">∩</tspan> / (1 − κ)</text>
+
+  <path d="M360 588 V622" class="arrow"/>
+  <rect x="90" y="623" width="540" height="124" rx="2" class="box"/>
+  <text x="360" y="674" text-anchor="middle" class="body">冲突不单独保留</text>
+  <text x="360" y="713" text-anchor="middle" class="small">非冲突证据按比例放大</text>
+
+  <!-- Yager branch -->
+  <rect x="770" y="346" width="540" height="62" rx="2" class="headbox"/>
+  <text x="1040" y="386" text-anchor="middle" class="head">Yager规则</text>
+
+  <path d="M1040 408 V442" class="arrow"/>
+  <rect x="770" y="443" width="540" height="145" rx="2" class="box"/>
+  <text x="1040" y="480" text-anchor="middle" class="body">将冲突计入不确定性</text>
+  <text x="1040" y="522" text-anchor="middle" class="math">b<tspan baseline-shift="super" font-size="16">Y</tspan><tspan baseline-shift="sub" font-size="16">k</tspan> = b<tspan baseline-shift="super" font-size="16">∩</tspan><tspan baseline-shift="sub" font-size="16">k</tspan></text>
+  <text x="1040" y="558" text-anchor="middle" class="math">u<tspan baseline-shift="super" font-size="16">Y</tspan> = u<tspan baseline-shift="super" font-size="16">∩</tspan> + κ</text>
+
+  <path d="M1040 588 V622" class="arrow"/>
+  <rect x="770" y="623" width="540" height="124" rx="2" class="box"/>
+  <text x="1040" y="674" text-anchor="middle" class="body">冲突保留为不确定性</text>
+  <text x="1040" y="713" text-anchor="middle" class="small">类别交集支持保持不变</text>
+</svg>

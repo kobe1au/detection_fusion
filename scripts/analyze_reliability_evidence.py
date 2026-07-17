@@ -9,17 +9,36 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
 
 
-BRANCHES = ("api", "graph", "manifest", "joint")
+MODALITY_BRANCHES = ("api", "graph", "manifest")
+BRANCHES = (*MODALITY_BRANCHES, "joint")
 
 EVIDENCE_FIELDS = (
     "api_integrity",
+    "api_encoder_coverage",
+    "api_total_pipeline_coverage",
+    "api_extractor_coverage",
+    "api_runtime_encoder_coverage",
+    "effective_api_integrity",
     "graph_integrity",
+    "graph_encoder_coverage",
+    "effective_graph_integrity",
     "manifest_integrity",
+    "effective_manifest_integrity",
     "code_integrity",
     "api_graph_anchor_support",
     "manifest_code_support",
     "manifest_to_code_conflict",
     "code_to_manifest_conflict",
+    "predictive_conflict",
+    "predictive_conflict_max",
+    "raw_conflict",
+    "acceptance_score",
+    "discount_api",
+    "discount_graph",
+    "discount_manifest",
+    "fusion_weight_api",
+    "fusion_weight_graph",
+    "fusion_weight_manifest",
     "api_alive",
     "graph_alive",
     "manifest_alive",
@@ -31,26 +50,55 @@ EVIDENCE_FIELDS = (
 
 EVIDENCE_BIN_SPECS = {
     "api_integrity": ("api",),
+    "api_encoder_coverage": ("api",),
+    "api_total_pipeline_coverage": ("api",),
+    "api_extractor_coverage": ("api",),
+    "api_runtime_encoder_coverage": ("api",),
+    "effective_api_integrity": ("api",),
     "graph_integrity": ("graph",),
+    "graph_encoder_coverage": ("graph",),
+    "effective_graph_integrity": ("graph",),
     "manifest_integrity": ("manifest",),
+    "effective_manifest_integrity": ("manifest",),
     "code_integrity": ("api", "graph", "joint"),
     "api_graph_anchor_support": ("api", "graph", "joint"),
     "manifest_code_support": ("manifest", "joint"),
     "manifest_to_code_conflict": ("manifest", "joint"),
     "code_to_manifest_conflict": ("api", "graph", "joint"),
     "max_manifest_code_conflict": ("api", "graph", "manifest", "joint"),
+    "predictive_conflict": ("api", "graph", "manifest"),
+    "predictive_conflict_max": ("api", "graph", "manifest"),
+    "raw_conflict": ("api", "graph", "manifest", "joint"),
+    "discount_api": ("api",),
+    "discount_graph": ("graph",),
+    "discount_manifest": ("manifest",),
+    "min_modality_discount": ("api", "graph", "manifest"),
+    "mean_modality_discount": ("api", "graph", "manifest"),
 }
 
 NATURAL_SUBSET_SPECS = {
     "api_low_integrity": ("api_integrity", "low"),
+    "api_low_encoder_coverage": ("api_encoder_coverage", "low"),
+    "api_low_effective_integrity": ("effective_api_integrity", "low"),
     "graph_low_integrity": ("graph_integrity", "low"),
+    "graph_low_encoder_coverage": ("graph_encoder_coverage", "low"),
+    "graph_low_effective_integrity": ("effective_graph_integrity", "low"),
     "manifest_low_integrity": ("manifest_integrity", "low"),
+    "manifest_low_effective_integrity": ("effective_manifest_integrity", "low"),
     "code_low_integrity": ("code_integrity", "low"),
     "api_graph_low_support": ("api_graph_anchor_support", "low"),
     "manifest_code_low_support": ("manifest_code_support", "low"),
     "manifest_to_code_high_conflict": ("manifest_to_code_conflict", "high"),
     "code_to_manifest_high_conflict": ("code_to_manifest_conflict", "high"),
     "max_manifest_code_high_conflict": ("max_manifest_code_conflict", "high"),
+    "predictive_high_conflict": ("predictive_conflict", "high"),
+    "raw_high_conflict": ("raw_conflict", "high"),
+    "api_low_trust": ("discount_api", "low"),
+    "graph_low_trust": ("discount_graph", "low"),
+    "manifest_low_trust": ("discount_manifest", "low"),
+    "min_modality_low_trust": ("min_modality_discount", "low"),
+    "mean_modality_low_trust": ("mean_modality_discount", "low"),
+    "low_acceptance": ("acceptance_score", "low"),
 }
 
 NATURAL_MISSING_SPECS = {
@@ -198,7 +246,7 @@ def reliability_table(frame: pd.DataFrame) -> pd.DataFrame:
     for group, group_frame in frame.groupby(available_groups, dropna=False):
         group_values = group if isinstance(group, tuple) else (group,)
         base = dict(zip(available_groups, group_values))
-        for branch in BRANCHES:
+        for branch in MODALITY_BRANCHES:
             reliability_key = f"predicted_reliability_{branch}"
             correct_key = f"{branch}_correct"
             if reliability_key not in group_frame.columns or correct_key not in group_frame.columns:
@@ -224,6 +272,90 @@ def reliability_table(frame: pd.DataFrame) -> pd.DataFrame:
                     "auc": _safe_auc(correctness, scores),
                     "ap_defined": int(ap_defined),
                     "ap": _safe_ap(correctness, scores),
+                }
+            )
+    return pd.DataFrame.from_records(records)
+
+
+def reliability_signal_diagnostics_table(
+    frame: pd.DataFrame,
+    *,
+    permutations: int = 100,
+    random_seed: int = 42,
+) -> pd.DataFrame:
+    """Compare calibrated reliability with its component signals and shuffles."""
+    if permutations <= 0:
+        raise ValueError("permutations must be positive")
+    intrinsic_keys = {
+        "api": "api_integrity",
+        "graph": "graph_integrity",
+        "manifest": "manifest_integrity",
+    }
+    records: list[dict[str, Any]] = []
+    group_columns = [
+        column
+        for column in ("experiment", "seed", "diagnostic_file", "split")
+        if column in frame.columns
+    ]
+    rng = np.random.default_rng(int(random_seed))
+    for group, group_frame in frame.groupby(group_columns, dropna=False):
+        group_values = group if isinstance(group, tuple) else (group,)
+        base = dict(zip(group_columns, group_values))
+        for branch in MODALITY_BRANCHES:
+            reliability_key = f"predicted_reliability_{branch}"
+            correct_key = f"{branch}_correct"
+            if reliability_key not in group_frame.columns or correct_key not in group_frame.columns:
+                continue
+            data = group_frame[[reliability_key, correct_key]].apply(
+                pd.to_numeric, errors="coerce"
+            ).dropna()
+            if data.empty:
+                continue
+            reliability = data[reliability_key].clip(0.0, 1.0).to_numpy(dtype=float)
+            correctness = _finite_binary(data[correct_key])
+            shuffled_auc = np.asarray(
+                [_safe_auc(correctness, rng.permutation(reliability)) for _ in range(permutations)],
+                dtype=float,
+            )
+            native_auc = _safe_auc(correctness, reliability)
+
+            intrinsic_auc = float("nan")
+            intrinsic_key = intrinsic_keys[branch]
+            if intrinsic_key in group_frame.columns:
+                component = group_frame.loc[data.index, intrinsic_key].apply(
+                    pd.to_numeric, errors="coerce"
+                )
+                mask = component.notna().to_numpy()
+                if mask.any():
+                    intrinsic_auc = _safe_auc(
+                        correctness[mask], component.to_numpy(dtype=float)[mask]
+                    )
+
+            certainty_auc = float("nan")
+            uncertainty_key = f"uncertainty_proxy_{branch}"
+            if uncertainty_key in group_frame.columns:
+                component = group_frame.loc[data.index, uncertainty_key].apply(
+                    pd.to_numeric, errors="coerce"
+                )
+                mask = component.notna().to_numpy()
+                if mask.any():
+                    certainty_auc = _safe_auc(
+                        correctness[mask], 1.0 - component.to_numpy(dtype=float)[mask]
+                    )
+
+            shuffled_mean = float(np.nanmean(shuffled_auc))
+            records.append(
+                {
+                    **base,
+                    "branch": branch,
+                    "count": int(reliability.size),
+                    "reliability_auc": native_auc,
+                    "intrinsic_integrity_auc": intrinsic_auc,
+                    "evidential_certainty_auc": certainty_auc,
+                    "shuffled_reliability_auc_mean": shuffled_mean,
+                    "shuffled_reliability_auc_std": float(np.nanstd(shuffled_auc)),
+                    "reliability_permutation_gap": float(native_auc - shuffled_mean),
+                    "permutations": int(permutations),
                 }
             )
     return pd.DataFrame.from_records(records)
@@ -276,6 +408,15 @@ def _with_derived_evidence(frame: pd.DataFrame) -> pd.DataFrame:
     ]
     if conflict_columns:
         out["max_manifest_code_conflict"] = out[conflict_columns].max(axis=1)
+    discount_columns = [
+        column
+        for column in ("discount_api", "discount_graph", "discount_manifest")
+        if column in out.columns
+    ]
+    if discount_columns:
+        numeric_discounts = out[discount_columns].apply(pd.to_numeric, errors="coerce")
+        out["min_modality_discount"] = numeric_discounts.min(axis=1)
+        out["mean_modality_discount"] = numeric_discounts.mean(axis=1)
     return out
 
 
@@ -395,6 +536,7 @@ def _classification_metrics_for_frame(frame: pd.DataFrame) -> dict[str, Any]:
         "count": int(labels_arr.size),
         "positive_rate": float(labels_arr.mean()) if labels_arr.size else float("nan"),
         "acc": float(accuracy_score(labels_arr, preds_arr)),
+        "error_rate": float(1.0 - accuracy_score(labels_arr, preds_arr)),
         "macro_f1": float(f1_score(labels_arr, preds_arr, average="macro", zero_division=0)),
         "brier": float(np.mean((probs_arr - labels_arr.astype(float)) ** 2)),
         "ece_10": _ece(confidence, correctness, bins=10),
@@ -405,6 +547,9 @@ def _classification_metrics_for_frame(frame: pd.DataFrame) -> dict[str, Any]:
         "ap_defined": int(ap_defined),
         "ap": _safe_ap(labels_arr.astype(float), probs_arr),
     }
+    malware_mask = labels_arr == 1
+    if malware_mask.any():
+        out["malware_fn_rate"] = float(((preds_arr == 0) & malware_mask).sum() / malware_mask.sum())
     if "acceptance_score" in frame.columns:
         acceptance = pd.to_numeric(frame.loc[valid_index, "acceptance_score"], errors="coerce")
         if acceptance.notna().any():
@@ -412,7 +557,32 @@ def _classification_metrics_for_frame(frame: pd.DataFrame) -> dict[str, Any]:
     if "rejected" in frame.columns:
         rejected = pd.to_numeric(frame.loc[valid_index, "rejected"], errors="coerce")
         if rejected.notna().any():
-            out["rejection_rate"] = float((rejected.dropna() >= 0.5).mean())
+            rejected_bool = rejected.fillna(1.0).to_numpy(dtype=float) >= 0.5
+            accepted_bool = ~rejected_bool
+            out["rejection_rate"] = float(rejected_bool.mean())
+            out["accepted_rate"] = float(accepted_bool.mean())
+            out["accepted_count"] = int(accepted_bool.sum())
+            if accepted_bool.any():
+                accepted_errors = (preds_arr[accepted_bool] != labels_arr[accepted_bool]).astype(float)
+                out["selective_risk"] = float(accepted_errors.mean())
+                out["selective_acc"] = float(1.0 - accepted_errors.mean())
+                out["selective_macro_f1"] = float(
+                    f1_score(
+                        labels_arr[accepted_bool],
+                        preds_arr[accepted_bool],
+                        average="macro",
+                        zero_division=0,
+                    )
+                )
+                accepted_malware = accepted_bool & malware_mask
+                if accepted_malware.any():
+                    out["accepted_malware_fn_rate"] = float(
+                        ((preds_arr == 0) & accepted_malware).sum() / accepted_malware.sum()
+                    )
+            else:
+                out["selective_risk"] = float("nan")
+                out["selective_acc"] = float("nan")
+                out["selective_macro_f1"] = float("nan")
     return out
 
 
@@ -530,7 +700,7 @@ def _write_reliability_diagrams_for_frame(
         import matplotlib.pyplot as plt
     except Exception:
         return
-    for branch in BRANCHES:
+    for branch in MODALITY_BRANCHES:
         reliability_key = f"predicted_reliability_{branch}"
         correct_key = f"{branch}_correct"
         if reliability_key not in frame.columns or correct_key not in frame.columns:
@@ -635,6 +805,12 @@ def main() -> None:
         default=10,
         help="Minimum samples required before writing a natural subset row.",
     )
+    parser.add_argument(
+        "--reliability-permutations",
+        type=int,
+        default=100,
+        help="Number of score shuffles used for the reliability-alignment diagnostic.",
+    )
     parser.add_argument("--fail-if-empty", action="store_true")
     args = parser.parse_args()
 
@@ -646,6 +822,7 @@ def main() -> None:
             raise RuntimeError("No gate diagnostics were found.")
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_reliability_calibration.csv", index=False)
+        pd.DataFrame().to_csv(Path(args.out_dir) / "i1_reliability_signal_diagnostics.csv", index=False)
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_evidence_groups.csv", index=False)
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_evidence_bin_effects.csv", index=False)
         pd.DataFrame().to_csv(Path(args.out_dir) / "natural_degradation_subsets.csv", index=False)
@@ -667,6 +844,13 @@ def main() -> None:
     if frame.empty and args.fail_if_empty:
         raise RuntimeError("No diagnostics remained after filtering.")
     _write_csv(reliability_table(frame), Path(args.out_dir) / "i1_reliability_calibration.csv")
+    _write_csv(
+        reliability_signal_diagnostics_table(
+            frame,
+            permutations=int(args.reliability_permutations),
+        ),
+        Path(args.out_dir) / "i1_reliability_signal_diagnostics.csv",
+    )
     _write_csv(evidence_group_table(frame), Path(args.out_dir) / "i1_evidence_groups.csv")
     _write_csv(
         evidence_bin_effects_table(frame, bin_scope=args.bin_scope),

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<android.support.v7.widget.CardView android:id="@id/layout_content" android:layout_width="280.0dip" android:layout_height="wrap_content" app:cardBackgroundColor="@color/white" app:cardCornerRadius="8.0dip" app:cardElevation="0.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <LinearLayout android:gravity="center_horizontal" android:orientation="vertical" android:layout_width="fill_parent" android:layout_height="wrap_content">
+        <TextView android:textSize="15.0sp" android:textStyle="bold" android:textColor="#ff4a52ab" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="20.0dip" android:text="评分说明" />
+        <TextView android:textSize="14.0sp" android:textColor="#ff333333" android:background="@drawable/shape_transcrip_explan_dialog_bg" android:padding="10.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="10.0dip" android:layout_marginTop="14.0dip" android:layout_marginRight="10.0dip" android:text="1.图中所示达标率和准确率和您设置的目标分无关，是和满分标准对比产生的百分数；\n2.写作的WD是指Written Discourse（书面语篇）。" android:lineSpacingMultiplier="1.3" />
+        <TextView android:textSize="15.0sp" android:textStyle="bold" android:textColor="@color/white" android:gravity="center" android:background="@drawable/shape_transcrip_enter_commit_bg" android:layout_width="200.0dip" android:layout_height="32.0dip" android:layout_marginTop="20.0dip" android:layout_marginBottom="19.0dip" android:text="确 定" />
+    </LinearLayout>
+</android.support.v7.widget.CardView>

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:id="@id/rl_tab" android:layout_width="fill_parent" android:layout_height="wrap_content"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <ImageView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="57.0dip" android:src="@drawable/triangle_0515" />
+    <LinearLayout android:orientation="vertical" android:background="@drawable/bg_class_supervise" android:layout_width="fill_parent" android:layout_height="340.0dip" android:layout_marginLeft="15.0dip" android:layout_marginRight="15.0dip" android:layout_marginBottom="15.0dip">
+        <TextView android:textSize="14.0sp" android:textStyle="bold" android:textColor="#ff897c5f" android:gravity="left" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="20.0dip" android:layout_marginTop="8.0dip" android:text="课程安排" android:includeFontPadding="false" />
+        <RelativeLayout android:layout_width="fill_parent" android:layout_height="0.0dip" android:layout_marginLeft="10.0dip" android:layout_marginTop="10.0dip" android:layout_marginRight="10.0dip" android:layout_weight="1.0">
+            <com.client.ytkorean.module_experience.widgets.ClassTabView android:id="@id/ctab" android:layout_width="fill_parent" android:layout_height="fill_parent" />
+            <FrameLayout android:id="@id/rl_cover" android:layout_width="fill_parent" android:layout_height="fill_parent" />
+        </RelativeLayout>
+        <TextView android:textSize="12.0sp" android:textStyle="bold" android:textColor="#ff685b40" android:gravity="center" android:background="@drawable/shape_supervise_tab_more" android:layout_width="fill_parent" android:layout_height="34.0dip" android:layout_margin="5.0dip" android:text="展示更多" android:layout_alignParentBottom="true" />
+    </LinearLayout>
+</LinearLayout>

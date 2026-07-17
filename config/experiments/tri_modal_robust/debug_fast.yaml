@@ -1,21 +1,21 @@
 defaults:
-  - evidential_trusted_fusion.yaml
+  - base_tri_modal_robust.yaml
 
 method:
   name: debug_fast
 
 train:
   exp_name: debug_fast
-  epochs: 60
-  patience: 8
+  epochs: 2
+  patience: 1
+  batch_size: 8
+  eval_batch_size: 16
+  num_workers: 0
+  eval_num_workers: 0
+
+calibration:
+  epochs: 1
 
 eval:
-  run_test: true
-  run_robust_test: true
-  perturb_strengths: [0.5]
-  perturb_tests:
-    - clean
-    - all_degraded
-    - api_missing
-    - graph_missing
-    - manifest_missing
+  run_test: false
+  run_robust_test: false

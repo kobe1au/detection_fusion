@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<top.limuyang2.shadowlayoutlib.ShadowRelativeLayout android:id="@id/rl_group" android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="50.0dip" android:layout_margin="7.0dip" app:l_radius="5.0dip" app:l_shadowAlpha="0.35" app:l_shadowElevation="3.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+    <TextView android:textSize="15.0sp" android:textColor="#ff517ffe" android:id="@id/tv_group" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="第1组" android:layout_centerInParent="true" />
+    <ImageView android:id="@id/iv_select" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_margin="5.0dip" android:src="@drawable/fuxi_wancheng_191126" android:layout_alignParentRight="true" />
+</top.limuyang2.shadowlayoutlib.ShadowRelativeLayout>

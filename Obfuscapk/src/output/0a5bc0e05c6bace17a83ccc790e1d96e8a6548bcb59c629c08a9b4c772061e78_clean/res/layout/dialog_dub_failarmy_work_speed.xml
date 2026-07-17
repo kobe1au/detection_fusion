@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:background="@drawable/shape_dub_work_more_bg" android:layout_width="fill_parent" android:layout_height="wrap_content"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <TextView android:textSize="16.0sp" android:textColor="#ff343434" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="25.0dip" android:layout_marginTop="28.0dip" android:text="调整播放速度" />
+    <androidx.appcompat.widget.AppCompatSeekBar android:id="@id/sb_speed" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginLeft="25.0dip" android:layout_marginTop="65.0dip" android:layout_marginRight="25.0dip" android:maxHeight="2.0dip" android:max="4" android:progress="2" android:progressDrawable="@drawable/dub_work_speed_seekbar" android:minHeight="2.0dip" android:thumb="@drawable/ic_speedb_0325" />
+    <LinearLayout android:orientation="horizontal" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginLeft="28.0dip" android:layout_marginTop="10.0dip" android:layout_marginRight="28.0dip">
+        <TextView android:textSize="14.0sp" android:textColor="#ff343434" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="0.5" />
+        <Space android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_weight="1.0" />
+        <TextView android:textSize="14.0sp" android:textColor="#ff343434" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="0.8" />
+        <Space android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_weight="1.0" />
+        <TextView android:textSize="14.0sp" android:textColor="#ff343434" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="1.0" />
+        <Space android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_weight="1.0" />
+        <TextView android:textSize="14.0sp" android:textColor="#ff343434" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="1.2" />
+        <Space android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_weight="1.0" />
+        <TextView android:textSize="14.0sp" android:textColor="#ff343434" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="1.5" />
+    </LinearLayout>
+    <TextView android:textSize="18.0sp" android:textStyle="bold" android:textColor="#ff808080" android:gravity="center" android:id="@id/tv_cancel" android:background="#fff2f2f2" android:layout_width="fill_parent" android:layout_height="45.0dip" android:layout_marginTop="78.0dip" android:text="取消" />
+</LinearLayout>

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:id="@id/test_share_back" android:background="#50000000" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <LinearLayout android:orientation="vertical" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_alignParentBottom="true">
+        <LinearLayout android:orientation="horizontal" android:background="#fff2f5f7" android:paddingLeft="10.0dip" android:paddingRight="10.0dip" android:layout_width="fill_parent" android:layout_height="wrap_content">
+            <RelativeLayout android:id="@id/rl_wechat" android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_marginLeft="10.0dip" android:layout_marginRight="10.0dip" android:layout_weight="1.0">
+                <ImageView android:id="@id/iv_wechat" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="35.0dip" android:src="@drawable/wechat190222" android:layout_centerHorizontal="true" />
+                <TextView android:textSize="12.0sp" android:textColor="#ff000000" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="10.0dip" android:layout_marginBottom="35.0dip" android:text="微信好友" android:layout_below="@id/iv_wechat" android:layout_centerHorizontal="true" />
+            </RelativeLayout>
+            <RelativeLayout android:id="@id/rl_qq" android:visibility="visible" android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_marginLeft="10.0dip" android:layout_marginRight="10.0dip" android:layout_weight="1.0">
+                <ImageView android:id="@id/iv_qq" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="35.0dip" android:src="@drawable/qq190222" android:layout_centerHorizontal="true" />
+                <TextView android:textSize="12.0sp" android:textColor="#ff000000" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="10.0dip" android:layout_marginBottom="35.0dip" android:text="QQ好友" android:layout_below="@id/iv_qq" android:layout_centerHorizontal="true" />
+            </RelativeLayout>
+            <RelativeLayout android:id="@id/rl_circle" android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_marginLeft="10.0dip" android:layout_marginRight="10.0dip" android:layout_weight="1.0">
+                <ImageView android:id="@id/iv_circle" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="35.0dip" android:src="@drawable/cicle190222" android:layout_centerHorizontal="true" />
+                <TextView android:textSize="12.0sp" android:textColor="#ff000000" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="10.0dip" android:layout_marginBottom="35.0dip" android:text="朋友圈" android:layout_below="@id/iv_circle" android:layout_centerHorizontal="true" />
+            </RelativeLayout>
+            <RelativeLayout android:id="@id/rl_copy" android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_marginLeft="10.0dip" android:layout_marginRight="10.0dip" android:layout_weight="1.0">
+                <ImageView android:id="@id/iv_url" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="35.0dip" android:src="@drawable/link190222" android:layout_centerHorizontal="true" />
+                <TextView android:textSize="12.0sp" android:textColor="#ff000000" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="10.0dip" android:layout_marginBottom="35.0dip" android:text="复制链接" android:layout_below="@id/iv_url" android:layout_centerHorizontal="true" />
+            </RelativeLayout>
+            <RelativeLayout android:id="@id/rl_net" android:layout_width="0.0dip" android:layout_height="wrap_content" android:layout_marginLeft="10.0dip" android:layout_marginRight="10.0dip" android:layout_weight="1.0">
+                <ImageView android:id="@id/iv_net" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="35.0dip" android:src="@drawable/andoidweb190222" android:layout_centerHorizontal="true" />
+                <TextView android:textSize="12.0sp" android:textColor="#ff000000" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="10.0dip" android:layout_marginBottom="35.0dip" android:text="浏览器" android:layout_below="@id/iv_net" android:layout_centerHorizontal="true" />
+            </RelativeLayout>
+        </LinearLayout>
+        <TextView android:textSize="18.0sp" android:textColor="#ff333333" android:gravity="center" android:id="@id/tv_cancel" android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="40.0dip" android:text="取消" />
+    </LinearLayout>
+</RelativeLayout>

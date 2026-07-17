@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:orientation="vertical" android:id="@id/rl_study_cal" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginTop="10.0dip" android:layout_marginBottom="9.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <TextView android:textSize="11.0sp" android:textStyle="bold" android:textColor="#ff333333" android:gravity="center" android:id="@id/tv_study_cal_day" android:layout_width="18.0dip" android:layout_height="18.0dip" android:includeFontPadding="false" android:layout_centerHorizontal="true" />
+    <ImageView android:id="@id/iv_study_cal_red" android:visibility="invisible" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="-6.0dip" android:layout_marginTop="-6.0dip" android:src="@drawable/kulian_191126" android:layout_toRightOf="@id/tv_study_cal_day" android:layout_below="@id/tv_study_cal_day" />
+    <ImageView android:id="@id/iv_study_cal_line" android:visibility="invisible" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="3.0dip" android:src="@drawable/rectangle_191126" android:layout_below="@id/tv_study_cal_day" android:layout_centerHorizontal="true" />
+</RelativeLayout>

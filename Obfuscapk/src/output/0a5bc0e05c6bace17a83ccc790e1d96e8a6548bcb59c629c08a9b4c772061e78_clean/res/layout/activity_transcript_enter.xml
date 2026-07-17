@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:background="@color/white" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <include layout="@layout/include_head_free" />
+    <androidx.recyclerview.widget.RecyclerView android:id="@id/mRecyclerView" android:layout_width="fill_parent" android:layout_height="0.0dip" android:layout_weight="1.0" />
+    <View android:background="#1a2f3470" android:layout_width="fill_parent" android:layout_height="0.5dip" />
+    <TextView android:textSize="16.0sp" android:textStyle="bold" android:textColor="#ffffffff" android:gravity="center" android:layout_gravity="center" android:id="@id/tv_commit" android:background="@drawable/shape_transcrip_enter_commit_bg" android:layout_width="250.0dip" android:layout_height="40.0dip" android:layout_marginTop="10.0dip" android:layout_marginBottom="10.0dip" android:text="确认提交" />
+</LinearLayout>

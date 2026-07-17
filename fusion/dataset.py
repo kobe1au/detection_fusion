@@ -61,7 +61,27 @@ def apply_graph_encoder_budget(
         data["graph_integrity_before_encoder_budget"] = raw_integrity
         return data
 
-    keep = torch.arange(max_nodes, dtype=torch.long)
+    # Graph message passing is order-insensitive, so retain security-relevant
+    # nodes across all DEX files before filling the remaining budget from the
+    # original prefix. This avoids silently dropping sensitive nodes that happen
+    # to occur in a later DEX while keeping the selection modality-intrinsic.
+    sensitive = data.get("sensitive_mask")
+    if isinstance(sensitive, torch.Tensor) and sensitive.numel() == storage_nodes:
+        sensitive_flag = sensitive.view(-1).bool()
+        sensitive_indices = torch.nonzero(sensitive_flag, as_tuple=False).view(-1)
+        if int(sensitive_indices.numel()) >= max_nodes:
+            keep = sensitive_indices[:max_nodes]
+        else:
+            non_sensitive_indices = torch.nonzero(
+                ~sensitive_flag, as_tuple=False
+            ).view(-1)
+            remaining = max_nodes - int(sensitive_indices.numel())
+            keep = torch.cat(
+                [sensitive_indices, non_sensitive_indices[:remaining]], dim=0
+            )
+        keep = keep.sort().values.long()
+    else:
+        keep = torch.arange(max_nodes, dtype=torch.long)
     mapping = torch.full((storage_nodes,), -1, dtype=torch.long)
     mapping[keep] = torch.arange(max_nodes, dtype=torch.long)
     data["x"] = x[keep]
@@ -143,23 +163,17 @@ def apply_graph_encoder_budget(
     data["graph_truncated_by_encoder_budget"] = 1.0
     data["graph_integrity_before_encoder_budget"] = raw_integrity
     refresh_observable_signals(data)
-    # effective_graph_integrity = max(
-    #     0.0,
-    #     min(1.0, float(data["graph_integrity"]) * data["graph_encoder_coverage"]),
-    # )
-    # data["graph_integrity"] = effective_graph_integrity
-    # data["code_integrity"] = math.sqrt(
-    #     max(0.0, float(data["api_integrity"]) * effective_graph_integrity)
-    # )
-    # data["q_graph"] = effective_graph_integrity
-    # data["r_graph"] = effective_graph_integrity
-    
-    # Keep graph_integrity/q_graph/r_graph as the observable structural integrity
-    # of the graph after budgeted graph construction. Do NOT multiply coverage into
-    # these aliases here; build_evidence()/visible_integrity_modifier applies the
-    # encoder-coverage correction exactly once.
 
-    graph_integrity = max(0.0, min(1.0, float(data["graph_integrity"])))
+    # Encoder truncation is a visibility constraint, not a parse/extraction
+    # failure. Preserve the pre-budget graph integrity as q_graph/r_graph and
+    # let graph_encoder_coverage account for the lost visibility exactly once.
+    graph_integrity = max(0.0, min(1.0, raw_integrity))
+    data["graph_integrity"] = graph_integrity
+    data["q_graph"] = graph_integrity
+    data["r_graph"] = graph_integrity
+    data["code_integrity"] = math.sqrt(
+        max(0.0, float(data["api_integrity"]) * graph_integrity)
+    )
     graph_coverage = max(0.0, min(1.0, float(data["graph_encoder_coverage"])))
 
     data["effective_graph_integrity"] = graph_integrity * graph_coverage
@@ -639,6 +653,7 @@ class RobustTriModalDataset(Dataset):
         n = int(parts["api_ids"].numel())
         parts["api_event_count_before_encoder_budget"] = n
         parts["api_event_count_after_encoder_budget"] = n
+        parts["api_runtime_encoder_coverage"] = 1.0
         parts["api_encoder_coverage"] = 1.0
         parts["api_truncated_by_encoder_budget"] = 0.0
         if self.max_api_events_per_sample is None:
@@ -647,7 +662,8 @@ class RobustTriModalDataset(Dataset):
             return parts
         limit = max(0, int(self.max_api_events_per_sample))
         parts["api_event_count_after_encoder_budget"] = limit
-        parts["api_encoder_coverage"] = float(limit / max(n, 1))
+        parts["api_runtime_encoder_coverage"] = float(limit / max(n, 1))
+        parts["api_encoder_coverage"] = parts["api_runtime_encoder_coverage"]
         parts["api_truncated_by_encoder_budget"] = 1.0
         device = parts["api_ids"].device
         # Intrinsic, modality-independent priority: keep all sensitive API events
@@ -657,7 +673,7 @@ class RobustTriModalDataset(Dataset):
         # behavioural n-grams, so an even/strided subsample would shatter those
         # patterns. We deliberately do NOT use api_in_graph_mask /
         # method_api_edge_index here: making the kept API set depend on the graph
-        # would couple the branches and break the evidential independence premise.
+        # would duplicate graph-derived selection evidence in the API branch.
         sensitive = parts.get("api_sensitive_mask")
         if isinstance(sensitive, torch.Tensor) and sensitive.numel() == n:
             sens_flag = sensitive.to(device).view(-1) > 0.5
@@ -854,6 +870,7 @@ class RobustTriModalDataset(Dataset):
             "q_align": q_align,
             "api_event_count_before_encoder_budget": api_parts.get("api_event_count_before_encoder_budget", int(final_api_ids.numel())),
             "api_event_count_after_encoder_budget": api_parts.get("api_event_count_after_encoder_budget", int(final_api_ids.numel())),
+            "api_runtime_encoder_coverage": api_parts.get("api_runtime_encoder_coverage", 1.0),
             "api_encoder_coverage": api_parts.get("api_encoder_coverage", 1.0),
             "api_truncated_by_encoder_budget": api_parts.get("api_truncated_by_encoder_budget", 0.0),
             "pert_api": 0.0,
@@ -1025,9 +1042,23 @@ class RobustTriModalDataset(Dataset):
             data = self._aggregate_api_graph(dex_list)
             if data is None:
                 return self._dummy(label, sid, year, "empty valid sample", pt_path)
+            # _aggregate_api_graph applies the current encoder budget. Preserve
+            # those runtime values across the persisted observable-metadata
+            # merge below; PT metadata describes extraction time and may have
+            # been produced with a different (or unlimited) runtime budget.
+            runtime_api_budget = {
+                key: data[key]
+                for key in (
+                    "api_event_count_before_encoder_budget",
+                    "api_event_count_after_encoder_budget",
+                    "api_runtime_encoder_coverage",
+                    "api_truncated_by_encoder_budget",
+                )
+            }
             apply_dex_success_ratio(data, sources)
             data.update(self._manifest_payload(raw))
             data.update(raw["observable_metadata"])
+            data.update(runtime_api_budget)
             refresh_observable_signals(data)
             if self.robust_aug and self.is_train:
                 perturb_type, strength = sample_training_perturbation(self.perturb_prob, self.perturb_strengths)

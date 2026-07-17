@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="760" viewBox="0 0 1220 760">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#333333"/>
+    </marker>
+    <style>
+      text { font-family: "Microsoft YaHei", "SimSun", Arial, sans-serif; fill: #222222; }
+      .title { font-size: 26px; font-weight: 700; }
+      .box-title { font-size: 18px; font-weight: 700; }
+      .box-text { font-size: 15px; }
+      .small { font-size: 13px; fill: #555555; }
+      .box { fill: #ffffff; stroke: #333333; stroke-width: 1.5; rx: 12; }
+      .source { fill: #e9f3ff; stroke: #4f88c6; }
+      .api { fill: #e9f3ff; stroke: #4f88c6; }
+      .graph { fill: #ecf7ef; stroke: #5a9b69; }
+      .manifest { fill: #fff3e4; stroke: #d28a29; }
+      .evidence { fill: #f3ecff; stroke: #8560b8; }
+      .calib { fill: #fff7df; stroke: #c49a2c; }
+      .output { fill: #fff0f0; stroke: #c45a5a; }
+      .arrow { stroke: #333333; stroke-width: 1.7; fill: none; marker-end: url(#arrow); }
+      .line { stroke: #333333; stroke-width: 1.7; fill: none; }
+      .dash { fill: none; stroke: #888888; stroke-width: 1.3; stroke-dasharray: 7 6; rx: 16; }
+    </style>
+  </defs>
+
+  <rect x="18" y="18" width="1184" height="724" fill="#ffffff" stroke="#dddddd" stroke-width="1"/>
+  <text x="610" y="58" class="title" text-anchor="middle">基于可观测证据的三模态可信度评估框架</text>
+
+  <rect x="60" y="315" width="185" height="95" class="box source"/>
+  <text x="152.5" y="352" class="box-title" text-anchor="middle">APK 静态解析</text>
+  <text x="152.5" y="382" class="box-text" text-anchor="middle">代码、结构、声明</text>
+
+  <rect x="315" y="115" width="220" height="90" class="box api"/>
+  <text x="425" y="150" class="box-title" text-anchor="middle">API 调用序列</text>
+  <text x="425" y="178" class="box-text" text-anchor="middle">行为事件与敏感接口</text>
+
+  <rect x="315" y="315" width="220" height="90" class="box graph"/>
+  <text x="425" y="350" class="box-title" text-anchor="middle">程序调用图</text>
+  <text x="425" y="378" class="box-text" text-anchor="middle">方法节点与调用边</text>
+
+  <rect x="315" y="515" width="220" height="90" class="box manifest"/>
+  <text x="425" y="550" class="box-title" text-anchor="middle">Manifest 声明信息</text>
+  <text x="425" y="578" class="box-text" text-anchor="middle">权限、组件与配置</text>
+
+  <rect x="635" y="85" width="260" height="150" class="box evidence"/>
+  <text x="765" y="124" class="box-title" text-anchor="middle">可观测证据构建</text>
+  <text x="765" y="158" class="box-text" text-anchor="middle">模态可用性 a_m(x)</text>
+  <text x="765" y="184" class="box-text" text-anchor="middle">模态完整性 q_m(x)</text>
+  <text x="765" y="210" class="box-text" text-anchor="middle">模型可见比例 v_m(x)</text>
+
+  <rect x="635" y="315" width="260" height="120" class="box evidence"/>
+  <text x="765" y="354" class="box-title" text-anchor="middle">跨模态支持关系</text>
+  <text x="765" y="386" class="box-text" text-anchor="middle">API-Graph 支持 s_ag(x)</text>
+  <text x="765" y="412" class="box-text" text-anchor="middle">Manifest-Code 支持 s_mc(x)</text>
+
+  <rect x="635" y="535" width="260" height="105" class="box calib"/>
+  <text x="765" y="575" class="box-title" text-anchor="middle">分支能力先验</text>
+  <text x="765" y="607" class="box-text" text-anchor="middle">校准集分支性能 C_m</text>
+
+  <rect x="970" y="190" width="195" height="115" class="box calib"/>
+  <text x="1067.5" y="230" class="box-title" text-anchor="middle">单调可靠性校准</text>
+  <text x="1067.5" y="262" class="box-text" text-anchor="middle">R_m(x)=g_m(o_m)</text>
+  <text x="1067.5" y="286" class="small" text-anchor="middle">正向证据增强，可信度不降</text>
+
+  <rect x="970" y="395" width="195" height="115" class="box output"/>
+  <text x="1067.5" y="435" class="box-title" text-anchor="middle">三模态可信评分</text>
+  <text x="1067.5" y="467" class="box-text" text-anchor="middle">T_api, T_graph, T_man</text>
+  <text x="1067.5" y="491" class="small" text-anchor="middle">供后续证据折扣融合使用</text>
+
+  <rect x="290" y="75" width="625" height="585" class="dash"/>
+  <text x="602.5" y="655" class="small" text-anchor="middle">从静态解析结果中构建样本级证据，并估计不同模态在当前样本上的可信程度</text>
+
+  <path d="M 245 362.5 H 285" class="line"/>
+  <path d="M 285 160 H 315" class="arrow"/>
+  <path d="M 285 360 H 315" class="arrow"/>
+  <path d="M 285 560 H 315" class="arrow"/>
+  <path d="M 285 160 V 560" class="line"/>
+
+  <path d="M 535 160 H 585 V 160 H 635" class="arrow"/>
+  <path d="M 535 360 H 585 V 160 H 635" class="arrow"/>
+  <path d="M 535 560 H 585 V 160 H 635" class="arrow"/>
+
+  <path d="M 535 160 H 585 V 375 H 635" class="arrow"/>
+  <path d="M 535 360 H 585 V 375 H 635" class="arrow"/>
+  <path d="M 535 560 H 585 V 375 H 635" class="arrow"/>
+
+  <path d="M 895 160 H 935 V 247.5 H 970" class="arrow"/>
+  <path d="M 895 375 H 935 V 247.5 H 970" class="arrow"/>
+  <path d="M 895 587.5 H 935 V 452.5 H 970" class="arrow"/>
+  <path d="M 1067.5 305 V 395" class="arrow"/>
+</svg>

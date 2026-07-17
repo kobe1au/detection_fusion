@@ -1,0 +1,21 @@
+defaults:
+  - ../seeds/seed_42.yaml
+
+method:
+  name: appendix_risk_level_0_05_eval
+
+selective_prediction:
+  mode: risk_control
+  threshold_score: model_acceptance
+  risk_target: malware_fn_rate_after_rejection
+  risk_level: 0.05
+
+eval:
+  eval_only: true
+  output_name: appendix_risk_level_0_05_eval
+  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
+  # Keep this run identical to the 3% sensitivity except for risk_level.
+  # Both decision thresholds are refitted from the validation holdouts.
+  refit_rejection_threshold: true
+  run_test: true
+  run_robust_test: true

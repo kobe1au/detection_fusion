@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout android:orientation="vertical" android:id="@id/rl_all" android:background="#fffefefe" android:layout_width="fill_parent" android:layout_height="fill_parent"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <TextView android:textSize="12.0sp" android:textColor="#ff919191" android:id="@id/tv_scroll_sign" android:visibility="invisible" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="500.0dip" android:text="向上滑动，该单词标为" android:drawableLeft="@drawable/lianxi_tishi_191126" android:drawablePadding="10.0dip" android:layout_centerHorizontal="true" />
+    <p4d236d9a.pabb3141d.p62608e08.widgets.DelRecycleView android:id="@id/rv_word" android:layout_width="fill_parent" android:layout_height="545.0dip" />
+    <include layout="@layout/include_head" />
+    <TextView android:textSize="12.0sp" android:textColor="#ff919191" android:id="@id/tv_study_detail_sign" android:visibility="visible" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="15.0dip" android:layout_marginBottom="40.0dip" android:text="向上滑动，该单词标为已掌握，不再出现在练习中" android:drawableLeft="@drawable/lianxi_tishi_191126" android:drawablePadding="5.0dip" android:layout_above="@id/tv_practice" android:layout_centerHorizontal="true" />
+    <TextView android:id="@id/tv_practice" android:layout_marginLeft="45.0dip" android:layout_marginRight="45.0dip" android:layout_marginBottom="40.0dip" android:text="练习本组" android:layout_alignParentBottom="true" style="@style/Bule_btn" />
+</RelativeLayout>

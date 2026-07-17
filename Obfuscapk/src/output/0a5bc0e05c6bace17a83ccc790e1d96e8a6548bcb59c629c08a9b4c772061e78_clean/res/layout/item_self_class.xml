@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout android:id="@id/rl_self" android:background="@drawable/bg_class_top_self1" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginRight="15.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <TextView android:textSize="16.0sp" android:textStyle="bold" android:textColor="#ffffffff" android:gravity="left" android:layout_gravity="center_horizontal" android:id="@id/tv_self_title" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="33.0dip" android:text="口语-RA" />
+    <TextView android:textSize="10.0sp" android:textColor="#66ffffff" android:gravity="center|left" android:layout_gravity="bottom|center" android:id="@id/tv_self_content" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginBottom="20.0dip" android:text="·  发音" android:drawableRight="@drawable/zixueke_0515" android:drawablePadding="15.0dip" />
+</FrameLayout>

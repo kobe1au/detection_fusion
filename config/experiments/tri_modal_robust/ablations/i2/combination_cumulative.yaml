@@ -1,12 +1,21 @@
 defaults:
   - ../../evidential_trusted_fusion.yaml
 
-# I2 mechanism: Josang cumulative belief fusion (associative, accumulates evidence).
 method:
-  name: ablation_combination_cumulative
+  name: i2_combination_cumulative
 
 train:
-  exp_name: ablation_combination_cumulative
+  exp_name: i2_combination_cumulative
 
 fusion:
+  # Fair no-I2 control: retain evidential branch opinions and I1 trust
+  # discounting, but replace the learned global router/unknown outcome with the
+  # same fixed cumulative opinion-fusion rule for every sample.
   combination: cumulative
+  routing:
+    enabled: false
+    use_fused_prediction_loss: false
+    final_temperature_scaling: false
+  branch_competence_prior:
+    # Keep I1 identical to the main method; only the fusion rule changes.
+    enabled: false

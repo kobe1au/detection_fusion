@@ -1,0 +1,12 @@
+defaults:
+  - ../evidential_trusted_fusion.yaml
+
+method:
+  name: appendix_edl_weight_0_10
+
+train:
+  exp_name: appendix_edl_weight_0_10
+
+loss:
+  evidential_loss_weight: 0.10
+

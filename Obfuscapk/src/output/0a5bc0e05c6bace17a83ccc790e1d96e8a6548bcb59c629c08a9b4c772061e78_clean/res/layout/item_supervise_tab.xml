@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout android:orientation="vertical" android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginTop="5.0dip" android:layout_marginBottom="10.0dip"
+  xmlns:android="http://schemas.android.com/apk/res/android">
+    <RelativeLayout android:gravity="center_vertical" android:id="@id/rl_change" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginLeft="15.0dip" android:layout_marginRight="15.0dip">
+        <LinearLayout android:gravity="center_vertical" android:orientation="horizontal" android:background="@drawable/shape_supervise_tab_select" android:layout_width="wrap_content" android:layout_height="26.0dip" android:layout_alignBottom="@id/iv_alpaca">
+            <com.client.ytkorean.module_experience.widgets.StrokeTextView android:textSize="12.0sp" android:textStyle="bold" android:textColor="#ff333333" android:id="@id/tv_tab_step" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="32.0dip" android:text="DAY 1" />
+            <TextView android:textSize="12.0sp" android:textStyle="bold" android:textColor="#ffffffff" android:gravity="left" android:id="@id/tv_tab_title" android:paddingRight="15.0dip" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="12.0dip" android:text="考试快速入门" />
+        </LinearLayout>
+        <ImageView android:id="@id/iv_alpaca" android:layout_width="30.0dip" android:layout_height="wrap_content" android:src="@drawable/yangtuo_0515" />
+        <ImageView android:id="@id/iv_zhankai" android:layout_width="wrap_content" android:layout_height="wrap_content" android:src="@drawable/ic_down_0515" android:layout_alignParentRight="true" android:layout_centerVertical="true" />
+    </RelativeLayout>
+    <androidx.recyclerview.widget.RecyclerView android:id="@id/rv_zhankai" android:background="#ffffffff" android:layout_width="fill_parent" android:layout_height="wrap_content" android:layout_marginLeft="10.0dip" android:layout_marginTop="10.0dip" android:layout_marginRight="10.0dip" />
+</LinearLayout>

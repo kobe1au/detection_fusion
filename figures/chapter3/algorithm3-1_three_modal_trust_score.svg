@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1040" viewBox="0 0 1400 1040">
+  <defs>
+    <style>
+      .rule { stroke: #111111; stroke-width: 2.2; }
+      .thin-rule { stroke: #333333; stroke-width: 1.25; }
+      .title { font: 27px "SimSun", "Microsoft YaHei", serif; fill: #111111; }
+      .body { font: 24px "SimSun", "Microsoft YaHei", serif; fill: #111111; }
+      .keyword { font: 700 24px "Times New Roman", serif; fill: #111111; }
+      .math { font: italic 24px "Cambria Math", "Times New Roman", serif; fill: #111111; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1400" height="1040" fill="#ffffff"/>
+  <line x1="40" y1="35" x2="1360" y2="35" class="rule"/>
+  <text x="105" y="82" class="title">算法3-1：三模态可信评分计算方法</text>
+  <line x1="40" y1="105" x2="1360" y2="105" class="thin-rule"/>
+
+  <text x="105" y="151" class="keyword">Input:</text>
+  <text x="205" y="151" class="body">样本</text>
+  <text x="266" y="151" class="math">x</text>
+  <text x="286" y="151" class="body">的静态解析元数据</text>
+
+  <text x="105" y="194" class="keyword">Input:</text>
+  <text x="205" y="194" class="body">已训练的可靠性校准器集合</text>
+  <text x="530" y="194" class="math">{g<tspan baseline-shift="sub" font-size="17">m</tspan>}</text>
+
+  <text x="105" y="237" class="keyword">Input:</text>
+  <text x="205" y="237" class="body">分支能力先验</text>
+  <text x="374" y="237" class="math">{C<tspan baseline-shift="sub" font-size="17">m</tspan>}</text>
+  <text x="430" y="237" class="body">和正常可见水平</text>
+  <text x="625" y="237" class="math">{ρ<tspan baseline-shift="sub" font-size="17">m</tspan>}</text>
+
+  <text x="105" y="280" class="keyword">Output:</text>
+  <text x="218" y="280" class="body">三个模态的可信评分</text>
+  <text x="460" y="280" class="math">T<tspan baseline-shift="sub" font-size="17">api</tspan>(x), T<tspan baseline-shift="sub" font-size="17">graph</tspan>(x), T<tspan baseline-shift="sub" font-size="17">man</tspan>(x)</text>
+
+  <text x="105" y="333" class="keyword">Begin:</text>
+
+  <text x="105" y="380" class="math">ℳ ← {api, graph, man}</text>
+
+  <text x="105" y="427" class="body">根据解析状态计算各模态的可用性</text>
+  <text x="535" y="427" class="math">a<tspan baseline-shift="sub" font-size="17">m</tspan>(x)</text>
+
+  <text x="105" y="474" class="body">根据内容保留情况和特征有效性计算模态完整性</text>
+  <text x="705" y="474" class="math">q<tspan baseline-shift="sub" font-size="17">m</tspan>(x)</text>
+
+  <text x="105" y="521" class="body">根据编码器实际输入规模计算模型可见比例</text>
+  <text x="657" y="521" class="math">v<tspan baseline-shift="sub" font-size="17">m</tspan>(x)</text>
+
+  <text x="105" y="568" class="body">计算跨模态结构支持、语义支持和声明—行为不一致程度</text>
+
+  <text x="105" y="621" class="keyword">for each</text>
+  <text x="208" y="621" class="math">m ∈ ℳ</text>
+  <text x="304" y="621" class="keyword">do</text>
+
+  <text x="155" y="668" class="body">按照式（3-16）至式（3-18）构造证据向量</text>
+  <text x="748" y="668" class="math">o<tspan baseline-shift="sub" font-size="17">m</tspan>(x)</text>
+
+  <text x="155" y="715" class="math">R<tspan baseline-shift="sub" font-size="17">m</tspan>(x) ← g<tspan baseline-shift="sub" font-size="17">m</tspan>(o<tspan baseline-shift="sub" font-size="17">m</tspan>(x))</text>
+
+  <text x="155" y="762" class="body">按照式（3-25）和式（3-26）计算可见性修正因子</text>
+  <text x="826" y="762" class="math">M̃<tspan baseline-shift="sub" font-size="17">m</tspan>(x)</text>
+
+  <text x="155" y="809" class="math">T<tspan baseline-shift="sub" font-size="17">m</tspan>(x) ← a<tspan baseline-shift="sub" font-size="17">m</tspan>(x) C<tspan baseline-shift="sub" font-size="17">m</tspan> R<tspan baseline-shift="sub" font-size="17">m</tspan>(x)<tspan baseline-shift="super" font-size="17">α</tspan> M̃<tspan baseline-shift="sub" font-size="17">m</tspan>(x)</text>
+
+  <text x="105" y="856" class="keyword">end for</text>
+
+  <text x="105" y="903" class="keyword">return</text>
+  <text x="195" y="903" class="math">T<tspan baseline-shift="sub" font-size="17">api</tspan>(x), T<tspan baseline-shift="sub" font-size="17">graph</tspan>(x), T<tspan baseline-shift="sub" font-size="17">man</tspan>(x)</text>
+
+  <text x="105" y="950" class="keyword">End</text>
+  <line x1="40" y1="995" x2="1360" y2="995" class="rule"/>
+</svg>

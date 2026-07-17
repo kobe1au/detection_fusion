@@ -1,0 +1,18 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i2_router_known_only
+
+train:
+  exp_name: i2_router_known_only
+
+fusion:
+  routing:
+    # Remove only the residual error/abstention outcome. The correctness-target
+    # loss is incompatible with a forced-zero unknown mass, so this controlled
+    # cell retains the proper final-prediction loss only.
+    mode: known_only
+    target_loss_weight: 0.0
+    prediction_loss_weight: 1.0
+

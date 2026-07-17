@@ -9,3 +9,12 @@ train:
 
 model:
   fusion_mode: tri_modal_concat
+
+loss:
+  branch_aux_weight: 0.25
+  integrity_weighted_aux: false
+  branch_aux_weights:
+    api: 1.0
+    graph: 1.0
+    manifest: 1.0
+    joint: 0.0

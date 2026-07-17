@@ -1,0 +1,14 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i1_observable_only_reliability
+
+train:
+  exp_name: i1_observable_only_reliability
+
+fusion:
+  reliability_calibration:
+    # Removes the learned sample-difficulty source while retaining observable
+    # integrity, API-Graph support, and model visibility.
+    use_evidential_uncertainty: false
