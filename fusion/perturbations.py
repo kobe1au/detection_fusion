@@ -1,21 +1,19 @@
 from __future__ import annotations
 
 import random
-from typing import Iterable
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterable, Iterator
 
 import torch
 
 from fusion.semantic_categories import (
     SEMANTIC_CATEGORY_DIM,
     api_semantic_counts_from_type_ids,
+    graph_semantic_counts_from_method_api_edges,
 )
 
-from fusion.quality import (
-    refresh_api_quality,
-    refresh_graph_quality,
-    refresh_align_quality,
-    refresh_observable_signals,
-)
+from fusion.quality import refresh_observable_signals
 from fusion.utils import clamp_strength, scalar_float
 
 
@@ -26,6 +24,7 @@ API_PERTURBATIONS = {
     "api_feature_noise",
     "modality_dropout_api",
     "api_degraded",
+    "api_semantic_corrupted",
     "api_missing",
 }
 
@@ -36,6 +35,7 @@ GRAPH_PERTURBATIONS = {
     "graph_node_feature_mask",
     "modality_dropout_graph",
     "graph_degraded",
+    "graph_semantic_corrupted",
     "graph_missing",
 }
 
@@ -47,6 +47,7 @@ MANIFEST_PERTURBATIONS = {
     "manifest_feature_noise",
     "modality_dropout_manifest",
     "manifest_degraded",
+    "manifest_semantic_corrupted",
     "manifest_missing",
 }
 
@@ -56,6 +57,7 @@ COMBINED_PERTURBATIONS = {
     "api_manifest_degraded",
     "graph_manifest_degraded",
     "all_degraded",
+    "all_semantic_corrupted",
 }
 
 EVAL_PERTURB_TYPES = (
@@ -65,6 +67,52 @@ EVAL_PERTURB_TYPES = (
     | MANIFEST_PERTURBATIONS
     | COMBINED_PERTURBATIONS
 )
+
+
+class _ObservableRefreshBatch:
+    __slots__ = ("data", "requested")
+
+    def __init__(self, data: dict) -> None:
+        self.data = data
+        self.requested = False
+
+
+_ACTIVE_OBSERVABLE_REFRESH_BATCH: ContextVar[
+    _ObservableRefreshBatch | None
+] = ContextVar("active_observable_refresh_batch", default=None)
+
+
+def _request_observable_refresh(data: dict) -> None:
+    """Refresh now, or mark the current compound perturbation for one refresh."""
+
+    batch = _ACTIVE_OBSERVABLE_REFRESH_BATCH.get()
+    if batch is not None and batch.data is data:
+        batch.requested = True
+        return
+    refresh_observable_signals(data)
+
+
+@contextmanager
+def _coalesced_observable_refresh(data: dict) -> Iterator[None]:
+    """Coalesce nested refresh requests for one sample into a final refresh."""
+
+    current = _ACTIVE_OBSERVABLE_REFRESH_BATCH.get()
+    if current is not None and current.data is data:
+        yield
+        return
+
+    batch = _ObservableRefreshBatch(data)
+    token = _ACTIVE_OBSERVABLE_REFRESH_BATCH.set(batch)
+    completed = False
+    try:
+        yield
+        completed = True
+    finally:
+        _ACTIVE_OBSERVABLE_REFRESH_BATCH.reset(token)
+        # Preserve the previous failure semantics: a mutation that raises before
+        # its old refresh site must not partially materialise new observables.
+        if completed and batch.requested:
+            refresh_observable_signals(data)
 
 
 def _num_to_perturb(total: int, strength: float) -> int:
@@ -80,12 +128,6 @@ def _set_min_pert(data: dict, key: str, strength: float) -> None:
     data[key] = max(current, clamp_strength(strength))
 
 
-def _zero_tensor_like(value):
-    if isinstance(value, torch.Tensor):
-        return torch.zeros_like(value)
-    return value
-
-
 def recompute_api_category_counts(data: dict) -> None:
     ids = data.get("api_type_ids")
     counts = api_semantic_counts_from_type_ids(ids)
@@ -93,6 +135,36 @@ def recompute_api_category_counts(data: dict) -> None:
     counts = counts.to(device=device) if device is not None else counts
     data["api_semantic_category_counts"] = counts
     data["api_category_counts"] = counts
+
+
+def _recompute_graph_category_counts_after_api_change(data: dict) -> None:
+    """Refresh graph semantics derived from API-to-method alignment.
+
+    API event/category perturbations can change both ``api_type_ids`` and the
+    remapped ``method_api_edge_index``.  Keeping the pre-perturbation graph
+    histogram would leak clean semantic metadata into the perturbed sample.
+    The runtime source marker preserves the explicit graph-semantic ablation.
+    """
+    source = str(data.get("graph_semantic_source", "alignment") or "alignment").lower()
+    api_types = data.get("api_type_ids")
+    if source == "alignment":
+        counts = graph_semantic_counts_from_method_api_edges(
+            api_types,
+            data.get("method_api_edge_index"),
+        )
+    elif source == "full_api":
+        counts = api_semantic_counts_from_type_ids(api_types)
+    elif source == "zero":
+        counts = torch.zeros((SEMANTIC_CATEGORY_DIM,), dtype=torch.float32)
+    else:
+        raise ValueError(
+            f"Unsupported graph_semantic_source={source!r}; expected "
+            "'alignment', 'full_api', or 'zero'"
+        )
+    if isinstance(api_types, torch.Tensor):
+        counts = counts.to(device=api_types.device)
+    data["graph_semantic_category_counts"] = counts
+    data["graph_category_counts"] = counts
 
 
 def _select_api_events(data: dict, keep: torch.Tensor) -> None:
@@ -177,8 +249,8 @@ def apply_api_event_dropout(data: dict, strength: float, sensitive_only: bool = 
     _set_min_pert(data, "pert_api", actual)
     data["api_aug_type"] = "api_sensitive_event_dropout" if sensitive_only else "api_event_dropout"
     recompute_api_category_counts(data)
-    refresh_api_quality(data)
-    refresh_align_quality(data)
+    _recompute_graph_category_counts_after_api_change(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -203,8 +275,8 @@ def apply_api_category_dropout(data: dict, strength: float) -> dict:
     _set_min_pert(data, "pert_api", actual)
     data["api_aug_type"] = "api_category_dropout"
     recompute_api_category_counts(data)
-    refresh_api_quality(data)
-    refresh_align_quality(data)
+    _recompute_graph_category_counts_after_api_change(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -221,16 +293,41 @@ def apply_api_feature_noise(data: dict, strength: float) -> dict:
         return data
     idx = torch.randperm(n, device=ids.device)[:n_noise]
     ids_new = ids.clone()
-    replacement = torch.randint(1, int(ids.max().item()) + 2, (n_noise,), device=ids.device)
-    same = replacement == ids_new[idx]
-    replacement[same] = replacement[same] % (int(ids.max().item()) + 1) + 1
-    ids_new[idx] = replacement
+    type_ids = data.get("api_type_ids")
+    type_ids_new = type_ids.clone() if isinstance(type_ids, torch.Tensor) else None
+    sensitive = data.get("api_sensitive_mask")
+    sensitive_new = sensitive.clone() if isinstance(sensitive, torch.Tensor) else None
+    for target in idx:
+        different = torch.nonzero(ids != ids[target], as_tuple=False).view(-1)
+        if different.numel() > 0:
+            donor = different[
+                torch.randint(different.numel(), (1,), device=ids.device)
+            ].view(())
+            ids_new[target] = ids[donor]
+            if type_ids_new is not None and type_ids_new.numel() == n:
+                type_ids_new[target] = type_ids[donor.to(type_ids.device)]
+            if sensitive_new is not None and sensitive_new.numel() == n:
+                sensitive_new[target] = sensitive[donor.to(sensitive.device)]
+        else:
+            # A constant-ID sequence has no empirical donor. Move the hash to
+            # a guaranteed different bucket and mark its unknown semantics
+            # consistently instead of retaining the original clean category.
+            ids_new[target] = int(ids[target].item()) + 1
+            if type_ids_new is not None and type_ids_new.numel() == n:
+                type_ids_new[target] = 0
+            if sensitive_new is not None and sensitive_new.numel() == n:
+                sensitive_new[target] = 0
     data["api_ids"] = ids_new
+    if type_ids_new is not None and type_ids_new.numel() == n:
+        data["api_type_ids"] = type_ids_new
+    if sensitive_new is not None and sensitive_new.numel() == n:
+        data["api_sensitive_mask"] = sensitive_new
     actual = float((ids_new != ids).float().mean().item())
     _set_min_pert(data, "pert_api", actual)
     data["api_aug_type"] = "api_feature_noise"
-    refresh_api_quality(data)
-    refresh_align_quality(data)
+    recompute_api_category_counts(data)
+    _recompute_graph_category_counts_after_api_change(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -264,7 +361,8 @@ def apply_api_missing(data: dict) -> dict:
     data["api_parse_ok"] = False
     data["api_parse_error"] = "synthetic modality missing"
     data["api_aug_type"] = "modality_dropout_api"
-    refresh_align_quality(data)
+    _recompute_graph_category_counts_after_api_change(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -283,8 +381,7 @@ def apply_graph_sparsify(data: dict, strength: float) -> dict:
     actual = 1.0 - float(keep.float().mean().item())
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_sparsify"
-    refresh_graph_quality(data)
-    refresh_align_quality(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -310,8 +407,7 @@ def apply_graph_local_break(data: dict, strength: float) -> dict:
     actual = 1.0 - float(keep.float().mean().item())
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_local_break"
-    refresh_graph_quality(data)
-    refresh_align_quality(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -339,8 +435,7 @@ def apply_graph_feature_obfuscation(data: dict, strength: float) -> dict:
     actual = float(n_mask) / max(int(candidates.numel()), 1)
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_feature_obfuscation"
-    refresh_graph_quality(data)
-    refresh_align_quality(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -368,8 +463,7 @@ def apply_graph_node_feature_mask(data: dict, strength: float) -> dict:
     actual = float(n_mask) / max(int(candidates.numel()), 1)
     _set_min_pert(data, "pert_graph", actual)
     data["graph_aug_type"] = "graph_node_feature_mask"
-    refresh_graph_quality(data)
-    refresh_align_quality(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -400,7 +494,7 @@ def apply_graph_missing(data: dict) -> dict:
     data["graph_parse_ok"] = False
     data["graph_parse_error"] = "synthetic modality missing"
     data["graph_aug_type"] = "modality_dropout_graph"
-    refresh_observable_signals(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -542,7 +636,7 @@ def apply_manifest_permission_mask(data: dict, strength: float) -> dict:
         data["manifest_permission_ids"] = ids[keep].clone()
     _update_manifest_perturbation(data, actual)
     data["manifest_aug_type"] = "manifest_permission_mask"
-    refresh_observable_signals(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -571,7 +665,7 @@ def apply_manifest_permission_injection(data: dict, strength: float) -> dict:
                 data["manifest_permission_ids"] = torch.unique(torch.cat([ids.long(), injected])).sort().values
     _update_manifest_perturbation(data, actual)
     data["manifest_aug_type"] = "manifest_permission_injection"
-    refresh_observable_signals(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -604,7 +698,7 @@ def apply_manifest_intent_mask(data: dict, strength: float) -> dict:
         data["manifest_intent_ids"] = ids[keep].clone()
     _update_manifest_perturbation(data, actual)
     data["manifest_aug_type"] = "manifest_intent_mask"
-    refresh_observable_signals(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -668,7 +762,7 @@ def apply_manifest_component_mask(data: dict, strength: float) -> dict:
     data["manifest_component_count"] = max(0, int(round(current_components * (1.0 - strength))))
     _update_manifest_perturbation(data, actual)
     data["manifest_aug_type"] = "manifest_component_mask"
-    refresh_observable_signals(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -705,7 +799,7 @@ def apply_manifest_feature_noise(data: dict, strength: float) -> dict:
         _set_manifest_semantic_counts(data, (counts.float() + noise).clamp_min(0.0))
     _update_manifest_perturbation(data, actual)
     data["manifest_aug_type"] = "manifest_feature_noise"
-    refresh_observable_signals(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -733,7 +827,7 @@ def apply_manifest_missing(data: dict) -> dict:
     data["manifest_parse_ok"] = False
     data["manifest_parse_error"] = "synthetic modality missing"
     data["manifest_aug_type"] = "modality_dropout_manifest"
-    refresh_observable_signals(data)
+    _request_observable_refresh(data)
     return data
 
 
@@ -745,11 +839,22 @@ def apply_manifest_degraded(data: dict, strength: float) -> dict:
         strength,
         [
             apply_manifest_permission_mask,
-            apply_manifest_permission_injection,
             apply_manifest_intent_mask,
             apply_manifest_component_mask,
-            apply_manifest_feature_noise,
         ],
+        "pert_manifest",
+    )
+
+
+def apply_manifest_semantic_corrupted(data: dict, strength: float) -> dict:
+    """Apply label-preserving semantic pollution without completeness metadata."""
+
+    if clamp_strength(strength) <= 0.0:
+        return data
+    return _apply_first_effective(
+        data,
+        strength,
+        [apply_manifest_permission_injection, apply_manifest_feature_noise],
         "pert_manifest",
     )
 
@@ -760,14 +865,15 @@ def _apply_first_effective(
     operations: list,
     pert_key: str,
 ) -> dict:
-    before = scalar_float(data.get(pert_key), 0.0)
-    operations = list(operations)
-    random.shuffle(operations)
-    for operation in operations:
-        data = operation(data, strength)
-        if scalar_float(data.get(pert_key), 0.0) > before:
-            return data
-    return data
+    with _coalesced_observable_refresh(data):
+        before = scalar_float(data.get(pert_key), 0.0)
+        operations = list(operations)
+        random.shuffle(operations)
+        for operation in operations:
+            data = operation(data, strength)
+            if scalar_float(data.get(pert_key), 0.0) > before:
+                return data
+        return data
 
 
 def apply_graph_degraded(data: dict, strength: float) -> dict:
@@ -778,10 +884,21 @@ def apply_graph_degraded(data: dict, strength: float) -> dict:
         strength,
         [
             apply_graph_sparsify,
-            apply_graph_local_break,
-            apply_graph_feature_obfuscation,
             apply_graph_node_feature_mask,
         ],
+        "pert_graph",
+    )
+
+
+def apply_graph_semantic_corrupted(data: dict, strength: float) -> dict:
+    """Apply structural/feature pollution not guaranteed visible to completeness."""
+
+    if clamp_strength(strength) <= 0.0:
+        return data
+    return _apply_first_effective(
+        data,
+        strength,
+        [apply_graph_local_break, apply_graph_feature_obfuscation],
         "pert_graph",
     )
 
@@ -793,8 +910,9 @@ def apply_graph_degraded(data: dict, strength: float) -> dict:
 
 _PERTURB_REGISTRY: dict = {
     "api_degraded": lambda d, s: random.choice(
-        [apply_api_event_dropout, apply_api_category_dropout, apply_api_feature_noise]
+        [apply_api_event_dropout, apply_api_category_dropout]
     )(d, s),
+    "api_semantic_corrupted": apply_api_feature_noise,
     "api_missing": lambda d, _s: apply_api_missing(d),
     "modality_dropout_api": lambda d, _s: apply_api_missing(d),
     "api_event_dropout": lambda d, s: apply_api_event_dropout(d, s, sensitive_only=False),
@@ -802,6 +920,7 @@ _PERTURB_REGISTRY: dict = {
     "api_category_dropout": apply_api_category_dropout,
     "api_feature_noise": apply_api_feature_noise,
     "graph_degraded": apply_graph_degraded,
+    "graph_semantic_corrupted": apply_graph_semantic_corrupted,
     "graph_missing": lambda d, _s: apply_graph_missing(d),
     "modality_dropout_graph": lambda d, _s: apply_graph_missing(d),
     "graph_sparsify": apply_graph_sparsify,
@@ -809,6 +928,7 @@ _PERTURB_REGISTRY: dict = {
     "graph_feature_obfuscation": apply_graph_feature_obfuscation,
     "graph_node_feature_mask": apply_graph_node_feature_mask,
     "manifest_degraded": apply_manifest_degraded,
+    "manifest_semantic_corrupted": apply_manifest_semantic_corrupted,
     "manifest_missing": lambda d, _s: apply_manifest_missing(d),
     "modality_dropout_manifest": lambda d, _s: apply_manifest_missing(d),
     "manifest_permission_mask": apply_manifest_permission_mask,
@@ -832,20 +952,25 @@ def apply_perturbation(data: dict, perturb_type: str | None, strength: float) ->
     strength = clamp_strength(strength)
     if perturb_type in {None, "clean"}:
         return data
-    if perturb_type == "api_graph_degraded":
-        data = _apply_one(data, "api_degraded", strength)
-        return _apply_one(data, "graph_degraded", strength)
-    if perturb_type == "api_manifest_degraded":
-        data = _apply_one(data, "api_degraded", strength)
-        return _apply_one(data, "manifest_degraded", strength)
-    if perturb_type == "graph_manifest_degraded":
-        data = _apply_one(data, "graph_degraded", strength)
-        return _apply_one(data, "manifest_degraded", strength)
-    if perturb_type == "all_degraded":
-        data = _apply_one(data, "api_degraded", strength)
-        data = _apply_one(data, "graph_degraded", strength)
-        return _apply_one(data, "manifest_degraded", strength)
-    return _apply_one(data, perturb_type, strength)
+    with _coalesced_observable_refresh(data):
+        if perturb_type == "api_graph_degraded":
+            data = _apply_one(data, "api_degraded", strength)
+            return _apply_one(data, "graph_degraded", strength)
+        if perturb_type == "api_manifest_degraded":
+            data = _apply_one(data, "api_degraded", strength)
+            return _apply_one(data, "manifest_degraded", strength)
+        if perturb_type == "graph_manifest_degraded":
+            data = _apply_one(data, "graph_degraded", strength)
+            return _apply_one(data, "manifest_degraded", strength)
+        if perturb_type == "all_degraded":
+            data = _apply_one(data, "api_degraded", strength)
+            data = _apply_one(data, "graph_degraded", strength)
+            return _apply_one(data, "manifest_degraded", strength)
+        if perturb_type == "all_semantic_corrupted":
+            data = _apply_one(data, "api_semantic_corrupted", strength)
+            data = _apply_one(data, "graph_semantic_corrupted", strength)
+            return _apply_one(data, "manifest_semantic_corrupted", strength)
+        return _apply_one(data, perturb_type, strength)
 
 
 def sample_training_perturbation(

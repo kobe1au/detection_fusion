@@ -1,179 +1,311 @@
 # Tri-Modal Robust Experiments
 
-This directory keeps the formal experiment plan intentionally small.
-Most stable model constants live in `fusion/constants.py`; YAML files only
-express the conceptual experiment differences.
+This directory contains the pre-registered experiment catalog for the current
+I1/I2/I3 pipeline. Stable defaults live in `fusion/constants.py`; YAML files
+declare only meaningful experimental differences.
 
-Main groups:
+## Current method identity
 
-- `python run.py final`: full method with seed 42.
-- `python run.py seed`: full method with seeds 42, 2024, and 3407.
-- `python run.py baselines`: internal representation/fusion baselines.
-- `python run.py trusted_baselines`: adapted recent trusted-fusion baselines
-  under the same APK encoders, data split, and training budget.
-- `python run.py module`: three innovation-level removals for I1/I2/I3. The
-  no-I1 run retains the global router but removes calibrated reliability and
-  visibility inputs while keeping integrity-weighted encoder supervision fixed;
-  the no-I2 run retains I1 and the routed evidential-opinion path but fixes its
-  weights to the exact reliability prior; the no-I3 run evaluates the main
-  checkpoint without classification-threshold fitting or rejection.
-- `python run.py mechanism`: atomic mechanism checks for I1/I2/I3.
-- `python run.py i2_atomic`: prior-only, no-unknown, no-disagreement,
-  posthoc-only, and encoder-only router controls. Classical Dempster,
-  cumulative, log-pool, and ECML-style substitutions remain under `i2_rules`.
-- `python run.py i1_i2_2x2`: factorial I1 reliability x I2 routing matrix.
-- `python run.py i3_2x2`: factorial classification-threshold x malware-risk
-  rejection matrix, reusing the same seed-42 prediction checkpoint.
-- `python run.py factorial_remaining`: the six non-primary cells from both
-  2x2 matrices; use this after `final` to avoid rerunning seed 42.
-- `python run.py external`: Obfuscapk eval-only sets using the seed-42 checkpoint.
-- `python run.py appendix`: small appendix sensitivities only.
+- **I1 — intrinsic branch-correctness calibration.** Each alive API, Graph, or
+  Manifest branch estimates `P(its own argmax is correct)` using an ordered
+  `clean competence - degradation penalty` model. Phase one fits competence
+  from a monotone margin spline plus a predicted-class intercept. Phase two
+  freezes competence and learns a bias-free non-negative penalty from effective
+  quality deficit and fold-local class-conditional diagonal-Mahalanobis tail
+  excess, so degradation can never increase reliability. Each I1 fit estimates
+  its class references only from clean rows in
+  that fit's training selection; at inference, the branch's own predicted class
+  selects the reference. The main method does not reuse perturbation identity or
+  severity, target labels, other-modality outputs, cross-modal disagreement, or
+  EDL certainty in I1, and does not multiply the calibrated probability by a
+  second visibility modifier. Branch-local completeness views and the API,
+  Graph, and Manifest single-branch semantic views supervise only the affected
+  branch. Clean/completeness/semantic objective masses are fixed at
+  0.50/0.25/0.25; `all_semantic_corrupted` remains I2-only.
+- **I2 — conditional routing plus threshold-aligned malware-FN risk.** `pi` is a conditional
+  distribution over available branches. Its common-scale prior is the positive
+  scaled log-odds of I1 correctness, and the main route is fitted only with the
+  proper mixture NLL. Branch conflict is normalized Jensen-Shannon divergence
+  from a reliability-weighted leave-one-out peer consensus; dead/no-peer cases
+  add no artificial conflict. On perturbation rows, that same mixture NLL is
+  reduced by a perturb-type/strength-balanced mean plus a stateless entropic
+  soft worst-group term; the
+  latter changes group aggregation, not the per-row supervision target. All
+  row/subset-oracle weights are zero in the primary method. The detached
+  source-level subset oracle is retained only as an optional add-on experiment,
+  not as part of the deployed method or primary objective.
+  Encoder training uses an alive-only
+  uniform route; the log-odds prior is activated only after I1 fitting. `u` is
+  fitted only on samples that the fixed deployable classifier predicts benign,
+  with target `1` exactly for malware false negatives. On the predicted-malware
+  side that event is impossible, so its deployed risk is fixed to zero. The
+  final classifier uses temperature-scaled
+  `p_mix = sum_i pi_i p_i`; `u` is only a rejection ranking score. Clean and
+  perturbed calibration families receive an explicit configurable objective
+  prior (main cell 0.5/0.5, sensitivity cells 0.7/0.3 and 0.3/0.7). Three
+  pairwise completeness views are included symmetrically. Within the perturb
+  side, the main route combines the mechanism-balanced mean with a stateless
+  entropic soft worst-group risk; it does not maintain call-order-dependent
+  Group-DRO state. I3 then
+  calibrates acceptance against this same thresholded malware-FN event on a
+  disjoint decision set.
+  There is no unknown semantic class and no known-mass budget.
+- **I3 — malware-FN selective risk control.** The binary
+  operating threshold is an unconstrained macro-F1 utility boundary fitted
+  first and fixed as the classifier boundary that defines I2's FN-risk target;
+  it is not part of I3. A disjoint decision-calibration subset then fits
+  the acceptance threshold using `1-u` as the primary score. Its bounded loss
+  is `1{accepted and predicted benign}` among malware, so the empirical
+  denominator is **all malware**, not accepted malware. The finite-sample rule
+  `(accepted_FN + 1)/(n_malware + 1) <= alpha` provides expected CRC under the
+  stated exchangeability assumptions. It does not provide a high-probability
+  guarantee or a guarantee for FNR conditional on accepted malware; that
+  operational conditional FNR is reported separately.
 
-Method-identity warning:
+Classical Dempster, cumulative subjective logic, log-pool, and the custom
+conflict-weighted opinion rule are explicit I2 comparison cells. They never
+replace the routed main path silently.
 
-- The proposed I2 path is `combination: routed` in both encoder training and
-  evaluation. It does not switch to a classical evidence rule at any stage.
-- The proposed I3 path is `selective_prediction.mode: risk_control` with a
-  malware false-negative target. Conformal variants are explicit comparison
-  experiments under `ablations/i3`; they are not the proposed method.
-- Thesis drafts, figures, or result files created before this method identity
-  was fixed must not be used to describe the current implementation.
+## Validation lifecycle
 
-The trusted-fusion baselines are controlled adaptations rather than exact
-reproductions on their original datasets. In particular, `qmf_style_adapted`
-uses QMF's official detached energy-weighted late-fusion rule and fixed
-temperature, while retaining this repository's common branch-training
-objective instead of QMF's task-specific confidence-ranking loss. Report these
-methods as `*-style adapted` in the thesis and state the shared-encoder protocol.
+The validation set is split by canonical package-isolation group into:
 
-Paper mapping:
+1. 50% for checkpoint selection;
+2. 25% for post-hoc model fitting and the classification threshold;
+3. 25% for the final I3 decision rule.
 
-- I1: calibrated branch-correctness reliability. Observable extraction and
-  relation evidence is combined with branch evidential certainty by a monotone
-  calibrator, so API, Graph, and Manifest reliability share the same semantics:
-  estimated probability that the frozen branch prediction is correct.
-- I2: global opinion routing. During encoder training, a lightweight router
-  jointly observes observable integrity, branch opinions, availability, and
-  prediction disagreement. On the independent post-hoc subset, the same router
-  is refined using the three calibrated branch-correctness probabilities. A
-  separately reported relative effective-integrity
-  factor constrains the route when model-visible evidence falls below its clean
-  calibration reference. The router allocates mass to API, Graph, Manifest, or
-  a residual error/abstention outcome; this residual is not a third semantic
-  class. Its total known-branch mass cannot exceed the reliability-derived
-  prior, so learned routing may move prior mass toward abstention but cannot
-  manufacture extra trust. The router participates in encoder training and is
-  subsequently refined on the independent post-hoc split. Classical evidence
-  rules are used only as explicitly named comparison methods.
-- I3: constrained classification and malware false-negative risk control. The
-  post-hoc validation subset first selects the malware decision threshold that
-  maximizes macro-F1 while keeping malware recall at or above 90%. With that
-  classifier fixed, the disjoint decision-calibration subset selects the lowest
-  acceptance threshold whose finite-sample corrected expected risk of accepting
-  a malware sample as benign meets the configured target. This risk is divided
-  by all malware calibration samples, not only accepted malware samples.
+The post-hoc quarter uses five deterministic package-group folds. Every
+clean/degraded view of one package stays in the same fold. For each outer route
+holdout, inner I1 fits exclude both the outer holdout and the row being predicted;
+this produces strict OOF route predictions for the risk head and temperature.
+Every inner, outer, and deployment I1 fit re-estimates its class-conditional
+diagonal-Mahalanobis references from only the clean rows in its own training
+selection before building branch-local calibration features.
+The binary classification cutoff is first selected on the raw log-odds of clean
+upstream-OOF route outputs. Risk is fitted on strict OOF-route outputs using that
+fixed cutoff, after which deployable I1 and route modules are refitted on all
+eligible post-hoc identities. The scalar temperature is monotone and the raw
+cutoff is mapped through it exactly; the full-data temperature fit therefore
+cannot change which samples are predicted malware or benign.
 
-I3 comparisons use the same seed-42 checkpoint and the same held-out
-calibration subset: no rejection, a maximum-probability threshold, an
-evidential-uncertainty threshold, marginal and class-conditional split
-conformal prediction, conflict-augmented conformal prediction, and the main
-malware false-negative risk-control rule.
+Unknown or failed calibration samples stop the run. I1, route, and risk stages
+use deterministic full-batch LBFGS with a strong-Wolfe line search, explicit
+effective-parameter regularization for I2, best-state restoration, and scale
+guards. Every fold starts
+from the same parameter snapshot, and every OOF cache row must be written exactly
+once before a pipeline checkpoint can be saved.
 
-Validation protocol for formal runs with selective prediction:
+The numerical budgets above do not rerun the complete fusion stack at every
+optimizer step. Each fit materializes its frozen tensors once: I1 reuses its
+branch-local feature matrix and evaluates three packed branch heads, the route
+reuses prepared three-opinion inputs, and the risk stage reuses its
+five-dimensional feature matrix. Subsequent steps run only the corresponding
+small calibrator, route kernel, or logistic head. All perturbation sources share
+one boundary-preserving evaluation worker pool, while their source identities
+and objective masses remain separate. Stage summaries report full decision
+forwards separately from lightweight forwards, together with cache and total
+post-hoc wall time.
 
-- 50% of validation groups select the checkpoint.
-- 25% fit post-hoc reliability/routing parameters and the constrained malware
-  classification threshold when needed.
-- 25% fit the selective decision rule. Threshold, conformal, and risk-control
-  variants use this same final subset, so their comparison has an equal budget.
+## Encoder-stage performance contract
 
-The post-hoc subset is evaluated once in its clean form and under single- and
-all-modality degradation at strengths 0.1, 0.3, 0.5, 0.7, and 0.9, plus three
-missing-modality views. Reliability and probability calibration use only clean
-rows. Each router objective balances clean rows equally with one degraded or
-missing scenario family, so the perturbation-grid size does not set an implicit
-deployment prior. Checkpoint selection and the disjoint decision-calibration
-subset never consume these transformed views.
+The encoder-selection stage keeps the original candidate epochs, clean
+Macro-F1 checkpoint score, patience, optimizer, and augmentation stream. Its
+runtime path is optimized without changing those choices: PT tensor storages
+are memory-mapped read-only, already budgeted Graph batches carry a CPU-checked
+contract so the encoder does not repeat no-op GPU truncation, and materialized
+Manifest/code relations are not recomputed as fallbacks. Per-epoch checkpoint
+validation uses a lean inference profile that computes only the classification
+metrics consumed by checkpoint selection; complete diagnostics are still
+computed after the best encoder is restored. Each epoch log reports separate
+`train_wall_seconds` and `val_wall_seconds` values so remaining I/O or encoder
+cost can be measured rather than inferred from total runtime.
 
-Non-selective baselines use the same 50% checkpoint-selection subset and leave
-the remaining validation groups unused for model selection.
+## Experiment groups
 
-For the I1+I2 forced-classification table, compare every method at the common
-0.5 decision boundary using `fixed_0_5_macro_f1`, AUC, and AP. The
-validation-fitted malware threshold belongs to I3 and is reported only with
-the risk-control experiments. Brier score and ECE may be reported as
-full-pipeline calibration outcomes, but they do not isolate I1/I2 because the
-main routed method fits one final temperature while the plain baselines do not.
-Do not attribute that cross-method calibration difference to routing alone
-unless the same final calibration is fitted for every baseline.
+- `python run.py final`: primary seed-42 method.
+- `python run.py seed`: primary method for seeds 42, 2024, and 3407.
+- `python run.py baselines`: representation, fixed-logit, and the adapted dense
+  embedding-gated late-fusion baseline. The latter is not a strict sparse-MoE
+  or Shazeer reproduction.
+- `python run.py trusted_baselines`: TMC-style adapted, ECML-style adapted, and
+  the QMF-Energy component baseline.
+- `python run.py module`: complete I1, learned-I2, and I3 removals. I3 removal
+  retains the shared macro-F1 classifier boundary and disables only selective
+  malware-FN acceptance control.
+- `python run.py i1_atomic`: five single-axis I1 ablations: model visibility,
+  embedding density, margin, predicted-class intercept, and learned calibration.
+  Every feature cell keeps the same clean and single-branch semantic supervision
+  rows; `no_embedding_density` zero-masks only that slot. The class-intercept
+  cell does not remove the predicted-class selector required by class-conditional
+  density.
+- `python run.py i1_comparator`: matched-budget per-branch temperature-scaling
+  comparator. It is a baseline replacement, not an atomic feature ablation.
+- `python run.py i2_atomic`: learned-`pi`, learned-`u`, route-conflict, and
+  risk-conflict ablations.
+- `python run.py i2_rules`: four fixed fusion-rule comparisons.
+- `python run.py i2_scenario_weights`: clean/perturb objective-prior sensitivity
+  at 0.7/0.3 and 0.3/0.7 (the primary cell is 0.5/0.5).
+- `python run.py i2_robust_route`: compare the primary mixture-NLL plus soft
+  worst-group route against the optional source-subset-oracle add-on and the
+  `rho=0` mean-only reduction, including their joint add-on/mean-only cell;
+  independently remove the three pairwise-completeness views and compare
+  perturb-type balancing with the five-family taxonomy. These are validation-only
+  selection cells; none should be chosen from test perturbation results.
+- `python run.py i2_prior_beta_sensitivity`: fixed odds-prior beta 0.5/1/2 for
+  the `prior_only` ablation. Beta remains non-trainable in all three cells;
+  learned routing retains its separately fitted positive beta. This comparator
+  is deliberately a fixed odds rule, not a fitted soft router: because odds
+  diverge as reliability approaches one, the beta=1 cell can behave like a
+  near-hard selector and is reported with that exact interpretation.
+
+Protocol warning: the existing robust-test summaries were already inspected
+while designing the soft-worst and pairwise-view revisions and the optional
+source-subset-oracle add-on.
+Those rows are therefore development diagnostics, not an untouched final test.
+Freeze the new configuration using validation-only robustness cells, then report
+one new held-out or external confirmatory test; do not tune the three route
+hyperparameters again from the same test table.
+
+- `python run.py i3_acceptance_score`: compare `1-u`, pre-trust conflict,
+  trusted conflict, product, strict MSP, and deployment-class probability under
+  the same malware-FN CRC rule and the same `alpha`. The MSP/probability cells
+  change only `threshold_score`; they do not replace CRC with fixed coverage.
+- `python run.py i3_mechanism`: conformal controls plus threshold baselines for
+  deployment-class probability, strict MSP `max(p, 1-p)`, routed evidential
+  mixture certainty, and learned model acceptance. Deployment-class probability
+  is threshold-aware; it is deliberately not labelled MSP when the fitted class
+  cutoff is not 0.5. The optional `predictive_entropy_threshold` target implements
+  normalized certainty `1-H(p)/log(2)` as a sanity check. In this binary task it
+  is a monotone transform of MSP, so it must not be reported as an independent
+  ranking baseline or interpreted as additional evidence.
+- `python run.py mechanism`: all atomic I1/I2/I3 checks.
+- `python run.py factorial_remaining`: non-primary cells of the I1×I2 matrix
+  after `final` has completed.
+- `python run.py appendix`: small sensitivity runs.
+
+The I1×I2 factorial has exactly four cells: both on, I1 off, learned I2 off,
+and both off. Turning learned I2 off fixes `pi` to the I1 reliability prior and
+uses the deterministic reliability-deficit risk; it does not change I1.
+
+The fitted unconstrained macro-F1 classification boundary is a shared operating
+point, not part of I3. The atomic `no_i3_decision_layer.yaml` experiment keeps
+that exact boundary and disables only selective acceptance. There is therefore
+no classification×risk 2×2 in the formal plan: toggling the classifier would
+change the task protocol rather than isolate I3.
+
+## Literature-baseline wording
+
+Always report the two evidence baselines as **TMC-style adapted** and
+**ECML-style adapted**. They retain the relevant evidential objectives and
+fusion mechanisms under this repository's APK modalities, encoders, missing-
+view handling, data split, and training budget. They are not strict
+reproductions of the original papers. Report `qmf_energy` only as the
+**QMF-Energy component baseline**.
 
 ## Recommended execution order
 
-Use the AutoDL path overlay for every command below.
+Use the AutoDL path overlay for every command. Before the first formal run,
+rebuild the Manifest vocabulary from the current train split and migrate only
+the Manifest-owned PT fields. This preserves the expensive API/Graph tensors
+and does not parse APKs. Run the first command without `--apply`, inspect its
+coverage/diff report, then repeat it with `--apply`:
 
 ```bash
-# 1. Primary full method. Inspect this run before launching the full matrix.
-python run.py final --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
+# Read-only preflight
+python scripts/migrate_manifest_vocab_pts.py \
+  --train-csv labels/train.csv \
+  --pt-dir /root/autodl-tmp/pts_all \
+  --build-config config/build_pts.yaml \
+  --vocab-out config/manifest_vocab.yaml \
+  --manifest-jsonl-dir /root/autodl-tmp/pts_all/_manifest_jsonl \
+  --audit-json manifest_migration_dry_run.json
 
-# 2. Remaining full-method seeds. Do not run the `seed` group after `final`,
-# because that group also contains seed 42.
-python run.py seed_2024 seed_3407 --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
+# Atomic Manifest-only migration and complete post-audit
+python scripts/migrate_manifest_vocab_pts.py \
+  --train-csv labels/train.csv \
+  --pt-dir /root/autodl-tmp/pts_all \
+  --build-config config/build_pts.yaml \
+  --vocab-out config/manifest_vocab.yaml \
+  --manifest-jsonl-dir /root/autodl-tmp/pts_all/_manifest_jsonl \
+  --audit-json manifest_migration_apply.json \
+  --apply
+```
 
-# 3. Common representation/fusion baselines and recent trusted-fusion
-# adaptations (TMC-style, QMF-style, and ECML-style).
+Do not run extraction, migration, or training concurrently. Formal training
+checks the train CSV/vocabulary hashes and every PT's sample identity and
+Manifest provenance before accepting the pool. After migration, all checkpoints
+must be retrained from scratch.
+
+```bash
+# 1. Primary method
+python run.py final \
+  --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
+
+# 2. Other primary seeds (avoid rerunning seed 42)
+python run.py seed_2024 seed_3407 \
+  --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
+
+# 3. Common and literature-style baselines
 python run.py baselines trusted_baselines \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 
-# 4. Innovation-level, atomic, and the six remaining factorial cells. The trusted-fusion
-# Dempster/cumulative/log-pool rule substitutions remain mechanism ablations;
-# they are not substitutes for the independent trusted-fusion baselines above.
+# 3a. Repeat every main-table baseline at seed 2024
+python run.py baselines trusted_baselines \
+  --extra-config \
+    config/experiments/tri_modal_robust/_autodl_paths.yaml \
+    config/experiments/tri_modal_robust/_seed_2024_overlay.yaml
+
+# 3b. Repeat every main-table baseline at seed 3407
+python run.py baselines trusted_baselines \
+  --extra-config \
+    config/experiments/tri_modal_robust/_autodl_paths.yaml \
+    config/experiments/tri_modal_robust/_seed_3407_overlay.yaml
+
+# 4. Module, atomic, rule, and remaining factorial comparisons
 python run.py module mechanism factorial_remaining \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 
-# 5. Optional training and appendix sensitivities.
-python run.py training_ablation appendix --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
-
-# A focused eval-only comparison of the 3% and 5% malware-FN risk levels.
-# Reuse the same seed-42 checkpoint and refit both validation-based decision
-# thresholds. The two runs differ only in the target residual malware-FN risk.
-python run.py risk_05 risk_03 --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
+# 5. Optional sensitivities
+python run.py training_ablation appendix \
+  --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 ```
 
-Every test run writes `risk_coverage_curve.csv`, with one threshold-achievable
-operating point per acceptance-score level and test scenario. It can be used
-directly for risk-coverage plots. To compare two runs at matched acceptance
-rates from their gate diagnostics, run:
+`paper_main` includes all three primary-method seeds but only the seed-42
+baseline configs. A formal mean/std main table therefore also
+requires the two baseline-overlay commands above. Mechanism ablations remain
+seed-42 controlled comparisons unless they are explicitly repeated with the
+same two seed overlays.
 
-```bash
-python scripts/compare_risk_coverage.py \
-  --input old=PATH_TO_OLD/gate_diagnostics.csv \
-  --input new=PATH_TO_NEW/gate_diagnostics.csv \
-  --split test_clean \
-  --out-dir results/risk_coverage_comparison
-```
+`python run.py all` is a catalog, not a from-scratch schedule: eval-only runs
+need their corresponding newly trained checkpoint, and natural-subset runs
+need freshly generated manifests.
 
-Natural subsets must be rebuilt from the new seed-42 gate diagnostics before
-their eval-only configs are run:
+For forced-classification I1/I2 comparisons, report the common 0.5-boundary
+macro-F1, AUC, and AP. Report the fitted classification threshold only with I3.
+For I1 report per-branch Brier/ECE/AUC/AP and reliability–accuracy gap. For I2
+report mixture NLL plus risk Brier/ECE/AUC/AP and the target-aligned
+`malware_fn_risk_aurc`. Keep generic classification-error AURC as a secondary
+MSP-comparable selective-classification diagnostic; it is not the primary score
+for the FN-only `u` head. For I3 report coverage, accepted-
+malware recall, FNR conditional on accepted malware, the CRC-aligned accepted-FN
+risk among all malware, risk–coverage curves, generic AURC, and
+`malware_fn_risk_aurc`. Both AURCs are computed only
+within the hard-eligible population (at least one branch actually available),
+with equal-score ties admitted atomically. Always report
+`selective_max_achievable_coverage` beside AURC so that this conditional ranking
+metric is not mistaken for coverage over all test samples. Hard-ineligible
+samples are rejected by threshold/CRC modes; conformal mode assigns the full
+two-class prediction set, which is likewise non-singleton and therefore
+rejected without breaking set-coverage semantics.
+
+Natural subsets must be rebuilt from the new seed-42 diagnostics before their
+eval-only configs are run:
 
 ```bash
 python scripts/build_natural_subset_csvs.py \
   --diagnostics results/tri_modal_robust/evidential_seed_42/42/gate_diagnostics.csv \
   --test-csv labels/test.csv \
   --out-dir labels/natural_subsets
-python run.py natural_subsets --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
-```
-
-The builder writes `subset_manifest.json` with source and generated-CSV hashes
-and refuses partial, duplicate, or subsequently modified artifacts. The three
-common comparison subsets are low API effective integrity, low API-Graph
-support, and high predictive conflict. Low acceptance is defined by the
-proposed method and is evaluated only as an I3 diagnostic for Ours, not as a
-neutral baseline-comparison subset.
-
-The three newer Obfuscapk scenarios are an external robustness supplement and
-should run only after their aligned PT directories and CSV files are present:
-
-```bash
-python run.py external_new baseline_obfuscapk_new \
+python run.py natural_subsets \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 ```

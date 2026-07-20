@@ -11,10 +11,6 @@ fusion:
   use_conflict_discount: false
   use_confidence_proxy: false
   use_hard_alive_mask: false
-  branch_competence_prior:
-    enabled: false
-  visible_integrity_modifier:
-    enabled: false
   reliability_calibration:
     enabled: false
   probability_calibration:
@@ -31,5 +27,5 @@ selective_prediction:
 
 loss:
   branch_aux_weight: 0.0
-  integrity_weighted_aux: false
+  auxiliary_weight_mode: unmasked_uniform
   evidential_loss_weight: 0.0

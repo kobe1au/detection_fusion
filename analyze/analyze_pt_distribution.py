@@ -61,7 +61,7 @@ def summarize_array(arr: np.ndarray) -> Dict[str, float]:
 
 
 def load_one_pt(pt_path: Path) -> Dict[str, Any]:
-    obj = torch.load(pt_path, map_location="cpu")
+    obj = torch.load(pt_path, map_location="cpu", weights_only=True)
     dex_list = obj if isinstance(obj, list) else [obj]
 
     num_dex = 0

@@ -58,6 +58,16 @@ def _build_fingerprint(cfg: dict, vocab: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _manifest_vocab_digest(vocab: dict) -> str:
+    encoded = json.dumps(
+        _canonical(vocab),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _validate_unique_hashes(jobs: list[dict[str, Any]]) -> None:
     seen: dict[str, str] = {}
     duplicates: list[str] = []
@@ -85,7 +95,7 @@ def _resume_existing(job: dict[str, Any], cfg: dict, build_fingerprint: str) -> 
     if not bool(cfg.get("resume", False)) or not path.exists():
         return False, {**row, "status": "pending"}
     try:
-        raw = torch.load(path, map_location="cpu", weights_only=False)
+        raw = torch.load(path, map_location="cpu", weights_only=True)
         meta = raw.get("direct_build_meta", {}) if isinstance(raw, dict) else {}
         version = int(meta.get("pt_schema_version", 0)) if isinstance(meta, dict) else 0
         fingerprint = str(meta.get("build_fingerprint") or "") if isinstance(meta, dict) else ""
@@ -98,11 +108,18 @@ def _resume_existing(job: dict[str, Any], cfg: dict, build_fingerprint: str) -> 
         payload_complete = isinstance(raw, dict) and all(
             key in raw for key in CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS
         )
+        manifest_meta = raw.get("manifest_meta", {}) if isinstance(raw, dict) else {}
+        identity_complete = (
+            str(meta.get("sha256") or "").strip().lower() == sha
+            and isinstance(manifest_meta, dict)
+            and str(manifest_meta.get("sha256") or "").strip().lower() == sha
+        )
         if (
             version == PT_SCHEMA_VERSION
             and fingerprint == build_fingerprint
             and observable_complete
             and payload_complete
+            and identity_complete
         ):
             return True, {**row, "status": "ok", "reason": ""}
         return False, {**row, "status": "failed", "reason": "schema or build fingerprint mismatch"}
@@ -352,6 +369,24 @@ def _build_one(
     vocab: dict[str, Any],
     build_fingerprint: str,
 ) -> dict[str, Any]:
+    expected_sha = str(job.get("sha256") or "").strip().lower()
+    manifest_sha = str(
+        manifest_record.get("sha256") or manifest_record.get("sid") or ""
+    ).strip().lower()
+    if not expected_sha or manifest_sha != expected_sha:
+        return {
+            "split": str(job.get("split") or ""),
+            "sha256": expected_sha,
+            "path": str(
+                Path(cfg["out_dirs"][str(job.get("split") or "")])
+                / f"{expected_sha}.pt"
+            ),
+            "status": "failed",
+            "reason": (
+                "Manifest record identity mismatch: "
+                f"job={expected_sha!r} manifest={manifest_sha!r}"
+            ),
+        }
     resumed, row = _resume_existing(job, cfg, build_fingerprint)
     if resumed:
         return row
@@ -368,7 +403,7 @@ def _build_one(
 
     path = out_dir / f"{sha}.pt"
     try:
-        code_payload = torch.load(path, map_location="cpu", weights_only=False)
+        code_payload = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(code_payload, dict) or not isinstance(code_payload.get("dex_list"), list):
             raise ValueError("Graph/API extractor did not produce a current top-level dex_list payload")
         manifest_payload = vectorize_manifest_record(
@@ -387,6 +422,17 @@ def _build_one(
                 "split": split,
                 "sha256": sha,
                 "apk_name": Path(job["apk_path"]).name,
+                "manifest_vocab_sha256": _manifest_vocab_digest(vocab),
+                "manifest_train_csv_sha256": str(
+                    (vocab.get("metadata") or {}).get(
+                        "train_csv_sha256", ""
+                    )
+                ),
+                "manifest_train_sample_ids_sha256": str(
+                    (vocab.get("metadata") or {}).get(
+                        "train_sample_ids_sha256", ""
+                    )
+                ),
             }
         )
         atomic_torch_save(payload, path)

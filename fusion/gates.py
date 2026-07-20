@@ -3,101 +3,155 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from fusion.constants import ArchitectureConstants, EvidenceIndex, GateConstants
+from fusion.constants import ArchitectureConstants, GateConstants
 
 
-class FourBranchEvidenceGate(nn.Module):
-    """Evidence-only four-way gate for API, Graph, Manifest, and Joint branches."""
+TRI_MODAL_EMBEDDING_BRANCHES = ("api", "graph", "manifest")
 
-    def __init__(self, evidence_dim: int = EvidenceIndex.BASE_DIM, hidden_dim: int | None = None):
+
+class DenseTriModalEmbeddingGate(nn.Module):
+    """Small dense late-fusion gate over the three modality embeddings.
+
+    This is an intentionally generic black-box gating baseline, not a strict
+    reproduction of a sparse mixture-of-experts model.  Each branch embedding
+    is normalised, unavailable branches are zeroed before concatenation, and a
+    dense MLP produces one routing logit per modality.  Softmax normalisation is
+    restricted to alive branches, so an unavailable encoder can never receive
+    decision mass through a learned bias.
+
+    ``detach_embeddings`` controls only the gate-input path.  The fused branch
+    logits remain differentiable in either case.  The adapted baseline config
+    leaves it disabled, matching an ordinary end-to-end dense gate trained only
+    on the training split.
+    """
+
+    def __init__(
+        self,
+        embedding_dims: dict[str, int],
+        *,
+        hidden_dim: int | None = None,
+        detach_embeddings: bool = False,
+    ):
         super().__init__()
-        hidden_dim = hidden_dim or ArchitectureConstants.GATE_HIDDEN_DIM
-        self.evidence_dim = int(evidence_dim)
-        self.net = nn.Sequential(
-            nn.Linear(self.evidence_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, GateConstants.NUM_BRANCHES),
-        )
-        nn.init.constant_(self.net[-1].bias, ArchitectureConstants.GATE_INIT_BIAS)
-        with torch.no_grad():
-            self.net[-1].bias[3] = ArchitectureConstants.GATE_JOINT_INIT_BIAS
-
-    def forward(self, evidence: torch.Tensor) -> torch.Tensor:
-        if evidence.size(-1) != self.evidence_dim:
+        if set(embedding_dims) != set(TRI_MODAL_EMBEDDING_BRANCHES):
             raise ValueError(
-                f"FourBranchEvidenceGate expected {self.evidence_dim} features, got {evidence.size(-1)}"
+                "DenseTriModalEmbeddingGate embedding_dims must contain exactly "
+                f"{TRI_MODAL_EMBEDDING_BRANCHES}"
             )
-        return torch.softmax(self.net(evidence), dim=-1)
-
-
-def heuristic_reliability_gate(evidence: torch.Tensor) -> torch.Tensor:
-    required_dim = EvidenceIndex.MANIFEST_ALIVE + 1
-    if evidence.size(-1) < required_dim:
-        raise ValueError(
-            f"heuristic_reliability_gate expected >= {required_dim} evidence dims, "
-            f"got {evidence.size(-1)}"
+        self.embedding_dims = {
+            name: int(embedding_dims[name]) for name in TRI_MODAL_EMBEDDING_BRANCHES
+        }
+        if any(value <= 0 for value in self.embedding_dims.values()):
+            raise ValueError("all dense embedding-gate dimensions must be positive")
+        hidden_dim = int(hidden_dim or ArchitectureConstants.GATE_HIDDEN_DIM)
+        if hidden_dim <= 0:
+            raise ValueError("dense embedding-gate hidden_dim must be positive")
+        self.detach_embeddings = bool(detach_embeddings)
+        self.input_norms = nn.ModuleDict(
+            {
+                name: nn.LayerNorm(self.embedding_dims[name])
+                for name in TRI_MODAL_EMBEDDING_BRANCHES
+            }
         )
-    r_api = evidence[:, EvidenceIndex.R_API : EvidenceIndex.R_API + 1]
-    r_graph = evidence[:, EvidenceIndex.R_GRAPH : EvidenceIndex.R_GRAPH + 1]
-    r_manifest = evidence[:, EvidenceIndex.R_MANIFEST : EvidenceIndex.R_MANIFEST + 1]
+        input_dim = sum(self.embedding_dims.values()) + len(
+            TRI_MODAL_EMBEDDING_BRANCHES
+        )
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, len(TRI_MODAL_EMBEDDING_BRANCHES)),
+        )
+        # Begin from an alive-only uniform route.  This avoids assigning a
+        # branch-specific competence prior before the data have trained it.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
-    api_graph = evidence[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT : EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT + 1]
-    manifest_code = evidence[:, EvidenceIndex.MANIFEST_CODE_SUPPORT : EvidenceIndex.MANIFEST_CODE_SUPPORT + 1]
+    def forward(
+        self,
+        embeddings: dict[str, torch.Tensor],
+        alive: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if set(embeddings) != set(TRI_MODAL_EMBEDDING_BRANCHES):
+            raise ValueError(
+                "dense embedding gate requires exactly API, Graph, and Manifest "
+                "embeddings"
+            )
+        reference = embeddings[TRI_MODAL_EMBEDDING_BRANCHES[0]]
+        if reference.ndim != 2:
+            raise ValueError("dense embedding-gate inputs must have shape [B, D]")
+        batch_size = int(reference.size(0))
+        if alive.shape != (batch_size, len(TRI_MODAL_EMBEDDING_BRANCHES)):
+            raise ValueError(
+                "dense embedding-gate alive mask must have shape "
+                f"[B, {len(TRI_MODAL_EMBEDDING_BRANCHES)}], got {tuple(alive.shape)}"
+            )
+        alive_mask = alive.to(
+            device=reference.device, dtype=reference.dtype
+        ).gt(0.0)
+        alive_float = alive_mask.to(dtype=reference.dtype)
 
-    api_alive = evidence[:, EvidenceIndex.API_ALIVE : EvidenceIndex.API_ALIVE + 1]
-    graph_alive = evidence[:, EvidenceIndex.GRAPH_ALIVE : EvidenceIndex.GRAPH_ALIVE + 1]
-    manifest_alive = evidence[:, EvidenceIndex.MANIFEST_ALIVE : EvidenceIndex.MANIFEST_ALIVE + 1]
+        features: list[torch.Tensor] = []
+        for index, name in enumerate(TRI_MODAL_EMBEDDING_BRANCHES):
+            value = embeddings[name]
+            expected_shape = (batch_size, self.embedding_dims[name])
+            if value.shape != expected_shape:
+                raise ValueError(
+                    f"dense embedding gate expected {name} shape {expected_shape}, "
+                    f"got {tuple(value.shape)}"
+                )
+            value = value.to(device=reference.device, dtype=reference.dtype)
+            if self.detach_embeddings:
+                value = value.detach()
+            value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+            value = self.input_norms[name](value)
+            features.append(value * alive_float[:, index : index + 1])
+        gate_input = torch.cat([*features, alive_float], dim=-1)
+        scores = self.net(gate_input)
 
-    alive_sum = (api_alive + graph_alive + manifest_alive).clamp_min(1.0)
-    reliability_support = (
-        r_api * api_alive + r_graph * graph_alive + r_manifest * manifest_alive
-    ) / alive_sum
-
-    code_alive = torch.maximum(api_alive, graph_alive)
-    pair_support = api_alive * graph_alive + code_alive * manifest_alive
-    pair_consistency = (
-        api_graph * api_alive * graph_alive
-        + manifest_code * code_alive * manifest_alive
-    ) / pair_support.clamp_min(1.0)
-
-    joint_score = (reliability_support.square() * (0.5 + 0.5 * pair_consistency)).clamp(0.0, 1.0)
-    joint_availability = (alive_sum / 3.0).clamp(0.0, 1.0)
-
-    scores = torch.cat(
-        [
-            r_api * api_alive,
-            r_graph * graph_alive,
-            r_manifest * manifest_alive,
-            joint_score * joint_availability,
-        ],
-        dim=-1,
-    )
-    denom = scores.sum(dim=-1, keepdim=True)
-    normalized = scores / denom.clamp_min(GateConstants.EPS)
-    fallback = torch.full_like(scores, GateConstants.UNIFORM_BRANCH_WEIGHT)
-    return torch.where(denom > GateConstants.EPS, normalized, fallback)
-
-
-def confidence_gate(scores: torch.Tensor) -> torch.Tensor:
-    if scores.ndim != 2 or scores.size(-1) != GateConstants.NUM_BRANCHES:
-        raise ValueError(f"confidence_gate expected [B, 4] confidence scores, got {tuple(scores.shape)}")
-    scores = scores.clamp(0.0, 1.0)
-
-    denom = scores.sum(dim=-1, keepdim=True)
-    normalized = scores / denom.clamp_min(GateConstants.EPS)
-    fallback = torch.full_like(scores, GateConstants.UNIFORM_BRANCH_WEIGHT)
-    return torch.where(denom > GateConstants.EPS, normalized, fallback)
+        has_available = alive_mask.any(dim=-1, keepdim=True)
+        unavailable_floor = torch.finfo(scores.dtype).min
+        masked_scores = scores.masked_fill(~alive_mask, unavailable_floor)
+        # Avoid an all-(-inf) softmax for the explicit all-dead fallback.
+        stable_scores = torch.where(
+            has_available, masked_scores, torch.zeros_like(masked_scores)
+        )
+        weights = torch.softmax(stable_scores, dim=-1) * alive_float
+        weights = torch.where(
+            has_available,
+            weights / weights.sum(dim=-1, keepdim=True).clamp_min(GateConstants.EPS),
+            torch.zeros_like(weights),
+        )
+        return weights, masked_scores
 
 
-def apply_alive_mask(gate_weights: torch.Tensor, evidence: torch.Tensor) -> torch.Tensor:
-    api_alive = evidence[:, EvidenceIndex.API_ALIVE : EvidenceIndex.API_ALIVE + 1].clamp(0.0, 1.0)
-    graph_alive = evidence[:, EvidenceIndex.GRAPH_ALIVE : EvidenceIndex.GRAPH_ALIVE + 1].clamp(0.0, 1.0)
-    manifest_alive = evidence[:, EvidenceIndex.MANIFEST_ALIVE : EvidenceIndex.MANIFEST_ALIVE + 1].clamp(0.0, 1.0)
-
-    joint_alive = torch.maximum(torch.maximum(api_alive, graph_alive), manifest_alive)
-    support = torch.cat([api_alive, graph_alive, manifest_alive, joint_alive], dim=-1)
-
-    masked = gate_weights * support
-    denom = masked.sum(dim=-1, keepdim=True)
-    fallback = torch.full_like(masked, GateConstants.UNIFORM_BRANCH_WEIGHT)
-    return torch.where(denom > GateConstants.EPS, masked / denom.clamp_min(GateConstants.EPS), fallback)
+def dense_embedding_late_fusion_logits(
+    branch_logits: dict[str, torch.Tensor],
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse the three branch logits, with zero logits as the all-dead fallback."""
+    if set(branch_logits) != set(TRI_MODAL_EMBEDDING_BRANCHES):
+        raise ValueError(
+            "dense embedding late fusion requires exactly API, Graph, and "
+            "Manifest logits"
+        )
+    reference = branch_logits[TRI_MODAL_EMBEDDING_BRANCHES[0]]
+    if reference.ndim != 2:
+        raise ValueError("dense embedding late-fusion logits must have shape [B, C]")
+    expected_weight_shape = (reference.size(0), len(TRI_MODAL_EMBEDDING_BRANCHES))
+    if weights.shape != expected_weight_shape:
+        raise ValueError(
+            f"dense embedding late-fusion weights must have shape {expected_weight_shape}, "
+            f"got {tuple(weights.shape)}"
+        )
+    ordered: list[torch.Tensor] = []
+    for name in TRI_MODAL_EMBEDDING_BRANCHES:
+        value = branch_logits[name]
+        if value.shape != reference.shape:
+            raise ValueError("all dense embedding late-fusion logits must agree in shape")
+        ordered.append(value.to(device=reference.device, dtype=reference.dtype))
+    stacked = torch.stack(ordered, dim=1)
+    operative_weights = weights.to(device=reference.device, dtype=reference.dtype)
+    # When all sources are dead, DenseTriModalEmbeddingGate returns all-zero
+    # weights. The weighted sum is therefore explicit zero logits and softmax is
+    # the uniform class distribution, independent of placeholder branch heads.
+    return (stacked * operative_weights.unsqueeze(-1)).sum(dim=1)

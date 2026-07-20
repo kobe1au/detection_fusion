@@ -9,16 +9,12 @@ train:
 
 fusion:
   # Keep I2's global router, but remove every sample-level reliability input
-  # supplied by I1. The router can still use branch opinions, availability,
-  # and cross-branch disagreement.
+  # supplied by I1. Its route residual still sees branch uncertainty and
+  # availability; its risk head still sees the fixed structural-conflict term.
   combination: routed
   routing:
     enabled: true
   use_reliability_discount: false
-  branch_competence_prior:
-    enabled: false
-  visible_integrity_modifier:
-    enabled: false
   reliability_calibration:
     enabled: false
 

@@ -1,0 +1,13 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i2_router_no_risk_conflict
+
+train:
+  exp_name: i2_router_no_risk_conflict
+
+fusion:
+  routing:
+    # Remove only structural conflict from u; pi's outlier penalty is unchanged.
+    risk_conflict_enabled: false

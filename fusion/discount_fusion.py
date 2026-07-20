@@ -13,6 +13,7 @@ from fusion.evidential import (
     combine_opinions_with_diagnostics,
     logits_to_opinion,
     multisource_conflict,
+    opinion_to_dirichlet_alpha,
     opinion_to_prob,
     predictive_opinion_conflict,
     trust_discount,
@@ -21,8 +22,12 @@ from fusion.evidential import (
 from fusion.opinion_router import GlobalOpinionRouter
 from fusion.reliability_calibration import (
     BRANCH_NAMES,
+    MONOTONIC_CORRECTNESS_METHOD,
+    TEMPERATURE_SCALING_CONFIDENCE_METHOD,
+    BranchTemperatureScalingConfidenceCalibrator,
     MonotonicReliabilityCalibrator,
     build_monotonic_reliability_features,
+    normalize_reliability_calibration_method,
 )
 
 
@@ -68,68 +73,96 @@ def _column(evidence: torch.Tensor, index: int) -> torch.Tensor:
     return evidence[:, index].clamp(0.0, 1.0)
 
 
-def _optional_column(evidence: torch.Tensor, index: int, default: float = 1.0) -> torch.Tensor:
-    if evidence.size(-1) > index:
-        return _column(evidence, index)
-    return torch.full_like(evidence[:, 0], float(default)).clamp(0.0, 1.0)
-
-
-def _mean_alive_integrity(
-    integrities: torch.Tensor,
-    alive: torch.Tensor,
-) -> torch.Tensor:
-    alive_float = alive.to(dtype=integrities.dtype)
-    return (integrities * alive_float).sum(dim=-1) / alive_float.sum(dim=-1).clamp_min(1.0)
-
-
-def _available_pair_support(
-    api_graph_available: torch.Tensor,
-    manifest_code_available: torch.Tensor,
-    anchor_support: torch.Tensor,
-    manifest_support: torch.Tensor,
-) -> torch.Tensor:
-    pair_count = api_graph_available.to(anchor_support.dtype) + manifest_code_available.to(anchor_support.dtype)
-    pair_sum = (
-        anchor_support * api_graph_available.to(anchor_support.dtype)
-        + manifest_support * manifest_code_available.to(anchor_support.dtype)
-    )
-    return torch.where(
-        pair_count > 0,
-        pair_sum / pair_count.clamp_min(1.0),
-        torch.zeros_like(pair_sum),
-    )
+def _effective_integrity_terms(evidence: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Return observable integrity after the actual encoder coverage budget."""
+    return {
+        "api": (
+            _column(evidence, EvidenceIndex.API_INTEGRITY)
+            * _column(evidence, EvidenceIndex.API_ENCODER_COVERAGE)
+        ).clamp(0.0, 1.0),
+        "graph": (
+            _column(evidence, EvidenceIndex.GRAPH_INTEGRITY)
+            * _column(evidence, EvidenceIndex.GRAPH_ENCODER_COVERAGE)
+        ).clamp(0.0, 1.0),
+        "manifest": _column(evidence, EvidenceIndex.MANIFEST_INTEGRITY),
+    }
 
 
 class DiscountProbabilityFusion(nn.Module):
     """Calibrated monotonic probability discount fusion with rejection support."""
 
-    def __init__(self, config: dict | None = None):
+    def __init__(
+        self,
+        config: dict | None = None,
+        *,
+        embedding_dims: dict[str, int] | None = None,
+    ):
         super().__init__()
         self.config = dict(config or {})
+        if "final_temperature_scaling" in self.config:
+            raise ValueError(
+                "fusion.final_temperature_scaling is not a valid top-level "
+                "switch; use fusion.routing.final_temperature_scaling"
+            )
         if not bool(self.config.get("force_fp32_decision", True)):
             raise ValueError("fusion.force_fp32_decision=false is unsupported")
         self.register_buffer("_calibration_active", torch.tensor(False, dtype=torch.bool))
-        self.register_buffer(
-            "_branch_competence_active",
-            torch.tensor(False, dtype=torch.bool),
-            persistent=False,
+        # The buffer is the checkpoint source of truth; the Python shadow is
+        # the hot-path value. Reading a CUDA scalar buffer with ``.item()`` in
+        # every forward would otherwise serialize the device.
+        self._calibration_active_shadow = False
+        removed_fusion_keys = sorted(
+            set(self.config)
+            & {"branch_competence_prior", "visible_integrity_modifier"}
         )
-        self.register_buffer(
-            "_branch_competence_prior",
-            torch.ones(len(BRANCH_NAMES), dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_visible_integrity_reference_active",
-            torch.tensor(False, dtype=torch.bool),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_visible_integrity_reference",
-            torch.ones(len(EVIDENCE_BRANCHES), dtype=torch.float32),
-            persistent=False,
-        )
+        if removed_fusion_keys:
+            raise ValueError(
+                "Removed validation-global fusion keys are unsupported: "
+                f"{removed_fusion_keys}"
+            )
         reliability_cfg = self.config.get("reliability_calibration", {}) or {}
+        configured_embedding_dims = reliability_cfg.get("embedding_dims")
+        if configured_embedding_dims is not None and not isinstance(
+            configured_embedding_dims, dict
+        ):
+            raise ValueError(
+                "fusion.reliability_calibration.embedding_dims must be a mapping"
+            )
+        if embedding_dims is None and isinstance(configured_embedding_dims, dict):
+            embedding_dims = {
+                str(name): int(value)
+                for name, value in configured_embedding_dims.items()
+            }
+        elif embedding_dims is not None and isinstance(configured_embedding_dims, dict):
+            normalized_configured_dims = {
+                str(name): int(value)
+                for name, value in configured_embedding_dims.items()
+            }
+            normalized_runtime_dims = {
+                str(name): int(value) for name, value in embedding_dims.items()
+            }
+            if normalized_configured_dims != normalized_runtime_dims:
+                raise ValueError(
+                    "Configured I1 embedding_dims disagree with encoder dimensions: "
+                    f"configured={normalized_configured_dims}, "
+                    f"runtime={normalized_runtime_dims}"
+                )
+        removed_reliability_keys = sorted(
+            set(reliability_cfg)
+            & {
+                "feature_schema",
+                "missing_relation_support",
+                "use_relation_evidence",
+                "use_edl_certainty_feature",
+                "use_evidential_uncertainty",
+                "group_mean_alignment",
+            }
+        )
+        if removed_reliability_keys:
+            raise ValueError(
+                "Removed I1 reliability keys are unsupported: "
+                f"{removed_reliability_keys}"
+            )
         # I2 combination rule. "linear" provides a reliability-discount
         # probability comparison; the evidence rules operate on opinions.
         combination = str(self.config.get("combination", "linear")).lower()
@@ -140,58 +173,158 @@ class DiscountProbabilityFusion(nn.Module):
             )
         self.combination = combination
         routing_cfg = self.config.get("routing", {}) or {}
+        removed_routing_keys = sorted(
+            set(routing_cfg)
+            & {
+                "use_disagreement",
+                "risk_enabled",
+                "target_loss_weight",
+                "use_fused_prediction_loss",
+                "mass_constraint",
+                "known_mass_excess_penalty_weight",
+                "initial_known_retention",
+                "acceptance_mode",
+                "hidden_dim",
+            }
+        )
+        if removed_routing_keys:
+            raise ValueError(
+                "Removed I2-v1 routing keys are not supported: "
+                f"{removed_routing_keys}"
+            )
         self.routing_mode = str(routing_cfg.get("mode", "learned")).strip().lower()
         if self.routing_mode not in GlobalOpinionRouter.MODES:
             raise ValueError(
                 "fusion.routing.mode must be one of "
                 f"{GlobalOpinionRouter.MODES}, got {self.routing_mode!r}"
             )
-        self.routing_use_disagreement = bool(
-            routing_cfg.get("use_disagreement", True)
+        routing_enabled = bool(routing_cfg.get("enabled", False))
+        self.routing_route_conflict_enabled = bool(
+            routing_cfg.get("route_conflict_enabled", True)
         )
+        self.routing_risk_conflict_enabled = bool(
+            routing_cfg.get("risk_conflict_enabled", True)
+        )
+        self.routing_risk_mode = str(
+            routing_cfg.get("risk_mode", "learned")
+        ).strip().lower()
+        self.routing_risk_target = str(
+            routing_cfg.get("risk_target", "mixture_argmax_error")
+        ).strip().lower()
         self.routing_train_end_to_end = bool(
-            routing_cfg.get("train_end_to_end", True)
+            routing_cfg.get("train_end_to_end", False)
         )
+        if routing_enabled and self.routing_train_end_to_end:
+            raise ValueError(
+                "I2-v2 requires fusion.routing.train_end_to_end=false; pi and u "
+                "must be fitted post-hoc with their own proper losses"
+            )
         self.routing_posthoc_refine = bool(
             routing_cfg.get("posthoc_refine", True)
         )
+        if (
+            routing_enabled
+            and not self.routing_posthoc_refine
+            and (
+                self.routing_mode == "learned"
+                or self.routing_risk_mode == "learned"
+            )
+        ):
+            raise ValueError(
+                "learned I2 components require fusion.routing.posthoc_refine=true"
+            )
         self.opinion_router = (
             GlobalOpinionRouter(
-                hidden_dim=int(routing_cfg.get("hidden_dim", 16)),
                 mode=self.routing_mode,
-                use_disagreement=self.routing_use_disagreement,
-                initial_known_retention=float(
-                    routing_cfg.get("initial_known_retention", 0.99)
-                ),
+                route_conflict_enabled=self.routing_route_conflict_enabled,
+                risk_conflict_enabled=self.routing_risk_conflict_enabled,
+                risk_mode=self.routing_risk_mode,
+                risk_target=self.routing_risk_target,
+                initial_risk=float(routing_cfg.get("initial_risk", 0.10)),
+                fixed_prior_beta=float(routing_cfg.get("fixed_prior_beta", 1.0)),
             )
-            if bool(routing_cfg.get("enabled", False))
+            if routing_enabled
             else None
         )
         # Instantiate the shared router before the optional I1 calibrator. This
         # keeps router initialization identical when the calibrator itself is
         # removed in an I1 ablation; only the ablated module then consumes a
         # different number of RNG draws.
-        self.reliability_calibrator = (
-            MonotonicReliabilityCalibrator(
-                hidden_dim=int(reliability_cfg.get("hidden_dim", 16)),
-                missing_relation_support=float(
-                    reliability_cfg.get("missing_relation_support", 0.0)
-                ),
-                use_relation_evidence=bool(
-                    reliability_cfg.get("use_relation_evidence", True)
-                ),
+        self.reliability_calibration_method = (
+            normalize_reliability_calibration_method(
+                reliability_cfg.get("method", MONOTONIC_CORRECTNESS_METHOD)
+            )
+        )
+        reliability_enabled = bool(reliability_cfg.get("enabled", False))
+        if (
+            reliability_enabled
+            and self.reliability_calibration_method
+            == TEMPERATURE_SCALING_CONFIDENCE_METHOD
+        ):
+            unsupported_active_features = [
+                name
+                for name, default in (
+                    ("use_model_visibility", False),
+                    ("use_embedding_density", False),
+                    ("use_prediction_margin", False),
+                    ("use_predicted_class_feature", False),
+                )
+                if bool(reliability_cfg.get(name, default))
+            ]
+            if unsupported_active_features:
+                raise ValueError(
+                    "temperature_scaling_confidence is a raw-logit-only I1 "
+                    "baseline; disable unused feature-calibrator switches: "
+                    f"{unsupported_active_features}"
+                )
+            self.reliability_calibrator = (
+                BranchTemperatureScalingConfidenceCalibrator(
+                    apply_alive_mask=bool(
+                        reliability_cfg.get("apply_alive_mask", True)
+                    ),
+                    initial_temperature=float(
+                        reliability_cfg.get("initial_temperature", 1.0)
+                    ),
+                )
+            )
+        elif reliability_enabled:
+            self.reliability_calibrator = MonotonicReliabilityCalibrator(
                 use_model_visibility=bool(
                     reliability_cfg.get("use_model_visibility", False)
+                ),
+                use_embedding_density=bool(
+                    reliability_cfg.get("use_embedding_density", False)
+                ),
+                use_prediction_margin=bool(
+                    reliability_cfg.get("use_prediction_margin", True)
+                ),
+                use_predicted_class_feature=bool(
+                    reliability_cfg.get("use_predicted_class_feature", True)
                 ),
                 apply_alive_mask=bool(
                     reliability_cfg.get("apply_alive_mask", True)
                 ),
-                use_evidential_uncertainty=bool(
-                    reliability_cfg.get("use_evidential_uncertainty", False)
+                embedding_dims=embedding_dims,
+                embedding_density_variance_shrinkage=float(
+                    reliability_cfg.get(
+                        "embedding_density_variance_shrinkage", 0.10
+                    )
+                ),
+                embedding_density_reference_quantile=float(
+                    reliability_cfg.get(
+                        "embedding_density_reference_quantile", 0.95
+                    )
+                ),
+                embedding_density_min_class_samples=int(
+                    reliability_cfg.get(
+                        "embedding_density_min_class_samples", 8
+                    )
                 ),
             )
-            if bool(reliability_cfg.get("enabled", False))
-            else None
+        else:
+            self.reliability_calibrator = None
+        uses_opinion_combination = (
+            self.combination == "routed" or self.combination in COMBINATION_RULES
         )
         configured_reliability_branches = reliability_cfg.get(
             "branches", BRANCH_NAMES
@@ -211,24 +344,49 @@ class DiscountProbabilityFusion(nn.Module):
                 "fusion.reliability_calibration.branches contains unsupported "
                 f"branches: {invalid_reliability_branches}"
             )
+        if (
+            bool(getattr(self.reliability_calibrator, "use_embedding_density", False))
+            and set(reliability_branches) != set(BRANCH_NAMES)
+        ):
+            raise ValueError(
+                "I1 embedding density currently requires all three formal "
+                "branches so every cached inference path has a fitted reference"
+            )
         if len(set(reliability_branches)) != len(reliability_branches):
             raise ValueError(
                 "fusion.reliability_calibration.branches must not contain duplicates"
             )
         self.reliability_calibration_branches = reliability_branches
+        if (
+            self.reliability_calibrator is not None
+            and uses_opinion_combination
+        ):
+            missing_routed_branches = sorted(
+                set(EVIDENCE_BRANCHES) - set(reliability_branches)
+            )
+            if missing_routed_branches:
+                raise ValueError(
+                    "opinion fusion requires calibrated reliability branches "
+                    f"{list(EVIDENCE_BRANCHES)}; missing {missing_routed_branches}"
+                )
         if self.combination == "routed" and self.opinion_router is None:
             raise ValueError(
                 "fusion.combination=routed requires fusion.routing.enabled=true"
             )
         self.log_final_temperature = (
             nn.Parameter(torch.zeros(()))
-            if self.combination == "routed"
-            and self.opinion_router is not None
+            if uses_opinion_combination
             and bool(routing_cfg.get("final_temperature_scaling", False))
             else None
         )
         self.evidence_activation = str(self.config.get("evidence_activation", "softplus")).lower()
         probability_cfg = self.config.get("probability_calibration", {}) or {}
+        if bool(probability_cfg.get("enabled", False)) and uses_opinion_combination:
+            raise ValueError(
+                "branch probability calibration is unsupported for opinion "
+                "fusion because it does not parameterize the opinion path; "
+                "use fusion.routing.final_temperature_scaling instead"
+            )
         self.temperature_parameters = None
         if bool(probability_cfg.get("enabled", False)):
             confidence_cfg = self.config.get("confidence_proxy", {}) or {}
@@ -251,8 +409,48 @@ class DiscountProbabilityFusion(nn.Module):
         parameters: list[nn.Parameter] = []
         if self.reliability_calibrator is not None:
             for name in self.reliability_calibration_branches:
-                parameters.extend(self.reliability_calibrator.branches[name].parameters())
+                parameters.extend(
+                    self.reliability_calibrator.branch_parameters(name)
+                )
         return parameters
+
+    def reliability_competence_parameters(self) -> list[nn.Parameter]:
+        """Return only I1's clean-competence parameters.
+
+        The proposed calibrator is fitted in two ordered phases.  Keeping this
+        boundary at the fusion module prevents the training lifecycle from
+        depending on the calibrator's internal attribute layout.  Simpler I1
+        baselines (for example per-branch temperature scaling) intentionally
+        expose no such split and continue to use
+        :meth:`reliability_calibration_parameters`.
+        """
+
+        calibrator = self.reliability_calibrator
+        branch_parameters = getattr(
+            calibrator, "branch_competence_parameters", None
+        )
+        if not callable(branch_parameters):
+            return []
+        return [
+            parameter
+            for name in self.reliability_calibration_branches
+            for parameter in branch_parameters(name)
+        ]
+
+    def reliability_degradation_parameters(self) -> list[nn.Parameter]:
+        """Return only I1's non-negative degradation parameters."""
+
+        calibrator = self.reliability_calibrator
+        branch_parameters = getattr(
+            calibrator, "branch_degradation_parameters", None
+        )
+        if not callable(branch_parameters):
+            return []
+        return [
+            parameter
+            for name in self.reliability_calibration_branches
+            for parameter in branch_parameters(name)
+        ]
 
     def probability_calibration_parameters(self) -> list[nn.Parameter]:
         parameters: list[nn.Parameter] = []
@@ -261,15 +459,42 @@ class DiscountProbabilityFusion(nn.Module):
         return parameters
 
     def routing_calibration_parameters(self) -> list[nn.Parameter]:
-        parameters: list[nn.Parameter] = []
+        return [
+            *self.routing_distribution_parameters(),
+            *self.routing_risk_parameters(),
+        ]
+
+    def routing_distribution_parameters(self) -> list[nn.Parameter]:
+        """Parameters of the conditional class router pi."""
         if (
             self.combination == "routed"
             and self.opinion_router is not None
             and self.routing_posthoc_refine
-            and self.routing_mode != "prior_only"
         ):
-            parameters.extend(self.opinion_router.parameters())
-        return parameters
+            return list(self.opinion_router.route_parameters())
+        return []
+
+    def routing_risk_parameters(self) -> list[nn.Parameter]:
+        """Parameters of the independent configured decision-risk calibrator."""
+        if (
+            self.combination == "routed"
+            and self.opinion_router is not None
+            and self.routing_posthoc_refine
+        ):
+            return list(self.opinion_router.risk_parameters())
+        return []
+
+    def set_routing_risk_decision_threshold(
+        self,
+        raw_log_odds_threshold: float,
+    ) -> None:
+        if self.opinion_router is None:
+            raise ValueError(
+                "routing risk decision threshold requires an active router"
+            )
+        self.opinion_router.set_risk_decision_threshold(
+            raw_log_odds_threshold
+        )
 
     def routing_encoder_training_parameters(self) -> list[nn.Parameter]:
         """Return router parameters that participate in encoder training."""
@@ -280,7 +505,10 @@ class DiscountProbabilityFusion(nn.Module):
             or self.routing_mode == "prior_only"
         ):
             return []
-        return list(self.opinion_router.parameters())
+        return [
+            *self.opinion_router.route_parameters(),
+            *self.opinion_router.risk_parameters(),
+        ]
 
     def calibration_parameters(self) -> list[nn.Parameter]:
         return [
@@ -315,7 +543,7 @@ class DiscountProbabilityFusion(nn.Module):
         return parameters
 
     def final_temperature_parameters(self) -> list[nn.Parameter]:
-        """Return the scalar routed-output calibration parameter, if enabled."""
+        """Return the scalar opinion-output calibration parameter, if enabled."""
         return [] if self.log_final_temperature is None else [self.log_final_temperature]
 
     def final_temperature(self) -> torch.Tensor | None:
@@ -325,126 +553,37 @@ class DiscountProbabilityFusion(nn.Module):
 
     @property
     def calibration_active(self) -> bool:
-        return bool(self._calibration_active.item())
+        return self._calibration_active_shadow
 
     def set_calibration_active(self, enabled: bool) -> None:
-        self._calibration_active.fill_(bool(enabled))
+        resolved = bool(enabled)
+        self._calibration_active.fill_(resolved)
+        self._calibration_active_shadow = resolved
 
-    @property
-    def branch_competence_active(self) -> bool:
-        return bool(self._branch_competence_active.item())
-
-    def set_branch_competence_prior(self, values, enabled: bool = True) -> None:
-        tensor = torch.as_tensor(
-            values,
-            dtype=self._branch_competence_prior.dtype,
-            device=self._branch_competence_prior.device,
-        ).view(-1)
-        if tensor.numel() != len(BRANCH_NAMES):
-            raise ValueError(
-                f"branch competence prior expects {len(BRANCH_NAMES)} values, got {tensor.numel()}"
-            )
-        if not torch.isfinite(tensor).all():
-            raise ValueError("branch competence prior contains non-finite values")
-        if bool((tensor < 0.0).any()) or bool((tensor > 1.0).any()):
-            raise ValueError("branch competence prior values must be within [0, 1]")
-        self._branch_competence_prior.copy_(tensor.clamp(0.0, 1.0))
-        self._branch_competence_active.fill_(bool(enabled))
-
-    def branch_competence_prior_values(self) -> dict[str, float]:
-        values = self._branch_competence_prior.detach().cpu().tolist()
-        return {name: float(value) for name, value in zip(BRANCH_NAMES, values)}
-
-    @property
-    def visible_integrity_reference_active(self) -> bool:
-        return bool(self._visible_integrity_reference_active.item())
-
-    def set_visible_integrity_reference(self, values, enabled: bool = True) -> None:
-        tensor = torch.as_tensor(
-            values,
-            dtype=self._visible_integrity_reference.dtype,
-            device=self._visible_integrity_reference.device,
-        ).view(-1)
-        if tensor.numel() != len(EVIDENCE_BRANCHES):
-            raise ValueError(
-                f"visible integrity reference expects {len(EVIDENCE_BRANCHES)} values, got {tensor.numel()}"
-            )
-        if not torch.isfinite(tensor).all():
-            raise ValueError("visible integrity reference contains non-finite values")
-        if bool((tensor <= 0.0).any()) or bool((tensor > 1.0).any()):
-            raise ValueError("visible integrity reference values must be within (0, 1]")
-        self._visible_integrity_reference.copy_(tensor.clamp(1.0e-6, 1.0))
-        self._visible_integrity_reference_active.fill_(bool(enabled))
-
-    def visible_integrity_reference_values(self) -> dict[str, float]:
-        values = self._visible_integrity_reference.detach().cpu().tolist()
-        return {name: float(value) for name, value in zip(EVIDENCE_BRANCHES, values)}
-
-    def _visible_integrity_terms(
+    def _load_from_state_dict(
         self,
-        evidence: torch.Tensor,
-        cfg: dict,
-        eps: float,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor, float, float]:
-        modifier_cfg = cfg.get("visible_integrity_modifier", {}) or {}
-        enabled = bool(modifier_cfg.get("enabled", False))
-        mode = str(modifier_cfg.get("mode", "bounded_visibility")).lower()
-        if mode not in {"bounded_visibility", "relative_effective"}:
-            raise ValueError(
-                "fusion.visible_integrity_modifier.mode must be "
-                "'bounded_visibility' or 'relative_effective'"
-            )
-        if mode == "relative_effective":
-            # The main method uses the parameter-free relative effective
-            # integrity M_m=min(1, e_m / median_cal(e_m)).
-            beta = 1.0
-            min_value = 0.0
-        else:
-            beta = float(modifier_cfg.get("beta", 1.0))
-            min_value = float(modifier_cfg.get("min_value", 0.5))
-        if not math.isfinite(beta) or beta <= 0.0:
-            raise ValueError("fusion.visible_integrity_modifier.beta must be finite and positive")
-        if not math.isfinite(min_value) or not 0.0 <= min_value <= 1.0:
-            raise ValueError("fusion.visible_integrity_modifier.min_value must be within [0, 1]")
-
-        api_integrity = _column(evidence, EvidenceIndex.API_INTEGRITY)
-        graph_integrity = _column(evidence, EvidenceIndex.GRAPH_INTEGRITY)
-        manifest_integrity = _column(evidence, EvidenceIndex.MANIFEST_INTEGRITY)
-        api_coverage = _optional_column(evidence, EvidenceIndex.API_ENCODER_COVERAGE, 1.0)
-        graph_coverage = _optional_column(evidence, EvidenceIndex.GRAPH_ENCODER_COVERAGE, 1.0)
-        effective = {
-            "api": (api_integrity * api_coverage).clamp(0.0, 1.0),
-            "graph": (graph_integrity * graph_coverage).clamp(0.0, 1.0),
-            "manifest": manifest_integrity.clamp(0.0, 1.0),
-        }
-        visibility = {
-            "api": api_coverage.clamp(0.0, 1.0),
-            "graph": graph_coverage.clamp(0.0, 1.0),
-            "manifest": torch.ones_like(manifest_integrity),
-        }
-        device = evidence.device
-        dtype = evidence.dtype
-        if enabled and self.visible_integrity_reference_active:
-            reference = self._visible_integrity_reference.to(device=device, dtype=dtype).clamp_min(eps)
-            reference_by_branch = {name: reference[i] for i, name in enumerate(EVIDENCE_BRANCHES)}
-            modifier_source = effective if mode == "relative_effective" else visibility
-            relative = {
-                name: (modifier_source[name] / reference_by_branch[name]).clamp(0.0, 1.0)
-                for name in EVIDENCE_BRANCHES
-            }
-            factor = {
-                name: (min_value + (1.0 - min_value) * relative[name].pow(beta)).clamp(0.0, 1.0)
-                for name in EVIDENCE_BRANCHES
-            }
-            active = torch.full((evidence.size(0),), 1.0, device=device, dtype=dtype)
-        else:
-            reference_by_branch = {
-                name: torch.ones((), device=device, dtype=dtype) for name in EVIDENCE_BRANCHES
-            }
-            relative = {name: torch.ones_like(effective[name]) for name in EVIDENCE_BRANCHES}
-            factor = {name: torch.ones_like(effective[name]) for name in EVIDENCE_BRANCHES}
-            active = torch.zeros((evidence.size(0),), device=device, dtype=dtype)
-        return effective, relative, factor, active, beta, min_value
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        # State loading is a lifecycle boundary where one scalar device sync is
+        # acceptable and necessary to restore the hot-path shadow exactly.
+        self._calibration_active_shadow = bool(
+            self._calibration_active.detach().item()
+        )
 
     def _temperature(self, name: str, confidence_cfg: dict) -> float | torch.Tensor:
         if self.temperature_parameters is None or not self.calibration_active:
@@ -456,10 +595,12 @@ class DiscountProbabilityFusion(nn.Module):
         api_logits: torch.Tensor,
         graph_logits: torch.Tensor,
         manifest_logits: torch.Tensor,
-        joint_logits: torch.Tensor,
         evidence: torch.Tensor,
         embeddings: dict[str, torch.Tensor] | None = None,
         config: dict | None = None,
+        *,
+        reliability_override: torch.Tensor | None = None,
+        branch_distribution_override: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         # Encoders can remain under AMP, but calibration, probability discounting,
         # and rejection scores need FP32 to avoid quantized temperatures/thresholds.
@@ -468,10 +609,15 @@ class DiscountProbabilityFusion(nn.Module):
                 api_logits.float(),
                 graph_logits.float(),
                 manifest_logits.float(),
-                joint_logits.float(),
                 evidence.float(),
                 embeddings,
                 config,
+                None if reliability_override is None else reliability_override.float(),
+                (
+                    None
+                    if branch_distribution_override is None
+                    else branch_distribution_override.float()
+                ),
             )
 
     def _forward_evidential_fp32(
@@ -479,32 +625,30 @@ class DiscountProbabilityFusion(nn.Module):
         api_logits: torch.Tensor,
         graph_logits: torch.Tensor,
         manifest_logits: torch.Tensor,
-        joint_logits: torch.Tensor,
         evidence: torch.Tensor,
         embeddings: dict[str, torch.Tensor] | None,
         cfg: dict,
         rule: str,
+        reliability_override: torch.Tensor | None = None,
+        branch_distribution_override: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Fuse the three independent modality opinions in FP32.
 
-        The main path trains a global router jointly with the encoders and then
-        refines it on an independent post-hoc split. The router reserves explicit
-        mass for an unknown outcome. Classical evidential rules remain available
-        only as named comparison methods. The joint branch is never treated as a
-        fourth evidence source.
+        The main path freezes the encoders, then fits a conditional branch
+        distribution with identity-grouped nested cross-fitting and fits the
+        separate configured decision-event risk score from strictly out-of-fold upstream
+        predictions. Classical evidential rules remain available only as named
+        comparison methods.
         """
         eps = float(cfg.get("min_discount", GateConstants.EPS))
         use_hard_alive = bool(cfg.get("use_hard_alive_mask", True))
         use_reliability = bool(cfg.get("use_reliability_discount", True))
-        competence_cfg = cfg.get("branch_competence_prior", {}) or {}
-        use_competence = bool(competence_cfg.get("enabled", False))
         base_rate = float(cfg.get("base_rate", 0.5))
 
         logits_by_branch = {
             "api": api_logits,
             "graph": graph_logits,
             "manifest": manifest_logits,
-            "joint": joint_logits,
         }
         opinion_source = str(cfg.get("opinion_source", "evidential")).lower()
 
@@ -566,31 +710,46 @@ class DiscountProbabilityFusion(nn.Module):
         )
 
         # I1 reliability: the fitted post-hoc calibrator can combine observable
-        # evidence with EDL certainty. Before that fit, use observable integrity
-        # alone. Reusing certainty in both the opinion and the trust fallback
-        # would double-count one signal and let training increase its own fusion
-        # weight merely by producing more evidence.
+        # evidence with branch-local prediction features. Before that fit,
+        # observable integrity remains available for diagnostics/non-routed
+        # comparison rules, but the routed encoder-training path uses an
+        # alive-only neutral prior inside GlobalOpinionRouter. Raw integrity is
+        # not a common-scale correctness probability and must not be logit-routed.
         reliability_outputs: dict[str, torch.Tensor] = {}
-        calibrated = self.reliability_calibrator is not None and self.calibration_active
+        # Strict OOF route/risk fitting supplies already materialized I1 values.
+        # Re-running the calibrator here and immediately overwriting its output
+        # is both wasteful and, with dozens of scenario views, a dominant source
+        # of tiny GPU kernels and validation synchronizations.
+        calibrated = (
+            reliability_override is None
+            and self.reliability_calibrator is not None
+            and self.calibration_active
+        )
         routing_active = (
             rule == "routed"
             and self.opinion_router is not None
         )
-        competence_applied = (
-            use_competence
-            and self.branch_competence_active
-            and not routing_active
-        )
-        if calibrated:
-            all_reliability_outputs = self.reliability_calibrator(
-                evidence, evidential_certainty
+        if branch_distribution_override is not None and not routing_active:
+            raise ValueError(
+                "branch_distribution_override is only valid for the routed "
+                "opinion-combination rule"
             )
-            reliability_outputs = {
-                key: value
-                for key, value in all_reliability_outputs.items()
-                if not key.endswith("_joint")
-                or "joint" in self.reliability_calibration_branches
+        if calibrated:
+            branch_probabilities_for_reliability = {
+                name: (
+                    opinions[name]["belief"]
+                    + opinions[name]["uncertainty"].unsqueeze(-1)
+                    / float(opinions[name]["belief"].size(-1))
+                ).clamp(0.0, 1.0)
+                for name in BRANCH_NAMES
             }
+            all_reliability_outputs = self.reliability_calibrator(
+                evidence,
+                branch_probabilities=branch_probabilities_for_reliability,
+                branch_logits=logits_by_branch,
+                branch_embeddings=embeddings,
+            )
+            reliability_outputs = dict(all_reliability_outputs)
             observable_reliability = {
                 name: all_reliability_outputs[
                     f"predicted_reliability_{name}"
@@ -603,50 +762,49 @@ class DiscountProbabilityFusion(nn.Module):
                 for name in EVIDENCE_BRANCHES
             }
 
-        if use_competence and self.branch_competence_active:
-            competence_prior = self._branch_competence_prior.to(
-                device=api_integrity.device, dtype=api_integrity.dtype
-            )
-        else:
-            competence_prior = torch.ones(
-                len(BRANCH_NAMES), device=api_integrity.device, dtype=api_integrity.dtype
-            )
-        competence_by_branch = {name: competence_prior[i] for i, name in enumerate(BRANCH_NAMES)}
-        (
-            visible_effective_integrity,
-            visible_modifier,
-            visible_modifier_factor,
-            visible_modifier_active,
-            visible_modifier_beta,
-            visible_modifier_min_value,
-        ) = self._visible_integrity_terms(evidence, cfg, eps)
+        reliability_override_active = reliability_override is not None
+        if reliability_override_active:
+            if not self.calibration_active:
+                raise ValueError(
+                    "reliability_override is restricted to the active post-hoc lifecycle"
+                )
+            expected_shape = (evidence.size(0), len(EVIDENCE_BRANCHES))
+            if reliability_override.shape != expected_shape:
+                raise ValueError(
+                    "reliability_override must have shape "
+                    f"{expected_shape}, got {tuple(reliability_override.shape)}"
+                )
+            if not bool(torch.isfinite(reliability_override).all().item()) or bool(
+                ((reliability_override < 0.0) | (reliability_override > 1.0)).any().item()
+            ):
+                raise ValueError(
+                    "reliability_override must contain finite values within [0, 1]"
+                )
+            observable_reliability = {
+                name: reliability_override[:, index]
+                for index, name in enumerate(EVIDENCE_BRANCHES)
+            }
+            for name in EVIDENCE_BRANCHES:
+                value = observable_reliability[name]
+                reliability_outputs[f"predicted_reliability_{name}"] = value
+                reliability_outputs[f"predicted_reliability_logit_{name}"] = torch.logit(
+                    value.clamp(eps, 1.0 - eps)
+                )
+
+        effective_integrity = _effective_integrity_terms(evidence)
         beliefs: list[torch.Tensor] = []
         uncertainties: list[torch.Tensor] = []
         trust_by_branch: dict[str, torch.Tensor] = {}
         routing_reliability: dict[str, torch.Tensor] = {}
         for name in EVIDENCE_BRANCHES:
             reliability = observable_reliability[name]
-            if routing_active:
-                # The fitted correctness probability is already on a common
-                # scale across branches. The routed path therefore uses it
-                # directly, without multiplying the dataset-level competence
-                # prior.
-                reliability = (
-                    reliability.clamp(0.0, 1.0)
-                    if use_reliability
-                    else torch.ones_like(reliability)
-                )
-                trust = (reliability * visible_modifier_factor[name]).clamp(0.0, 1.0)
+            if use_reliability:
+                reliability = reliability.clamp(0.0, 1.0)
             else:
-                if use_reliability:
-                    reliability = reliability.clamp(0.0, 1.0)
-                else:
-                    reliability = torch.ones_like(reliability)
-                trust = (
-                    competence_by_branch[name]
-                    * reliability
-                    * visible_modifier_factor[name]
-                ).clamp(0.0, 1.0)
+                reliability = torch.ones_like(reliability)
+            # I1 already estimates the operative correctness probability. It
+            # is therefore the sole learned trust signal for every fusion rule.
+            trust = reliability
             if use_hard_alive:
                 # Dead modalities become vacuous opinions (the identity element of
                 # the fusion), contributing nothing instead of voting.
@@ -664,6 +822,18 @@ class DiscountProbabilityFusion(nn.Module):
             raw_conflict = multisource_conflict(
                 beliefs, uncertainties, eps=eps
             ).clamp(0.0, 1.0)
+            # During encoder training there is no fitted I1 probability yet.
+            # Pass a common unit value so both route and risk diagnostics are
+            # neutral apart from the explicit alive mask. The active post-hoc
+            # path keeps the configured calibrated/raw-ablation reliability.
+            router_reliability = {
+                name: (
+                    routing_reliability[name].detach()
+                    if self.calibration_active
+                    else torch.ones_like(routing_reliability[name])
+                )
+                for name in EVIDENCE_BRANCHES
+            }
             routing_outputs = self.opinion_router(
                 beliefs={name: opinions[name]["belief"] for name in EVIDENCE_BRANCHES},
                 uncertainties={
@@ -671,12 +841,10 @@ class DiscountProbabilityFusion(nn.Module):
                 },
                 # Reliability supervision and routing supervision remain
                 # separate: routing NLL must not distort correctness calibration.
-                reliability={
-                    name: routing_reliability[name].detach()
-                    for name in EVIDENCE_BRANCHES
-                },
+                reliability=router_reliability,
                 alive=alive_by_branch,
-                visible_factor=visible_modifier_factor,
+                learned_active=self.calibration_active,
+                branch_distribution_override=branch_distribution_override,
                 eps=eps,
             )
             fused_belief = routing_outputs["belief"]
@@ -687,22 +855,38 @@ class DiscountProbabilityFusion(nn.Module):
                     beliefs,
                     uncertainties,
                     rule=rule,
+                    availability_masks=(
+                        [alive_by_branch[name] for name in EVIDENCE_BRANCHES]
+                        if rule == "ecml"
+                        else None
+                    ),
                     eps=eps,
                 )
             )
             raw_conflict = combination_diagnostics["raw_conflict"].clamp(0.0, 1.0)
-        uncalibrated_final_prob = opinion_to_prob(
-            fused_belief, fused_uncertainty, base_rate=base_rate, eps=eps
+        fused_alpha = opinion_to_dirichlet_alpha(
+            fused_belief, fused_uncertainty, eps=eps
+        )
+        # I2-v2 keeps the proper targets separate. pi's conditional mixture is
+        # the classifier; u is an independently fitted decision-event risk
+        # score for I3 rejection. Mapping u back into class probability would make the
+        # deployed classifier differ from the one optimized by mixture NLL.
+        uncalibrated_final_prob = (
+            routing_outputs["mixture_probability"]
+            if routing_active
+            else opinion_to_prob(
+                fused_belief, fused_uncertainty, base_rate=base_rate, eps=eps
+            )
         )
         uncalibrated_final_log_prob = torch.log(
             uncalibrated_final_prob.clamp_min(eps)
         )
         final_temperature = (
             self.final_temperature()
-            if routing_active and self.calibration_active
+            if self.calibration_active
             else None
         )
-        if routing_active and final_temperature is not None:
+        if final_temperature is not None:
             final_logits = F.log_softmax(
                 uncalibrated_final_log_prob / final_temperature.clamp_min(eps),
                 dim=-1,
@@ -736,38 +920,54 @@ class DiscountProbabilityFusion(nn.Module):
             actual_routing_weights = torch.cat(
                 [weights3, torch.zeros_like(weights3[:, :1])], dim=-1
             )
-        fusion_weights = torch.cat([weights3, torch.zeros_like(weights3[:, :1])], dim=-1)
+        fusion_weights = weights3
 
         total_reliability = (weights3 * torch.stack(
             [trust_by_branch[name] for name in EVIDENCE_BRANCHES], dim=-1
         )).sum(dim=-1).clamp(0.0, 1.0)
-        # Keep every atomic acceptance component observable.  The canonical
-        # ``acceptance_score`` remains backward compatible and defaults to the
-        # historical product, while experiments may select one component via
-        # ``fusion.routing.acceptance_score_mode``.
-        acceptance_score_unknown_only = (
-            1.0 - actual_routing_weights[:, -1]
+        routing_risk_probability = (
+            routing_outputs["risk_probability"]
+            if routing_active
+            else fused_uncertainty
         ).clamp(0.0, 1.0)
-        acceptance_score_fused_certainty = (1.0 - fused_uncertainty).clamp(
+        routing_risk_logit = (
+            routing_outputs["risk_logit"]
+            if routing_active
+            else torch.logit(
+                routing_risk_probability.clamp(eps, 1.0 - eps)
+            )
+        )
+        acceptance_score_fused_risk = (1.0 - routing_risk_probability).clamp(
             0.0, 1.0
         )
-        acceptance_score_conflict_only = (1.0 - raw_conflict).clamp(0.0, 1.0)
+        mixture_uncertainty_burden = (
+            routing_outputs["risk_uncertainty_burden"]
+            if routing_active
+            else fused_uncertainty
+        ).clamp(0.0, 1.0)
+        acceptance_score_mixture_certainty = (
+            1.0 - mixture_uncertainty_burden
+        ).clamp(0.0, 1.0)
+        # ``predictive_conflict`` is computed from the raw (alive-masked)
+        # opinions before I1 trust discounting. ``raw_conflict`` denotes
+        # conflict after trust discounting. Expose both semantics so
+        # an acceptance ablation cannot silently switch between them.
+        acceptance_score_pretrust_conflict = (1.0 - predictive_conflict).clamp(
+            0.0, 1.0
+        )
+        acceptance_score_trusted_conflict = (1.0 - raw_conflict).clamp(0.0, 1.0)
         acceptance_score_product = (
-            acceptance_score_fused_certainty * acceptance_score_conflict_only
+            acceptance_score_mixture_certainty * acceptance_score_trusted_conflict
         ).clamp(0.0, 1.0)
         routing_cfg = cfg.get("routing", {}) or {}
         acceptance_score_mode = str(
-            routing_cfg.get(
-                "acceptance_score_mode",
-                routing_cfg.get("acceptance_mode", "product"),
-            )
+            routing_cfg.get("acceptance_score_mode", "product")
         ).strip().lower()
-        if acceptance_score_mode == "current_product":
-            acceptance_score_mode = "product"
         acceptance_scores = {
-            "unknown_only": acceptance_score_unknown_only,
-            "fused_certainty": acceptance_score_fused_certainty,
-            "conflict_only": acceptance_score_conflict_only,
+            "fused_risk": acceptance_score_fused_risk,
+            "mixture_certainty": acceptance_score_mixture_certainty,
+            "pretrust_conflict": acceptance_score_pretrust_conflict,
+            "trusted_conflict": acceptance_score_trusted_conflict,
             "product": acceptance_score_product,
         }
         if acceptance_score_mode not in acceptance_scores:
@@ -775,9 +975,9 @@ class DiscountProbabilityFusion(nn.Module):
                 "fusion.routing.acceptance_score_mode must be one of "
                 f"{sorted(acceptance_scores)}, got {acceptance_score_mode!r}"
             )
-        if acceptance_score_mode == "unknown_only" and not routing_active:
+        if acceptance_score_mode == "fused_risk" and not routing_active:
             raise ValueError(
-                "fusion.routing.acceptance_score_mode=unknown_only requires "
+                "fusion.routing.acceptance_score_mode=fused_risk requires "
                 "fusion.combination=routed with routing enabled"
             )
         acceptance_score = acceptance_scores[acceptance_score_mode]
@@ -793,22 +993,29 @@ class DiscountProbabilityFusion(nn.Module):
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             )
-            if final_temperature is None or not routing_active
+            if final_temperature is None
             else final_temperature.expand(batch),
-            "final_is_log_probability": torch.ones((), device=final_logits.device, dtype=torch.bool),
+            "final_is_log_probability": True,
             "fusion_weights": fusion_weights,
+            # Preserve full, differentiable Dirichlet parameters for adapted
+            # TMC/ECML training objectives. Final probabilities alone do not
+            # retain evidence strength and cannot reconstruct these losses.
+            "dirichlet_alpha_fused": fused_alpha,
             "fused_uncertainty": fused_uncertainty,
             "fused_belief_malware": fused_belief[:, 1] if fused_belief.size(-1) > 1 else fused_belief[:, 0],
             "raw_conflict": raw_conflict,
+            "pretrust_conflict": predictive_conflict,
+            "trusted_conflict": raw_conflict,
             "predictive_conflict": predictive_conflict,
             "predictive_conflict_max": predictive_conflict_max,
             "total_reliability": total_reliability,
             "acceptance_score": acceptance_score,
-            "acceptance_score_unknown_only": acceptance_score_unknown_only,
-            "acceptance_score_fused_certainty": acceptance_score_fused_certainty,
-            "acceptance_score_conflict_only": acceptance_score_conflict_only,
+            "acceptance_score_fused_risk": acceptance_score_fused_risk,
+            "acceptance_score_mixture_certainty": acceptance_score_mixture_certainty,
+            "mixture_uncertainty_burden": mixture_uncertainty_burden,
+            "acceptance_score_pretrust_conflict": acceptance_score_pretrust_conflict,
+            "acceptance_score_trusted_conflict": acceptance_score_trusted_conflict,
             "acceptance_score_product": acceptance_score_product,
-            "acceptance_score_current_product": acceptance_score_product,
             "routing_active": torch.full(
                 (batch,),
                 float(routing_active),
@@ -827,12 +1034,6 @@ class DiscountProbabilityFusion(nn.Module):
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             ),
-            "routing_mode_known_only": torch.full(
-                (batch,),
-                float(routing_active and self.routing_mode == "known_only"),
-                device=final_logits.device,
-                dtype=final_logits.dtype,
-            ),
             "routing_train_end_to_end": torch.full(
                 (batch,),
                 float(routing_active and self.routing_train_end_to_end),
@@ -846,34 +1047,169 @@ class DiscountProbabilityFusion(nn.Module):
                 dtype=final_logits.dtype,
             ),
             "routing_weights": actual_routing_weights,
-            "routing_weight_unknown": actual_routing_weights[:, -1],
-            "routing_known_mass": (
-                routing_outputs["known_mass"]
+            "routing_risk_probability": routing_risk_probability,
+            "routing_risk_logit": routing_risk_logit,
+            "routing_risk_training_logit": (
+                routing_outputs["risk_training_logit"]
                 if routing_active
-                else torch.ones_like(actual_routing_weights[:, -1])
+                else routing_risk_logit
             ),
-            "routing_prior_known_mass": (
-                routing_outputs["prior_known_mass"]
+            "routing_weight_risk": routing_risk_probability,
+            "routing_risk_mode_learned": (
+                routing_outputs["risk_mode_learned"]
                 if routing_active
-                else torch.ones_like(actual_routing_weights[:, -1])
+                else torch.zeros_like(routing_risk_probability)
             ),
-            "routing_prior_unknown_mass": (
-                routing_outputs["prior_unknown_mass"]
+            "routing_risk_mode_reliability_prior": (
+                routing_outputs["risk_mode_reliability_prior"]
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_risk_mode_disabled": (
+                routing_outputs["risk_mode_disabled"]
+                if routing_active
+                else torch.ones_like(routing_risk_probability)
+            ),
+            "routing_learned_components_active": (
+                routing_outputs["learned_components_active"]
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_has_available": (
+                routing_outputs["has_available"]
+                if routing_active
+                else torch.ones_like(routing_risk_probability)
+            ),
+            "routing_committed_mass": (1.0 - routing_risk_probability).clamp(0.0, 1.0),
+            "routing_mixture_prob": (
+                routing_outputs["mixture_probability"]
+                if routing_active
+                else final_prob
+            ),
+            "routing_mixture_prob_malware": (
+                routing_outputs["mixture_probability"][:, 1]
+                if routing_active
+                else final_prob[:, 1]
+            ),
+            "routing_mixture_pred": (
+                routing_outputs["mixture_probability"].argmax(dim=-1)
+                if routing_active
+                else final_prob.argmax(dim=-1)
+            ).to(dtype=final_logits.dtype),
+            "routing_branch_distribution": (
+                routing_outputs["branch_distribution"]
+                if routing_active
+                else weights3
+            ),
+            "routing_scores": (
+                routing_outputs["routing_scores"]
+                if routing_active
+                else torch.log(weights3.clamp_min(eps))
+            ),
+            "routing_prior_branch_distribution": (
+                routing_outputs["prior_branch_distribution"]
+                if routing_active
+                else weights3
+            ),
+            "routing_route_prior_beta": (
+                routing_outputs["route_prior_beta"].expand(batch)
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_prior_only_odds_beta": (
+                routing_outputs["prior_only_odds_beta"].expand(batch)
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_prior_only_odds_beta_active": (
+                routing_outputs["prior_only_odds_beta_active"]
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_risk_reliability_deficit": (
+                routing_outputs["risk_reliability_deficit"]
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_risk_uncertainty_burden": (
+                routing_outputs["risk_uncertainty_burden"]
+                if routing_active
+                else fused_uncertainty
+            ),
+            "routing_risk_decision_boundary_proximity": (
+                routing_outputs["risk_decision_boundary_proximity"]
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_risk_predicted_malware": (
+                routing_outputs["risk_predicted_malware"]
+                if routing_active
+                else final_prob.argmax(dim=-1).to(final_prob.dtype)
+            ),
+            "routing_risk_decision_log_odds_threshold": (
+                routing_outputs["risk_decision_log_odds_threshold"]
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_risk_decision_threshold_active": (
+                routing_outputs["risk_decision_threshold_active"]
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_risk_target_mixture_argmax_error": torch.full_like(
+                routing_risk_probability,
+                float(self.routing_risk_target == "mixture_argmax_error"),
+            ),
+            "routing_risk_target_threshold_classification_error": torch.full_like(
+                routing_risk_probability,
+                float(
+                    self.routing_risk_target
+                    == "threshold_classification_error"
+                ),
+            ),
+            "routing_risk_target_threshold_malware_false_negative": torch.full_like(
+                routing_risk_probability,
+                float(
+                    self.routing_risk_target
+                    == "threshold_malware_false_negative"
+                ),
+            ),
+            "routing_risk_target_reliability_deficit_score": torch.full_like(
+                routing_risk_probability,
+                float(self.routing_risk_target == "reliability_deficit_score"),
+            ),
+            "routing_risk_structural_conflict": (
+                routing_outputs["risk_structural_conflict"]
+                if routing_active
+                else predictive_conflict
+            ),
+            "routing_risk_missing_fraction": (
+                routing_outputs["risk_missing_fraction"]
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_conflict_penalty_mean": (
+                routing_outputs["conflict_penalty"].mean(dim=-1)
+                if routing_active
+                else torch.zeros_like(routing_risk_probability)
+            ),
+            "routing_route_conflict_feature_active": (
+                routing_outputs["route_conflict_feature_active"]
                 if routing_active
                 else torch.zeros_like(actual_routing_weights[:, -1])
             ),
-            "routing_reliability_prior_known_mass": (
-                routing_outputs["reliability_prior_known_mass"]
+            "routing_route_conflict_feature_configured": (
+                routing_outputs["route_conflict_feature_configured"]
                 if routing_active
-                else torch.ones_like(actual_routing_weights[:, -1])
+                else torch.zeros_like(actual_routing_weights[:, -1])
             ),
-            "routing_known_retention": (
-                routing_outputs["known_retention"]
+            "routing_risk_conflict_feature_active": (
+                routing_outputs["risk_conflict_feature_active"]
                 if routing_active
-                else torch.ones_like(actual_routing_weights[:, -1])
+                else torch.zeros_like(actual_routing_weights[:, -1])
             ),
-            "routing_disagreement_feature_active": (
-                routing_outputs["disagreement_feature_active"]
+            "routing_risk_conflict_feature_configured": (
+                routing_outputs["risk_conflict_feature_configured"]
                 if routing_active
                 else torch.zeros_like(actual_routing_weights[:, -1])
             ),
@@ -888,31 +1224,29 @@ class DiscountProbabilityFusion(nn.Module):
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             ),
+            "routing_prefit_uniform_prior_active": (
+                routing_outputs["prefit_uniform_prior_active"]
+                if routing_active
+                else torch.zeros_like(actual_routing_weights[:, -1])
+            ),
+            "reliability_override_active": torch.full(
+                (batch,),
+                float(reliability_override_active),
+                device=final_logits.device,
+                dtype=final_logits.dtype,
+            ),
             "combination_rule_is_evidential": torch.ones((batch,), device=final_logits.device, dtype=final_logits.dtype),
-            "branch_competence_active": torch.full(
-                (batch,),
-                float(competence_applied),
-                device=final_logits.device,
-                dtype=final_logits.dtype,
-            ),
-            "visible_integrity_modifier_active": visible_modifier_active,
-            "visible_integrity_modifier_beta": torch.full(
-                (batch,),
-                visible_modifier_beta,
-                device=final_logits.device,
-                dtype=final_logits.dtype,
-            ),
-            "visible_integrity_modifier_min_value": torch.full(
-                (batch,),
-                visible_modifier_min_value,
-                device=final_logits.device,
-                dtype=final_logits.dtype,
-            ),
             "calibration_active": torch.full(
                 (batch,), float(self.calibration_active), device=final_logits.device, dtype=final_logits.dtype
             ),
         }
         outputs.update(reliability_outputs)
+        for name in BRANCH_NAMES:
+            if name not in self.reliability_calibration_branches:
+                # An unfitted branch must not be exported as a calibrated
+                # correctness probability.
+                outputs.pop(f"predicted_reliability_{name}", None)
+                outputs.pop(f"predicted_reliability_logit_{name}", None)
         for index, name in enumerate(BRANCH_NAMES):
             outputs[f"fusion_weight_{name}"] = fusion_weights[:, index]
             outputs[f"routing_weight_{name}"] = (
@@ -921,28 +1255,36 @@ class DiscountProbabilityFusion(nn.Module):
                 else torch.zeros_like(actual_routing_weights[:, 0])
             )
             outputs[f"uncertainty_proxy_{name}"] = opinions[name]["uncertainty"]
+            if routing_active:
+                # Exact, branch-local inputs to the conditional router.  The
+                # post-hoc route optimizer caches these tensors once because
+                # encoder logits, I1 reliability and availability are frozen
+                # throughout that stage.  Exporting the actual inputs avoids
+                # reconstructing subjective opinions from rounded diagnostics
+                # or duplicating the reliability policy in train.py.
+                outputs[f"routing_input_belief_{name}"] = opinions[name]["belief"]
+                outputs[f"routing_input_uncertainty_{name}"] = opinions[name][
+                    "uncertainty"
+                ]
+                outputs[f"routing_input_reliability_{name}"] = router_reliability[
+                    name
+                ]
+                outputs[f"routing_input_alive_{name}"] = alive_by_branch[name]
             outputs[f"evidential_certainty_{name}"] = evidential_certainty[name]
-            outputs[f"branch_competence_prior_{name}"] = torch.full(
-                (batch,),
-                float(competence_prior[index].detach().cpu().item()),
-                device=final_logits.device,
-                dtype=final_logits.dtype,
-            )
-            if name in visible_effective_integrity:
-                ref_index = EVIDENCE_BRANCHES.index(name)
-                outputs[f"effective_{name}_integrity"] = visible_effective_integrity[name]
-                outputs[f"visible_modifier_{name}"] = visible_modifier[name]
-                outputs[f"visible_modifier_factor_{name}"] = visible_modifier_factor[name]
-                outputs[f"visible_integrity_reference_{name}"] = torch.full(
-                    (batch,),
-                    float(self._visible_integrity_reference[ref_index].detach().cpu().item()),
-                    device=final_logits.device,
-                    dtype=final_logits.dtype,
-                )
+            if name in effective_integrity:
+                outputs[f"effective_{name}_integrity"] = effective_integrity[name]
             outputs[f"calibrated_log_prob_{name}"] = torch.log(
                 opinions[name]["expected_prob"].clamp_min(eps)
             )
+            if name in EVIDENCE_BRANCHES:
+                outputs[f"dirichlet_alpha_{name}"] = opinions[name]["alpha"]
             if name in trust_by_branch:
+                if calibrated and name in self.reliability_calibration_branches:
+                    outputs[f"clean_correctness_probability_{name}"] = (
+                        observable_reliability[name]
+                    )
+                outputs[f"effective_trust_cap_{name}"] = trust_by_branch[name]
+                # Historical operational-trust alias.
                 outputs[f"discount_{name}"] = trust_by_branch[name]
         return outputs
 
@@ -951,10 +1293,11 @@ class DiscountProbabilityFusion(nn.Module):
         api_logits: torch.Tensor,
         graph_logits: torch.Tensor,
         manifest_logits: torch.Tensor,
-        joint_logits: torch.Tensor,
         evidence: torch.Tensor,
         embeddings: dict[str, torch.Tensor] | None = None,
         config: dict | None = None,
+        reliability_override: torch.Tensor | None = None,
+        branch_distribution_override: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         cfg = dict(self.config)
         cfg.update(config or {})
@@ -967,7 +1310,20 @@ class DiscountProbabilityFusion(nn.Module):
         combination = str(cfg.get("combination", self.combination)).lower()
         if combination == "routed" or combination in COMBINATION_RULES:
             return self._forward_evidential_fp32(
-                api_logits, graph_logits, manifest_logits, joint_logits, evidence, embeddings, cfg, combination
+                api_logits,
+                graph_logits,
+                manifest_logits,
+                evidence,
+                embeddings,
+                cfg,
+                combination,
+                reliability_override,
+                branch_distribution_override,
+            )
+
+        if reliability_override is not None or branch_distribution_override is not None:
+            raise ValueError(
+                "post-hoc reliability/route overrides require fusion.combination=routed"
             )
 
         eps = float(cfg.get("min_discount", GateConstants.EPS))
@@ -988,16 +1344,18 @@ class DiscountProbabilityFusion(nn.Module):
             )
         use_conflict = bool(cfg.get("use_conflict_discount", True))
         use_support = bool(cfg.get("use_support_discount", True))
-        linear_use_joint = bool(cfg.get("linear_use_joint_branch", True))
-        competence_cfg = cfg.get("branch_competence_prior", {}) or {}
-        use_competence = bool(competence_cfg.get("enabled", False))
+        if "linear_use_joint_branch" in cfg:
+            raise ValueError(
+                "fusion.linear_use_joint_branch was removed; linear fusion now "
+                "always uses exactly API, Graph, and Manifest"
+            )
         weight_gamma = float(cfg.get("weight_sharpening_gamma", 1.0))
         if not math.isfinite(weight_gamma) or weight_gamma <= 0.0:
             raise ValueError("fusion.weight_sharpening_gamma must be finite and positive")
 
         confidence_cfg = cfg.get("confidence_proxy", {}) or {}
         reliability_cfg = cfg.get("reliability_calibration", {}) or {}
-        logits_by_branch = (api_logits, graph_logits, manifest_logits, joint_logits)
+        logits_by_branch = (api_logits, graph_logits, manifest_logits)
 
         proxies: dict[str, dict[str, torch.Tensor]] = {}
         for name, logits in zip(BRANCH_NAMES, logits_by_branch):
@@ -1006,25 +1364,6 @@ class DiscountProbabilityFusion(nn.Module):
                 temperature=self._temperature(name, confidence_cfg),
                 eps=eps,
             )
-
-        # I1 support for linear no-I2 ablation:
-        # Compute EDL certainty for reliability calibration only.
-        # This does NOT enable I2 because these opinions are not combined by
-        # Dempster/cumulative rules; they only provide the 6th reliability feature.
-        evidential_certainty: dict[str, torch.Tensor] | None = None
-        if bool(reliability_cfg.get("use_evidential_uncertainty", False)):
-            opinions_for_reliability = {
-                name: logits_to_opinion(
-                    logits,
-                    evidence_activation=self.evidence_activation,
-                    eps=eps,
-                )
-                for name, logits in zip(BRANCH_NAMES, logits_by_branch)
-            }
-            evidential_certainty = {
-                name: (1.0 - opinions_for_reliability[name]["uncertainty"]).clamp(0.0, 1.0)
-                for name in BRANCH_NAMES
-            }
 
         confidence_factors = []
         for name in BRANCH_NAMES:
@@ -1045,7 +1384,7 @@ class DiscountProbabilityFusion(nn.Module):
         alive_api = _column(evidence, EvidenceIndex.API_ALIVE).bool()
         alive_graph = _column(evidence, EvidenceIndex.GRAPH_ALIVE).bool()
         alive_manifest = _column(evidence, EvidenceIndex.MANIFEST_ALIVE).bool()
-        alive_joint = alive_api | alive_graph | alive_manifest
+        any_alive = alive_api | alive_graph | alive_manifest
         code_alive = alive_api | alive_graph
         api_graph_applicable = alive_api & alive_graph
         manifest_code_relation_observed = (
@@ -1102,61 +1441,59 @@ class DiscountProbabilityFusion(nn.Module):
         else:
             manifest_conflict_factor = torch.ones_like(manifest_conflict)
             code_conflict_factor = torch.ones_like(code_conflict)
-        joint_conflict_factor = torch.minimum(
-            manifest_conflict_factor,
-            code_conflict_factor,
-        )
-
-        mean_alive_integrity = _mean_alive_integrity(
-            torch.stack([api_integrity, graph_integrity, manifest_integrity], dim=-1),
-            torch.stack([alive_api, alive_graph, alive_manifest], dim=-1),
-        )
-        pair_support = _available_pair_support(
-            api_graph_applicable,
-            manifest_code_applicable,
-            anchor_support,
-            manifest_support,
-        )
-        pair_support_applicable = api_graph_applicable | manifest_code_applicable
-        joint_support_factor = (
-            torch.where(
-                pair_support_applicable,
-                0.5 + 0.5 * pair_support,
-                torch.ones_like(pair_support),
-            )
-            if use_support
-            else torch.ones_like(pair_support)
-        )
         reliability_outputs: dict[str, torch.Tensor] = {}
+        observable_reliability_fallback = [
+            api_integrity,
+            graph_integrity,
+            manifest_integrity,
+        ]
         if calibrated_reliability_active:
             reliability_outputs = self.reliability_calibrator(
                 evidence,
-                evidential_certainty=evidential_certainty,
+                branch_probabilities={
+                    name: proxies[name]["prob"] for name in BRANCH_NAMES
+                },
+                branch_logits={
+                    name: logits for name, logits in zip(BRANCH_NAMES, logits_by_branch)
+                },
+                branch_embeddings=embeddings,
             )
             base_reliability = [
-                reliability_outputs[f"predicted_reliability_{name}"]
-                for name in BRANCH_NAMES
+                (
+                    reliability_outputs[f"predicted_reliability_{name}"]
+                    if name in self.reliability_calibration_branches
+                    else observable_reliability_fallback[index]
+                )
+                for index, name in enumerate(BRANCH_NAMES)
             ]
         else:
             features, feature_diagnostics = build_monotonic_reliability_features(
                 evidence,
-                missing_relation_support=float(
-                    reliability_cfg.get("missing_relation_support", 0.0)
+                use_model_visibility=bool(
+                    reliability_cfg.get("use_model_visibility", False)
                 ),
-                use_relation_evidence=bool(
-                    reliability_cfg.get("use_relation_evidence", False)
+                # Encoder training has no fitted fold-local embedding
+                # reference. The fixed topology therefore exposes a neutral
+                # zero slot until the post-hoc lifecycle becomes active.
+                use_embedding_density=False,
+                use_prediction_margin=bool(
+                    reliability_cfg.get("use_prediction_margin", True)
                 ),
-                evidential_certainty=evidential_certainty,
+                use_predicted_class_feature=bool(
+                    reliability_cfg.get("use_predicted_class_feature", True)
+                ),
+                branch_probabilities={
+                    name: proxies[name]["prob"] for name in BRANCH_NAMES
+                },
+                branch_logits={
+                    name: logits
+                    for name, logits in zip(BRANCH_NAMES, logits_by_branch)
+                },
             )
             reliability_outputs.update(feature_diagnostics)
             for name, value in features.items():
                 reliability_outputs[f"reliability_features_{name}"] = value
-            base_reliability = [
-                api_integrity,
-                graph_integrity,
-                manifest_integrity,
-                mean_alive_integrity,
-            ]
+            base_reliability = observable_reliability_fallback
         estimated_reliability = [
             value.clamp(0.0, 1.0) for value in base_reliability
         ]
@@ -1179,52 +1516,16 @@ class DiscountProbabilityFusion(nn.Module):
             reliability_for_acceptance = [
                 torch.ones_like(api_integrity) for _ in BRANCH_NAMES
             ]
-        if use_competence and self.branch_competence_active:
-            competence_prior = self._branch_competence_prior.to(
-                device=api_integrity.device,
-                dtype=api_integrity.dtype,
-            )
-        else:
-            competence_prior = torch.ones(
-                len(BRANCH_NAMES),
-                device=api_integrity.device,
-                dtype=api_integrity.dtype,
-            )
-        (
-            visible_effective_integrity,
-            visible_modifier,
-            visible_modifier_factor,
-            visible_modifier_active,
-            visible_modifier_beta,
-            visible_modifier_min_value,
-        ) = self._visible_integrity_terms(evidence, cfg, eps)
+        effective_integrity = _effective_integrity_terms(evidence)
         raw_discounts = torch.stack(
             [
-                competence_prior[0] * reliability_for_fusion[0] * visible_modifier_factor["api"] * code_anchor_factor * code_conflict_factor * confidence_factors[0],
-                competence_prior[1] * reliability_for_fusion[1] * visible_modifier_factor["graph"] * code_anchor_factor * code_conflict_factor * confidence_factors[1],
-                competence_prior[2] * reliability_for_fusion[2] * visible_modifier_factor["manifest"] * manifest_support_factor * manifest_conflict_factor * confidence_factors[2],
-                competence_prior[3] * reliability_for_fusion[3] * joint_support_factor * joint_conflict_factor * confidence_factors[3],
+                reliability_for_fusion[0] * code_anchor_factor * code_conflict_factor * confidence_factors[0],
+                reliability_for_fusion[1] * code_anchor_factor * code_conflict_factor * confidence_factors[1],
+                reliability_for_fusion[2] * manifest_support_factor * manifest_conflict_factor * confidence_factors[2],
             ],
             dim=-1,
         )
-        alive_mask = torch.stack([alive_api, alive_graph, alive_manifest, alive_joint], dim=-1)
-        if not linear_use_joint:
-            # Keep tensor shape [B, 4] for diagnostics compatibility,
-            # but force the joint branch to contribute zero probability mass.
-            raw_discounts = torch.cat(
-                [
-                    raw_discounts[:, :3],
-                    torch.zeros_like(raw_discounts[:, 3:4]),
-                ],
-                dim=-1,
-            )
-            alive_mask = torch.cat(
-                [
-                    alive_mask[:, :3],
-                    torch.zeros_like(alive_mask[:, 3:4]),
-                ],
-                dim=-1,
-            )
+        alive_mask = torch.stack([alive_api, alive_graph, alive_manifest], dim=-1)
         discounts = raw_discounts * alive_mask.to(raw_discounts.dtype) if use_hard_alive else raw_discounts
         discounts_for_weight = discounts.detach() if detach_discount else discounts
         if use_hard_alive:
@@ -1237,16 +1538,9 @@ class DiscountProbabilityFusion(nn.Module):
         fallback = str(cfg.get("fallback", "uniform")).lower()
         if fallback != "uniform":
             raise ValueError(f"Unsupported discount fusion fallback: {fallback}")
-        if linear_use_joint:
-            fallback_weights = torch.full_like(discounts_for_weight, 1.0 / len(BRANCH_NAMES))
-        else:
-            fallback_weights = torch.cat(
-                [
-                    torch.full_like(discounts_for_weight[:, :3], 1.0 / len(EVIDENCE_BRANCHES)),
-                    torch.zeros_like(discounts_for_weight[:, 3:4]),
-                ],
-                dim=-1,
-            )
+        fallback_weights = torch.full_like(
+            discounts_for_weight, 1.0 / len(BRANCH_NAMES)
+        )
         if use_hard_alive:
             alive_fallback = alive_mask.to(discounts_for_weight.dtype)
             alive_count = alive_fallback.sum(dim=-1, keepdim=True)
@@ -1264,6 +1558,20 @@ class DiscountProbabilityFusion(nn.Module):
         branch_prob = torch.stack([proxies[name]["prob"] for name in BRANCH_NAMES], dim=1)
         final_prob = (fusion_weights.unsqueeze(-1) * branch_prob).sum(dim=1)
         final_prob = final_prob / final_prob.sum(dim=-1, keepdim=True).clamp_min(eps)
+        # Placeholder branch logits are implementation details, not evidence.
+        # When every primary modality is unavailable, expose an explicit
+        # maximum-uncertainty class distribution instead of averaging those
+        # arbitrary placeholders through the fallback weights.
+        all_modalities_dead = ~any_alive
+        uniform_prob = torch.full_like(
+            final_prob,
+            1.0 / float(final_prob.size(-1)),
+        )
+        final_prob = torch.where(
+            all_modalities_dead.view(-1, 1),
+            uniform_prob,
+            final_prob,
+        )
         final_logits = torch.log(final_prob.clamp_min(eps))
         final_proxy = compute_branch_confidence_proxy(final_logits, temperature=1.0, eps=eps)
         reliability_matrix = torch.stack(reliability_for_acceptance, dim=-1)
@@ -1314,33 +1622,14 @@ class DiscountProbabilityFusion(nn.Module):
             ).view(-1),
             "final_prob": final_prob,
             "final_logits": final_logits,
-            "final_is_log_probability": torch.ones((), device=final_logits.device, dtype=torch.bool),
+            "final_is_log_probability": True,
             "total_reliability": total_reliability,
             "final_uncertainty_proxy": final_proxy["uncertainty_proxy"],
             "effective_conflict": effective_conflict,
             "acceptance_score": acceptance_score,
-            "visible_integrity_modifier_active": visible_modifier_active,
-            "visible_integrity_modifier_beta": torch.full(
-                (batch,),
-                visible_modifier_beta,
-                device=final_logits.device,
-                dtype=final_logits.dtype,
-            ),
-            "visible_integrity_modifier_min_value": torch.full(
-                (batch,),
-                visible_modifier_min_value,
-                device=final_logits.device,
-                dtype=final_logits.dtype,
-            ),
             "calibration_active": torch.full(
                 (final_logits.size(0),),
                 float(self.calibration_active),
-                device=final_logits.device,
-                dtype=final_logits.dtype,
-            ),
-            "linear_joint_branch_active": torch.full(
-                (final_logits.size(0),),
-                float(linear_use_joint),
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             ),
@@ -1368,46 +1657,35 @@ class DiscountProbabilityFusion(nn.Module):
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             ),
-            "branch_competence_active": torch.full(
-                (final_logits.size(0),),
-                float(use_competence and self.branch_competence_active),
-                device=final_logits.device,
-                dtype=final_logits.dtype,
-            ),
             "weight_sharpening_gamma": torch.full(
                 (final_logits.size(0),),
                 weight_gamma,
                 device=final_logits.device,
                 dtype=final_logits.dtype,
             ),
-            "joint_conflict_factor": joint_conflict_factor,
             "api_graph_support_applicable": api_graph_applicable.to(dtype=discounts.dtype),
             "manifest_code_conflict_applicable": manifest_code_applicable.to(dtype=discounts.dtype),
             "manifest_code_relation_applicable": manifest_code_applicable.to(dtype=discounts.dtype),
         }
         outputs.update(reliability_outputs)
+        for name in BRANCH_NAMES:
+            if name not in self.reliability_calibration_branches:
+                outputs.pop(f"predicted_reliability_{name}", None)
+                outputs.pop(f"predicted_reliability_logit_{name}", None)
         for index, name in enumerate(BRANCH_NAMES):
+            if (
+                calibrated_reliability_active
+                and name in self.reliability_calibration_branches
+            ):
+                outputs[f"clean_correctness_probability_{name}"] = (
+                    estimated_reliability[index]
+                )
+            outputs[f"effective_trust_cap_{name}"] = discounts[:, index]
+            # Historical operational-trust alias.
             outputs[f"discount_{name}"] = discounts[:, index]
             outputs[f"fusion_weight_{name}"] = fusion_weights[:, index]
-            if evidential_certainty is not None:
-                outputs[f"evidential_certainty_{name}"] = evidential_certainty[name]
-            outputs[f"branch_competence_prior_{name}"] = torch.full(
-                (final_logits.size(0),),
-                float(competence_prior[index].detach().cpu().item()),
-                device=final_logits.device,
-                dtype=final_logits.dtype,
-            )
-            if name in visible_effective_integrity:
-                ref_index = EVIDENCE_BRANCHES.index(name)
-                outputs[f"effective_{name}_integrity"] = visible_effective_integrity[name]
-                outputs[f"visible_modifier_{name}"] = visible_modifier[name]
-                outputs[f"visible_modifier_factor_{name}"] = visible_modifier_factor[name]
-                outputs[f"visible_integrity_reference_{name}"] = torch.full(
-                    (batch,),
-                    float(self._visible_integrity_reference[ref_index].detach().cpu().item()),
-                    device=final_logits.device,
-                    dtype=final_logits.dtype,
-                )
+            if name in effective_integrity:
+                outputs[f"effective_{name}_integrity"] = effective_integrity[name]
             outputs[f"calibrated_log_prob_{name}"] = torch.log(
                 proxies[name]["prob"].clamp_min(eps)
             )

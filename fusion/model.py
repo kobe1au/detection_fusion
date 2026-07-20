@@ -7,16 +7,15 @@ import torch
 import torch.nn as nn
 from fusion.evidence import build_evidence
 
-from fusion.constants import ArchitectureConstants, EvidenceIndex, GateConstants
+from fusion.constants import ArchitectureConstants, EvidenceIndex
 from fusion.discount_fusion import DiscountProbabilityFusion
 from fusion.gates import (
-    FourBranchEvidenceGate,
-    heuristic_reliability_gate,
-    confidence_gate,
-    apply_alive_mask,
+    DenseTriModalEmbeddingGate,
+    dense_embedding_late_fusion_logits,
 )
 from fusion.graph_encoders import GraphEncoderGAT, GraphEncoderGCN
 from fusion.semantic_categories import validate_api_type_mapping
+from fusion.utils import strict_finite_integer
 from torch_geometric.utils import softmax
 
 
@@ -32,11 +31,15 @@ TRI_MODAL_FUSION_MODES = {
     "api_graph_manifest_concat",
     "tri_modal_concat",
     "tri_modal_fixed_gate",
-    "tri_modal_reliability_gate",
-    "tri_modal_confidence_gate",
-    "tri_modal_ours",
     "tri_modal_quality_fusion",
+    "tri_modal_dense_embedding_gate",
     "discount_probability",
+}
+
+API_GRAPH_CONCAT_FUSION_MODES = {"api_graph", "api_graph_concat"}
+TRI_MODAL_CONCAT_FUSION_MODES = {
+    "api_graph_manifest_concat",
+    "tri_modal_concat",
 }
 
 
@@ -50,11 +53,13 @@ def quality_aware_logit_fusion(
     *,
     temperature: float = 10.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """QMF-style detached energy weighting for a shared-label task.
+    """QMF-Energy detached weighting component for a shared-label task.
 
-    Final logits follow the official QMF late-fusion core. The normalized
-    weights returned here are diagnostics only and do not replace QMF's
-    unnormalized energy-weighted decision rule.
+    Final logits follow QMF's late-fusion energy component. This helper does
+    not implement QMF's history-based confidence-ranking objective, so callers
+    must not identify it as the complete QMF method. The normalized weights
+    returned here are diagnostics only and do not replace the unnormalized
+    energy-weighted decision rule.
     """
     if not logits_by_branch:
         raise ValueError("quality_aware_logit_fusion requires at least one branch")
@@ -84,38 +89,45 @@ def quality_aware_logit_fusion(
 
 
 def _fusion_single_api(_model, batch_size, device, dtype, tensors, extra):
-    gate = torch.zeros((batch_size, 4), device=device, dtype=dtype)
+    gate = torch.zeros((batch_size, 3), device=device, dtype=dtype)
     gate[:, 0] = 1.0
     return tensors["api_logits"], gate, extra
 
 
 def _fusion_single_graph(_model, batch_size, device, dtype, tensors, extra):
-    gate = torch.zeros((batch_size, 4), device=device, dtype=dtype)
+    gate = torch.zeros((batch_size, 3), device=device, dtype=dtype)
     gate[:, 1] = 1.0
     return tensors["graph_logits"], gate, extra
 
 
 def _fusion_single_manifest(_model, batch_size, device, dtype, tensors, extra):
-    gate = torch.zeros((batch_size, 4), device=device, dtype=dtype)
+    gate = torch.zeros((batch_size, 3), device=device, dtype=dtype)
     gate[:, 2] = 1.0
     return tensors["manifest_logits"], gate, extra
 
 
 def _fusion_api_graph_concat(model, batch_size, device, dtype, tensors, extra):
-    logits = model.api_graph_concat_head(
-        torch.cat([tensors["api_emb"], tensors["graph_emb"]], dim=-1)
-    )
-    gate = torch.zeros((batch_size, 4), device=device, dtype=dtype)
-    gate[:, 3] = 1.0
-    extra["joint_logits_aux"] = logits
+    if model.api_graph_concat_head is None:
+        raise RuntimeError(
+            "api_graph_concat fusion requires an initialized API/Graph concat head"
+        )
+    logits = model.api_graph_concat_head(tensors["api_graph_concat_input"])
+    gate = torch.zeros((batch_size, 3), device=device, dtype=dtype)
+    gate[:, :2] = 0.5
+    extra["concat_logits_aux"] = logits
     return logits, gate, extra
 
 
 def _fusion_tri_concat(model, batch_size, device, dtype, tensors, extra):
-    logits = model.tri_concat_head(tensors["joint_input"])
-    gate = torch.zeros((batch_size, 4), device=device, dtype=dtype)
-    gate[:, 3] = 1.0
-    extra["joint_logits_aux"] = logits
+    if model.tri_concat_head is None:
+        raise RuntimeError(
+            "tri_modal_concat fusion requires an initialized tri-modal concat head"
+        )
+    logits = model.tri_concat_head(tensors["tri_modal_concat_input"])
+    gate = torch.full(
+        (batch_size, 3), 1.0 / 3.0, device=device, dtype=dtype
+    )
+    extra["concat_logits_aux"] = logits
     return logits, gate, extra
 
 
@@ -126,7 +138,6 @@ def _fusion_quality_aware(model, batch_size, device, dtype, tensors, extra):
         tensors["api_logits"],
         tensors["graph_logits"],
         tensors["manifest_logits"],
-        tensors["joint_logits"],
         tensors["api_emb"],
         tensors["graph_emb"],
         tensors["manifest_emb"],
@@ -153,26 +164,82 @@ def _fusion_quality_aware(model, batch_size, device, dtype, tensors, extra):
         alive,
         temperature=model.quality_fusion_temperature,
     )
-    gate = torch.cat(
-        [weights3.to(dtype=dtype), torch.zeros((batch_size, 1), device=device, dtype=dtype)],
-        dim=-1,
-    )
+    gate = weights3.to(dtype=dtype)
     for index, name in enumerate(("api", "graph", "manifest")):
         extra[f"qmf_energy_{name}"] = energy[:, index]
         extra[f"fusion_weight_{name}"] = weights3[:, index]
-    extra["fusion_weight_joint"] = torch.zeros((batch_size,), device=device, dtype=dtype)
     extra["gate_prior_enabled"] = False
     return logits, gate, extra
 
 
-def _fusion_evidence_based(model, batch_size, device, dtype, tensors, extra):
-    """Evidence-based gate fusion (fixed / reliability / confidence / learned)."""
+def _fusion_dense_embedding_gate(model, batch_size, device, dtype, tensors, extra):
+    """Adapted dense embedding-gated three-branch late-fusion baseline."""
     evidence, diagnostics = build_evidence(
         tensors["graph_data"],
         tensors["api_logits"],
         tensors["graph_logits"],
         tensors["manifest_logits"],
-        tensors["joint_logits"],
+        tensors["api_emb"],
+        tensors["graph_emb"],
+        tensors["manifest_emb"],
+        use_consistency_evidence=False,
+        use_conflict_evidence=False,
+        use_perturbation_evidence=False,
+    )
+    extra.update(diagnostics)
+    extra["gate_evidence"] = evidence.detach()
+    alive = torch.stack(
+        [
+            evidence[:, EvidenceIndex.API_ALIVE],
+            evidence[:, EvidenceIndex.GRAPH_ALIVE],
+            evidence[:, EvidenceIndex.MANIFEST_ALIVE],
+        ],
+        dim=-1,
+    )
+    if model.dense_embedding_gate is None:
+        raise RuntimeError(
+            "tri_modal_dense_embedding_gate requires an initialized dense gate"
+        )
+    weights3, gate_scores = model.dense_embedding_gate(
+        {
+            "api": tensors["api_emb"],
+            "graph": tensors["graph_emb"],
+            "manifest": tensors["manifest_emb"],
+        },
+        alive,
+    )
+    logits = dense_embedding_late_fusion_logits(
+        {
+            "api": tensors["api_logits"],
+            "graph": tensors["graph_logits"],
+            "manifest": tensors["manifest_logits"],
+        },
+        weights3,
+    )
+    gate = weights3.to(dtype=dtype)
+    extra["dense_embedding_gate_scores"] = gate_scores
+    extra["dense_embedding_gate_active"] = torch.ones(
+        (batch_size,), device=device, dtype=dtype
+    )
+    extra["dense_embedding_gate_detached"] = torch.full(
+        (batch_size,),
+        float(model.dense_embedding_gate.detach_embeddings),
+        device=device,
+        dtype=dtype,
+    )
+    for index, name in enumerate(("api", "graph", "manifest")):
+        extra[f"fusion_weight_{name}"] = weights3[:, index]
+    extra["gate_prior_enabled"] = False
+    return logits, gate, extra
+
+
+def _fusion_fixed_gate(model, batch_size, device, dtype, tensors, extra):
+    """Canonical equal-weight API/Graph/Manifest late fusion."""
+    evidence, diagnostics = build_evidence(
+        tensors["graph_data"],
+        tensors["api_logits"],
+        tensors["graph_logits"],
+        tensors["manifest_logits"],
         tensors["api_emb"],
         tensors["graph_emb"],
         tensors["manifest_emb"],
@@ -183,53 +250,30 @@ def _fusion_evidence_based(model, batch_size, device, dtype, tensors, extra):
     extra.update(diagnostics)
     extra["gate_evidence"] = evidence.detach()
 
-    mode = model.fusion_mode
-    if mode == "tri_modal_fixed_gate":
-        # Canonical three-modality late fusion.  The learned joint head is not a
-        # fourth source and must not double-count the same three embeddings.
-        gate_weights = torch.zeros((batch_size, 4), device=device, dtype=dtype)
-        gate_weights[:, :3] = 1.0 / 3.0
-        extra["gate_prior_enabled"] = False
-    elif mode == "tri_modal_reliability_gate":
-        gate_weights = heuristic_reliability_gate(evidence).to(dtype=dtype)
-        extra["gate_prior_enabled"] = False
-    elif mode == "tri_modal_confidence_gate":
-        gate_weights = confidence_gate(
-            torch.stack(
-                [
-                    diagnostics["api_confidence"],
-                    diagnostics["graph_confidence"],
-                    diagnostics["manifest_confidence"],
-                    diagnostics["joint_confidence"],
-                ],
-                dim=-1,
-            )
-        ).to(dtype=dtype)
-        extra["gate_prior_enabled"] = False
-    else:
-        gate_input = evidence.detach() if model.gate_detach else evidence
-        gate_weights = model.gate_net(gate_input)
-        if model.apply_alive_mask_to_learned_gate:
-            gate_weights = apply_alive_mask(gate_weights, evidence).to(dtype=dtype)
-        extra["gate_prior_enabled"] = True
+    gate_weights = torch.full(
+        (batch_size, 3), 1.0 / 3.0, device=device, dtype=dtype
+    )
+    extra["gate_prior_enabled"] = False
 
     logits = (
         gate_weights[:, 0:1] * tensors["api_logits"]
         + gate_weights[:, 1:2] * tensors["graph_logits"]
         + gate_weights[:, 2:3] * tensors["manifest_logits"]
-        + gate_weights[:, 3:4] * tensors["joint_logits"]
     )
     return logits, gate_weights, extra
 
 
 def _fusion_discount_probability(model, batch_size, device, dtype, tensors, extra):
     del batch_size, device, dtype
+    if model.discount_fusion is None:
+        raise RuntimeError(
+            "discount_probability fusion requires an initialized discount fusion module"
+        )
     evidence, diagnostics = build_evidence(
         tensors["graph_data"],
         tensors["api_logits"],
         tensors["graph_logits"],
         tensors["manifest_logits"],
-        tensors["joint_logits"],
         tensors["api_emb"],
         tensors["graph_emb"],
         tensors["manifest_emb"],
@@ -243,7 +287,6 @@ def _fusion_discount_probability(model, batch_size, device, dtype, tensors, extr
         tensors["api_logits"],
         tensors["graph_logits"],
         tensors["manifest_logits"],
-        tensors["joint_logits"],
         evidence,
         embeddings={
             "api": tensors["api_emb"],
@@ -267,11 +310,9 @@ FUSION_DISPATCH: dict[str, callable] = {
     "api_graph_concat": _fusion_api_graph_concat,
     "api_graph_manifest_concat": _fusion_tri_concat,
     "tri_modal_concat": _fusion_tri_concat,
-    "tri_modal_fixed_gate": _fusion_evidence_based,
-    "tri_modal_reliability_gate": _fusion_evidence_based,
-    "tri_modal_confidence_gate": _fusion_evidence_based,
-    "tri_modal_ours": _fusion_evidence_based,
+    "tri_modal_fixed_gate": _fusion_fixed_gate,
     "tri_modal_quality_fusion": _fusion_quality_aware,
+    "tri_modal_dense_embedding_gate": _fusion_dense_embedding_gate,
     "discount_probability": _fusion_discount_probability,
 }
 
@@ -307,7 +348,11 @@ class ApiSequenceEncoder(nn.Module):
         self.type_vocab_size = int(type_vocab_size)
         self.emb_dim = int(emb_dim)
         self.encoder_type = str(encoder_type).lower()
-        self.max_seq_len = int(max_seq_len)
+        self.max_seq_len = strict_finite_integer(
+            max_seq_len, field_name="ApiSequenceEncoder.max_seq_len"
+        )
+        if self.max_seq_len <= 0:
+            raise ValueError("ApiSequenceEncoder.max_seq_len must be positive")
         self.max_valid_api_id = self.num_hash_buckets + 1
         self.overflow_id = self.num_hash_buckets + 2
         self.api_embedding = nn.Embedding(self.overflow_id + 1, emb_dim, padding_idx=0)
@@ -412,18 +457,17 @@ class ApiSequenceEncoder(nn.Module):
             )
         if api_batch.numel() > 1 and (api_batch[1:] < api_batch[:-1]).any():
             raise ValueError("api_batch must be grouped in non-decreasing sample order")
-        if self.max_seq_len > 0:
-            raw_lengths = torch.bincount(api_batch, minlength=num_graphs).to(device=device)
-            offsets = torch.zeros((num_graphs + 1,), device=device, dtype=torch.long)
-            offsets[1:] = raw_lengths.cumsum(dim=0)
-            local_pos = torch.arange(api_batch.numel(), device=device) - offsets[api_batch]
-            keep = local_pos < self.max_seq_len
-            api_ids = api_ids[keep]
-            api_batch = api_batch[keep]
-            if api_ids.numel() == 0:
-                return self._empty_output(num_graphs, device, dtype)
-        else:
-            keep = slice(None)
+        raw_lengths = torch.bincount(api_batch, minlength=num_graphs).to(device=device)
+        observed_max = int(raw_lengths.max().item()) if raw_lengths.numel() > 0 else 0
+        if observed_max > self.max_seq_len:
+            raise RuntimeError(
+                "API dataset/encoder budget contract was violated: the encoder "
+                "must never truncate silently because reliability evidence and "
+                "semantic counts were already computed from the dataset output; "
+                f"observed per-sample length {observed_max} exceeds max_seq_len="
+                f"{self.max_seq_len}"
+            )
+        keep = slice(None)
 
         raw_type_ids = getattr(graph_data, "api_type_ids", None)
         api_type_ids = (
@@ -479,7 +523,7 @@ class TriModalRobustModel(nn.Module):
         self,
         in_feat_dim: int = 515,
         num_classes: int = 2,
-        fusion_mode: str = "tri_modal_ours",
+        fusion_mode: str = "discount_probability",
         api_num_hash_buckets: int = 8192,
         api_type_vocab_size: int = 16,
         api_emb_dim: int = 128,
@@ -500,21 +544,19 @@ class TriModalRobustModel(nn.Module):
         manifest_emb_dim: int = 128,
         manifest_hidden_dim: int = 256,
         manifest_dropout: float = 0.1,
-        joint_emb_dim: int = 128,
         quality_fusion_temperature: float = 10.0,
         gate_hidden_dim: int = 128,
         gate_detach: bool = True,
         use_consistency_evidence: bool = True,
         use_conflict_evidence: bool = True,
         use_perturbation_evidence: bool = False,
-        apply_alive_mask_to_learned_gate: bool = True,
         discount_fusion_config: dict | None = None,
     ):
         super().__init__()
         # Defensive check: ensure DEFAULT_API_TYPE_ID_TO_CATEGORY stays
         # consistent with the extractor taxonomy and the 12-D shared space.
         validate_api_type_mapping()
-        fusion_mode = str(fusion_mode or "tri_modal_ours")
+        fusion_mode = str(fusion_mode or "discount_probability")
         if fusion_mode not in TRI_MODAL_FUSION_MODES:
             raise ValueError(f"Unsupported tri-modal fusion_mode: {fusion_mode}")
 
@@ -524,7 +566,6 @@ class TriModalRobustModel(nn.Module):
         self.graph_emb_dim = int(graph_emb_dim)
         self.manifest_in_dim = int(manifest_in_dim)
         self.manifest_emb_dim = int(manifest_emb_dim)
-        self.joint_emb_dim = int(joint_emb_dim)
         if not math.isfinite(float(quality_fusion_temperature)) or float(quality_fusion_temperature) <= 0.0:
             raise ValueError("quality_fusion_temperature must be finite and positive")
         self.quality_fusion_temperature = float(quality_fusion_temperature)
@@ -536,7 +577,6 @@ class TriModalRobustModel(nn.Module):
                 "Synthetic pert_* metadata is diagnostic-only and cannot be enabled in TriModalRobustModel."
             )
         self.use_perturbation_evidence = False
-        self.apply_alive_mask_to_learned_gate = bool(apply_alive_mask_to_learned_gate)
         self.api_encoder = ApiSequenceEncoder(
             num_hash_buckets=api_num_hash_buckets,
             type_vocab_size=api_type_vocab_size,
@@ -578,34 +618,71 @@ class TriModalRobustModel(nn.Module):
             dropout=manifest_dropout,
         )
 
-        self.joint_encoder = nn.Sequential(
-            nn.Linear(api_emb_dim + graph_emb_dim + manifest_emb_dim, max(joint_emb_dim * 2, 128)),
-            nn.GELU(),
-            nn.Dropout(ArchitectureConstants.HEAD_DROPOUT),
-            nn.Linear(max(joint_emb_dim * 2, 128), joint_emb_dim),
-            nn.LayerNorm(joint_emb_dim),
-        )
         self.api_head = build_main_head(api_emb_dim, num_classes)
         self.graph_head = build_main_head(graph_emb_dim, num_classes)
         self.manifest_head = build_main_head(manifest_emb_dim, num_classes)
-        self.joint_head = build_main_head(joint_emb_dim, num_classes)
-        self.api_graph_concat_head = build_main_head(api_emb_dim + graph_emb_dim, num_classes)
-        self.tri_concat_head = build_main_head(api_emb_dim + graph_emb_dim + manifest_emb_dim, num_classes)
-        self.gate_net = FourBranchEvidenceGate(
-            evidence_dim=EvidenceIndex.BASE_DIM,
-            hidden_dim=gate_hidden_dim,
+        self.api_graph_concat_head = (
+            build_main_head(api_emb_dim + graph_emb_dim, num_classes)
+            if self.fusion_mode in API_GRAPH_CONCAT_FUSION_MODES
+            else None
         )
-        self.discount_fusion = DiscountProbabilityFusion(discount_fusion_config)
+        self.tri_concat_head = (
+            build_main_head(
+                api_emb_dim + graph_emb_dim + manifest_emb_dim,
+                num_classes,
+            )
+            if self.fusion_mode in TRI_MODAL_CONCAT_FUSION_MODES
+            else None
+        )
+        # Independent black-box routing comparison.  It is instantiated only
+        # for its explicit fusion mode, so the proposed method's RNG stream and
+        # parameterization remain unchanged.
+        self.dense_embedding_gate = (
+            DenseTriModalEmbeddingGate(
+                {
+                    "api": self.api_emb_dim,
+                    "graph": self.graph_emb_dim,
+                    "manifest": self.manifest_emb_dim,
+                },
+                hidden_dim=gate_hidden_dim,
+                detach_embeddings=gate_detach,
+            )
+            if self.fusion_mode == "tri_modal_dense_embedding_gate"
+            else None
+        )
+        self.discount_fusion = (
+            DiscountProbabilityFusion(
+                discount_fusion_config,
+                embedding_dims={
+                    "api": self.api_emb_dim,
+                    "graph": self.graph_emb_dim,
+                    "manifest": self.manifest_emb_dim,
+                },
+            )
+            if self.fusion_mode == "discount_probability"
+            else None
+        )
 
     def calibration_parameters(self) -> list[nn.Parameter]:
         """Parameters fitted after model selection without changing encoders."""
+        if self.discount_fusion is None:
+            return []
         return self.discount_fusion.calibration_parameters()
 
     def encoder_training_frozen_parameters(self) -> list[nn.Parameter]:
         """Parameters that must remain untouched during encoder training."""
+        if self.discount_fusion is None:
+            return []
         return self.discount_fusion.encoder_training_frozen_parameters()
 
     def set_calibration_active(self, enabled: bool) -> None:
+        if self.discount_fusion is None:
+            if enabled:
+                raise RuntimeError(
+                    "Post-hoc fusion calibration is only available for "
+                    "fusion_mode='discount_probability'"
+                )
+            return
         self.discount_fusion.set_calibration_active(enabled)
 
     def _manifest_input(self, graph_data, batch_size: int, device, dtype) -> torch.Tensor:
@@ -662,32 +739,63 @@ class TriModalRobustModel(nn.Module):
         manifest_x = self._manifest_input(graph_data, batch_size, device, dtype)
         manifest_emb = self.manifest_encoder(manifest_x)
 
-        api_joint_mask = self._availability_mask(
+        api_available = self._availability_mask(
             graph_data, "api_alive", "q_api", batch_size, device, dtype
         )
-        graph_joint_mask = self._availability_mask(
+        graph_available = self._availability_mask(
             graph_data, "graph_alive", "q_graph", batch_size, device, dtype
         )
-        manifest_joint_mask = self._availability_mask(
+        manifest_available = self._availability_mask(
             graph_data, "manifest_alive", "q_manifest", batch_size, device, dtype
         )
-        api_emb_for_joint = api_emb * api_joint_mask
-        graph_emb_for_joint = graph_emb * graph_joint_mask
-        manifest_emb_for_joint = manifest_emb * manifest_joint_mask
-
-        joint_input = torch.cat([api_emb_for_joint, graph_emb_for_joint, manifest_emb_for_joint], dim=-1)
         api_logits = self.api_head(api_emb)
         graph_logits = self.graph_head(graph_emb)
         manifest_logits = self.manifest_head(manifest_emb)
-        joint_emb = self.joint_encoder(joint_input)
-        joint_logits = self.joint_head(joint_emb)
 
         extra = {
             "api_logits_aux": api_logits,
             "graph_logits_aux": graph_logits,
             "manifest_logits_aux": manifest_logits,
-            "joint_logits_aux": joint_logits,
         }
+
+        fusion_tensors = {
+            "api_logits": api_logits,
+            "graph_logits": graph_logits,
+            "manifest_logits": manifest_logits,
+            "api_emb": api_emb,
+            "graph_emb": graph_emb,
+            "manifest_emb": manifest_emb,
+            "graph_data": graph_data,
+        }
+        concat_features: dict[str, torch.Tensor] = {}
+        if self.fusion_mode in API_GRAPH_CONCAT_FUSION_MODES:
+            api_emb_for_concat = api_emb * api_available
+            graph_emb_for_concat = graph_emb * graph_available
+            concat_features = {
+                "api_emb_for_concat": api_emb_for_concat,
+                "graph_emb_for_concat": graph_emb_for_concat,
+                "api_graph_concat_input": torch.cat(
+                    [api_emb_for_concat, graph_emb_for_concat], dim=-1
+                ),
+            }
+        elif self.fusion_mode in TRI_MODAL_CONCAT_FUSION_MODES:
+            api_emb_for_concat = api_emb * api_available
+            graph_emb_for_concat = graph_emb * graph_available
+            manifest_emb_for_concat = manifest_emb * manifest_available
+            concat_features = {
+                "api_emb_for_concat": api_emb_for_concat,
+                "graph_emb_for_concat": graph_emb_for_concat,
+                "manifest_emb_for_concat": manifest_emb_for_concat,
+                "tri_modal_concat_input": torch.cat(
+                    [
+                        api_emb_for_concat,
+                        graph_emb_for_concat,
+                        manifest_emb_for_concat,
+                    ],
+                    dim=-1,
+                ),
+            }
+        fusion_tensors.update(concat_features)
 
         handler = FUSION_DISPATCH[self.fusion_mode]
         logits, gate_weights, extra = handler(
@@ -695,22 +803,26 @@ class TriModalRobustModel(nn.Module):
             batch_size,
             device,
             dtype,
-            {
-                "api_logits": api_logits,
-                "graph_logits": graph_logits,
-                "manifest_logits": manifest_logits,
-                "joint_logits": joint_logits,
-                "api_emb": api_emb,
-                "graph_emb": graph_emb,
-                "manifest_emb": manifest_emb,
-                "api_emb_for_joint": api_emb_for_joint,
-                "graph_emb_for_joint": graph_emb_for_joint,
-                "manifest_emb_for_joint": manifest_emb_for_joint,
-                "joint_input": joint_input,
-                "graph_data": graph_data,
-            },
+            fusion_tensors,
             extra,
         )
+
+        primary_available = torch.cat(
+            [api_available, graph_available, manifest_available], dim=-1
+        ).bool()
+        if self.fusion_mode in {"api", "api_only"}:
+            selective_eligible = primary_available[:, 0]
+        elif self.fusion_mode in {"graph", "graph_only"}:
+            selective_eligible = primary_available[:, 1]
+        elif self.fusion_mode in {"manifest", "manifest_only"}:
+            selective_eligible = primary_available[:, 2]
+        elif self.fusion_mode in {"api_graph", "api_graph_concat"}:
+            selective_eligible = primary_available[:, :2].any(dim=-1)
+        else:
+            selective_eligible = primary_available.any(dim=-1)
+        # Explicitly describe availability of the branches consumed by this
+        # fusion mode. Evaluation must not infer it from unrelated live inputs.
+        extra["selective_eligible"] = selective_eligible
 
         extra["gate_weights_train"] = gate_weights
         extra["gate_weights"] = gate_weights.detach()
@@ -722,7 +834,6 @@ class TriModalRobustModel(nn.Module):
                 api_logits,
                 graph_logits,
                 manifest_logits,
-                joint_logits,
                 api_emb,
                 graph_emb,
                 manifest_emb,
@@ -737,9 +848,6 @@ class TriModalRobustModel(nn.Module):
             extra["api_emb"] = api_emb
             extra["graph_emb"] = graph_emb
             extra["manifest_emb"] = manifest_emb
-            extra["api_emb_for_joint"] = api_emb_for_joint
-            extra["graph_emb_for_joint"] = graph_emb_for_joint
-            extra["manifest_emb_for_joint"] = manifest_emb_for_joint
-            extra["joint_emb"] = joint_emb
+            extra.update(concat_features)
 
         return logits, extra

@@ -13,8 +13,8 @@
 <text x="635.0" y="180.62" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="28" font-weight="600" fill="#111111">Dempster规则</text>
 <text x="635.0" y="218.42000000000002" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="28" font-weight="400" fill="#111111">归一化非冲突证据</text>
 <rect x="470" y="355" width="330" height="150" rx="8" fill="#FFFFFF" stroke="#333333" stroke-width="2"/>
-<text x="635.0" y="420.62" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="28" font-weight="600" fill="#111111">Yager规则</text>
-<text x="635.0" y="458.42" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="28" font-weight="400" fill="#111111">冲突计入不确定性</text>
+<text x="635.0" y="420.62" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="28" font-weight="600" fill="#111111">条件意见路由</text>
+<text x="635.0" y="458.42" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="28" font-weight="400" fill="#111111">学习样本级路由权重</text>
 <polyline points="400,290 400,190 460,190" fill="none" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
 <polyline points="400,290 400,430 460,430" fill="none" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
 <rect x="920" y="115" width="330" height="150" rx="8" fill="#F4F4F4" stroke="#333333" stroke-width="2"/>
@@ -27,6 +27,6 @@
 <line x1="800" y1="430" x2="910" y2="430" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
 <rect x="1360" y="355" width="180" height="150" rx="8" fill="#EDEDED" stroke="#333333" stroke-width="2"/>
 <text x="1450.0" y="420.62" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="28" font-weight="600" fill="#111111">本文采用</text>
-<text x="1450.0" y="458.42" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="28" font-weight="400" fill="#111111">Yager规则</text>
+<text x="1450.0" y="458.42" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="28" font-weight="400" fill="#111111">条件意见路由</text>
 <line x1="1250" y1="430" x2="1350" y2="430" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
 </svg>

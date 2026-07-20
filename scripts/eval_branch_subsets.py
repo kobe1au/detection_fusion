@@ -31,8 +31,6 @@ from fusion.train import (
     load_config,
     select_device,
     set_seed,
-    apply_branch_competence_prior,
-    apply_model_visible_integrity_reference,
 )
 
 
@@ -40,22 +38,18 @@ BRANCH_LOGIT_KEYS = {
     "api": "api_logits_aux",
     "graph": "graph_logits_aux",
     "manifest": "manifest_logits_aux",
-    "joint": "joint_logits_aux",
 }
 
 DEFAULT_VARIANTS: dict[str, tuple[str, ...]] = {
-    "full_original": ("api", "graph", "manifest", "joint"),
+    "full_original": ("api", "graph", "manifest"),
     "api_only": ("api",),
     "graph_only": ("graph",),
     "manifest_only": ("manifest",),
-    "joint_only": ("joint",),
-    "api_joint": ("api", "joint"),
     "api_manifest": ("api", "manifest"),
     "api_graph": ("api", "graph"),
-    "no_api": ("graph", "manifest", "joint"),
-    "no_graph": ("api", "manifest", "joint"),
-    "no_manifest": ("api", "graph", "joint"),
-    "no_joint": ("api", "graph", "manifest"),
+    "no_api": ("graph", "manifest"),
+    "no_graph": ("api", "manifest"),
+    "no_manifest": ("api", "graph"),
 }
 
 
@@ -233,6 +227,18 @@ class BranchSubsetWrapper(nn.Module):
         extra["acceptance_score"] = acceptance
         extra["total_reliability"] = total_reliability
         extra["final_uncertainty_proxy"] = uncertainty
+        primary_alive: dict[str, torch.Tensor] = {}
+        for branch in ("api", "graph", "manifest"):
+            value = extra.get(f"{branch}_alive")
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(
+                    f"Branch-subset evaluation requires {branch}_alive diagnostics"
+                )
+            primary_alive[branch] = value.view(-1).to(device=ref.device) > 0.0
+        extra["selective_eligible"] = torch.stack(
+            [primary_alive[branch] for branch in self.keep_branches],
+            dim=-1,
+        ).any(dim=-1)
         for index, branch in enumerate(BRANCH_NAMES):
             extra[f"fusion_weight_{branch}"] = weights[:, index]
         return final_logits, extra
@@ -241,7 +247,7 @@ class BranchSubsetWrapper(nn.Module):
 def _parse_variant(raw: str) -> tuple[str, tuple[str, ...]]:
     if "=" not in raw:
         if raw not in DEFAULT_VARIANTS:
-            raise ValueError(f"Unknown variant {raw!r}; use NAME=api,joint for custom subsets")
+            raise ValueError(f"Unknown variant {raw!r}; use NAME=api,graph for custom subsets")
         return raw, DEFAULT_VARIANTS[raw]
     name, branches = raw.split("=", 1)
     name = name.strip()
@@ -252,17 +258,16 @@ def _parse_variant(raw: str) -> tuple[str, tuple[str, ...]]:
 
 
 def _load_checkpoint_model(cfg: dict, checkpoint_path: Path, device: torch.device):
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    checkpoint_cfg = (ckpt.get("cfg") or ckpt.get("config")) if isinstance(ckpt, dict) else None
-    model_cfg = _copy_runtime_paths(checkpoint_cfg, cfg) if isinstance(checkpoint_cfg, dict) else cfg
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(ckpt, dict) or not isinstance(ckpt.get("cfg"), dict):
+        raise ValueError(
+            "The checkpoint must use the current schema and contain a cfg mapping"
+        )
+    model_cfg = _copy_runtime_paths(ckpt["cfg"], cfg)
     train_ds = build_dataset(model_cfg, "train", is_train=False)
     feature_dim = int(train_ds.feature_dim)
     model = build_model(model_cfg, feature_dim).to(device)
     model.load_state_dict(ckpt["model"])
-    branch_competence_summary = dict(ckpt.get("branch_competence_prior") or {"enabled": False})
-    apply_branch_competence_prior(model, branch_competence_summary)
-    visible_integrity_summary = dict(ckpt.get("model_visible_integrity_reference") or {"enabled": False})
-    apply_model_visible_integrity_reference(model, visible_integrity_summary)
     model.eval()
     return model, model_cfg, ckpt
 
@@ -308,14 +313,18 @@ def main() -> None:
     )
     parser.add_argument("--config", required=True, help="Base experiment YAML.")
     parser.add_argument("--extra-config", action="append", default=[], help="Optional override YAML, e.g. _autodl_paths.yaml.")
-    parser.add_argument("--checkpoint", required=True, help="Path to best_tri_modal_robust.pt.")
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Path to a current pipeline-fitted checkpoint.",
+    )
     parser.add_argument("--split", default="test", choices=["val", "test"], help="Dataset split to evaluate.")
     parser.add_argument("--output-dir", default="results/branch_subset_diagnostics")
     parser.add_argument(
         "--variant",
         action="append",
         default=[],
-        help="Variant name or custom NAME=api,joint. Defaults to a standard diagnostic suite.",
+        help="Variant name or custom NAME=api,graph. Defaults to a standard diagnostic suite.",
     )
     parser.add_argument("--weight-mode", default="renorm", choices=["renorm", "uniform"])
     parser.add_argument("--robust", action="store_true", help="Also evaluate configured perturbation scenarios.")

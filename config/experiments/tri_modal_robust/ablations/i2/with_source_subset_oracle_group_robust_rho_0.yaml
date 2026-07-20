@@ -1,0 +1,17 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i2_with_source_subset_oracle_group_robust_rho_0
+
+train:
+  exp_name: i2_with_source_subset_oracle_group_robust_rho_0
+
+fusion:
+  routing:
+    # Source-subset add-on without the soft-worst term: the fourth cell of the
+    # optional oracle x group-robust 2x2 sensitivity experiment.
+    subset_oracle_loss_weight: 0.25
+    subset_oracle_temperature: 0.25
+    group_robust_objective:
+      soft_worst_weight: 0.0

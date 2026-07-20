@@ -120,7 +120,7 @@ def main() -> None:
         "conformal_selective_risk",
         "conformal_empirical_coverage_benign",
         "conformal_empirical_coverage_malware",
-        "conformal_malware_fn_after_rejection",
+        "conformal_accepted_fn_risk_among_malware",
     ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8", newline="") as f:
@@ -151,8 +151,8 @@ def main() -> None:
                     "conformal_empirical_coverage_malware": metrics.get(
                         "conformal_empirical_coverage_malware", float("nan")
                     ),
-                    "conformal_malware_fn_after_rejection": metrics.get(
-                        "conformal_malware_fn_after_rejection", float("nan")
+                    "conformal_accepted_fn_risk_among_malware": metrics.get(
+                        "conformal_accepted_fn_risk_among_malware", float("nan")
                     ),
                 }
             )

@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 from torch_geometric.data import Data
 
+import fusion.evidence as evidence_module
 from fusion.constants import EvidenceIndex
 from fusion.dataset import FatalDatasetConfigError, RobustTriModalDataset
 from fusion.evidence import build_evidence
@@ -67,14 +68,13 @@ def _old_list_pt(tmp_path: Path, sid: str = "sample") -> tuple[Path, Path]:
 
 def test_observable_schema_strict_missing_fields(tmp_path: Path):
     pt_dir, csv_path = _old_list_pt(tmp_path, "strict_missing")
-    dataset = RobustTriModalDataset(
-        str(pt_dir),
-        str(csv_path),
-        is_train=False,
-        manifest_dim=16,
-    )
     with pytest.raises(FatalDatasetConfigError, match="top-level mapping"):
-        dataset[0]
+        RobustTriModalDataset(
+            str(pt_dir),
+            str(csv_path),
+            is_train=False,
+            manifest_dim=16,
+        )
 
 
 def test_observable_schema_strict_accepts_complete_merged_payload(tmp_path: Path):
@@ -123,7 +123,7 @@ def test_observable_schema_strict_accepts_complete_merged_payload(tmp_path: Path
             "graph_largest_component_ratio": 1.0,
             "schema_version": OBSERVABLE_SCHEMA_VERSION,
         },
-        "direct_build_meta": {"dex_success_ratio": 1.0},
+        "direct_build_meta": {"dex_success_ratio": 1.0, "sha256": sid},
     }
     manifest_payload = {
         "manifest_x": torch.ones(16),
@@ -134,7 +134,7 @@ def test_observable_schema_strict_accepts_complete_merged_payload(tmp_path: Path
         "manifest_permission_category_map": torch.zeros((1, 12)),
         "manifest_intent_category_map": torch.zeros((1, 12)),
         "manifest_stats": torch.ones(11),
-        "manifest_meta": {},
+        "manifest_meta": {"sha256": sid},
         "manifest_permission_dim": 1,
         "manifest_intent_dim": 1,
         "manifest_feature_dim": 0,
@@ -177,7 +177,7 @@ def test_observable_schema_strict_accepts_complete_merged_payload(tmp_path: Path
 def test_current_schema_rejects_list_payload_even_with_nested_metadata(tmp_path: Path):
     pt_dir, csv_path = _old_list_pt(tmp_path, "nested_old")
     path = pt_dir / "nested_old.pt"
-    raw = torch.load(path, map_location="cpu", weights_only=False)
+    raw = torch.load(path, map_location="cpu", weights_only=True)
     nested = {key: 0 for key in OBSERVABLE_REQUIRED_FIELDS}
     nested.update(
         {
@@ -189,14 +189,13 @@ def test_current_schema_rejects_list_payload_even_with_nested_metadata(tmp_path:
     )
     raw[0]["observable_metadata"] = nested
     torch.save(raw, path)
-    dataset = RobustTriModalDataset(
-        str(pt_dir),
-        str(csv_path),
-        is_train=False,
-        manifest_dim=16,
-    )
     with pytest.raises(FatalDatasetConfigError, match="top-level mapping"):
-        dataset[0]
+        RobustTriModalDataset(
+            str(pt_dir),
+            str(csv_path),
+            is_train=False,
+            manifest_dim=16,
+        )
 
 
 def test_api_integrity_parse_failed_low():
@@ -497,7 +496,6 @@ def test_main_evidence_excludes_perturbation_fields():
         logits,
         logits,
         logits,
-        logits,
         emb,
         emb,
         emb,
@@ -513,7 +511,6 @@ def test_main_evidence_excludes_perturbation_fields():
         logits,
         logits,
         logits,
-        logits,
         emb,
         emb,
         emb,
@@ -521,6 +518,37 @@ def test_main_evidence_excludes_perturbation_fields():
         use_conflict_evidence=True,
     )
     assert torch.equal(before, after)
+
+
+def test_materialized_manifest_relations_skip_fallback_recomputation(monkeypatch):
+    data = _evidence_data()
+    logits = torch.zeros(1, 2)
+    emb = torch.zeros(1, 4)
+
+    def _unexpected_fallback(*_args, **_kwargs):
+        raise AssertionError("materialized observable relations must not be recomputed")
+
+    monkeypatch.setattr(
+        evidence_module,
+        "_fallback_manifest_signals",
+        _unexpected_fallback,
+    )
+    evidence, diagnostics = build_evidence(
+        data,
+        logits,
+        logits,
+        logits,
+        emb,
+        emb,
+        emb,
+        use_consistency_evidence=True,
+        use_conflict_evidence=True,
+    )
+
+    assert evidence[0, EvidenceIndex.MANIFEST_CODE_SUPPORT].item() == pytest.approx(
+        0.4
+    )
+    assert diagnostics["manifest_to_code_conflict"].item() == pytest.approx(0.2)
 
 
 def test_api_visibility_uses_runtime_encoder_coverage_only():
@@ -533,7 +561,6 @@ def test_api_visibility_uses_runtime_encoder_coverage_only():
 
     evidence, diagnostics = build_evidence(
         data,
-        logits,
         logits,
         logits,
         logits,
@@ -595,7 +622,6 @@ def test_api_graph_anchor_support_not_named_consistency():
     emb = torch.zeros(1, 4)
     _, diagnostics = build_evidence(
         data,
-        logits,
         logits,
         logits,
         logits,

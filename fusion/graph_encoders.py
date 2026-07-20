@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import Optional
 
 import torch
@@ -7,6 +8,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, GCNConv
 from torch_geometric.utils import softmax
+
+
+_IMPLICIT_ENCODER_TRUNCATION_WARNED = False
+
+
+def _warn_implicit_encoder_truncation_once(max_nodes: int) -> None:
+    """Warn once when the encoder, rather than the dataset, owns truncation."""
+    global _IMPLICIT_ENCODER_TRUNCATION_WARNED
+    if _IMPLICIT_ENCODER_TRUNCATION_WARNED:
+        return
+    _IMPLICIT_ENCODER_TRUNCATION_WARNED = True
+    warnings.warn(
+        "Graph input exceeded encoder max_nodes="
+        f"{int(max_nodes)} without graph_encoder_budget_max_nodes metadata; "
+        "the encoder is truncating implicitly, so dataset-side graph "
+        "coverage/integrity accounting cannot reflect the removed nodes. "
+        "Configure one shared dataset/encoder graph budget. This warning is "
+        "emitted once per process.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,6 +56,10 @@ def _recover_truncated_sensitive_mask(data, keep_local_parts) -> Optional[torch.
         return None
     if sensitive_mask.numel() != data.x.size(0):
         return None
+    if keep_local_parts is None:
+        # ``None`` is the identity-truncation sentinel. Preserve the exact
+        # original mask instead of rebuilding it through per-graph indices.
+        return sensitive_mask
 
     batch = getattr(data, "batch", None)
     if batch is None:
@@ -143,6 +169,62 @@ def _filter_edges(edge_index: torch.Tensor, keep_global: torch.Tensor,
     return torch.stack([src[valid], dst[valid]], dim=0)
 
 
+def _has_prevalidated_graph_budget_contract(
+    data,
+    *,
+    batch: torch.Tensor,
+    num_nodes_total: int,
+    max_nodes: int,
+) -> bool:
+    """Validate the CPU collate proof used by the no-truncation fast path."""
+    contract = getattr(data, "graph_encoder_budget_contract", None)
+    if contract is None:
+        return False
+    if (
+        not isinstance(contract, (tuple, list))
+        or len(contract) != 3
+        or contract[0] != 1
+        or isinstance(contract[1], bool)
+        or not isinstance(contract[1], int)
+        or not isinstance(contract[2], (tuple, list))
+    ):
+        raise RuntimeError("Malformed graph_encoder_budget_contract metadata")
+
+    dataset_budget = int(contract[1])
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in contract[2]
+    ):
+        raise RuntimeError("Malformed graph_encoder_budget_contract graph sizes")
+    graph_sizes = tuple(contract[2])
+    if dataset_budget <= 0 or not graph_sizes or any(size < 0 for size in graph_sizes):
+        raise RuntimeError("Malformed graph_encoder_budget_contract values")
+    if dataset_budget != int(max_nodes):
+        raise ValueError(
+            "Dataset graph budget and encoder max_nodes must match to avoid "
+            f"double truncation: dataset={[dataset_budget]}, encoder={int(max_nodes)}"
+        )
+    violated = [idx for idx, size in enumerate(graph_sizes) if size > dataset_budget]
+    if violated:
+        raise RuntimeError(
+            "Dataset graph-budget contract was violated before the encoder: "
+            f"graphs={violated}, sizes={[graph_sizes[idx] for idx in violated]}, "
+            f"budget={int(max_nodes)}"
+        )
+
+    expected_nodes = sum(graph_sizes)
+    ptr = getattr(data, "ptr", None)
+    if isinstance(ptr, torch.Tensor) and ptr.numel() != len(graph_sizes) + 1:
+        raise RuntimeError(
+            "Dataset graph-budget contract graph count no longer matches the batch"
+        )
+    if expected_nodes != int(num_nodes_total) or batch.numel() != num_nodes_total:
+        raise RuntimeError(
+            "Dataset graph-budget contract node counts no longer match the batch"
+        )
+    return True
+
+
 def truncate_per_graph(data, max_nodes: int, use_behavior_hint: bool = False):
     """Sensitive-node-priority truncation (vectorised)."""
     batch = getattr(data, "batch", None)
@@ -153,14 +235,51 @@ def truncate_per_graph(data, max_nodes: int, use_behavior_hint: bool = False):
     if num_nodes_total == 0:
         return data.x, data.edge_index, batch, []
 
+    if _has_prevalidated_graph_budget_contract(
+        data,
+        batch=batch,
+        num_nodes_total=num_nodes_total,
+        max_nodes=max_nodes,
+    ):
+        # The Dataset already applied this exact per-graph budget and collate
+        # verified every graph size on CPU. ``None`` denotes identity selection.
+        return data.x, data.edge_index, batch, None
+
     num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
     device = data.x.device
     graph_sizes = torch.bincount(batch, minlength=num_graphs)
 
+    dataset_budget = getattr(data, "graph_encoder_budget_max_nodes", None)
+    if isinstance(dataset_budget, torch.Tensor):
+        dataset_budget = dataset_budget.detach().to(device=device).long().view(-1)
+        if dataset_budget.numel() == 1 and num_graphs > 1:
+            dataset_budget = dataset_budget.expand(num_graphs)
+        elif dataset_budget.numel() != num_graphs:
+            raise RuntimeError(
+                "graph_encoder_budget_max_nodes must contain one value per graph; "
+                f"got {dataset_budget.numel()} values for {num_graphs} graphs"
+            )
+        budgeted = dataset_budget > 0
+        if budgeted.any() and (dataset_budget[budgeted] != int(max_nodes)).any():
+            configured = sorted(set(dataset_budget[budgeted].cpu().tolist()))
+            raise ValueError(
+                "Dataset graph budget and encoder max_nodes must match to avoid "
+                f"double truncation: dataset={configured}, encoder={int(max_nodes)}"
+            )
+        violated = budgeted & (graph_sizes > dataset_budget)
+        if violated.any():
+            graph_ids = torch.where(violated)[0].cpu().tolist()
+            raise RuntimeError(
+                "Dataset graph-budget contract was violated before the encoder: "
+                f"graphs={graph_ids}, sizes={graph_sizes[violated].cpu().tolist()}, "
+                f"budget={int(max_nodes)}"
+            )
+
     if graph_sizes.max().item() <= max_nodes:
-        keep_local_parts = [torch.arange(graph_sizes[g].item(), device=device)
-                            for g in range(num_graphs)]
-        return data.x, data.edge_index, batch, keep_local_parts
+        return data.x, data.edge_index, batch, None
+
+    if not isinstance(dataset_budget, torch.Tensor):
+        _warn_implicit_encoder_truncation_once(max_nodes)
 
     # Intrinsic, modality-independent priority: keep sensitive method nodes
     # first (sensitivity is a property of the method itself). We deliberately do
@@ -221,6 +340,12 @@ def _empty_graph_forward(data, batch, keep_local_parts, out_dim: int):
 
 def _num_graphs_from_batch(batch, data) -> int:
     """Return the number of graphs from a PyG batch tensor."""
+    ptr = getattr(data, "ptr", None)
+    if isinstance(ptr, torch.Tensor) and ptr.numel() > 0:
+        return int(ptr.numel() - 1)
+    declared = getattr(data, "num_graphs", None)
+    if isinstance(declared, int) and declared > 0:
+        return declared
     if batch is not None and batch.numel() > 0:
         return int(batch.max().item()) + 1
     return int(getattr(data, "num_graphs", 1))
@@ -260,7 +385,13 @@ class GraphEncoderGAT(nn.Module):
         for conv, norm in zip(self.gat_layers, self.norm_layers):
             h = norm(F.elu(conv(h, edge_index)))
         num_graphs = _num_graphs_from_batch(batch, data)
-        sensitive_mask = _recover_truncated_sensitive_mask(data, keep_local_parts)
+        sensitive_mask = None
+        if self.use_behavior_hint:
+            sensitive_mask = (
+                getattr(data, "sensitive_mask", None)
+                if keep_local_parts is None
+                else _recover_truncated_sensitive_mask(data, keep_local_parts)
+            )
         graph_emb = self.readout(h, batch, num_graphs, sensitive_mask)
         return h, graph_emb, batch, keep_local_parts
 class GraphEncoderGCN(nn.Module):
@@ -284,6 +415,12 @@ class GraphEncoderGCN(nn.Module):
         h = self.norm1(F.elu(self.gcn1(h, edge_index)))
         h = self.norm2(F.elu(self.gcn2(h, edge_index)))
         num_graphs = _num_graphs_from_batch(batch, data)
-        sensitive_mask = _recover_truncated_sensitive_mask(data, keep_local_parts)
+        sensitive_mask = None
+        if self.use_behavior_hint:
+            sensitive_mask = (
+                getattr(data, "sensitive_mask", None)
+                if keep_local_parts is None
+                else _recover_truncated_sensitive_mask(data, keep_local_parts)
+            )
         graph_emb = self.readout(h, batch, num_graphs, sensitive_mask)
         return h, graph_emb, batch, keep_local_parts

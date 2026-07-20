@@ -1,0 +1,14 @@
+defaults:
+  - ../ablations/i2/router_prior_only.yaml
+
+method:
+  name: appendix_odds_prior_beta_0_5
+  protocol_id: odds_prior_beta0p5
+
+train:
+  exp_name: appendix_odds_prior_beta_0_5
+
+fusion:
+  routing:
+    # Fixed sensitivity only: prior_only never optimizes beta.
+    fixed_prior_beta: 0.5

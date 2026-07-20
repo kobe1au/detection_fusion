@@ -573,14 +573,11 @@ def refresh_observable_signals(data: dict[str, Any]) -> None:
             "q_graph": graph_integrity,
             "q_manifest": manifest_integrity,
             "q_align": anchor,
-            "r_api": api_integrity,
-            "r_graph": graph_integrity,
-            "r_manifest": manifest_integrity,
         }
     )
 
 
-# Legacy quality helpers retained for explicit baseline/compatibility runs.
+# Scalar construction helpers used while materialising the runtime sample.
 def compute_api_quality(api_ids, api_type_ids=None, api_in_graph_mask=None) -> float:
     if not isinstance(api_ids, torch.Tensor):
         return 0.0
@@ -634,29 +631,3 @@ def compute_align_quality(
     return compute_api_graph_anchor_support(
         method_api_edge_index, num_api, num_nodes, num_storage_nodes
     )
-
-
-def compute_manifest_quality(manifest_x, manifest_category_counts=None, manifest_stats=None, manifest_meta=None) -> float:
-    meta = manifest_meta if isinstance(manifest_meta, dict) else {}
-    if meta.get("parse_error"):
-        return 0.0
-    stored = meta.get("quality_score")
-    if stored is not None:
-        return clamp01(scalar_float(stored, 0.0))
-    return 1.0 if any(isinstance(v, torch.Tensor) and v.numel() > 0 for v in (manifest_x, manifest_category_counts, manifest_stats)) else 0.0
-
-
-def refresh_api_quality(data: dict) -> None:
-    refresh_observable_signals(data)
-
-
-def refresh_graph_quality(data: dict) -> None:
-    refresh_observable_signals(data)
-
-
-def refresh_align_quality(data: dict) -> None:
-    refresh_observable_signals(data)
-
-
-def refresh_code_quality(data: dict) -> None:
-    refresh_observable_signals(data)

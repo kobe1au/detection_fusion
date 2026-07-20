@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
-import warnings
+import math
+import numbers
 from contextlib import nullcontext
+from decimal import Decimal, InvalidOperation
 
 import torch
 
@@ -29,6 +31,38 @@ def clamp01(x: float) -> float:
 
 def clamp_strength(strength: float) -> float:
     return max(0.0, min(1.0, float(strength)))
+
+
+def strict_finite_integer(value, *, field_name: str) -> int:
+    """Parse an integer without silently truncating floats or booleans."""
+    if isinstance(value, bool) or type(value).__name__ == "bool_":
+        raise ValueError(f"{field_name} must be a finite integer, got boolean {value!r}")
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Rational):
+        if value.denominator == 1:
+            return int(value)
+        raise ValueError(f"{field_name} must be a finite integer, got {value!r}")
+    if isinstance(value, numbers.Real):
+        numeric = float(value)
+        if math.isfinite(numeric) and numeric.is_integer():
+            return int(numeric)
+        raise ValueError(f"{field_name} must be a finite integer, got {value!r}")
+    try:
+        numeric = Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite integer, got {value!r}") from exc
+    if not numeric.is_finite() or numeric != numeric.to_integral_value():
+        raise ValueError(f"{field_name} must be a finite integer, got {value!r}")
+    return int(numeric)
+
+
+def strict_binary_integer(value, *, field_name: str = "label") -> int:
+    """Parse the project's binary label contract without lossy coercion."""
+    parsed = strict_finite_integer(value, field_name=field_name)
+    if parsed not in {0, 1}:
+        raise ValueError(f"{field_name} must be binary (0 or 1), got {value!r}")
+    return parsed
 
 
 # ── AMP helpers ───────────────────────────────────────────────────────

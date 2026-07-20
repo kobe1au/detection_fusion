@@ -1,0 +1,26 @@
+defaults:
+  - ../baselines/trusted/ecml_style_adapted.yaml
+
+method:
+  name: natural_subset_ecml_style_adapted_eval
+
+eval:
+  eval_only: true
+  output_name: natural_subset_ecml_style_adapted_eval
+  checkpoint_path: results/tri_modal_robust/baseline_ecml_style_adapted/42/best_tri_modal_robust.pt
+  refit_decision_calibration: false
+  run_test: false
+  run_robust_test: false
+  extra_sets:
+    - name: natural_api_low_effective_integrity
+      csv: labels/natural_subsets/test_api_low_effective_integrity.csv
+      allow_pt_superset: true
+      skip_if_empty: false
+    - name: natural_api_graph_low_support
+      csv: labels/natural_subsets/test_api_graph_low_support.csv
+      allow_pt_superset: true
+      skip_if_empty: false
+    - name: natural_predictive_high_conflict
+      csv: labels/natural_subsets/test_predictive_high_conflict.csv
+      allow_pt_superset: true
+      skip_if_empty: false

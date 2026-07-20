@@ -9,13 +9,11 @@ train:
 
 fusion:
   # Fair no-I2 control: retain evidential branch opinions and I1 trust
-  # discounting, but replace the learned global router/unknown outcome with the
+  # discounting, but replace the learned route/risk components with the
   # same fixed cumulative opinion-fusion rule for every sample.
   combination: cumulative
   routing:
     enabled: false
-    use_fused_prediction_loss: false
-    final_temperature_scaling: false
-  branch_competence_prior:
-    # Keep I1 identical to the main method; only the fusion rule changes.
-    enabled: false
+    acceptance_score_mode: product
+    # Equal one-scalar output calibration across all opinion rules.
+    final_temperature_scaling: true

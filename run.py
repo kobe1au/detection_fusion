@@ -14,6 +14,14 @@ os.chdir(ROOT)
 
 PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
 CONFIG_DIR = Path("config/experiments/tri_modal_robust")
+# Only these directories participate in the formal experiment catalog.
+FORMAL_CONFIG_DIRS = {
+    "ablations",
+    "appendix",
+    "baselines",
+    "natural_subsets",
+    "seeds",
+}
 NATURAL_SUBSET_DIR = Path("labels/natural_subsets")
 NATURAL_SUBSET_SCHEMA_VERSION = 3
 NATURAL_SUBSET_FILES = (
@@ -23,8 +31,9 @@ NATURAL_SUBSET_FILES = (
     "test_low_acceptance.csv",
 )
 
-# Paper method: I1 calibrated branch-correctness reliability, I2 global opinion
-# routing with an explicit unknown mass, and I3 malware-FN risk control.
+# Paper method: I1 calibrated branch-correctness reliability, I2 conditional
+# modality routing plus threshold-aligned malware-FN risk, and I3 malware-FN
+# risk control.
 FINAL_TEMPLATE = "evidential_trusted_fusion.yaml"
 PRIMARY_SEED = "seeds/seed_42.yaml"
 
@@ -35,12 +44,13 @@ BASELINES = [
     "baselines/api_graph_concat.yaml",
     "baselines/tri_modal_concat.yaml",
     "baselines/fixed_logit_fusion.yaml",
+    "baselines/dense_embedding_gate_adapted.yaml",
 ]
 
 TRUSTED_FUSION_BASELINES = [
-    "baselines/trusted/tmc_style.yaml",
-    "baselines/trusted/qmf_style.yaml",
-    "baselines/trusted/ecml_style.yaml",
+    "baselines/trusted/tmc_style_adapted.yaml",
+    "baselines/trusted/qmf_energy.yaml",
+    "baselines/trusted/ecml_style_adapted.yaml",
 ]
 
 NATURAL_SUBSET_OURS_EVAL = [
@@ -54,19 +64,20 @@ NATURAL_SUBSET_BASELINE_EVAL = [
     "natural_subsets/api_graph_concat_eval.yaml",
     "natural_subsets/tri_modal_concat_eval.yaml",
     "natural_subsets/fixed_logit_fusion_eval.yaml",
+    "natural_subsets/dense_embedding_gate_adapted_eval.yaml",
 ]
 
 NATURAL_SUBSET_I2_EVAL = [
     "natural_subsets/dempster_eval.yaml",
     "natural_subsets/cumulative_eval.yaml",
     "natural_subsets/log_pool_eval.yaml",
-    "natural_subsets/ecml_style_eval.yaml",
+    "natural_subsets/conflict_weighted_opinion_eval.yaml",
 ]
 
 NATURAL_SUBSET_TRUSTED_EVAL = [
-    "natural_subsets/tmc_style_eval.yaml",
-    "natural_subsets/qmf_style_eval.yaml",
-    "natural_subsets/ecml_adapted_eval.yaml",
+    "natural_subsets/tmc_style_adapted_eval.yaml",
+    "natural_subsets/qmf_energy_eval.yaml",
+    "natural_subsets/ecml_style_adapted_eval.yaml",
 ]
 
 NATURAL_SUBSET_EVAL = [
@@ -78,50 +89,89 @@ NATURAL_SUBSET_EVAL = [
 
 MODULE_ABLATIONS = [
     "ablations/modules/no_reliability_discount.yaml",
-    "ablations/i2/router_prior_only.yaml",
-    "ablations/modules/no_i3_selective_rejection.yaml",
+    "ablations/modules/no_i2_learned_components.yaml",
+    "ablations/modules/no_i3_decision_layer.yaml",
 ]
 
 I1_ATOMIC_ABLATIONS = [
-    "ablations/i1/no_relation_evidence.yaml",
-    "ablations/i1/observable_only_reliability.yaml",
     "ablations/i1/no_model_visibility_feature.yaml",
-    "ablations/i1/no_visibility_modifier.yaml",
+    "ablations/i1/no_embedding_density.yaml",
+    "ablations/i1/no_prediction_margin.yaml",
+    "ablations/i1/no_predicted_class_intercept.yaml",
     "ablations/i1/no_learned_reliability_calibration.yaml",
-    "ablations/i1/no_integrity_weighted_aux.yaml",
+]
+
+I1_COMPARATORS = [
+    # Matched-budget simple comparator: same nested OOF identities/views as I1,
+    # but only one NLL-fitted scalar temperature per modality branch.
+    "ablations/i1/temperature_scaling_confidence.yaml",
 ]
 
 I2_ROUTER_ATOMIC_ABLATIONS = [
     "ablations/i2/router_prior_only.yaml",
-    "ablations/i2/router_known_only.yaml",
-    "ablations/i2/router_no_disagreement.yaml",
-    "ablations/i2/router_no_encoder_training.yaml",
-    "ablations/i2/router_no_posthoc_refine.yaml",
+    "ablations/i2/router_risk_prior.yaml",
+    "ablations/i2/router_no_route_conflict.yaml",
+    "ablations/i2/router_no_risk_conflict.yaml",
+]
+
+I2_SCENARIO_WEIGHT_ABLATIONS = [
+    "ablations/i2/scenario_weight_clean_0_70.yaml",
+    "ablations/i2/scenario_weight_clean_0_30.yaml",
+]
+
+I2_ROBUST_ROUTE_ABLATIONS = [
+    "ablations/i2/with_source_subset_oracle.yaml",
+    "ablations/i2/group_robust_rho_0.yaml",
+    "ablations/i2/with_source_subset_oracle_group_robust_rho_0.yaml",
+    "ablations/i2/no_pairwise_completeness_views.yaml",
+    "ablations/i2/group_robust_family_taxonomy.yaml",
+]
+
+I2_PRIOR_BETA_SENSITIVITY = [
+    "appendix/prior_beta_0_5.yaml",
+    # beta=1 is the already registered prior-only atomic cell.
+    "ablations/i2/router_prior_only.yaml",
+    "appendix/prior_beta_2_0.yaml",
 ]
 
 I2_RULE_ABLATIONS = [
     "ablations/i2/combination_dempster.yaml",
     "ablations/i2/combination_cumulative.yaml",
     "ablations/i2/combination_log_pool.yaml",
-    "ablations/i2/combination_ecml_style.yaml",
+    "ablations/i2/combination_conflict_weighted_opinion.yaml",
 ]
 
 I2_MECHANISM_ABLATIONS = [
     *I2_ROUTER_ATOMIC_ABLATIONS,
     *I2_RULE_ABLATIONS,
+    *I2_SCENARIO_WEIGHT_ABLATIONS,
+    *I2_ROBUST_ROUTE_ABLATIONS,
+]
+
+I3_ACCEPTANCE_SCORE_ABLATIONS = [
+    PRIMARY_SEED,
+    "ablations/i3/acceptance_pretrust_conflict.yaml",
+    "ablations/i3/acceptance_trusted_conflict.yaml",
+    "ablations/i3/acceptance_product.yaml",
+    "ablations/i3/acceptance_msp_risk_control.yaml",
+    "ablations/i3/acceptance_deployed_class_probability_risk_control.yaml",
 ]
 
 I3_MECHANISM_ABLATIONS = [
     "ablations/i3/class_conditional_conformal.yaml",
     "ablations/i3/marginal_conformal.yaml",
     "ablations/i3/conflict_augmented_conformal.yaml",
-    "ablations/i3/threshold_rejection.yaml",
+    "ablations/i3/deployed_class_probability_threshold.yaml",
+    "ablations/i3/msp_threshold.yaml",
     "ablations/i3/uncertainty_threshold.yaml",
     "ablations/i3/model_acceptance_threshold.yaml",
+    # fused_risk is the primary experiment; avoid re-running that reference.
+    *I3_ACCEPTANCE_SCORE_ABLATIONS[1:],
 ]
 
 MECHANISM_ABLATIONS = [
     *I1_ATOMIC_ABLATIONS,
+    *I1_COMPARATORS,
     *I2_MECHANISM_ABLATIONS,
     *I3_MECHANISM_ABLATIONS,
 ]
@@ -129,28 +179,16 @@ MECHANISM_ABLATIONS = [
 I1_I2_FACTORIAL = [
     PRIMARY_SEED,
     "ablations/modules/no_reliability_discount.yaml",
-    "ablations/i2/router_prior_only.yaml",
+    "ablations/modules/no_i2_learned_components.yaml",
     "ablations/factorial/i1_i2/i1_off_i2_off.yaml",
-]
-
-I3_FACTORIAL = [
-    # The primary seed is the on/on cell. Reuse its fitted pipeline rather than
-    # pulling an appendix sensitivity config into the paper ablation plan.
-    PRIMARY_SEED,
-    "ablations/factorial/i3/classification_off_risk_on.yaml",
-    "ablations/factorial/i3/classification_on_risk_off.yaml",
-    "ablations/modules/no_i3_selective_rejection.yaml",
 ]
 
 FACTORIAL_ABLATIONS = [
     *I1_I2_FACTORIAL,
-    # The complete method is the on/on cell of both matrices; execute it once.
-    *I3_FACTORIAL[1:],
 ]
 
 FACTORIAL_REMAINING = [
     *I1_I2_FACTORIAL[1:],
-    *I3_FACTORIAL[1:],
 ]
 
 TRAINING_ABLATIONS = [
@@ -160,124 +198,19 @@ TRAINING_ABLATIONS = [
     "ablations/training/no_edl_class_weight.yaml",
 ]
 
-EXTERNAL_EVAL = [
-    "external/obfuscapk_nop_eval.yaml",
-    "external/obfuscapk_goto_eval.yaml",
-    "external/obfuscapk_method_rename_eval.yaml",
-    "external/obfuscapk_string_eval.yaml",
-    "external/obfuscapk_combined_eval.yaml",
-    "external/obfuscapk_advanced_reflection_eval.yaml",
-    "external/obfuscapk_call_indirection_eval.yaml",
-    "external/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-]
-
-GRAPH_ONLY_OBFUSCAPK_EVAL = [
-    "graph_only_obfuscapk/obfuscapk_nop_eval.yaml",
-    "graph_only_obfuscapk/obfuscapk_goto_eval.yaml",
-    "graph_only_obfuscapk/obfuscapk_method_rename_eval.yaml",
-    "graph_only_obfuscapk/obfuscapk_string_eval.yaml",
-    "graph_only_obfuscapk/obfuscapk_combined_eval.yaml",
-    "graph_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "graph_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "graph_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-]
-
-API_ONLY_OBFUSCAPK_EVAL = [
-    "api_only_obfuscapk/obfuscapk_nop_eval.yaml",
-    "api_only_obfuscapk/obfuscapk_goto_eval.yaml",
-    "api_only_obfuscapk/obfuscapk_method_rename_eval.yaml",
-    "api_only_obfuscapk/obfuscapk_string_eval.yaml",
-    "api_only_obfuscapk/obfuscapk_combined_eval.yaml",
-    "api_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "api_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "api_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-]
-
-MANIFEST_ONLY_OBFUSCAPK_EVAL = [
-    "manifest_only_obfuscapk/obfuscapk_nop_eval.yaml",
-    "manifest_only_obfuscapk/obfuscapk_goto_eval.yaml",
-    "manifest_only_obfuscapk/obfuscapk_method_rename_eval.yaml",
-    "manifest_only_obfuscapk/obfuscapk_string_eval.yaml",
-    "manifest_only_obfuscapk/obfuscapk_combined_eval.yaml",
-    "manifest_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "manifest_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "manifest_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-]
-
-API_GRAPH_CONCAT_OBFUSCAPK_EVAL = [
-    "api_graph_concat_obfuscapk/obfuscapk_nop_eval.yaml",
-    "api_graph_concat_obfuscapk/obfuscapk_goto_eval.yaml",
-    "api_graph_concat_obfuscapk/obfuscapk_method_rename_eval.yaml",
-    "api_graph_concat_obfuscapk/obfuscapk_string_eval.yaml",
-    "api_graph_concat_obfuscapk/obfuscapk_combined_eval.yaml",
-    "api_graph_concat_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "api_graph_concat_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "api_graph_concat_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-]
-
-TRI_MODAL_CONCAT_OBFUSCAPK_EVAL = [
-    "tri_modal_concat_obfuscapk/obfuscapk_nop_eval.yaml",
-    "tri_modal_concat_obfuscapk/obfuscapk_goto_eval.yaml",
-    "tri_modal_concat_obfuscapk/obfuscapk_method_rename_eval.yaml",
-    "tri_modal_concat_obfuscapk/obfuscapk_string_eval.yaml",
-    "tri_modal_concat_obfuscapk/obfuscapk_combined_eval.yaml",
-    "tri_modal_concat_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "tri_modal_concat_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "tri_modal_concat_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-]
-
-FIXED_LOGIT_FUSION_OBFUSCAPK_EVAL = [
-    "fixed_logit_fusion_obfuscapk/obfuscapk_nop_eval.yaml",
-    "fixed_logit_fusion_obfuscapk/obfuscapk_goto_eval.yaml",
-    "fixed_logit_fusion_obfuscapk/obfuscapk_method_rename_eval.yaml",
-    "fixed_logit_fusion_obfuscapk/obfuscapk_string_eval.yaml",
-    "fixed_logit_fusion_obfuscapk/obfuscapk_combined_eval.yaml",
-    "fixed_logit_fusion_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "fixed_logit_fusion_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "fixed_logit_fusion_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-]
-
-BASELINE_OBFUSCAPK_EVAL = [
-    *API_ONLY_OBFUSCAPK_EVAL,
-    *GRAPH_ONLY_OBFUSCAPK_EVAL,
-    *MANIFEST_ONLY_OBFUSCAPK_EVAL,
-    *API_GRAPH_CONCAT_OBFUSCAPK_EVAL,
-    *TRI_MODAL_CONCAT_OBFUSCAPK_EVAL,
-    *FIXED_LOGIT_FUSION_OBFUSCAPK_EVAL,
-]
-
-EXTERNAL_OBFUSCAPK_NEW_EVAL = [
-    "external/obfuscapk_advanced_reflection_eval.yaml",
-    "external/obfuscapk_call_indirection_eval.yaml",
-    "external/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-]
-
-BASELINE_OBFUSCAPK_NEW_EVAL = [
-    "api_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "api_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "api_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-    "graph_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "graph_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "graph_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-    "manifest_only_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "manifest_only_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "manifest_only_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-    "api_graph_concat_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "api_graph_concat_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "api_graph_concat_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-    "tri_modal_concat_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "tri_modal_concat_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "tri_modal_concat_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-    "fixed_logit_fusion_obfuscapk/obfuscapk_advanced_reflection_eval.yaml",
-    "fixed_logit_fusion_obfuscapk/obfuscapk_call_indirection_eval.yaml",
-    "fixed_logit_fusion_obfuscapk/obfuscapk_mixed_api_graph_manifest_eval.yaml",
-]
-
 APPENDIX_SENSITIVITY = [
     "appendix/edl_weight_0_10.yaml",
+    # Canonical clean-only temperature scaling is separated from the
+    # matched-budget I1 comparator in the formal mechanism comparisons.
+    "ablations/i1/temperature_scaling_confidence_clean_only.yaml",
+    "appendix/prior_beta_0_5.yaml",
+    "appendix/prior_beta_2_0.yaml",
     "appendix/risk_level_0_03_eval.yaml",
     "appendix/risk_level_0_05_eval.yaml",
     "appendix/risk_level_0_10_eval.yaml",
+    # Binary entropy certainty is rank-equivalent to MSP; retain only as a
+    # numerical sanity check rather than a formal independent mechanism cell.
+    "ablations/i3/predictive_entropy_threshold.yaml",
 ]
 
 SEEDS = [
@@ -295,57 +228,85 @@ ALIASES = {
     "manifest": "baselines/manifest_only.yaml",
     "concat": "baselines/tri_modal_concat.yaml",
     "late": "baselines/fixed_logit_fusion.yaml",
+    "embedding_gate": "baselines/dense_embedding_gate_adapted.yaml",
     "no_i1": "ablations/modules/no_reliability_discount.yaml",
-    "no_i2": "ablations/i2/router_prior_only.yaml",
+    "no_i2": "ablations/modules/no_i2_learned_components.yaml",
     "no_i2_cumulative": "ablations/i2/combination_cumulative.yaml",
-    "no_i2_linear": "ablations/modules/no_i2_conflict_aware_fusion.yaml",
-    "no_i3": "ablations/modules/no_i3_selective_rejection.yaml",
-    "no_relation": "ablations/i1/no_relation_evidence.yaml",
-    "observable_only": "ablations/i1/observable_only_reliability.yaml",
+    "no_i3": "ablations/modules/no_i3_decision_layer.yaml",
     "no_model_visibility": "ablations/i1/no_model_visibility_feature.yaml",
-    "no_visibility_modifier": "ablations/i1/no_visibility_modifier.yaml",
+    "no_prediction_margin": "ablations/i1/no_prediction_margin.yaml",
+    "no_predicted_class_intercept": "ablations/i1/no_predicted_class_intercept.yaml",
     "no_learned_reliability": "ablations/i1/no_learned_reliability_calibration.yaml",
-    "no_integrity_aux": "ablations/i1/no_integrity_weighted_aux.yaml",
+    "i1_temperature": "ablations/i1/temperature_scaling_confidence.yaml",
+    "i1_temperature_clean": "ablations/i1/temperature_scaling_confidence_clean_only.yaml",
     "dempster": "ablations/i2/combination_dempster.yaml",
     "cumulative": "ablations/i2/combination_cumulative.yaml",
     "log_pool": "ablations/i2/combination_log_pool.yaml",
-    "ecml_style": "ablations/i2/combination_ecml_style.yaml",
+    "conflict_weighted_opinion": "ablations/i2/combination_conflict_weighted_opinion.yaml",
     "router_prior_only": "ablations/i2/router_prior_only.yaml",
-    "router_known_only": "ablations/i2/router_known_only.yaml",
-    "router_no_disagreement": "ablations/i2/router_no_disagreement.yaml",
-    "router_no_encoder_training": "ablations/i2/router_no_encoder_training.yaml",
-    "router_no_posthoc_refine": "ablations/i2/router_no_posthoc_refine.yaml",
+    "router_risk_prior": "ablations/i2/router_risk_prior.yaml",
+    "router_no_route_conflict": "ablations/i2/router_no_route_conflict.yaml",
+    "router_no_risk_conflict": "ablations/i2/router_no_risk_conflict.yaml",
+    "i2_weight_clean_070": "ablations/i2/scenario_weight_clean_0_70.yaml",
+    "i2_weight_clean_030": "ablations/i2/scenario_weight_clean_0_30.yaml",
+    "prior_beta_050": "appendix/prior_beta_0_5.yaml",
+    "prior_beta_100": "ablations/i2/router_prior_only.yaml",
+    "prior_beta_200": "appendix/prior_beta_2_0.yaml",
     "class_conditional_conformal": "ablations/i3/class_conditional_conformal.yaml",
     "marginal_conformal": "ablations/i3/marginal_conformal.yaml",
     "conflict_conformal": "ablations/i3/conflict_augmented_conformal.yaml",
-    "threshold_rejection": "ablations/i3/threshold_rejection.yaml",
+    "deployed_probability_threshold": "ablations/i3/deployed_class_probability_threshold.yaml",
+    "msp_threshold": "ablations/i3/msp_threshold.yaml",
+    "predictive_entropy_threshold": "ablations/i3/predictive_entropy_threshold.yaml",
     "uncertainty_threshold": "ablations/i3/uncertainty_threshold.yaml",
     "acceptance_threshold": "ablations/i3/model_acceptance_threshold.yaml",
+    "accept_risk": PRIMARY_SEED,
+    "accept_pretrust_conflict": "ablations/i3/acceptance_pretrust_conflict.yaml",
+    "accept_trusted_conflict": "ablations/i3/acceptance_trusted_conflict.yaml",
+    "accept_product": "ablations/i3/acceptance_product.yaml",
+    "accept_msp_crc": "ablations/i3/acceptance_msp_risk_control.yaml",
+    "accept_deployed_probability_crc": "ablations/i3/acceptance_deployed_class_probability_risk_control.yaml",
     "i1_on_i2_on": PRIMARY_SEED,
     "i1_off_i2_on": "ablations/modules/no_reliability_discount.yaml",
-    "i1_on_i2_off": "ablations/i2/router_prior_only.yaml",
+    "i1_on_i2_off": "ablations/modules/no_i2_learned_components.yaml",
     "i1_off_i2_off": "ablations/factorial/i1_i2/i1_off_i2_off.yaml",
-    "classification_on_risk_on": PRIMARY_SEED,
-    "classification_off_risk_on": "ablations/factorial/i3/classification_off_risk_on.yaml",
-    "classification_on_risk_off": "ablations/factorial/i3/classification_on_risk_off.yaml",
-    "classification_off_risk_off": "ablations/modules/no_i3_selective_rejection.yaml",
+    "i3_on": PRIMARY_SEED,
+    "i3_off": "ablations/modules/no_i3_decision_layer.yaml",
     "risk_03": "appendix/risk_level_0_03_eval.yaml",
     "risk_05": "appendix/risk_level_0_05_eval.yaml",
-    "posthoc_pilot": "appendix/refit_seed_42_posthoc.yaml",
-    "refit_seed_42": "appendix/refit_seed_42_posthoc.yaml",
-    "tmc_style": "baselines/trusted/tmc_style.yaml",
-    "qmf_style": "baselines/trusted/qmf_style.yaml",
-    "ecml_adapted": "baselines/trusted/ecml_style.yaml",
+    "tmc": "baselines/trusted/tmc_style_adapted.yaml",
+    "tmc_style_adapted": "baselines/trusted/tmc_style_adapted.yaml",
+    "qmf_energy": "baselines/trusted/qmf_energy.yaml",
+    "ecml": "baselines/trusted/ecml_style_adapted.yaml",
+    "ecml_style_adapted": "baselines/trusted/ecml_style_adapted.yaml",
     "no_edl_supervision": "ablations/training/no_edl_supervision.yaml",
     "natural_ours": "natural_subsets/ours_eval.yaml",
     "natural_dempster": "natural_subsets/dempster_eval.yaml",
     "natural_cumulative": "natural_subsets/cumulative_eval.yaml",
     "natural_log_pool": "natural_subsets/log_pool_eval.yaml",
-    "natural_ecml_style": "natural_subsets/ecml_style_eval.yaml",
-    "natural_tmc_style": "natural_subsets/tmc_style_eval.yaml",
-    "natural_qmf_style": "natural_subsets/qmf_style_eval.yaml",
-    "natural_ecml_adapted": "natural_subsets/ecml_adapted_eval.yaml",
+    "natural_conflict_weighted_opinion": "natural_subsets/conflict_weighted_opinion_eval.yaml",
+    "natural_embedding_gate": "natural_subsets/dense_embedding_gate_adapted_eval.yaml",
+    "natural_tmc": "natural_subsets/tmc_style_adapted_eval.yaml",
+    "natural_qmf_energy": "natural_subsets/qmf_energy_eval.yaml",
+    "natural_ecml": "natural_subsets/ecml_style_adapted_eval.yaml",
     "temp_eval": "seeds/temperature_scaling_false_eval.yaml",
+}
+
+# Old aliases named partial mechanisms as if they were complete literature
+# methods. Failing explicitly prevents old commands and checkpoints from being
+# silently reinterpreted under the current style-adapted baseline protocol.
+REMOVED_ALIASES = {
+    "tmc_faithful": "use 'tmc' (TMC-style adapted)",
+    "tmc_style": "use 'tmc' (TMC-style adapted)",
+    "qmf_style": "use 'qmf_energy' (energy-fusion component only)",
+    "ecml_faithful": "use 'ecml' (ECML-style adapted)",
+    "ecml_adapted": "use 'ecml' (ECML-style adapted) or 'conflict_weighted_opinion'",
+    "ecml_style": "use 'ecml' (ECML-style adapted) or 'conflict_weighted_opinion'",
+    "ecml_inspired": "use 'conflict_weighted_opinion'; this custom rule is not ECML",
+    "natural_tmc_style": "use 'natural_tmc'",
+    "natural_qmf_style": "use 'natural_qmf_energy'",
+    "natural_ecml_adapted": "use 'natural_ecml'",
+    "natural_ecml_style": "use 'natural_conflict_weighted_opinion'",
 }
 
 GROUPS = {
@@ -364,36 +325,21 @@ GROUPS = {
     "module": MODULE_ABLATIONS,
     "mechanism": MECHANISM_ABLATIONS,
     "i1_atomic": I1_ATOMIC_ABLATIONS,
+    "i1_comparator": I1_COMPARATORS,
+    "i1_comparators": I1_COMPARATORS,
     "i2_atomic": I2_ROUTER_ATOMIC_ABLATIONS,
     "i2_rules": I2_RULE_ABLATIONS,
+    "i2_scenario_weights": I2_SCENARIO_WEIGHT_ABLATIONS,
+    "i2_robust_route": I2_ROBUST_ROUTE_ABLATIONS,
+    "i2_prior_beta_sensitivity": I2_PRIOR_BETA_SENSITIVITY,
     "i2_mechanism": I2_MECHANISM_ABLATIONS,
     "i3_mechanism": I3_MECHANISM_ABLATIONS,
+    "i3_acceptance_score": I3_ACCEPTANCE_SCORE_ABLATIONS,
     "i1_i2_2x2": I1_I2_FACTORIAL,
     "i1_i2_factorial": I1_I2_FACTORIAL,
-    "i3_2x2": I3_FACTORIAL,
-    "i3_factorial": I3_FACTORIAL,
     "factorial": FACTORIAL_ABLATIONS,
     "factorial_remaining": FACTORIAL_REMAINING,
     "training_ablation": TRAINING_ABLATIONS,
-    "external": EXTERNAL_EVAL,
-    "obfuscapk": EXTERNAL_EVAL,
-    "external_new": EXTERNAL_OBFUSCAPK_NEW_EVAL,
-    "obfuscapk_new": EXTERNAL_OBFUSCAPK_NEW_EVAL,
-    "api_only_obfuscapk": API_ONLY_OBFUSCAPK_EVAL,
-    "api_obfuscapk": API_ONLY_OBFUSCAPK_EVAL,
-    "graph_only_obfuscapk": GRAPH_ONLY_OBFUSCAPK_EVAL,
-    "graph_obfuscapk": GRAPH_ONLY_OBFUSCAPK_EVAL,
-    "manifest_only_obfuscapk": MANIFEST_ONLY_OBFUSCAPK_EVAL,
-    "manifest_obfuscapk": MANIFEST_ONLY_OBFUSCAPK_EVAL,
-    "api_graph_concat_obfuscapk": API_GRAPH_CONCAT_OBFUSCAPK_EVAL,
-    "tri_modal_concat_obfuscapk": TRI_MODAL_CONCAT_OBFUSCAPK_EVAL,
-    "concat_obfuscapk": TRI_MODAL_CONCAT_OBFUSCAPK_EVAL,
-    "fixed_logit_fusion_obfuscapk": FIXED_LOGIT_FUSION_OBFUSCAPK_EVAL,
-    "late_fusion_obfuscapk": FIXED_LOGIT_FUSION_OBFUSCAPK_EVAL,
-    "baseline_obfuscapk": BASELINE_OBFUSCAPK_EVAL,
-    "baselines_obfuscapk": BASELINE_OBFUSCAPK_EVAL,
-    "baseline_obfuscapk_new": BASELINE_OBFUSCAPK_NEW_EVAL,
-    "baselines_obfuscapk_new": BASELINE_OBFUSCAPK_NEW_EVAL,
     "seed": SEEDS,
     "full": SEEDS,
     "appendix": APPENDIX_SENSITIVITY,
@@ -405,7 +351,6 @@ GROUPS = {
         *MECHANISM_ABLATIONS,
         *FACTORIAL_ABLATIONS,
     ],
-    "paper_external": [PRIMARY_SEED, *EXTERNAL_EVAL],
     "paper_evidential": [
         *SEEDS,
         *BASELINES,
@@ -423,7 +368,6 @@ GROUPS = {
         *MECHANISM_ABLATIONS,
         *FACTORIAL_ABLATIONS,
         *TRAINING_ABLATIONS,
-        *EXTERNAL_EVAL,
     ],
 }
 
@@ -436,6 +380,8 @@ def available_configs() -> dict[str, Path]:
     for path in sorted(CONFIG_DIR.rglob("*.yaml")):
         relative = path.relative_to(CONFIG_DIR)
         if any(part.startswith(".") for part in relative.parts):
+            continue
+        if len(relative.parts) > 1 and relative.parts[0] not in FORMAL_CONFIG_DIRS:
             continue
         if path.name in {"base_tri_modal_robust.yaml", "debug_fast.yaml"} or path.stem.startswith("_"):
             continue
@@ -453,10 +399,25 @@ def _require_paths(group: str, relative_paths: list[str]) -> list[Path]:
     missing = [str(path) for path in paths if not path.is_file()]
     if missing:
         raise ValueError(f"Experiment group '{group}' references missing configs: {missing}")
-    return paths
+    # Composite paper groups intentionally reuse reference cells from module
+    # and factorial matrices. Execute each physical config once while
+    # preserving the declared first-occurrence order.
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        key = path.resolve()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
 
 
 def resolve_targets(target: str) -> list[Path]:
+    if target in REMOVED_ALIASES:
+        raise ValueError(
+            f"Experiment alias '{target}' was removed because its method identity "
+            f"was ambiguous; {REMOVED_ALIASES[target]}."
+        )
     if target in GROUPS:
         return _require_paths(target, GROUPS[target])
     if target == "all":
@@ -575,7 +536,12 @@ def validate_natural_subset_artifacts(root: Path = ROOT) -> None:
             )
 
 
-def run_config(config_path: Path, extra_configs: list[Path] | None = None) -> None:
+def run_config(
+    config_path: Path,
+    extra_configs: list[Path] | None = None,
+    *,
+    overwrite: bool = False,
+) -> None:
     extra_configs = list(extra_configs or [])
     if "natural_subsets" in config_path.parts:
         validate_natural_subset_artifacts()
@@ -589,6 +555,7 @@ def run_config(config_path: Path, extra_configs: list[Path] | None = None) -> No
             "--config",
             str(config_path),
             *[str(path) for path in extra_configs],
+            *(["--overwrite"] if overwrite else []),
         ],
         check=True,
     )
@@ -604,6 +571,11 @@ def main() -> None:
     )
     parser.add_argument("--list", action="store_true", help="List runnable experiment configs.")
     parser.add_argument("--dry-run", action="store_true", help="Print configs without training.")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Explicitly allow each selected run to replace existing artifacts.",
+    )
     parser.add_argument(
         "--extra-config",
         nargs="*",
@@ -637,7 +609,7 @@ def main() -> None:
             print(f"{path}{suffix}")
         return
     for path in targets:
-        run_config(path, extra_configs)
+        run_config(path, extra_configs, overwrite=args.overwrite)
 
 
 if __name__ == "__main__":

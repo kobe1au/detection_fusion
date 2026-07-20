@@ -12,6 +12,11 @@ data:
   val_csv: labels/val.csv
   test_csv: labels/test.csv
   out_dir: results/tri_modal_robust
+  # Formal runs refuse to start unless this vocabulary records hashes for the
+  # current train CSV and train identity set. Populate it with the Manifest-only
+  # PT migration command after any split change.
+  manifest_vocab_path: config/manifest_vocab.yaml
+  require_manifest_vocab_provenance: true
 
 train:
   seed: 42

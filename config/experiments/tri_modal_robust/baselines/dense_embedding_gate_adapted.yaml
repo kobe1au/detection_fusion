@@ -1,0 +1,50 @@
+defaults:
+  - _base.yaml
+
+method:
+  name: dense_embedding_gate_adapted
+  # This is a controlled dense late-fusion gate over the shared APK branch
+  # embeddings. It is not a strict reproduction of sparse MoE/Shazeer models.
+  protocol_id: dense_embedding_gate_adapted_v1
+
+train:
+  exp_name: dense_embedding_gate_adapted
+
+model:
+  fusion_mode: tri_modal_dense_embedding_gate
+  gate:
+    hidden_dim: 128
+    # Ordinary end-to-end adapted gate: gradients from gate selection may reach
+    # the three encoders, using training labels only. Missing branches remain
+    # hard-masked before the alive-only softmax.
+    detach: false
+    # This adapted baseline gates raw branch embeddings plus availability only;
+    # none of the proposed method's handcrafted relation evidence is consumed.
+    use_consistency_evidence: false
+    use_conflict_evidence: false
+    use_perturbation_evidence: false
+
+loss:
+  branch_aux_weight: 0.25
+  auxiliary_weight_mode: alive_masked_uniform
+  branch_aux_weights:
+    api: 1.0
+    graph: 1.0
+    manifest: 1.0
+
+# Give the classifier the same 50/25/25 validation budget and the same I3 CRC
+# threshold protocol as the proposed method. The black-box gate has no learned
+# u head, so strict MSP is the pre-registered, domain-standard acceptance score.
+classification_threshold:
+  enabled: true
+  objective: macro_f1
+  selection_rule: macro_f1_unconstrained_v1
+
+selective_prediction:
+  enabled: true
+  mode: risk_control
+  threshold_score: msp
+  risk_target: accepted_fn_risk_among_malware
+  risk_level: 0.05
+  min_calibration_malware: 100
+  require_feasible: true

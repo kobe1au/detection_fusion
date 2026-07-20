@@ -11,8 +11,6 @@ fusion:
   combination: log_pool
   routing:
     enabled: false
-    use_fused_prediction_loss: false
-    final_temperature_scaling: false
-  branch_competence_prior:
-    # Keep I1 identical to the main method; only the fusion rule changes.
-    enabled: false
+    acceptance_score_mode: product
+    # Equal one-scalar output calibration across all opinion rules.
+    final_temperature_scaling: true

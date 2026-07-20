@@ -8,18 +8,31 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-FORMAL_TARGETS = {
+METHOD_TARGETS = {
     "ours": "final",
-    "tmc_dempster": "dempster",
+    "tmc": "tmc",
+    "ecml": "ecml",
+    # Component-level QMF comparison: energy-weighted late fusion only.
+    "qmf_energy": "qmf_energy",
+}
+
+I2_MECHANISM_TARGETS = {
+    "dempster_rule_only": "dempster",
     "cumulative_subjective_logic": "cumulative",
     "log_pool": "log_pool",
-    "ecml_style": "ecml_style",
+    "conflict_weighted_opinion": "conflict_weighted_opinion",
 }
+
+FORMAL_TARGETS = {**METHOD_TARGETS, **I2_MECHANISM_TARGETS}
 
 BASELINE_TARGETS = FORMAL_TARGETS
 
 NATURAL_TARGETS = {
     "ours": "natural_ours",
+    "tmc": "natural_tmc",
+    "ecml": "natural_ecml",
+    "qmf_energy": "natural_qmf_energy",
+    "conflict_weighted_opinion": "natural_conflict_weighted_opinion",
 }
 
 
@@ -36,15 +49,15 @@ def run_target(target: str, extra_config: str | None, dry_run: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run paper-level trusted-fusion baselines backed by the existing "
-            "tri-modal evidential pipeline."
+            "Run paper-level shared-encoder method baselines and controlled "
+            "I2 fusion-mechanism comparisons."
         )
     )
     parser.add_argument(
         "--method",
         choices=["all", *BASELINE_TARGETS.keys()],
         default="all",
-        help="Trusted-fusion method to run.",
+        help="Paper comparison to run.",
     )
     parser.add_argument(
         "--extra-config",

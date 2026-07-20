@@ -1,0 +1,25 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i1_temperature_scaling_confidence_clean_only
+  protocol_id: i1_temperature_scaling_confidence_clean_v1
+
+train:
+  exp_name: i1_temperature_scaling_confidence_clean_only
+
+fusion:
+  reliability_calibration:
+    # Canonical clean-validation temperature scaling. Nested package-group OOF
+    # fitting is retained, but perturbed calibration views are excluded. This
+    # is reported separately from the matched-budget primary comparator.
+    enabled: true
+    method: temperature_scaling_confidence
+    temperature_fit_source: clean_only
+    initial_temperature: 1.0
+    branches: [api, graph, manifest]
+    use_model_visibility: false
+    use_embedding_density: false
+    use_prediction_margin: false
+    use_predicted_class_feature: false
+    apply_alive_mask: true

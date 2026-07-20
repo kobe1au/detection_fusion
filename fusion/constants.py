@@ -1,13 +1,8 @@
 class ArchitectureConstants:
     HEAD_HIDDEN_DIMS = [256, 128]
     HEAD_DROPOUT_RATES = [0.3, 0.2]
-    HEAD_DROPOUT = 0.2
 
     GATE_HIDDEN_DIM = 128
-    GATE_INIT_BIAS = 0.0
-    GATE_JOINT_INIT_BIAS = 0.5
-
-    MODALITY_ALIVE_THRESHOLD = 0.01
 
 
 class QualityConstants:
@@ -23,12 +18,7 @@ class QualityConstants:
     GRAPH_EDGE_WEIGHT = 0.35
     GRAPH_FEATURE_WEIGHT = 0.30
 
-    ALIGN_NODE_COVER_WEIGHT = 0.5
-    ALIGN_API_COVER_WEIGHT = 0.5
-
 class GateConstants:
-    NUM_BRANCHES = 4
-    UNIFORM_BRANCH_WEIGHT = 0.25
     EPS = 1e-8
 
 
@@ -48,14 +38,6 @@ class EvidenceIndex:
     GRAPH_ENCODER_COVERAGE = 12
 
     BASE_DIM = 13
-
-    # Compatibility aliases for old gate/loss code. They point only to
-    # observable integrity/support fields and never to synthetic pert_*.
-    R_API = API_INTEGRITY
-    R_GRAPH = GRAPH_INTEGRITY
-    R_MANIFEST = MANIFEST_INTEGRITY
-    Q_ALIGN = API_GRAPH_ANCHOR_SUPPORT
-
 
 class TriModalConfigDefaults:
     """Stable defaults for the lean observable-reliability pipeline.
@@ -95,7 +77,6 @@ class TriModalConfigDefaults:
         "model": {
             "num_classes": 2,
             "fusion_mode": "discount_probability",
-            "joint_emb_dim": 128,
             "max_nodes_gnn": 12288,
             "api_encoder": {
                 "type": "transformer",
@@ -136,7 +117,6 @@ class TriModalConfigDefaults:
                 "use_consistency_evidence": True,
                 "use_conflict_evidence": True,
                 "use_perturbation_evidence": False,
-                "apply_alive_mask": True,
             },
         },
         "fusion": {
@@ -145,19 +125,6 @@ class TriModalConfigDefaults:
             "detach_confidence_proxy": True,
             "use_confidence_proxy": True,
             "use_reliability_discount": True,
-            "branch_competence_prior": {
-                "enabled": True,
-                "metric": "macro_f1",
-                "normalization": "best",
-                "min_value": 0.5,
-            },
-            "visible_integrity_modifier": {
-                "enabled": True,
-                "mode": "bounded_visibility",
-                "beta": 1.0,
-                "min_value": 0.5,
-                "min_reference": 1.0e-6,
-            },
             "weight_sharpening_gamma": 1.0,
             "use_support_discount": True,
             "use_conflict_discount": True,
@@ -171,14 +138,23 @@ class TriModalConfigDefaults:
                 "temperature_api": 1.0,
                 "temperature_graph": 1.0,
                 "temperature_manifest": 1.0,
-                "temperature_joint": 1.0,
             },
             "reliability_calibration": {
                 "enabled": True,
-                "hidden_dim": 16,
-                "missing_relation_support": 0.0,
-                "use_relation_evidence": True,
-                "use_evidential_uncertainty": True,
+                "method": "monotonic_correctness",
+                "use_model_visibility": True,
+                "use_embedding_density": False,
+                "embedding_density_variance_shrinkage": 0.10,
+                "embedding_density_reference_quantile": 0.95,
+                "embedding_density_min_class_samples": 8,
+                "use_prediction_margin": True,
+                "use_predicted_class_feature": True,
+                "objective_weights": {
+                    "clean": 0.50,
+                    "completeness": 0.25,
+                    "semantic": 0.25,
+                },
+                "require_all_objective_families": False,
                 "apply_alive_mask": True,
                 "loss": "bce",
                 "weight": 1.0,
@@ -186,13 +162,27 @@ class TriModalConfigDefaults:
             "routing": {
                 "enabled": False,
                 "mode": "learned",
-                "hidden_dim": 16,
                 "calibration_weight": 1.0,
-                "use_disagreement": True,
-                "train_end_to_end": True,
+                "train_end_to_end": False,
                 "posthoc_refine": True,
-                "initial_known_retention": 0.99,
-                "use_fused_prediction_loss": False,
+                "prediction_loss_weight": 1.0,
+                "route_oracle_loss_weight": 0.0,
+                "route_oracle_temperature": 1.0,
+                "subset_oracle_loss_weight": 0.0,
+                "subset_oracle_temperature": 1.0,
+                "group_robust_objective": {
+                    "enabled": False,
+                    "taxonomy": "perturb_type_v1",
+                    "soft_worst_weight": 0.0,
+                    "temperature": 0.1,
+                    "apply_to": ["routing_distribution"],
+                },
+                "route_conflict_enabled": True,
+                "risk_conflict_enabled": True,
+                "risk_mode": "learned",
+                "risk_loss_weight": 1.0,
+                "risk_loss": "bce",
+                "initial_risk": 0.10,
                 "final_temperature_scaling": False,
                 "acceptance_score_mode": "product",
             },
@@ -214,14 +204,11 @@ class TriModalConfigDefaults:
                 "api": 1.0,
                 "graph": 1.0,
                 "manifest": 1.0,
-                "joint": 0.0,
             },
             # The auxiliary branch loss is weighted by observable integrity,
-            # not by the fitted branch-correctness calibrator.  Keep the old
-            # name as an explicit nullable compatibility alias; consumers
-            # should prefer it only when a legacy config sets a non-null value.
-            "integrity_weighted_aux": True,
-            "reliability_weighted_aux": None,
+            # not by the fitted branch-correctness calibrator. The explicit
+            # mode makes availability masking an independently testable choice.
+            "auxiliary_weight_mode": "integrity",
             "min_aux_weight": 0.2,
             "detach_reliability_for_aux": True,
             "reliability_calibration_weight": 0.0,
@@ -239,9 +226,10 @@ class TriModalConfigDefaults:
             "conformal_fraction": 0.5,
             "split_seed": 42,
             "stratified_group_split": True,
+            # Route-only pairwise completeness views are opt-in because they
+            # add three full transformed copies per configured strength.
+            "include_pairwise_completeness_views": False,
             "epochs": 30,
-            "patience": 4,
-            "min_delta": 0.00001,
             "lr": 0.001,
             "weight_decay": 0.0,
             "grad_clip": 5.0,
@@ -249,12 +237,12 @@ class TriModalConfigDefaults:
         "classification_threshold": {
             "enabled": False,
             "objective": "macro_f1",
-            "min_malware_recall": 0.90,
+            "selection_rule": "macro_f1_unconstrained_v1",
         },
         "selective_prediction": {
             "enabled": True,
             "mode": "conformal",
-            "threshold_score": "max_probability",
+            "threshold_score": "msp",
             "class_conditional": True,
             "target_coverage": 0.90,
             "use_raw_conflict": False,
@@ -278,6 +266,10 @@ class TriModalConfigDefaults:
                 "api_graph_degraded",
                 "manifest_degraded",
                 "all_degraded",
+                "api_semantic_corrupted",
+                "graph_semantic_corrupted",
+                "manifest_semantic_corrupted",
+                "all_semantic_corrupted",
                 "api_missing",
                 "graph_missing",
                 "manifest_missing",

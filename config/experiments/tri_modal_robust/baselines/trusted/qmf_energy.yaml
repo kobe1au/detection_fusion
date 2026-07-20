@@ -1,0 +1,40 @@
+defaults:
+  - ../../base_tri_modal_robust.yaml
+
+method:
+  name: qmf_energy_component
+  protocol_id: qmf_energy_v1
+
+train:
+  exp_name: baseline_qmf_energy
+
+model:
+  fusion_mode: tri_modal_quality_fusion
+  # Fixed by the official QMF late-fusion implementation, not tuned here.
+  quality_fusion_temperature: 10.0
+
+fusion:
+  mode: model_dispatch
+  use_reliability_discount: false
+  use_support_discount: false
+  use_conflict_discount: false
+  use_confidence_proxy: false
+  reliability_calibration:
+    enabled: false
+  probability_calibration:
+    enabled: false
+
+calibration:
+  enabled: false
+  holdout_enabled: true
+
+selective_prediction:
+  enabled: false
+
+loss:
+  # This is deliberately the QMF energy-fusion component under the common
+  # objective, not the full history-ranking QMF training algorithm.
+  objective: standard
+  branch_aux_weight: 0.25
+  auxiliary_weight_mode: unmasked_uniform
+  evidential_loss_weight: 0.0

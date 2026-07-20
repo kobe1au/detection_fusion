@@ -1,0 +1,13 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i1_no_prediction_margin
+
+train:
+  exp_name: i1_no_prediction_margin
+
+fusion:
+  reliability_calibration:
+    # Fixed topology: mask only the branch-local confidence margin.
+    use_prediction_margin: false

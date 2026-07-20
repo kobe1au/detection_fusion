@@ -19,7 +19,6 @@ SUBSET_SPECS: dict[str, tuple[str, str]] = {
 }
 
 SUBSET_SCHEMA_VERSION = 3
-LEGACY_OUTPUT_NAMES = ("test_raw_high_conflict.csv",)
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
@@ -207,13 +206,6 @@ def build_subsets(
     }
     _atomic_write_json(manifest, output_dir / "subset_manifest.json")
 
-    # The version-1 conflict cut was computed after trust discounting and is
-    # not comparable across methods. Remove only this known generated artifact
-    # after the complete version-3 output has been committed successfully.
-    for legacy_name in LEGACY_OUTPUT_NAMES:
-        legacy_path = output_dir / legacy_name
-        if legacy_path.exists():
-            legacy_path.unlink()
     return summary
 
 

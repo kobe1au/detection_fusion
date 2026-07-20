@@ -13,7 +13,12 @@ from scripts.analyze_reliability_evidence import (
     reliability_signal_diagnostics_table,
     reliability_table,
 )
-from scripts.collect_experiment_results import aggregate_metrics, collect_metric_rows
+from fusion.train import METRIC_SUMMARY_SCHEMA_VERSION as PRODUCER_METRIC_SCHEMA_VERSION
+from scripts.collect_experiment_results import (
+    METRIC_SUMMARY_SCHEMA_VERSION as COLLECTOR_METRIC_SCHEMA_VERSION,
+    aggregate_metrics,
+    collect_metric_rows,
+)
 from scripts.build_natural_subset_csvs import build_subsets
 
 
@@ -110,26 +115,6 @@ def test_reliability_signal_diagnostics_reports_certainty_and_permutation_gap():
     assert row["reliability_permutation_gap"] > 0.0
 
 
-def test_reliability_signal_diagnostics_excludes_auxiliary_joint_head():
-    frame = pd.DataFrame(
-        {
-            "experiment": ["final"] * 4,
-            "seed": ["42"] * 4,
-            "diagnostic_file": ["gate_diagnostics.csv"] * 4,
-            "split": ["test_clean"] * 4,
-            "predicted_reliability_api": [0.2, 0.3, 0.8, 0.9],
-            "api_integrity": [0.2, 0.4, 0.7, 0.9],
-            "api_correct": [0, 0, 1, 1],
-            "predicted_reliability_joint": [0.1, 0.2, 0.8, 0.9],
-            "joint_correct": [0, 0, 1, 1],
-        }
-    )
-
-    table = reliability_signal_diagnostics_table(frame, permutations=5)
-
-    assert set(table["branch"]) == {"api"}
-
-
 def test_natural_degradation_subset_table_reports_low_integrity_final_metrics():
     frame = pd.DataFrame(
         {
@@ -151,6 +136,24 @@ def test_natural_degradation_subset_table_reports_low_integrity_final_metrics():
     assert 0.10 < row["threshold"] < 0.20
     assert row["acc"] == pytest.approx(1.0)
     assert row["macro_f1"] == pytest.approx(1.0)
+
+
+def test_natural_degradation_analysis_rejects_fractional_labels():
+    frame = pd.DataFrame(
+        {
+            "experiment": ["final_seed_42", "final_seed_42"],
+            "seed": ["42", "42"],
+            "diagnostic_file": ["gate_diagnostics.csv"] * 2,
+            "split": ["test_clean", "test_clean"],
+            "api_integrity": [0.1, 0.9],
+            "label": [0.5, 1.0],
+            "prob_malware": [0.2, 0.8],
+            "pred": [0, 1],
+        }
+    )
+
+    with pytest.raises(ValueError, match="analysis label"):
+        natural_degradation_subset_table(frame, quantile=0.25, min_count=1)
 
 
 def test_natural_degradation_subset_table_reports_conflict_and_acceptance_risk():
@@ -208,8 +211,6 @@ def test_natural_subset_builder_writes_predictive_conflict_with_provenance(tmp_p
     diagnostics_path, test_csv_path = _natural_subset_inputs(tmp_path)
     output_dir = tmp_path / "subsets"
     output_dir.mkdir()
-    legacy_path = output_dir / "test_raw_high_conflict.csv"
-    legacy_path.write_text("sha256,label\nlegacy,0\n", encoding="utf-8")
 
     summary = build_subsets(
         diagnostics_path=diagnostics_path,
@@ -227,7 +228,6 @@ def test_natural_subset_builder_writes_predictive_conflict_with_provenance(tmp_p
         "low_acceptance",
     }
     assert (output_dir / "test_predictive_high_conflict.csv").is_file()
-    assert not legacy_path.exists()
     manifest = json.loads(
         (output_dir / "subset_manifest.json").read_text(encoding="utf-8")
     )
@@ -261,6 +261,14 @@ def test_aggregate_metrics_groups_seed_runs_by_method(tmp_path):
         run_dir.mkdir(parents=True)
         (run_dir / "summary.yaml").write_text(
             f"""
+metric_schema_version: 5
+run_identity:
+  experiment_name: final_seed_{seed}
+  method_name: final_seed_{seed}
+  seed: {seed}
+  method_protocol_id: trusted-fusion-v1
+  method_protocol_sha256: shared-protocol
+  method_implementation_sha256: shared-implementation
 test:
   macro_f1: {macro_f1}
   acc: 0.8
@@ -285,17 +293,59 @@ test:
     assert "sample_count" not in set(aggregate["metric"])
 
 
+def test_aggregate_metrics_marks_single_run_std_undefined_and_serializable(tmp_path):
+    metrics = pd.DataFrame.from_records(
+        [
+            {
+                "experiment": "final_seed_42",
+                "method": "final",
+                "seed": "42",
+                "method_protocol_id": "trusted-fusion-v1",
+                "method_protocol_sha256": "shared-protocol",
+                "method_implementation_sha256": "shared-implementation",
+                "section": "test",
+                "scenario": "test",
+                "macro_f1": 0.91,
+            }
+        ]
+    )
+
+    aggregate = aggregate_metrics(metrics)
+    row = aggregate[aggregate["metric"] == "macro_f1"].iloc[0]
+
+    assert row["mean"] == pytest.approx(0.91)
+    assert row["count"] == 1
+    assert row["std"] is None
+
+    yaml_rows = yaml.safe_load(yaml.safe_dump(aggregate.to_dict("records")))
+    assert yaml_rows[0]["std"] is None
+
+    csv_path = tmp_path / "aggregate.csv"
+    aggregate.to_csv(csv_path, index=False)
+    csv_rows = pd.read_csv(csv_path)
+    assert pd.isna(csv_rows.loc[0, "std"])
+
+
 def test_result_collector_reads_flat_summaries_and_deduplicates_copies(tmp_path):
     payload = """
+metric_schema_version: 5
 run_identity:
   experiment_name: evidential_seed_42
   method_name: evidential_trusted_fusion
   seed: 42
+  method_protocol_id: trusted-fusion-v1
   method_protocol_sha256: protocol123
   method_implementation_sha256: implementation456
+  selective_prediction_mode: risk_control
+  selective_score_type: msp
 test:
   macro_f1: 0.91
+  malware_fn_risk_aurc: 0.012
   conformal_empty_set_rate: 0.03
+  risk_control_guarantee_type: expected_crc
+  risk_control_guarantee_scope: exchangeable_expected_risk
+  risk_control_calibration_feasible: true
+  risk_control_calibration_corrected_risk: 0.04
 """
     nested = tmp_path / "evidential_seed_42" / "42"
     nested.mkdir(parents=True)
@@ -309,18 +359,27 @@ test:
     assert row["experiment"] == "evidential_seed_42"
     assert row["method"] == "evidential_trusted_fusion"
     assert str(row["seed"]) == "42"
+    assert row["method_protocol_id"] == "trusted-fusion-v1"
     assert row["method_protocol_sha256"] == "protocol123"
     assert row["method_implementation_sha256"] == "implementation456"
     assert row["conformal_empty_set_rate"] == pytest.approx(0.03)
+    assert row["malware_fn_risk_aurc"] == pytest.approx(0.012)
+    assert row["selective_score_type"] == "msp"
+    assert row["risk_control_guarantee_type"] == "expected_crc"
+    assert row["risk_control_guarantee_scope"] == "exchangeable_expected_risk"
+    assert bool(row["risk_control_calibration_feasible"]) is True
+    assert row["risk_control_calibration_corrected_risk"] == pytest.approx(0.04)
 
 
 def test_result_collector_normalizes_embedded_seed_method_names(tmp_path):
     for seed, macro_f1 in ((42, 0.90), (2024, 0.92), (3407, 0.91)):
         payload = {
+            "metric_schema_version": 5,
             "run_identity": {
                 "experiment_name": f"evidential_seed_{seed}",
                 "method_name": f"evidential_seed_{seed}",
                 "seed": seed,
+                "method_protocol_id": "trusted-fusion-v1",
                 "method_protocol_sha256": "shared-protocol",
                 "method_implementation_sha256": "shared-implementation",
             },
@@ -347,3 +406,86 @@ def test_result_collector_normalizes_embedded_seed_method_names(tmp_path):
     assert row["count"] == 3
     assert "classification_threshold" in set(aggregate["metric"])
     assert "risk_control_acceptance_rate" in set(aggregate["metric"])
+
+
+def test_result_collector_rejects_legacy_metric_semantics(tmp_path):
+    path = tmp_path / "summary_legacy.yaml"
+    path.write_text(
+        "test:\n  macro_f1: 0.99\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="metric_schema_version"):
+        collect_metric_rows(tmp_path)
+
+
+def test_result_collector_requires_embedded_identity_in_current_schema(tmp_path):
+    path = tmp_path / "summary_final_seed_42.yaml"
+    path.write_text(
+        "metric_schema_version: 5\ntest:\n  macro_f1: 0.99\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="required run_identity"):
+        collect_metric_rows(tmp_path)
+
+
+def test_metric_summary_schema_versions_match():
+    assert PRODUCER_METRIC_SCHEMA_VERSION == 5
+    assert COLLECTOR_METRIC_SCHEMA_VERSION == PRODUCER_METRIC_SCHEMA_VERSION
+
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4, "5"])
+def test_result_collector_rejects_wrong_metric_schema_version(tmp_path, version):
+    payload = {
+        "metric_schema_version": version,
+        "run_identity": {
+            "experiment_name": "wrong_schema",
+            "method_name": "wrong_schema",
+            "seed": 42,
+            "method_protocol_id": "trusted-fusion-v1",
+            "method_protocol_sha256": "protocol",
+            "method_implementation_sha256": "implementation",
+        },
+        "test": {"macro_f1": 0.9},
+    }
+    path = tmp_path / "summary.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="expected=5"):
+        collect_metric_rows(tmp_path)
+
+
+def test_result_collector_uses_only_canonical_sections_and_embedded_extra_eval(tmp_path):
+    payload = {
+        "metric_schema_version": 5,
+        "run_identity": {
+            "experiment_name": "canonical",
+            "method_name": "canonical",
+            "seed": 42,
+            "method_protocol_id": None,
+            "method_protocol_sha256": "protocol",
+            "method_implementation_sha256": "implementation",
+        },
+        "val_posthoc_calibration": {"macro_f1": 0.8},
+        "val_calibration": {"macro_f1": 0.1},
+        "extra_eval": {"natural_subset": {"macro_f1": 0.7}},
+    }
+    run_dir = tmp_path / "canonical" / "42"
+    run_dir.mkdir(parents=True)
+    (run_dir / "summary.yaml").write_text(
+        yaml.safe_dump(payload), encoding="utf-8"
+    )
+    (run_dir / "metrics_extra_eval.json").write_text(
+        json.dumps({"natural_subset": {"macro_f1": 0.2}}), encoding="utf-8"
+    )
+
+    metrics = collect_metric_rows(tmp_path)
+
+    posthoc = metrics[metrics["section"] == "val_posthoc_calibration"]
+    assert len(posthoc) == 1
+    assert posthoc.iloc[0]["macro_f1"] == pytest.approx(0.8)
+    extra = metrics[metrics["section"] == "extra_eval"]
+    assert len(extra) == 1
+    assert extra.iloc[0]["macro_f1"] == pytest.approx(0.7)
+    assert "extra_eval_json" not in set(metrics["section"])

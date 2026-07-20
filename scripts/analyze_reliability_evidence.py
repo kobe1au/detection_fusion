@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from fusion.utils import strict_binary_integer
+
 
 MODALITY_BRANCHES = ("api", "graph", "manifest")
-BRANCHES = (*MODALITY_BRANCHES, "joint")
+BRANCHES = MODALITY_BRANCHES
 
 EVIDENCE_FIELDS = (
     "api_integrity",
@@ -60,15 +67,15 @@ EVIDENCE_BIN_SPECS = {
     "effective_graph_integrity": ("graph",),
     "manifest_integrity": ("manifest",),
     "effective_manifest_integrity": ("manifest",),
-    "code_integrity": ("api", "graph", "joint"),
-    "api_graph_anchor_support": ("api", "graph", "joint"),
-    "manifest_code_support": ("manifest", "joint"),
-    "manifest_to_code_conflict": ("manifest", "joint"),
-    "code_to_manifest_conflict": ("api", "graph", "joint"),
-    "max_manifest_code_conflict": ("api", "graph", "manifest", "joint"),
+    "code_integrity": ("api", "graph"),
+    "api_graph_anchor_support": ("api", "graph"),
+    "manifest_code_support": ("manifest",),
+    "manifest_to_code_conflict": ("manifest",),
+    "code_to_manifest_conflict": ("api", "graph"),
+    "max_manifest_code_conflict": ("api", "graph", "manifest"),
     "predictive_conflict": ("api", "graph", "manifest"),
     "predictive_conflict_max": ("api", "graph", "manifest"),
-    "raw_conflict": ("api", "graph", "manifest", "joint"),
+    "raw_conflict": ("api", "graph", "manifest"),
     "discount_api": ("api",),
     "discount_graph": ("graph",),
     "discount_manifest": ("manifest",),
@@ -525,9 +532,21 @@ def _classification_metrics_for_frame(frame: pd.DataFrame) -> dict[str, Any]:
     if data.empty:
         return {}
     valid_index = data.index
-    labels_arr = data["label"].astype(int).to_numpy()
+    labels_arr = np.asarray(
+        [
+            strict_binary_integer(value, field_name="analysis label")
+            for value in data["label"].tolist()
+        ],
+        dtype=np.int64,
+    )
     probs_arr = data["prob_malware"].clip(0.0, 1.0).to_numpy(dtype=float)
-    preds_arr = data["pred"].astype(int).to_numpy()
+    preds_arr = np.asarray(
+        [
+            strict_binary_integer(value, field_name="analysis prediction")
+            for value in data["pred"].tolist()
+        ],
+        dtype=np.int64,
+    )
     confidence = np.maximum(probs_arr, 1.0 - probs_arr)
     correctness = (preds_arr == labels_arr).astype(float)
     auc_defined = _auc_defined(labels_arr.astype(float))
@@ -575,8 +594,13 @@ def _classification_metrics_for_frame(frame: pd.DataFrame) -> dict[str, Any]:
                     )
                 )
                 accepted_malware = accepted_bool & malware_mask
+                if malware_mask.any():
+                    out["accepted_fn_risk_among_malware"] = float(
+                        ((preds_arr == 0) & accepted_malware).sum()
+                        / malware_mask.sum()
+                    )
                 if accepted_malware.any():
-                    out["accepted_malware_fn_rate"] = float(
+                    out["fn_rate_given_accepted_malware"] = float(
                         ((preds_arr == 0) & accepted_malware).sum() / accepted_malware.sum()
                     )
             else:

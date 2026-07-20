@@ -1,0 +1,9 @@
+# Output-only overlay for the revised I2 candidate. Keeping a distinct
+# directory preserves the already inspected seed-42 result as a development
+# comparison and avoids using --overwrite for a scientifically different run.
+method:
+  name: evidential_trusted_fusion_i2_robust_v2
+
+train:
+  exp_name: evidential_trusted_fusion_i2_robust_v2
+

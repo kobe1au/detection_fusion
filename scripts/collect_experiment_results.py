@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import re
 from pathlib import Path
 from typing import Any
@@ -11,38 +10,38 @@ import pandas as pd
 import yaml
 
 
-BRANCHES = ("api", "graph", "manifest", "joint")
+BRANCHES = ("api", "graph", "manifest")
+METRIC_SUMMARY_SCHEMA_VERSION = 5
 
 SCALAR_TYPES = (str, int, float, bool, type(None))
 
-ATTENTION_KEYS = (
-    "mean_semantic_attention_entropy",
-    "mean_cross_modal_attention",
-    "semantic_residual_gate",
-    "mean_semantic_reliability_prior_api",
-    "mean_semantic_reliability_prior_graph",
-    "mean_semantic_reliability_prior_manifest",
-    "mean_semantic_attention_to_api",
-    "mean_semantic_attention_to_graph",
-    "mean_semantic_attention_to_manifest",
-    "macro_f1",
-    "acc",
-    "auc",
-    "ap",
-)
-
 SELECTIVE_KEYS = (
+    "metric_schema_version",
+    "selective_prediction_mode",
+    "selective_score_type",
     "classification_threshold",
     "fixed_0_5_acc",
     "fixed_0_5_macro_f1",
     "fixed_0_5_f1_pos",
     "fixed_0_5_recall_pos",
     "coverage",
+    "selective_eligible_rate",
+    "num_ineligible_forced_reject",
     "selective_metrics_defined",
     "selective_risk",
     "selective_acc",
     "selective_macro_f1",
     "aurc",
+    "aurc_defined",
+    "aurc_tie_policy",
+    "malware_fn_risk_aurc",
+    "malware_fn_risk_aurc_defined",
+    "malware_fn_risk_aurc_tie_policy",
+    "malware_fn_risk_aurc_target",
+    "malware_fn_risk_aurc_denominator",
+    "malware_fn_risk_aurc_coverage_normalization",
+    "selective_ranking_num_eligible",
+    "selective_max_achievable_coverage",
     "acceptance_score_mean",
     "acceptance_score_p10",
     "acceptance_score_p50",
@@ -62,26 +61,42 @@ SELECTIVE_KEYS = (
     "conformal_benign_acceptance_rate",
     "conformal_malware_acceptance_rate",
     "conformal_malware_rejection_rate",
-    "conformal_malware_fn_after_rejection",
-    "conformal_accepted_malware_fn_rate",
+    "conformal_accepted_fn_risk_among_malware",
+    "conformal_fn_rate_given_accepted_malware",
     "conformal_malware_fn_count",
     "conformal_accepted_malware_count",
     "conformal_selective_risk",
     "conformal_selective_acc",
+    "conformal_num_accepted",
+    "conformal_num_rejected",
+    "conformal_num_empty_sets",
+    "conformal_num_ambiguous_sets",
+    "conformal_num_ineligible_forced_reject",
+    "conformal_ineligible_set_policy",
     "conformal_empirical_coverage_benign",
     "conformal_empirical_coverage_malware",
     "risk_control_threshold",
+    "risk_control_acceptance_comparison",
     "risk_control_risk_level",
+    "risk_control_risk_target",
+    "risk_control_guarantee_type",
+    "risk_control_guarantee_scope",
+    "risk_control_risk_numerator",
+    "risk_control_risk_denominator",
+    "risk_control_eligibility_rule",
+    "risk_control_calibration_feasible",
+    "risk_control_calibration_corrected_risk",
     "risk_control_acceptance_rate",
     "risk_control_rejection_rate",
     "risk_control_selective_risk",
     "risk_control_selective_acc",
-    "risk_control_malware_fn_rate_after_rejection",
-    "risk_control_accepted_malware_fn_rate",
+    "risk_control_accepted_fn_risk_among_malware",
+    "risk_control_fn_rate_given_accepted_malware",
     "risk_control_malware_fn_count",
     "risk_control_accepted_malware_count",
     "risk_control_num_accepted",
     "risk_control_num_rejected",
+    "risk_control_num_ineligible_forced_reject",
     "risk_control_target_met_empirically",
 )
 
@@ -109,10 +124,17 @@ DEFAULT_AGGREGATE_METRICS = {
     "ece_10",
     "confidence_accuracy_gap",
     "coverage",
+    "selective_eligible_rate",
+    "num_ineligible_forced_reject",
     "selective_risk",
     "selective_acc",
     "selective_macro_f1",
     "aurc",
+    "aurc_defined",
+    "malware_fn_risk_aurc",
+    "malware_fn_risk_aurc_defined",
+    "selective_ranking_num_eligible",
+    "selective_max_achievable_coverage",
     "acceptance_score_mean",
     "acceptance_score_p10",
     "acceptance_score_p50",
@@ -125,8 +147,8 @@ DEFAULT_AGGREGATE_METRICS = {
     "conformal_benign_acceptance_rate",
     "conformal_malware_acceptance_rate",
     "conformal_malware_rejection_rate",
-    "conformal_malware_fn_after_rejection",
-    "conformal_accepted_malware_fn_rate",
+    "conformal_accepted_fn_risk_among_malware",
+    "conformal_fn_rate_given_accepted_malware",
     "conformal_malware_fn_count",
     "conformal_accepted_malware_count",
     "conformal_selective_risk",
@@ -135,26 +157,20 @@ DEFAULT_AGGREGATE_METRICS = {
     "conformal_empirical_coverage_malware",
     "risk_control_threshold",
     "risk_control_risk_level",
+    "risk_control_calibration_feasible",
+    "risk_control_calibration_corrected_risk",
     "risk_control_acceptance_rate",
     "risk_control_rejection_rate",
     "risk_control_selective_risk",
     "risk_control_selective_acc",
-    "risk_control_malware_fn_rate_after_rejection",
-    "risk_control_accepted_malware_fn_rate",
+    "risk_control_accepted_fn_risk_among_malware",
+    "risk_control_fn_rate_given_accepted_malware",
     "risk_control_malware_fn_count",
     "risk_control_accepted_malware_count",
     "risk_control_num_accepted",
     "risk_control_num_rejected",
+    "risk_control_num_ineligible_forced_reject",
     "risk_control_target_met_empirically",
-    "mean_semantic_attention_entropy",
-    "mean_cross_modal_attention",
-    "semantic_residual_gate",
-    "mean_semantic_reliability_prior_api",
-    "mean_semantic_reliability_prior_graph",
-    "mean_semantic_reliability_prior_manifest",
-    "mean_semantic_attention_to_api",
-    "mean_semantic_attention_to_graph",
-    "mean_semantic_attention_to_manifest",
 }
 
 BRANCH_AGGREGATE_SUFFIXES = (
@@ -168,6 +184,7 @@ BRANCH_AGGREGATE_SUFFIXES = (
 )
 
 NON_METRIC_COLUMNS = {
+    "metric_schema_version",
     "experiment",
     "method",
     "seed",
@@ -192,61 +209,61 @@ def _safe_load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-def _safe_load_json(path: Path) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    if not isinstance(data, dict):
-        raise ValueError(f"Expected a mapping in {path}")
-    return data
+def _validate_result_summary_schema(
+    summary_path: Path,
+    summary: dict[str, Any],
+) -> None:
+    """Reject legacy summaries whose metric semantics are no longer compatible."""
+
+    version = summary.get("metric_schema_version")
+    if version != METRIC_SUMMARY_SCHEMA_VERSION:
+        raise ValueError(
+            f"{summary_path} uses metric_schema_version={version!r}; expected="
+            f"{METRIC_SUMMARY_SCHEMA_VERSION}. Rerun with the current code and "
+            "collect from a new-run-only results root."
+        )
+    identity = summary.get("run_identity")
+    if not isinstance(identity, dict):
+        raise ValueError(f"{summary_path} is missing the required run_identity mapping")
+    required_identity = {
+        "experiment_name",
+        "method_name",
+        "seed",
+        "method_protocol_id",
+        "method_protocol_sha256",
+        "method_implementation_sha256",
+    }
+    missing = sorted(required_identity - set(identity))
+    if missing:
+        raise ValueError(
+            f"{summary_path} run_identity is missing required fields: {missing}"
+        )
 
 
 def _run_identity(
     summary_path: Path,
-    results_root: Path,
-    summary: dict[str, Any] | None = None,
+    summary: dict[str, Any],
 ) -> dict[str, Any]:
-    embedded = (summary or {}).get("run_identity") or {}
-    if isinstance(embedded, dict) and embedded.get("experiment_name"):
-        experiment = str(embedded["experiment_name"])
-        identity: dict[str, Any] = {
-            "experiment": experiment,
-            "method": _method_name(
-                str(embedded.get("method_name") or _method_name(experiment))
-            ),
-            "seed": str(embedded.get("seed", "")),
-            "run_dir": str(summary_path.parent),
-            "summary_path": str(summary_path),
-        }
-        for key, value in embedded.items():
-            if key not in {"experiment_name", "method_name", "seed"} and isinstance(
-                value, SCALAR_TYPES
-            ):
-                identity[str(key)] = value
-        return identity
-    if summary_path.name.startswith("summary_"):
-        experiment = summary_path.stem[len("summary_") :]
-        seed_match = re.search(r"(?:^|_)seed_(\d+)(?:_|$)", experiment)
-        return {
-            "experiment": experiment,
-            "method": _method_name(experiment),
-            "seed": seed_match.group(1) if seed_match else "",
-            "run_dir": str(summary_path.parent),
-            "summary_path": str(summary_path),
-        }
-    try:
-        rel = summary_path.parent.relative_to(results_root)
-        parts = rel.parts
-    except ValueError:
-        parts = summary_path.parent.parts
-    experiment = parts[-2] if len(parts) >= 2 else summary_path.parent.name
-    seed = parts[-1] if parts else ""
-    return {
+    # Schema validation requires this embedded identity before this function is
+    # called. Inferring method/seed from filenames or directory layouts would
+    # therefore be unreachable and, worse, could silently mix incompatible runs.
+    embedded = summary["run_identity"]
+    experiment = str(embedded["experiment_name"])
+    identity: dict[str, Any] = {
         "experiment": experiment,
-        "method": _method_name(experiment),
-        "seed": seed,
+        "method": _method_name(
+            str(embedded.get("method_name") or _method_name(experiment))
+        ),
+        "seed": str(embedded.get("seed", "")),
         "run_dir": str(summary_path.parent),
         "summary_path": str(summary_path),
     }
+    for key, value in embedded.items():
+        if key not in {"experiment_name", "method_name", "seed"} and isinstance(
+            value, SCALAR_TYPES
+        ):
+            identity[str(key)] = value
+    return identity
 
 
 def _method_name(experiment: str) -> str:
@@ -288,24 +305,22 @@ def _add_metric_row(
 
 def _summary_metric_rows(
     summary_path: Path,
-    results_root: Path,
     summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     summary = summary if summary is not None else _safe_load_yaml(summary_path)
-    identity = _run_identity(summary_path, results_root, summary)
+    _validate_result_summary_schema(summary_path, summary)
+    identity = _run_identity(summary_path, summary)
+    identity["metric_schema_version"] = int(summary["metric_schema_version"])
     rows: list[dict[str, Any]] = []
     _add_metric_row(
         rows, identity, "val_selection", "val_selection", summary.get("val_selection")
     )
-    posthoc_metrics = summary.get("val_posthoc_calibration")
-    if posthoc_metrics is None:
-        posthoc_metrics = summary.get("val_calibration")
     _add_metric_row(
         rows,
         identity,
         "val_posthoc_calibration",
         "val_posthoc_calibration",
-        posthoc_metrics,
+        summary.get("val_posthoc_calibration"),
     )
     _add_metric_row(
         rows,
@@ -325,10 +340,6 @@ def _summary_metric_rows(
     if isinstance(extra_eval, dict):
         for scenario, metrics in extra_eval.items():
             _add_metric_row(rows, identity, "extra_eval", str(scenario), metrics)
-    extra_json = summary_path.parent / "metrics_extra_eval.json"
-    if extra_json.exists():
-        for scenario, metrics in _safe_load_json(extra_json).items():
-            _add_metric_row(rows, identity, "extra_eval_json", str(scenario), metrics)
     return rows
 
 
@@ -348,7 +359,7 @@ def collect_metric_rows(results_root: Path) -> pd.DataFrame:
         if fingerprint in seen_payloads:
             continue
         seen_payloads.add(fingerprint)
-        rows.extend(_summary_metric_rows(path, results_root, summary))
+        rows.extend(_summary_metric_rows(path, summary))
     return pd.DataFrame.from_records(rows)
 
 
@@ -439,11 +450,23 @@ def aggregate_metrics(
                     **base,
                     "metric": metric,
                     "mean": float(values.mean()),
-                    "std": float(values.std(ddof=1)) if len(values) > 1 else 0.0,
+                    # A sample standard deviation is undefined for one run.
+                    # ``None`` becomes an empty CSV cell instead of falsely
+                    # claiming zero between-seed variation.
+                    "std": float(values.std(ddof=1)) if len(values) > 1 else None,
                     "count": int(values.size),
                 }
             )
-    return pd.DataFrame.from_records(records)
+    aggregate = pd.DataFrame.from_records(records)
+    if "std" in aggregate.columns:
+        # Preserve Python ``None`` in record/YAML consumers while pandas emits
+        # the same value as an empty, parseable field in CSV output.
+        aggregate["std"] = pd.Series(
+            [record["std"] for record in records],
+            index=aggregate.index,
+            dtype=object,
+        )
+    return aggregate
 
 
 def _filter_methods(aggregate: pd.DataFrame, prefixes: tuple[str, ...], extras: tuple[str, ...] = ()) -> pd.DataFrame:
@@ -488,12 +511,11 @@ def main() -> None:
         _filter_methods(
             aggregate,
             ("i3_",),
-            extras=("module_no_i3_selective_rejection",),
+            extras=("module_no_i3_decision_layer",),
         ),
         out_dir / "aggregate_i3_ablation.csv",
     )
     _write_csv(_branch_reliability_rows(metrics), out_dir / "i1_reliability_calibration_summary.csv")
-    _write_csv(_selected_columns(metrics, ATTENTION_KEYS), out_dir / "i2_attention_ablation.csv")
     _write_csv(_selected_columns(metrics, SELECTIVE_KEYS), out_dir / "i3_selective_results.csv")
     run_index_columns = [
         key
@@ -501,6 +523,8 @@ def main() -> None:
             "experiment",
             "method",
             "seed",
+            "metric_schema_version",
+            "method_protocol_id",
             "method_protocol_sha256",
             "method_implementation_sha256",
             "resolved_config_sha256",
@@ -509,8 +533,10 @@ def main() -> None:
             "evidential_certainty_enabled",
             "classification_threshold_enabled",
             "classification_threshold_objective",
-            "classification_min_malware_recall",
+            "classification_threshold_selection_rule",
+            "classification_threshold_constraint",
             "selective_prediction_mode",
+            "selective_score_type",
             "risk_control_level",
             "target_coverage",
             "conformal_uses_raw_conflict",

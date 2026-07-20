@@ -14,13 +14,18 @@ fusion:
     mode: prior_only
     train_end_to_end: false
     posthoc_refine: false
-    use_fused_prediction_loss: false
-    target_loss_weight: 0.0
     prediction_loss_weight: 0.0
+    route_oracle_loss_weight: 0.0
+    subset_oracle_loss_weight: 0.0
+    subset_oracle_temperature: 1.0
+    group_robust_objective:
+      enabled: false
+      soft_worst_weight: 0.0
+    risk_mode: reliability_prior
+    risk_target: reliability_deficit_score
+    risk_loss_weight: 0.0
     final_temperature_scaling: true
-  branch_competence_prior:
-    enabled: false
 
-# Both I1's decision-time reliability pathway and I2's learned arbitration are
-# off; the same routed opinion representation, final temperature, branch
-# opinion training, and I3 remain fixed.
+# Both I1's sample-level reliability and I2's learned route/risk components are
+# off. The route is uniform over alive branches and risk is the fixed reliability
+# deficit; representation, final temperature, and I3 protocol remain fixed.

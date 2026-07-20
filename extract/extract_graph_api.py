@@ -64,9 +64,16 @@ if str(ROOT) not in sys.path:
 
 try:
     from androguard.core.analysis.analysis import Analysis
-except Exception:  # pragma: no cover - androguard version compatibility
+    from androguard.core.dex import DEX
+except Exception as exc:  # pragma: no cover - optional extraction dependency
+    # Feature-schema helpers and PT migration utilities do not parse APKs and
+    # must remain importable without the heavyweight extraction environment.
+    # ``process_apk`` below fails explicitly if parsing is actually requested.
     Analysis = None
-from androguard.core.dex import DEX
+    DEX = None
+    _ANDROGUARD_IMPORT_ERROR = exc
+else:
+    _ANDROGUARD_IMPORT_ERROR = None
 
 from fusion.semantic_categories import (
     SEMANTIC_CATEGORIES,
@@ -1053,6 +1060,11 @@ def process_apk(
     split: str,
     cfg: Dict[str, Any],
 ) -> Tuple[bool, str]:
+    if DEX is None:
+        raise ModuleNotFoundError(
+            "APK extraction requires androguard; install the extraction "
+            "dependencies before calling process_apk"
+        ) from _ANDROGUARD_IMPORT_ERROR
     safe_mkdir(out_dir)
 
     sha = sha256_file(apk_path)

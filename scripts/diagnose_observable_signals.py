@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from fusion.dataset import RobustTriModalDataset
 from fusion.quality import OBSERVABLE_SIGNAL_FIELDS
+from fusion.utils import strict_binary_integer
 
 
 DEFAULT_SCENARIOS = (
@@ -113,7 +114,15 @@ def _distribution_table(rows: pd.DataFrame) -> pd.DataFrame:
 def _label_diagnostics(rows: pd.DataFrame) -> pd.DataFrame:
     records: list[dict] = []
     for group, frame in rows.groupby(["split", "scenario", "strength"], dropna=False):
-        labels = frame["label"].astype(int).to_numpy()
+        labels = np.asarray(
+            [
+                strict_binary_integer(
+                    value, field_name="observable diagnostic label"
+                )
+                for value in frame["label"].tolist()
+            ],
+            dtype=np.int64,
+        )
         for signal in OBSERVABLE_SIGNAL_FIELDS:
             values = frame[signal].astype(float).to_numpy()
             corr = float(np.corrcoef(values, labels)[0, 1]) if values.size > 1 and np.std(values) > 0 and np.std(labels) > 0 else 0.0
@@ -218,25 +227,6 @@ def _output_checks(distribution: pd.DataFrame, trends: pd.DataFrame) -> pd.DataF
     return pd.DataFrame.from_records(checks)
 
 
-def _paired_table(rows: pd.DataFrame, pair_csv: Path) -> pd.DataFrame:
-    pairs = pd.read_csv(pair_csv)
-    required = {"clean_id", "obfuscated_id"}
-    if not required.issubset(pairs.columns):
-        raise ValueError(f"Paired CSV must contain {sorted(required)}")
-    clean = rows[rows["scenario"] == "clean"].drop_duplicates("sid").set_index("sid")
-    records: list[dict] = []
-    for pair in pairs.to_dict("records"):
-        clean_id = str(pair["clean_id"]).lower()
-        obfuscated_id = str(pair["obfuscated_id"]).lower()
-        if clean_id not in clean.index or obfuscated_id not in clean.index:
-            continue
-        row = {"clean_id": clean_id, "obfuscated_id": obfuscated_id}
-        for signal in OBSERVABLE_SIGNAL_FIELDS:
-            row[f"delta_{signal}"] = float(clean.loc[obfuscated_id, signal] - clean.loc[clean_id, signal])
-        records.append(row)
-    return pd.DataFrame.from_records(records)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Diagnose observable reliability signals.")
     parser.add_argument("--pt-dir", required=True)
@@ -245,7 +235,6 @@ def main() -> None:
     parser.add_argument("--split", default="unknown")
     parser.add_argument("--scenarios", nargs="+", default=list(DEFAULT_SCENARIOS))
     parser.add_argument("--strengths", nargs="+", type=float, default=[0.1, 0.3, 0.5, 0.7, 0.9])
-    parser.add_argument("--paired-csv", default="")
     parser.add_argument("--fail-on-check-error", action="store_true")
     args = parser.parse_args()
 
@@ -290,10 +279,6 @@ def main() -> None:
         ),
         "checks_passed": bool(checks["passed"].astype(bool).all()),
     }
-    if args.paired_csv:
-        paired = _paired_table(frame, Path(args.paired_csv))
-        paired.to_csv(out_dir / "observable_signal_paired_shifts.csv", index=False)
-        summary["num_pairs"] = int(len(paired))
     with open(out_dir / "observable_signal_summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
     if args.fail_on_check_error and not summary["checks_passed"]:

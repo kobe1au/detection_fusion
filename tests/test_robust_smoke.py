@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import csv
+import random
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ import yaml
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch, Data
 
+import fusion.perturbations as perturbations_module
 from fusion.constants import EvidenceIndex
 from fusion.dataset import (
     FatalDatasetConfigError,
@@ -16,7 +19,6 @@ from fusion.dataset import (
     build_package_isolation_groups,
     robust_collate_fn,
 )
-from fusion.gates import heuristic_reliability_gate
 from fusion.losses import compute_robust_loss
 from fusion.quality import compute_align_quality
 from fusion.manifest_features import DEFAULT_CATEGORIES, load_manifest_vocab, vectorize_manifest_record
@@ -39,6 +41,7 @@ from fusion.semantic_categories import (
     DEFAULT_API_TYPE_ID_TO_CATEGORY,
     SEMANTIC_CATEGORIES,
     api_semantic_counts_from_type_ids,
+    graph_semantic_counts_from_method_api_edges,
     validate_api_type_mapping,
 )
 from scripts.build_tri_modal_pts_direct import (
@@ -51,7 +54,10 @@ from scripts.build_tri_modal_pts_direct import (
 )
 from fusion.quality import OBSERVABLE_REQUIRED_FIELDS, OBSERVABLE_SCHEMA_VERSION
 from fusion.perturbations import (
+    EVAL_PERTURB_TYPES,
+    apply_api_category_dropout,
     apply_api_event_dropout,
+    apply_api_feature_noise,
     apply_api_missing,
     apply_graph_feature_obfuscation,
     apply_graph_sparsify,
@@ -262,7 +268,7 @@ def test_posthoc_calibration_requires_discount_probability_fusion():
             {
                 "train": {"device": "cpu"},
                 "data": {},
-                "model": {"fusion_mode": "tri_modal_ours"},
+                "model": {"fusion_mode": "tri_modal_fixed_gate"},
                 "fusion": {"mode": "model_dispatch"},
                 "calibration": {"enabled": True},
                 "eval": {"run_test": False, "run_robust_test": False},
@@ -300,16 +306,15 @@ def test_eval_only_requires_checkpoint_path():
 
 def test_eval_only_checkpoint_config_rejects_semantic_mismatch():
     saved = {
-        "model": {"fusion_mode": "tri_modal_ours", "graph_encoder": {"use_behavior_hint": False}},
+        "model": {"fusion_mode": "tri_modal_fixed_gate", "graph_encoder": {"use_behavior_hint": False}},
         "data": {"graph_semantic_source": "alignment"},
     }
     current = {
-        "model": {"fusion_mode": "tri_modal_ours", "graph_encoder": {"use_behavior_hint": True}},
+        "model": {"fusion_mode": "tri_modal_fixed_gate", "graph_encoder": {"use_behavior_hint": True}},
         "data": {"graph_semantic_source": "alignment"},
     }
     with pytest.raises(ValueError, match="changes model/data semantics"):
         validate_eval_checkpoint_config(current, saved)
-    validate_eval_checkpoint_config(current, saved, allow_mismatch=True)
 
 
 def test_partition_validation_rejects_cross_split_package_leakage(tmp_path: Path):
@@ -442,7 +447,7 @@ def test_robust_model_forward_and_loss():
 
     model = TriModalRobustModel(
         in_feat_dim=16,
-        fusion_mode="tri_modal_ours",
+        fusion_mode="discount_probability",
         api_num_hash_buckets=64,
         api_type_vocab_size=16,
         api_emb_dim=32,
@@ -458,7 +463,7 @@ def test_robust_model_forward_and_loss():
         manifest_in_dim=32,
         manifest_emb_dim=32,
         manifest_hidden_dim=64,
-        joint_emb_dim=32,
+        discount_fusion_config={"combination": "dempster"},
     )
     logits, extra = model(batch, return_features=True)
     loss, parts = compute_robust_loss(
@@ -468,11 +473,11 @@ def test_robust_model_forward_and_loss():
         {"branch_aux_weight": 0.05},
     )
     assert logits.shape == (2, 2)
-    assert extra["gate_weights"].shape == (2, 4)
+    assert extra["fusion_weights"].shape == (2, 3)
+    assert torch.allclose(extra["fusion_weights"].sum(dim=-1), torch.ones(2))
     assert extra["gate_evidence"].shape == (2, EvidenceIndex.BASE_DIM)
     assert torch.allclose(extra["gate_evidence"][:, 4], extra["api_graph_anchor_support"])
     assert "api_graph_consistency" not in extra
-    assert extra["gate_prior_enabled"] is True
     assert "api_semantic_logits" not in extra
     assert extra["manifest_to_code_conflict"].shape == (2,)
     assert extra["code_to_manifest_conflict"].shape == (2,)
@@ -484,14 +489,16 @@ def test_robust_model_forward_and_loss():
     batch.q_api = torch.full((2, 1), 0.8)
     batch.pert_api = torch.full((2, 1), 0.5)
     _, observable_extra = model(batch, return_features=False)
-    assert torch.allclose(observable_extra["r_api"], torch.full((2,), 0.8))
+    assert torch.allclose(
+        observable_extra["api_integrity"], torch.full((2,), 0.8)
+    )
     assert "pert_api" not in observable_extra
     assert torch.allclose(observable_extra["gate_uses_perturbation_evidence"], torch.zeros(2))
 
     with pytest.raises(ValueError, match="diagnostic-only"):
         TriModalRobustModel(
             in_feat_dim=16,
-            fusion_mode="tri_modal_ours",
+            fusion_mode="discount_probability",
             use_perturbation_evidence=True,
         )
 
@@ -499,68 +506,35 @@ def test_robust_model_forward_and_loss():
     missing_api_batch.q_api = torch.zeros(2, 1)
     _, missing_api_extra = model(missing_api_batch, return_features=True)
     assert torch.allclose(
-        missing_api_extra["gate_weights"][:, 0],
+        missing_api_extra["fusion_weights"][:, 0],
         torch.zeros(2),
         atol=1e-6,
     )
     assert torch.allclose(
-        missing_api_extra["gate_weights"].sum(dim=-1),
+        missing_api_extra["fusion_weights"].sum(dim=-1),
         torch.ones(2),
         atol=1e-5,
     )
-    assert torch.allclose(
-        missing_api_extra["api_emb_for_joint"],
-        torch.zeros_like(missing_api_extra["api_emb_for_joint"]),
-        atol=1e-7,
-    )
-    assert torch.isfinite(missing_api_extra["joint_emb"]).all()
-
     missing_graph_batch = batch.clone()
     missing_graph_batch.q_graph = torch.zeros(2, 1)
     _, missing_graph_extra = model(missing_graph_batch, return_features=True)
-    assert torch.allclose(
-        missing_graph_extra["graph_emb_for_joint"],
-        torch.zeros_like(missing_graph_extra["graph_emb_for_joint"]),
-        atol=1e-7,
-    )
+    assert torch.equal(missing_graph_extra["fusion_weights"][:, 1], torch.zeros(2))
 
     missing_manifest_batch = batch.clone()
     missing_manifest_batch.q_manifest = torch.zeros(2, 1)
     _, missing_manifest_extra = model(missing_manifest_batch, return_features=True)
-    assert torch.allclose(
-        missing_manifest_extra["manifest_emb_for_joint"],
-        torch.zeros_like(missing_manifest_extra["manifest_emb_for_joint"]),
-        atol=1e-7,
+    assert torch.equal(
+        missing_manifest_extra["fusion_weights"][:, 2], torch.zeros(2)
     )
 
-    confidence_model = TriModalRobustModel(
-        in_feat_dim=16,
-        fusion_mode="tri_modal_confidence_gate",
-        api_num_hash_buckets=64,
-        api_type_vocab_size=16,
-        api_emb_dim=32,
-        api_hidden_dim=64,
-        api_layers=1,
-        api_heads=4,
-        api_max_seq_len=16,
-        graph_emb_dim=32,
-        graph_hidden=32,
-        graph_heads=4,
-        graph_layers=1,
-        max_nodes_gnn=64,
-        manifest_in_dim=32,
-        manifest_emb_dim=32,
-        manifest_hidden_dim=64,
-        joint_emb_dim=32,
-    )
-    _, confidence_extra = confidence_model(batch, return_features=False)
-    assert confidence_extra["gate_weights"].shape == (2, 4)
-    assert torch.allclose(
-        confidence_extra["gate_weights"].sum(dim=-1),
-        torch.ones(2),
-        atol=1e-5,
-    )
-    assert confidence_extra["gate_prior_enabled"] is False
+
+@pytest.mark.parametrize(
+    "removed_mode",
+    ("tri_modal_ours", "tri_modal_confidence_gate", "tri_modal_reliability_gate"),
+)
+def test_removed_four_branch_gate_modes_fail_fast(removed_mode):
+    with pytest.raises(ValueError, match="Unsupported tri-modal fusion_mode"):
+        TriModalRobustModel(in_feat_dim=16, fusion_mode=removed_mode)
 
 
 def test_api_encoder_rejects_invalid_batch_assignments():
@@ -579,6 +553,27 @@ def test_api_encoder_rejects_invalid_batch_assignments():
     data.api_batch = torch.tensor([0, 2], dtype=torch.long)
     with pytest.raises(ValueError, match="outside"):
         encoder(data, num_graphs=2, device=torch.device("cpu"), dtype=torch.float32)
+
+
+def test_api_encoder_rejects_silent_second_truncation():
+    encoder = ApiSequenceEncoder(
+        num_hash_buckets=16,
+        type_vocab_size=4,
+        emb_dim=8,
+        hidden_dim=8,
+        dropout=0.0,
+        num_layers=1,
+        num_heads=2,
+        max_seq_len=2,
+    )
+    data = Data()
+    data.api_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+    data.api_type_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+    data.api_sensitive_mask = torch.zeros(3)
+    data.api_batch = torch.zeros(3, dtype=torch.long)
+
+    with pytest.raises(RuntimeError, match="budget contract was violated"):
+        encoder(data, num_graphs=1, device=torch.device("cpu"), dtype=torch.float32)
 
 
 def test_api_hash_bucket_last_valid_id_is_not_overflow():
@@ -601,7 +596,7 @@ def test_api_hash_bucket_last_valid_id_is_not_overflow():
     assert normalized.tolist() == [0, 0, 1, 2, 17, 18, 18]
 
 
-def test_robust_dataset_collate(tmp_path: Path):
+def test_robust_dataset_collate(tmp_path: Path, monkeypatch):
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     sid = "sample1"
@@ -633,6 +628,20 @@ def test_robust_dataset_collate(tmp_path: Path):
         writer.writeheader()
         writer.writerow({"id": sid, "label": 1, "year": 2024})
 
+    # Some PyTorch releases accept pathlib.Path for ordinary torch.load calls
+    # but require a string filename when mmap=True.  Enforce the stricter
+    # contract here so the AutoDL runtime cannot regress silently.
+    original_torch_load = torch.load
+    mmap_paths = []
+
+    def strict_mmap_load(path, *args, **kwargs):
+        if kwargs.get("mmap", False):
+            assert isinstance(path, str)
+            mmap_paths.append(path)
+        return original_torch_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", strict_mmap_load)
+
     dataset = RobustTriModalDataset(
         str(pt_dir),
         str(csv_path),
@@ -640,6 +649,7 @@ def test_robust_dataset_collate(tmp_path: Path):
         manifest_dim=16,
         manifest_category_dim=12,
         manifest_stats_dim=11,
+        max_graph_nodes_per_sample=8,
     )
     batch = next(iter(DataLoader(dataset, batch_size=1, collate_fn=robust_collate_fn)))
     graph = batch["graph_batch"]
@@ -650,6 +660,10 @@ def test_robust_dataset_collate(tmp_path: Path):
     assert graph.graph_semantic_category_counts.shape == (1, 12)
     assert graph.api_category_counts.shape == (1, 12)
     assert graph.graph_semantic_category_counts.sum().item() == 2.0
+    assert graph.graph_encoder_budget_max_nodes.view(-1).tolist() == [8]
+    assert graph.graph_encoder_budget_contract == [1, 8, [3]]
+    assert graph.to(torch.device("cpu")).graph_encoder_budget_contract == [1, 8, [3]]
+    assert len(mmap_paths) >= 2  # feature-dimension inference and __getitem__
 
 
 def test_dataset_strict_split_integrity_rejects_csv_pt_mismatch(tmp_path: Path):
@@ -664,6 +678,87 @@ def test_dataset_strict_split_integrity_rejects_csv_pt_mismatch(tmp_path: Path):
 
     with pytest.raises(ValueError, match="Split integrity mismatch"):
         RobustTriModalDataset(str(pt_dir), str(csv_path), is_train=False)
+
+
+def _make_label_contract_fixture(
+    tmp_path: Path,
+    *,
+    label: object,
+    year: object | None = None,
+) -> tuple[Path, Path]:
+    pt_dir = tmp_path / "pts"
+    pt_dir.mkdir()
+    sid = "sample"
+    save_current_pt(pt_dir / f"{sid}.pt", {}, manifest_dim=16)
+    csv_path = tmp_path / "labels.csv"
+    fieldnames = ["id", "label"] + (["year"] if year is not None else [])
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        row: dict[str, object] = {"id": sid, "label": label}
+        if year is not None:
+            row["year"] = year
+        writer.writerow(row)
+    return pt_dir, csv_path
+
+
+@pytest.mark.parametrize("label", [0.5, 1.5, 2, "nan", "inf", "true"])
+def test_dataset_rejects_non_finite_or_non_binary_labels(tmp_path: Path, label: object):
+    pt_dir, csv_path = _make_label_contract_fixture(tmp_path, label=label)
+
+    with pytest.raises(ValueError, match="finite binary integers"):
+        RobustTriModalDataset(
+            str(pt_dir), str(csv_path), is_train=False, manifest_dim=16
+        )
+
+
+@pytest.mark.parametrize("mapped_value", [0.5, 2, float("nan"), float("inf"), True])
+def test_dataset_rejects_invalid_label_map_values(tmp_path: Path, mapped_value: object):
+    pt_dir, csv_path = _make_label_contract_fixture(tmp_path, label="malware")
+
+    with pytest.raises(ValueError, match=r"data\.label_map"):
+        RobustTriModalDataset(
+            str(pt_dir),
+            str(csv_path),
+            is_train=False,
+            manifest_dim=16,
+            label_map={"malware": mapped_value},
+        )
+
+
+def test_dataset_accepts_explicit_string_label_map(tmp_path: Path):
+    pt_dir, csv_path = _make_label_contract_fixture(tmp_path, label="malware")
+
+    dataset = RobustTriModalDataset(
+        str(pt_dir),
+        str(csv_path),
+        is_train=False,
+        manifest_dim=16,
+        label_map={"malware": 1},
+    )
+
+    assert dataset.sample_labels == [1]
+
+
+@pytest.mark.parametrize("year", [2020.5, "nan", "inf", "true"])
+def test_dataset_rejects_non_finite_or_fractional_years(tmp_path: Path, year: object):
+    pt_dir, csv_path = _make_label_contract_fixture(tmp_path, label=1, year=year)
+
+    with pytest.raises(ValueError, match="years that are not finite integers"):
+        RobustTriModalDataset(
+            str(pt_dir), str(csv_path), is_train=False, manifest_dim=16
+        )
+
+
+@pytest.mark.parametrize("budget", [0, -1, 1.5, float("nan"), True])
+def test_dataset_requires_a_positive_integral_api_budget(tmp_path: Path, budget: object):
+    with pytest.raises(ValueError, match="max_api_events_per_sample"):
+        RobustTriModalDataset(
+            str(tmp_path / "pts"),
+            str(tmp_path / "labels.csv"),
+            is_train=False,
+            max_api_events_per_sample=budget,
+        )
 
 
 def test_dataset_allows_pt_superset_for_real_failure_slice(tmp_path: Path):
@@ -885,62 +980,47 @@ def test_dataset_rejects_manifest_x_larger_than_configured_dim(tmp_path: Path):
 def test_dataset_requires_current_manifest_semantic_maps(tmp_path: Path):
     pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="missing_manifest_maps")
     path = pt_dir / "missing_manifest_maps.pt"
-    raw = torch.load(path, map_location="cpu", weights_only=False)
+    raw = torch.load(path, map_location="cpu", weights_only=True)
     del raw["manifest_permission_category_map"]
     torch.save(raw, path)
-    dataset = RobustTriModalDataset(
-        str(pt_dir),
-        str(csv_path),
-        is_train=False,
-        manifest_dim=16,
-    )
     with pytest.raises(FatalDatasetConfigError, match="missing top-level fields"):
-        dataset[0]
+        RobustTriModalDataset(
+            str(pt_dir),
+            str(csv_path),
+            is_train=False,
+            manifest_dim=16,
+        )
 
 
 def test_dataset_rejects_non_current_pt_schema_version(tmp_path: Path):
     pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="old_schema")
     path = pt_dir / "old_schema.pt"
-    raw = torch.load(path, map_location="cpu", weights_only=False)
+    raw = torch.load(path, map_location="cpu", weights_only=True)
     raw["direct_build_meta"]["pt_schema_version"] = PT_SCHEMA_VERSION - 1
     torch.save(raw, path)
-    dataset = RobustTriModalDataset(
-        str(pt_dir),
-        str(csv_path),
-        is_train=False,
-        manifest_dim=16,
-    )
     with pytest.raises(FatalDatasetConfigError, match="does not match required current version"):
-        dataset[0]
-
-
-def test_heuristic_joint_gate_uses_manifest_reliability():
-    evidence = torch.zeros(2, 11)
-    evidence[:, 0] = 1.0
-    evidence[:, 1] = 1.0
-    evidence[:, 3] = 1.0
-    evidence[:, 4] = 1.0
-    evidence[:, 5] = 1.0
-    evidence[:, 8] = 1.0
-    evidence[:, 9] = 1.0
-    evidence[:, 10] = 1.0
-    evidence[0, 2] = 1.0
-    evidence[1, 2] = 0.0
-
-    weights = heuristic_reliability_gate(evidence)
-    assert weights[0, 3] > weights[1, 3]
+        RobustTriModalDataset(
+            str(pt_dir),
+            str(csv_path),
+            is_train=False,
+            manifest_dim=16,
+        )
 
 
 def test_removed_legacy_loss_weights_are_rejected():
     logits = torch.zeros(2, 2, requires_grad=True)
     labels = torch.tensor([0, 1], dtype=torch.long)
-    extra = {"gate_weights_train": torch.full((2, 4), 0.25, requires_grad=True)}
+    extra = {
+        "gate_weights_train": torch.full(
+            (2, 3), 1.0 / 3.0, requires_grad=True
+        )
+    }
     for cfg in (
-        {"gate_prior_weight": 0.01},
-        {"cross_source_consistency_weight": 0.05},
-        {"semantic_reconstruction_weight": 0.1},
+        {"gate_prior_weight": 0.0},
+        {"cross_source_consistency_weight": 0.0},
+        {"semantic_reconstruction_weight": 0.0},
     ):
-        with pytest.raises(ValueError, match="removed from the formal lean pipeline"):
+        with pytest.raises(ValueError, match="Removed loss configuration keys"):
             compute_robust_loss(logits, labels, extra, cfg)
 
 
@@ -960,6 +1040,7 @@ def _perturbation_sample():
         "sensitive_mask": torch.ones(3, dtype=torch.uint8),
         "graph_semantic_category_counts": torch.ones(12),
         "graph_category_counts": torch.ones(12),
+        "graph_semantic_source": "alignment",
         "manifest_x": torch.ones(16),
         "manifest_permission_ids": torch.tensor([1, 2, 3, 4], dtype=torch.long),
         "manifest_intent_ids": torch.tensor([1, 2], dtype=torch.long),
@@ -982,6 +1063,84 @@ def _perturbation_sample():
     }
 
 
+def _assert_nested_perturbation_equal(actual, expected, path="root"):
+    assert type(actual) is type(expected), path
+    if isinstance(expected, dict):
+        assert set(actual) == set(expected), path
+        for key in expected:
+            _assert_nested_perturbation_equal(
+                actual[key], expected[key], f"{path}.{key}"
+            )
+    elif isinstance(expected, torch.Tensor):
+        assert torch.equal(actual, expected), path
+    else:
+        assert actual == expected, path
+
+
+def test_each_nonclean_perturbation_materializes_observables_once(monkeypatch):
+    original_refresh = perturbations_module.refresh_observable_signals
+    refresh_count = 0
+
+    def counted_refresh(data):
+        nonlocal refresh_count
+        refresh_count += 1
+        return original_refresh(data)
+
+    monkeypatch.setattr(
+        perturbations_module, "refresh_observable_signals", counted_refresh
+    )
+    perturb_types = sorted(
+        value for value in EVAL_PERTURB_TYPES if value not in {None, "clean"}
+    )
+    for index, perturb_type in enumerate(perturb_types):
+        random.seed(7000 + index)
+        torch.manual_seed(7000 + index)
+        before = refresh_count
+        apply_perturbation(_perturbation_sample(), perturb_type, 0.5)
+        assert refresh_count - before == 1, perturb_type
+
+
+@pytest.mark.parametrize(
+    ("compound", "sequential"),
+    [
+        ("api_graph_degraded", ("api_degraded", "graph_degraded")),
+        ("api_manifest_degraded", ("api_degraded", "manifest_degraded")),
+        ("graph_manifest_degraded", ("graph_degraded", "manifest_degraded")),
+        (
+            "all_degraded",
+            ("api_degraded", "graph_degraded", "manifest_degraded"),
+        ),
+        (
+            "all_semantic_corrupted",
+            (
+                "api_semantic_corrupted",
+                "graph_semantic_corrupted",
+                "manifest_semantic_corrupted",
+            ),
+        ),
+    ],
+)
+def test_compound_single_refresh_matches_sequential_materialization(
+    compound, sequential
+):
+    """One final refresh must preserve every legacy sequential output field."""
+
+    seed = 12031
+    random.seed(seed)
+    torch.manual_seed(seed)
+    actual = apply_perturbation(
+        copy.deepcopy(_perturbation_sample()), compound, 0.5
+    )
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+    expected = copy.deepcopy(_perturbation_sample())
+    for perturb_type in sequential:
+        expected = apply_perturbation(expected, perturb_type, 0.5)
+
+    _assert_nested_perturbation_equal(actual, expected)
+
+
 def test_api_missing_sets_q_align_zero():
     data = apply_api_missing(_perturbation_sample())
     assert data["q_api"] == 0.0
@@ -990,7 +1149,7 @@ def test_api_missing_sets_q_align_zero():
     assert data["code_integrity"] == 0.0
     assert data["pert_api"] == 1.0
     assert data["q_align"] == 0.0
-    assert data["graph_semantic_category_counts"].sum().item() == 12.0
+    assert data["graph_semantic_category_counts"].sum().item() == 0.0
 
 
 def test_api_event_dropout_removes_tokens_and_remaps_edges():
@@ -1013,7 +1172,39 @@ def test_api_event_dropout_removes_tokens_and_remaps_edges():
     assert out["q_api"] < 1.0
     assert out["q_api"] > 0.0
     assert out["q_align"] <= 0.8
-    assert out["graph_semantic_category_counts"].sum().item() == 12.0
+    expected_graph_counts = graph_semantic_counts_from_method_api_edges(
+        out["api_type_ids"], out["method_api_edge_index"]
+    )
+    assert torch.equal(out["graph_semantic_category_counts"], expected_graph_counts)
+    assert out["graph_semantic_category_counts"].sum().item() == 2.0
+
+
+def test_api_category_dropout_refreshes_graph_alignment_semantics():
+    torch.manual_seed(3)
+    out = apply_api_category_dropout(_perturbation_sample(), 0.5)
+    expected_graph_counts = graph_semantic_counts_from_method_api_edges(
+        out["api_type_ids"], out["method_api_edge_index"]
+    )
+
+    assert torch.equal(out["graph_semantic_category_counts"], expected_graph_counts)
+    assert torch.equal(out["graph_category_counts"], expected_graph_counts)
+
+
+def test_api_feature_noise_updates_semantics_and_graph_alignment():
+    torch.manual_seed(7)
+    data = _perturbation_sample()
+    original_ids = data["api_ids"].clone()
+    original_types = data["api_type_ids"].clone()
+    out = apply_api_feature_noise(data, 1.0)
+    expected_api_counts = api_semantic_counts_from_type_ids(out["api_type_ids"])
+    expected_graph_counts = graph_semantic_counts_from_method_api_edges(
+        out["api_type_ids"], out["method_api_edge_index"]
+    )
+
+    assert torch.all(out["api_ids"] != original_ids)
+    assert not torch.equal(out["api_type_ids"], original_types)
+    assert torch.equal(out["api_semantic_category_counts"], expected_api_counts)
+    assert torch.equal(out["graph_semantic_category_counts"], expected_graph_counts)
 
 
 def test_sensitive_api_dropout_is_noop_when_no_sensitive_events_exist():
@@ -1156,12 +1347,16 @@ def test_zero_strength_degradation_is_noop():
         "manifest_component_mask",
         "manifest_feature_noise",
         "api_degraded",
+        "api_semantic_corrupted",
         "graph_degraded",
+        "graph_semantic_corrupted",
         "manifest_degraded",
+        "manifest_semantic_corrupted",
         "api_graph_degraded",
         "api_manifest_degraded",
         "graph_manifest_degraded",
         "all_degraded",
+        "all_semantic_corrupted",
     ]
     for perturb_type in perturb_types:
         data = _perturbation_sample()
@@ -1176,6 +1371,50 @@ def test_zero_strength_degradation_is_noop():
                 assert torch.equal(actual, expected), perturb_type
             else:
                 assert actual == expected, perturb_type
+
+
+def test_aggregate_completeness_and_semantic_corruptions_are_separated():
+    torch.manual_seed(7)
+    scenarios = {
+        "api_degraded": (
+            {"api_event_dropout", "api_category_dropout"},
+            "api_aug_type",
+            "pert_api",
+        ),
+        "graph_degraded": (
+            {"graph_sparsify", "graph_node_feature_mask"},
+            "graph_aug_type",
+            "pert_graph",
+        ),
+        "manifest_degraded": (
+            {
+                "manifest_permission_mask",
+                "manifest_intent_mask",
+                "manifest_component_mask",
+            },
+            "manifest_aug_type",
+            "pert_manifest",
+        ),
+        "api_semantic_corrupted": (
+            {"api_feature_noise"},
+            "api_aug_type",
+            "pert_api",
+        ),
+        "graph_semantic_corrupted": (
+            {"graph_local_break", "graph_feature_obfuscation"},
+            "graph_aug_type",
+            "pert_graph",
+        ),
+        "manifest_semantic_corrupted": (
+            {"manifest_permission_injection", "manifest_feature_noise"},
+            "manifest_aug_type",
+            "pert_manifest",
+        ),
+    }
+    for perturb_type, (allowed, diagnostic_key, perturbation_key) in scenarios.items():
+        out = apply_perturbation(_perturbation_sample(), perturb_type, 0.5)
+        assert out[diagnostic_key] in allowed
+        assert float(out[perturbation_key]) > 0.0
 
 
 def test_eval_perturbation_is_deterministic_per_sample(tmp_path: Path):
@@ -1259,7 +1498,7 @@ def test_manifest_missing_zeroes_manifest_counts_and_q_manifest():
 def test_removed_cross_source_and_semantic_losses_are_not_supported():
     logits = torch.zeros(1, 2, requires_grad=True)
     labels = torch.tensor([0], dtype=torch.long)
-    with pytest.raises(ValueError, match="removed from the formal lean pipeline"):
+    with pytest.raises(ValueError, match="Removed loss configuration keys"):
         compute_robust_loss(
             logits,
             labels,
@@ -1268,8 +1507,8 @@ def test_removed_cross_source_and_semantic_losses_are_not_supported():
         )
 
 
-def test_loss_rejects_negative_auxiliary_weight():
-    with pytest.raises(ValueError, match="cross_source_consistency_weight"):
+def test_loss_rejects_removed_cross_source_weight_regardless_of_value():
+    with pytest.raises(ValueError, match="Removed loss configuration keys"):
         compute_robust_loss(
             torch.zeros(1, 2),
             torch.tensor([0]),
@@ -1397,7 +1636,8 @@ def test_direct_resume_requires_matching_current_schema(tmp_path: Path):
             "call_edge_index": torch.empty((2, 0), dtype=torch.long),
             "api_ids": torch.tensor([1]),
             "api_type_ids": torch.tensor([1]),
-        }
+        },
+        sid="abc",
     )
     payload["observable_metadata"] = observable
     payload["direct_build_meta"]["build_fingerprint"] = "match"
@@ -1438,13 +1678,16 @@ def test_direct_build_clears_resume_mismatch_reason_after_success(
             "call_edge_index": torch.empty((2, 0), dtype=torch.long),
             "api_ids": torch.tensor([1]),
             "api_type_ids": torch.tensor([1]),
-        }
+        },
+        sid="abc",
     )
     stale["direct_build_meta"]["build_fingerprint"] = "stale"
     torch.save(stale, path)
 
     def fake_process_apk(*_args, **_kwargs):
-        current = current_pt_payload(stale["dex_list"], manifest_dim=32)
+        current = current_pt_payload(
+            stale["dex_list"], manifest_dim=32, sid="abc"
+        )
         current["direct_build_meta"]["build_fingerprint"] = "temporary-code-stage"
         torch.save(current, path)
         return True, ""
@@ -1455,7 +1698,7 @@ def test_direct_build_clears_resume_mismatch_reason_after_success(
     )
     result = _build_one(
         job,
-        {"component_count": 1},
+        {"sha256": "abc", "component_count": 1},
         cfg,
         {
             "categories": list(DEFAULT_CATEGORIES),
@@ -1473,6 +1716,26 @@ def test_direct_build_clears_resume_mismatch_reason_after_success(
 def test_failed_ratio_guard_rejects_silent_bad_sample_rate():
     with pytest.raises(RuntimeError, match="failed sample ratio"):
         enforce_failed_ratio({"num_eval": 9, "num_failed": 1}, {"data": {"max_failed_ratio": 0.0}}, "train")
+
+
+@pytest.mark.parametrize(
+    "threshold", [float("nan"), float("inf"), -0.1, 1.0, 1.1, 0.1, True]
+)
+def test_failed_ratio_guard_rejects_invalid_or_nonzero_tolerance(threshold: object):
+    with pytest.raises(ValueError, match="max_failed_ratio"):
+        enforce_failed_ratio(
+            {"num_eval": 1, "num_failed": 0},
+            {"data": {"max_failed_ratio": threshold}},
+            "test",
+        )
+
+
+def test_failed_ratio_guard_rejects_empty_and_all_failed_evaluation():
+    cfg = {"data": {"max_failed_ratio": 0.0}}
+    with pytest.raises(RuntimeError, match="no requested samples"):
+        enforce_failed_ratio({"num_eval": 0, "num_failed": 0}, cfg, "empty")
+    with pytest.raises(RuntimeError, match="no samples were evaluated successfully"):
+        enforce_failed_ratio({"num_eval": 0, "num_failed": 3}, cfg, "all_failed")
 
 
 # ---------------------------------------------------------------------------
@@ -1590,8 +1853,8 @@ def test_graph_semantic_source_rejects_invalid_value(tmp_path: Path):
 # ── gradient-flow & empty-input integration tests ──────────────────────
 
 
-def test_learned_gate_receives_gradient():
-    """Backward pass must deliver non-zero gradients to gate_net parameters."""
+def test_dense_embedding_gate_receives_gradient():
+    """Backward pass must deliver non-zero gradients to the three-way gate."""
     items = []
     for i in range(2):
         data = Data(
@@ -1625,7 +1888,7 @@ def test_learned_gate_receives_gradient():
 
     model = TriModalRobustModel(
         in_feat_dim=16,
-        fusion_mode="tri_modal_ours",
+        fusion_mode="tri_modal_dense_embedding_gate",
         api_num_hash_buckets=64,
         api_type_vocab_size=16,
         api_emb_dim=32,
@@ -1641,12 +1904,10 @@ def test_learned_gate_receives_gradient():
         manifest_in_dim=32,
         manifest_emb_dim=32,
         manifest_hidden_dim=64,
-        joint_emb_dim=32,
     )
 
-    # Verify gate_net has trainable parameters.
-    gate_params = list(model.gate_net.parameters())
-    assert len(gate_params) > 0, "gate_net must have parameters"
+    gate_params = list(model.dense_embedding_gate.parameters())
+    assert gate_params
 
     logits, extra = model(batch, return_features=True)
     loss, _ = compute_robust_loss(
@@ -1661,7 +1922,7 @@ def test_learned_gate_receives_gradient():
     for p in gate_params:
         if p.grad is not None and p.grad.abs().sum().item() > 0.0:
             nonzero_grads += 1
-    assert nonzero_grads > 0, "gate_net received zero gradients — possible detach bug"
+    assert nonzero_grads > 0, "dense embedding gate received zero gradients"
 
 
 def test_empty_api_and_zero_node_graph_forward():
@@ -1701,7 +1962,7 @@ def test_empty_api_and_zero_node_graph_forward():
 
     model = TriModalRobustModel(
         in_feat_dim=16,
-        fusion_mode="tri_modal_ours",
+        fusion_mode="tri_modal_fixed_gate",
         api_num_hash_buckets=64,
         api_type_vocab_size=16,
         api_emb_dim=32,
@@ -1717,13 +1978,12 @@ def test_empty_api_and_zero_node_graph_forward():
         manifest_in_dim=32,
         manifest_emb_dim=32,
         manifest_hidden_dim=64,
-        joint_emb_dim=32,
     )
 
     logits, extra = model(batch, return_features=True)
     assert logits.shape == (2, 2), "output shape must be (batch, num_classes)"
     assert torch.isfinite(logits).all(), "logits must be finite with empty API"
-    assert extra["gate_weights"].shape == (2, 4)
+    assert extra["gate_weights"].shape == (2, 3)
     assert torch.isfinite(extra["gate_weights"]).all()
 
     # Also test with zero-node graphs.
@@ -1736,5 +1996,5 @@ def test_empty_api_and_zero_node_graph_forward():
     logits_zero, extra_zero = model(batch_zero, return_features=True)
     assert logits_zero.shape == (2, 2)
     assert torch.isfinite(logits_zero).all(), "logits must be finite with zero-node graph"
-    assert extra_zero["gate_weights"].shape == (2, 4)
+    assert extra_zero["gate_weights"].shape == (2, 3)
     assert torch.isfinite(extra_zero["gate_weights"]).all()

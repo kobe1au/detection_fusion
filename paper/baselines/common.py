@@ -18,6 +18,8 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+from fusion.utils import strict_binary_integer, strict_finite_integer
+
 
 def resolve_path(path: str | Path) -> Path:
     return Path(path).expanduser().resolve()
@@ -32,6 +34,51 @@ def set_reproducible_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def _strict_binary_label_series(series: pd.Series, *, context: str) -> pd.Series:
+    parsed: list[int] = []
+    invalid_rows: list[Any] = []
+    for row_index, raw_value in series.items():
+        try:
+            parsed.append(
+                strict_binary_integer(
+                    raw_value,
+                    field_name=f"{context} label at row {row_index}",
+                )
+            )
+        except ValueError:
+            invalid_rows.append(row_index)
+    if invalid_rows:
+        examples = [
+            {"row": row_index, "label": series.loc[row_index]}
+            for row_index in invalid_rows[:10]
+        ]
+        raise ValueError(
+            f"{context} contains labels that are not finite binary integers; "
+            f"examples={examples}"
+        )
+    return pd.Series(parsed, index=series.index, dtype="int64")
+
+
+def enforce_formal_split_completeness(
+    split_name: str,
+    *,
+    num_eval: int,
+    failures: Iterable[Any] | None = None,
+) -> None:
+    """Refuse paper metrics computed on only the successfully loaded subset."""
+    num_eval = strict_finite_integer(
+        num_eval, field_name=f"{split_name}.num_eval"
+    )
+    failure_rows = list(failures or [])
+    if num_eval > 0 and not failure_rows:
+        return
+    raise RuntimeError(
+        f"{split_name}: formal baseline refuses success-subset metrics; "
+        f"num_eval={num_eval}, num_failed={len(failure_rows)}, "
+        f"failure_examples={failure_rows[:3]}"
+    )
 
 
 def validation_selection_indices(
@@ -60,11 +107,15 @@ def validation_selection_indices(
             group = str(value or "").strip().lower()
             groups.append(group if group not in {"", "nan", "none", "null"} else sid)
 
+    validated_labels = _strict_binary_label_series(
+        frame["label"], context="validation selection frame"
+    ).tolist()
+
     class FrameView:
         def __init__(self) -> None:
             self.sample_sids = sids
             self.sample_groups = groups
-            self.sample_labels = frame["label"].astype(int).tolist()
+            self.sample_labels = validated_labels
 
         def __len__(self) -> int:
             return len(self.sample_sids)
@@ -93,15 +144,12 @@ def read_label_csv(path: str | Path) -> pd.DataFrame:
         raise ValueError(f"{path} must contain a label column")
     frame = frame.copy()
     frame["sha256"] = frame["sha256"].astype(str).str.strip().str.lower()
-    frame["label"] = pd.to_numeric(frame["label"], errors="raise").astype(int)
+    frame["label"] = _strict_binary_label_series(frame["label"], context=str(path))
     if bool((frame["sha256"] == "").any()):
         raise ValueError(f"{path} contains an empty sha256")
     if bool(frame["sha256"].duplicated().any()):
         duplicates = frame.loc[frame["sha256"].duplicated(), "sha256"].head(5).tolist()
         raise ValueError(f"{path} contains duplicate sha256 values: {duplicates}")
-    invalid_labels = sorted(set(frame["label"].tolist()) - {0, 1})
-    if invalid_labels:
-        raise ValueError(f"{path} contains non-binary labels: {invalid_labels}")
     return frame
 
 
@@ -113,7 +161,7 @@ def load_pt(pt_dir: str | Path, sha256: str) -> dict[str, Any]:
     path = pt_path_for(pt_dir, sha256)
     if not path.exists():
         raise FileNotFoundError(path)
-    obj = torch.load(path, map_location="cpu", weights_only=False)
+    obj = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(obj, dict):
         raise ValueError(f"Expected PT dict payload: {path}")
     return obj

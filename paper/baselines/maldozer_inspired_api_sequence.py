@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 from paper.baselines.common import (
     binary_metrics,
     concat_long_from_sources,
+    enforce_formal_split_completeness,
     load_pt,
     read_label_csv,
     set_reproducible_seed,
@@ -180,6 +181,11 @@ def evaluate_split(
         vocab_size=vocab_size,
         show_progress=show_progress,
     )
+    enforce_formal_split_completeness(
+        split_name,
+        num_eval=len(dataset),
+        failures=failures,
+    )
     prob = predict(
         model,
         dataset,
@@ -311,12 +317,27 @@ def main() -> None:
         vocab_size=int(args.vocab_size),
         show_progress=show_progress,
     )
+    enforce_formal_split_completeness(
+        "train",
+        num_eval=len(train_ds),
+        failures=train_failures,
+    )
+    enforce_formal_split_completeness(
+        "validation",
+        num_eval=len(val_full_ds),
+        failures=val_failures,
+    )
     selection_indices, validation_split = validation_selection_indices(
         val_frame,
         calibration_fraction=float(args.validation_fraction),
         seed=int(args.seed),
     )
     val_selection_ds = subset_api_dataset(val_full_ds, selection_indices)
+    enforce_formal_split_completeness(
+        "validation_selection",
+        num_eval=len(val_selection_ds),
+        failures=[],
+    )
     model = ApiSequenceCNN(
         vocab_size=int(args.vocab_size),
         emb_dim=int(args.emb_dim),

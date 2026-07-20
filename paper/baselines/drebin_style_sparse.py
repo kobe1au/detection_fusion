@@ -16,6 +16,7 @@ from paper.baselines.common import (
     binary_metrics,
     concat_float_from_sources,
     concat_long_from_sources,
+    enforce_formal_split_completeness,
     first_float,
     first_long,
     load_pt,
@@ -143,6 +144,11 @@ def evaluate_split(
         max_api_events=max_api_events,
         show_progress=show_progress,
     )
+    enforce_formal_split_completeness(
+        split_name,
+        num_eval=int(labels.size),
+        failures=failures,
+    )
     prob = model.predict_proba(feature_dicts)[:, 1]
     metrics = binary_metrics(labels, prob)
     metrics["num_failed"] = len(failures)
@@ -181,6 +187,11 @@ def main() -> None:
         args.train_csv,
         max_api_events=int(args.max_api_events),
         show_progress=show_progress,
+    )
+    enforce_formal_split_completeness(
+        "train",
+        num_eval=int(train_labels.size),
+        failures=train_failures,
     )
     print(f"Training Drebin-style model on {len(train_features)} samples...", flush=True)
     model = Pipeline(

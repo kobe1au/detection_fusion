@@ -1,0 +1,13 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i2_router_no_route_conflict
+
+train:
+  exp_name: i2_router_no_route_conflict
+
+fusion:
+  routing:
+    # Remove only the explicit one-way outlier penalty from pi.
+    route_conflict_enabled: false

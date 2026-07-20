@@ -1,0 +1,15 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i1_no_predicted_class_intercept
+
+train:
+  exp_name: i1_no_predicted_class_intercept
+
+fusion:
+  reliability_calibration:
+    # Fixed topology: remove only the explicit benign/malware conditional
+    # intercept. The density score still selects the reference corresponding
+    # to this branch's raw-logit prediction class.
+    use_predicted_class_feature: false

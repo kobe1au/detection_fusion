@@ -56,7 +56,7 @@ def graph_size_from_payload(payload: Any) -> dict[str, int]:
 
 
 def inspect_pt(path: Path, max_nodes: int) -> dict[str, Any]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
     sizes = graph_size_from_payload(payload)
     encoder_nodes = sizes["encoder_nodes"]
     truncated_nodes = max(encoder_nodes - max_nodes, 0)

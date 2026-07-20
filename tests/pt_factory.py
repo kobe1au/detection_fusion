@@ -14,9 +14,11 @@ def current_pt_payload(
     *,
     top_level: dict[str, Any] | None = None,
     manifest_dim: int = 16,
+    sid: str | None = None,
 ) -> dict[str, Any]:
     dex_list = [dexes] if isinstance(dexes, dict) else list(dexes)
     source = {**(dex_list[0] if dex_list else {}), **(top_level or {})}
+    sample_id = str(sid or source.get("sha256") or "test-sample").strip().lower()
     permission_dim = int(source.get("manifest_permission_dim", 2))
     intent_dim = int(source.get("manifest_intent_dim", 1))
     feature_dim = int(source.get("manifest_feature_dim", 0))
@@ -88,6 +90,7 @@ def current_pt_payload(
             "schema_version": OBSERVABLE_SCHEMA_VERSION,
             "build_fingerprint": "test-current-schema",
             "dex_success_ratio": 1.0,
+            "sha256": sample_id,
         },
         "manifest_x": manifest_x,
         "manifest_permission_ids": torch.as_tensor(
@@ -117,7 +120,10 @@ def current_pt_payload(
         "manifest_stats": torch.as_tensor(
             source.get("manifest_stats", torch.ones(11))
         ).float().view(-1),
-        "manifest_meta": dict(source.get("manifest_meta") or {}),
+        "manifest_meta": {
+            **dict(source.get("manifest_meta") or {}),
+            "sha256": sample_id,
+        },
         "manifest_permission_dim": permission_dim,
         "manifest_intent_dim": intent_dim,
         "manifest_feature_dim": feature_dim,
@@ -134,6 +140,11 @@ def save_current_pt(
     manifest_dim: int = 16,
 ) -> None:
     torch.save(
-        current_pt_payload(dexes, top_level=top_level, manifest_dim=manifest_dim),
+        current_pt_payload(
+            dexes,
+            top_level=top_level,
+            manifest_dim=manifest_dim,
+            sid=Path(path).stem,
+        ),
         path,
     )

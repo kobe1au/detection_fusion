@@ -75,7 +75,6 @@ def build_evidence(
     api_logits: torch.Tensor,
     graph_logits: torch.Tensor,
     manifest_logits: torch.Tensor,
-    joint_logits: torch.Tensor,
     api_emb: torch.Tensor,
     graph_emb: torch.Tensor,
     manifest_emb: torch.Tensor,
@@ -133,11 +132,31 @@ def build_evidence(
     api_counts = semantic_counts_attr(graph_data, "api_semantic_category_counts", batch_size, device, dtype)
     graph_counts = semantic_counts_attr(graph_data, "graph_semantic_category_counts", batch_size, device, dtype)
     manifest_counts = semantic_counts_attr(graph_data, "manifest_category_counts", batch_size, device, dtype)
-    fallback_support, fallback_manifest_conflict, fallback_code_conflict = _fallback_manifest_signals(
-        api_counts,
-        graph_counts,
-        manifest_counts,
+    missing_manifest_support = not isinstance(
+        getattr(graph_data, "manifest_code_support", None), torch.Tensor
     )
+    missing_manifest_conflict = not isinstance(
+        getattr(graph_data, "manifest_to_code_conflict", None), torch.Tensor
+    )
+    missing_code_conflict = not isinstance(
+        getattr(graph_data, "code_to_manifest_conflict", None), torch.Tensor
+    )
+    # Current PTs materialize all three observable relations in the Dataset.
+    # Their fallback used to be recomputed unconditionally with a Python loop
+    # over every GPU batch, even though the result was then discarded.  Only
+    # execute that path for genuinely incomplete direct-call inputs.
+    if missing_manifest_support or missing_manifest_conflict or missing_code_conflict:
+        (
+            fallback_support,
+            fallback_manifest_conflict,
+            fallback_code_conflict,
+        ) = _fallback_manifest_signals(
+            api_counts,
+            graph_counts,
+            manifest_counts,
+        )
+    else:
+        fallback_support = fallback_manifest_conflict = fallback_code_conflict = None
     manifest_support = observable_attr(
         graph_data,
         "manifest_code_support",
@@ -165,11 +184,14 @@ def build_evidence(
         dtype,
         0.0,
     )
-    if not isinstance(getattr(graph_data, "manifest_code_support", None), torch.Tensor):
+    if missing_manifest_support:
+        assert fallback_support is not None
         manifest_support = fallback_support
-    if not isinstance(getattr(graph_data, "manifest_to_code_conflict", None), torch.Tensor):
+    if missing_manifest_conflict:
+        assert fallback_manifest_conflict is not None
         manifest_conflict = fallback_manifest_conflict
-    if not isinstance(getattr(graph_data, "code_to_manifest_conflict", None), torch.Tensor):
+    if missing_code_conflict:
+        assert fallback_code_conflict is not None
         code_conflict = fallback_code_conflict
 
     evidence_anchor = anchor_support if use_consistency_evidence else torch.zeros_like(anchor_support)
@@ -297,15 +319,11 @@ def build_evidence(
         "q_graph": graph_integrity.detach().view(batch_size),
         "q_manifest": manifest_integrity.detach().view(batch_size),
         "q_align": anchor_support.detach().view(batch_size),
-        "r_api": api_integrity.detach().view(batch_size),
-        "r_graph": graph_integrity.detach().view(batch_size),
-        "r_manifest": manifest_integrity.detach().view(batch_size),
         "api_manifest_consistency": api_manifest_consistency.detach().view(batch_size),
         "graph_manifest_consistency": graph_manifest_consistency.detach().view(batch_size),
         "api_confidence": confidence(api_logits).to(dtype=dtype).detach().view(batch_size),
         "graph_confidence": confidence(graph_logits).to(dtype=dtype).detach().view(batch_size),
         "manifest_confidence": confidence(manifest_logits).to(dtype=dtype).detach().view(batch_size),
-        "joint_confidence": confidence(joint_logits).to(dtype=dtype).detach().view(batch_size),
         "api_semantic_category_counts": api_counts.detach(),
         "graph_semantic_category_counts": graph_counts.detach(),
         "manifest_category_counts": manifest_counts.detach(),

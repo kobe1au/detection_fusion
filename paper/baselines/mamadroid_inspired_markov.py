@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 from paper.baselines.common import (
     binary_metrics,
     concat_long_from_sources,
+    enforce_formal_split_completeness,
     load_pt,
     read_label_csv,
     set_reproducible_seed,
@@ -123,6 +124,11 @@ def evaluate_split(
         smoothing=smoothing,
         show_progress=show_progress,
     )
+    enforce_formal_split_completeness(
+        split_name,
+        num_eval=int(labels.size),
+        failures=failures,
+    )
     prob = model.predict_proba(features)[:, 1]
     metrics = binary_metrics(labels, prob)
     metrics["num_failed"] = len(failures)
@@ -165,6 +171,11 @@ def main() -> None:
         max_api_events=int(args.max_api_events),
         smoothing=float(args.smoothing),
         show_progress=show_progress,
+    )
+    enforce_formal_split_completeness(
+        "train",
+        num_eval=int(train_labels.size),
+        failures=train_failures,
     )
     print(f"Training MaMaDroid-inspired model on {train_features.shape[0]} samples...", flush=True)
     model = Pipeline(

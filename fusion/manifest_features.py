@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 from collections import Counter
 from dataclasses import dataclass, field
@@ -493,17 +492,3 @@ def vectorize_manifest_record(
         "manifest_intent_dim": len(intent_vocab),
         "manifest_feature_dim": len(feature_vocab),
     }
-
-
-def read_manifest_jsonl(path: str | Path) -> dict[str, dict[str, Any]]:
-    records = {}
-    with open(path, "r", encoding="utf-8-sig") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            sid = str(rec.get("sid") or rec.get("sha256") or "").lower()
-            if sid:
-                records[sid] = rec
-    return records

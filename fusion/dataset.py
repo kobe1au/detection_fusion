@@ -36,7 +36,7 @@ from fusion.quality import (
     refresh_observable_signals,
 )
 from fusion.pt_schema import CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS, PT_SCHEMA_VERSION
-from fusion.utils import scalar_float
+from fusion.utils import scalar_float, strict_binary_integer, strict_finite_integer
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,11 @@ def apply_graph_encoder_budget(
     graph_semantic_source: str,
 ) -> dict[str, Any]:
     """Apply the model's per-sample graph budget before evidence is refreshed."""
+    runtime_budget = int(max_nodes) if max_nodes is not None and max_nodes > 0 else 0
+    # Runtime-only contract consumed by the graph encoder.  It prevents a
+    # silently different second truncation when dataset and encoder budgets
+    # drift apart; no APK-derived PT field is changed or required.
+    data["graph_encoder_budget_max_nodes"] = runtime_budget
     x = data.get("x")
     if not isinstance(x, torch.Tensor) or x.ndim != 2:
         return data
@@ -62,26 +67,31 @@ def apply_graph_encoder_budget(
         return data
 
     # Graph message passing is order-insensitive, so retain security-relevant
-    # nodes across all DEX files before filling the remaining budget from the
-    # original prefix. This avoids silently dropping sensitive nodes that happen
-    # to occur in a later DEX while keeping the selection modality-intrinsic.
+    # real nodes across all DEX files before filling the remaining budget from
+    # the original real-node prefix. Ghost nodes keep empty DEX files
+    # representable, but must never consume budget while a real node is still
+    # available. Within each priority tier the original order is stable.
     sensitive = data.get("sensitive_mask")
     if isinstance(sensitive, torch.Tensor) and sensitive.numel() == storage_nodes:
-        sensitive_flag = sensitive.view(-1).bool()
-        sensitive_indices = torch.nonzero(sensitive_flag, as_tuple=False).view(-1)
-        if int(sensitive_indices.numel()) >= max_nodes:
-            keep = sensitive_indices[:max_nodes]
-        else:
-            non_sensitive_indices = torch.nonzero(
-                ~sensitive_flag, as_tuple=False
-            ).view(-1)
-            remaining = max_nodes - int(sensitive_indices.numel())
-            keep = torch.cat(
-                [sensitive_indices, non_sensitive_indices[:remaining]], dim=0
-            )
-        keep = keep.sort().values.long()
+        sensitive_flag = sensitive.view(-1).bool().to(x.device)
     else:
-        keep = torch.arange(max_nodes, dtype=torch.long)
+        sensitive_flag = torch.zeros(
+            storage_nodes, dtype=torch.bool, device=x.device
+        )
+    real_mask = data.get("real_node_mask")
+    if isinstance(real_mask, torch.Tensor) and real_mask.numel() == storage_nodes:
+        real_flag = real_mask.view(-1).bool().to(x.device)
+    else:
+        real_flag = torch.ones(
+            storage_nodes, dtype=torch.bool, device=x.device
+        )
+    priority_parts = (
+        torch.nonzero(real_flag & sensitive_flag, as_tuple=False).view(-1),
+        torch.nonzero(real_flag & ~sensitive_flag, as_tuple=False).view(-1),
+        torch.nonzero(~real_flag, as_tuple=False).view(-1),
+    )
+    keep = torch.cat(priority_parts, dim=0)[:max_nodes]
+    keep = keep.sort().values.long()
     mapping = torch.full((storage_nodes,), -1, dtype=torch.long)
     mapping[keep] = torch.arange(max_nodes, dtype=torch.long)
     data["x"] = x[keep]
@@ -165,12 +175,11 @@ def apply_graph_encoder_budget(
     refresh_observable_signals(data)
 
     # Encoder truncation is a visibility constraint, not a parse/extraction
-    # failure. Preserve the pre-budget graph integrity as q_graph/r_graph and
+    # failure. Preserve the pre-budget graph integrity as q_graph and
     # let graph_encoder_coverage account for the lost visibility exactly once.
     graph_integrity = max(0.0, min(1.0, raw_integrity))
     data["graph_integrity"] = graph_integrity
     data["q_graph"] = graph_integrity
-    data["r_graph"] = graph_integrity
     data["code_integrity"] = math.sqrt(
         max(0.0, float(data["api_integrity"]) * graph_integrity)
     )
@@ -317,6 +326,22 @@ def _validate_current_pt_payload(
         )
     if not str(direct_meta.get("build_fingerprint") or "").strip():
         raise FatalDatasetConfigError(f"PT is missing direct build fingerprint: {pt_path}")
+    expected_sid = Path(pt_path).stem.strip().lower()
+    direct_sid = str(direct_meta.get("sha256") or "").strip().lower()
+    if not direct_sid or direct_sid != expected_sid:
+        raise FatalDatasetConfigError(
+            "PT filename/direct_build_meta.sha256 identity mismatch: "
+            f"path={pt_path} expected={expected_sid!r} actual={direct_sid!r}"
+        )
+    manifest_meta = raw.get("manifest_meta")
+    if not isinstance(manifest_meta, dict):
+        raise FatalDatasetConfigError(f"PT manifest_meta must be a mapping: {pt_path}")
+    manifest_sid = str(manifest_meta.get("sha256") or "").strip().lower()
+    if not manifest_sid or manifest_sid != expected_sid:
+        raise FatalDatasetConfigError(
+            "PT filename/manifest_meta.sha256 identity mismatch: "
+            f"path={pt_path} expected={expected_sid!r} actual={manifest_sid!r}"
+        )
 
     observable = raw["observable_metadata"]
     if not isinstance(observable, dict):
@@ -384,6 +409,9 @@ class RobustTriModalDataset(Dataset):
         label_map: dict | None = None,
         strict_split_integrity: bool = True,
         allow_pt_superset: bool = False,
+        expected_manifest_vocab_sha256: str | None = None,
+        expected_manifest_train_csv_sha256: str | None = None,
+        expected_manifest_train_sample_ids_sha256: str | None = None,
     ):
         if eval_perturb_type not in EVAL_PERTURB_TYPES:
             raise ValueError(f"Unsupported eval_perturb_type: {eval_perturb_type}")
@@ -406,13 +434,20 @@ class RobustTriModalDataset(Dataset):
                 f"eval_perturb_strength must be within [0, 1], got {self.eval_perturb_strength}"
             )
         self.max_api_events_per_sample = (
-            int(max_api_events_per_sample) if max_api_events_per_sample is not None else None
+            strict_finite_integer(
+                max_api_events_per_sample,
+                field_name="max_api_events_per_sample",
+            )
+            if max_api_events_per_sample is not None
+            else None
         )
         self.max_graph_nodes_per_sample = (
             int(max_graph_nodes_per_sample)
             if max_graph_nodes_per_sample is not None
             else None
         )
+        if self.max_api_events_per_sample is not None and self.max_api_events_per_sample <= 0:
+            raise ValueError("max_api_events_per_sample must be positive; use None for no limit")
         if self.max_graph_nodes_per_sample is not None and self.max_graph_nodes_per_sample <= 0:
             raise ValueError("max_graph_nodes_per_sample must be positive")
         self.manifest_dim = int(manifest_dim)
@@ -436,6 +471,33 @@ class RobustTriModalDataset(Dataset):
         self.graph_semantic_source = src
         self.strict_split_integrity = bool(strict_split_integrity)
         self.allow_pt_superset = bool(allow_pt_superset)
+        manifest_provenance = {
+            "manifest_vocab_sha256": expected_manifest_vocab_sha256,
+            "manifest_train_csv_sha256": expected_manifest_train_csv_sha256,
+            "manifest_train_sample_ids_sha256": (
+                expected_manifest_train_sample_ids_sha256
+            ),
+        }
+        self.expected_manifest_provenance = {
+            key: str(value or "").strip().lower()
+            for key, value in manifest_provenance.items()
+            if str(value or "").strip()
+        }
+        if self.expected_manifest_provenance and len(
+            self.expected_manifest_provenance
+        ) != len(manifest_provenance):
+            missing = sorted(
+                set(manifest_provenance) - set(self.expected_manifest_provenance)
+            )
+            raise ValueError(
+                "Manifest PT provenance must be supplied as one complete tuple; "
+                f"missing={missing}"
+            )
+        for key, value in self.expected_manifest_provenance.items():
+            if len(value) != 64 or any(
+                char not in "0123456789abcdef" for char in value
+            ):
+                raise ValueError(f"{key} must be a lowercase SHA-256 digest")
 
         df = pd.read_csv(csv_path)
         id_col = next((c for c in ["id", "ID", "Id", "sha256"] if c in df.columns), None)
@@ -457,8 +519,25 @@ class RobustTriModalDataset(Dataset):
                 f"count={len(duplicate_csv_ids)} examples={duplicate_csv_ids[:10]}"
             )
         raw_labels = df["label"].astype(str).str.strip()
-        if label_map:
-            normalized_map = {str(k).strip(): int(v) for k, v in label_map.items()}
+        if label_map is not None:
+            if not isinstance(label_map, dict) or not label_map:
+                raise ValueError("data.label_map must be a non-empty mapping when provided")
+            normalized_map: dict[str, int] = {}
+            for raw_key, raw_value in label_map.items():
+                key = str(raw_key).strip()
+                if not key:
+                    raise ValueError("data.label_map contains an empty normalized key")
+                if key in normalized_map:
+                    raise ValueError(
+                        f"data.label_map contains duplicate normalized key {key!r}"
+                    )
+                normalized_map[key] = strict_binary_integer(
+                    raw_value,
+                    field_name=f"data.label_map[{key!r}]",
+                )
+            if df["label"].isna().any():
+                bad = df.loc[df["label"].isna(), [id_col, "label"]].head(10).to_dict("records")
+                raise ValueError(f"CSV {csv_path} contains missing labels; examples={bad}")
             mapped = raw_labels.map(normalized_map)
             if mapped.isna().any():
                 bad = df.loc[mapped.isna(), [id_col, "label"]].head(10).to_dict("records")
@@ -466,16 +545,36 @@ class RobustTriModalDataset(Dataset):
                     f"CSV {csv_path} contains labels not covered by data.label_map; "
                     f"examples={bad}"
                 )
-            label_series = mapped.astype(int)
+            label_series = mapped.astype("int64")
         else:
-            label_series = pd.to_numeric(df["label"], errors="coerce")
-            if label_series.isna().any():
-                bad = df.loc[label_series.isna(), [id_col, "label"]].head(10).to_dict("records")
-                raise ValueError(f"CSV {csv_path} contains non-integer labels; examples={bad}")
-            label_series = label_series.astype(int)
-        num_classes = int(num_classes)
-        if num_classes <= 1:
-            raise ValueError(f"num_classes must be > 1, got {num_classes}")
+            parsed_labels: list[int] = []
+            invalid_label_rows: list[Any] = []
+            for row_index, raw_value in df["label"].items():
+                try:
+                    parsed_labels.append(
+                        strict_binary_integer(
+                            raw_value,
+                            field_name=f"CSV label at row {row_index}",
+                        )
+                    )
+                except ValueError:
+                    invalid_label_rows.append(row_index)
+            if invalid_label_rows:
+                bad = (
+                    df.loc[invalid_label_rows, [id_col, "label"]]
+                    .head(10)
+                    .to_dict("records")
+                )
+                raise ValueError(
+                    f"CSV {csv_path} contains labels that are not finite binary integers; "
+                    f"examples={bad}"
+                )
+            label_series = pd.Series(parsed_labels, index=df.index, dtype="int64")
+        num_classes = strict_finite_integer(num_classes, field_name="num_classes")
+        if num_classes != 2:
+            raise ValueError(
+                f"The current dataset contract is binary-only; num_classes must be 2, got {num_classes}"
+            )
         invalid = ~label_series.between(0, num_classes - 1)
         if invalid.any():
             bad = df.loc[invalid, [id_col, "label"]].head(20).to_dict("records")
@@ -486,11 +585,31 @@ class RobustTriModalDataset(Dataset):
                 "Fix the CSV labels or set data.label_map in the config."
             )
         labels = dict(zip(sid_series, label_series))
-        years = (
-            dict(zip(sid_series, pd.to_numeric(df[year_col], errors="coerce").fillna(0).astype(int)))
-            if year_col
-            else {sid: 0 for sid in sid_series}
-        )
+        if year_col:
+            parsed_years: list[int] = []
+            invalid_year_rows: list[Any] = []
+            for row_index, raw_value in df[year_col].items():
+                try:
+                    parsed_years.append(
+                        strict_finite_integer(
+                            raw_value,
+                            field_name=f"CSV year at row {row_index}",
+                        )
+                    )
+                except ValueError:
+                    invalid_year_rows.append(row_index)
+            if invalid_year_rows:
+                bad = (
+                    df.loc[invalid_year_rows, [id_col, year_col]]
+                    .head(10)
+                    .to_dict("records")
+                )
+                raise ValueError(
+                    f"CSV {csv_path} contains years that are not finite integers; examples={bad}"
+                )
+            years = dict(zip(sid_series, parsed_years))
+        else:
+            years = {sid: 0 for sid in sid_series}
         groups = (
             dict(
                 zip(
@@ -550,11 +669,46 @@ class RobustTriModalDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _validate_manifest_pt_provenance(
+        self,
+        raw: dict[str, Any],
+        pt_path: str | Path,
+    ) -> None:
+        """Reject stale or partially migrated Manifest payloads."""
+        if not self.expected_manifest_provenance:
+            return
+        direct_meta = raw.get("direct_build_meta") or {}
+        mismatches = {
+            key: {
+                "expected": expected,
+                "actual": str(direct_meta.get(key) or "").strip().lower(),
+            }
+            for key, expected in self.expected_manifest_provenance.items()
+            if str(direct_meta.get(key) or "").strip().lower() != expected
+        }
+        if mismatches:
+            raise FatalDatasetConfigError(
+                "PT Manifest provenance does not match the current train-only "
+                "vocabulary. Run scripts/migrate_manifest_vocab_pts.py "
+                f"(dry-run, then --apply) before training: path={pt_path} "
+                f"mismatches={mismatches}"
+            )
+
     def _infer_feature_dim(self, default_dim: int) -> int:
         for pt_file, _, _, _ in self.samples:
             try:
-                raw = torch.load(pt_file, map_location="cpu", weights_only=False)
+                # Current APK payloads use PyTorch's zip format.  Memory mapping
+                # keeps unused tensor storages lazy instead of copying the whole
+                # multi-DEX payload on every epoch; tensors touched below retain
+                # exactly the same dtype and values.
+                raw = torch.load(
+                    str(pt_file),
+                    map_location="cpu",
+                    weights_only=True,
+                    mmap=True,
+                )
                 dex_list, _ = _validate_current_pt_payload(raw, pt_file)
+                self._validate_manifest_pt_provenance(raw, pt_file)
                 for dex in dex_list:
                     x = dex.get("call_x") if isinstance(dex, dict) else None
                     if isinstance(x, torch.Tensor) and x.ndim == 2 and x.size(1) > 0:
@@ -562,6 +716,8 @@ class RobustTriModalDataset(Dataset):
                         if self.drop_graph_behavior_hints and dim == 519:
                             return 515
                         return dim
+            except FatalDatasetConfigError:
+                raise
             except Exception as exc:
                 logger.warning("feature_dim inference failed for %s: %s", pt_file, exc)
         return int(default_dim)
@@ -585,6 +741,15 @@ class RobustTriModalDataset(Dataset):
         data.graph_semantic_category_counts = torch.zeros((self.manifest_category_dim,), dtype=torch.float32)
         data.api_category_counts = data.api_semantic_category_counts.clone()
         data.graph_category_counts = data.graph_semantic_category_counts.clone()
+        data.graph_encoder_budget_max_nodes = torch.tensor(
+            [
+                int(self.max_graph_nodes_per_sample)
+                if self.max_graph_nodes_per_sample is not None
+                and self.max_graph_nodes_per_sample > 0
+                else 0
+            ],
+            dtype=torch.long,
+        )
         data.manifest_x = torch.zeros((1, self.manifest_dim), dtype=torch.float32)
         data.manifest_permission_ids = torch.empty((0,), dtype=torch.long)
         data.manifest_intent_ids = torch.empty((0,), dtype=torch.long)
@@ -1007,6 +1172,10 @@ class RobustTriModalDataset(Dataset):
             ],
             dtype=torch.float32,
         )
+        obj.graph_encoder_budget_max_nodes = torch.tensor(
+            [int(data.get("graph_encoder_budget_max_nodes", 0))],
+            dtype=torch.long,
+        )
         obj.manifest_x = data["manifest_x"].float().view(1, -1)
         obj.manifest_permission_ids = data["manifest_permission_ids"].long().view(-1)
         obj.manifest_intent_ids = data["manifest_intent_ids"].long().view(-1)
@@ -1037,8 +1206,17 @@ class RobustTriModalDataset(Dataset):
     def __getitem__(self, idx: int):
         pt_path, label, sid, year = self.samples[idx]
         try:
-            raw = torch.load(pt_path, map_location="cpu", weights_only=False)
+            # PT files are intentionally left unchanged.  mmap only changes how
+            # their storages are paged into CPU memory and avoids eagerly reading
+            # large extraction fields that this runtime does not consume.
+            raw = torch.load(
+                str(pt_path),
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
             dex_list, sources = _validate_current_pt_payload(raw, pt_path)
+            self._validate_manifest_pt_provenance(raw, pt_path)
             data = self._aggregate_api_graph(dex_list)
             if data is None:
                 return self._dummy(label, sid, year, "empty valid sample", pt_path)
@@ -1059,6 +1237,9 @@ class RobustTriModalDataset(Dataset):
             data.update(self._manifest_payload(raw))
             data.update(raw["observable_metadata"])
             data.update(runtime_api_budget)
+            # Runtime-only selector used to keep API perturbations and their
+            # graph-alignment-derived semantic histogram consistent.
+            data["graph_semantic_source"] = self.graph_semantic_source
             refresh_observable_signals(data)
             if self.robust_aug and self.is_train:
                 perturb_type, strength = sample_training_perturbation(self.perturb_prob, self.perturb_strengths)
@@ -1073,7 +1254,11 @@ class RobustTriModalDataset(Dataset):
                 self.max_graph_nodes_per_sample,
                 self.graph_semantic_source,
             )
-            return self._to_data_object(data, label, sid, year)
+            obj = self._to_data_object(data, label, sid, year)
+            # Runtime-only isolation metadata from the split CSV. It is not
+            # persisted into, or required from, the APK-derived PT payload.
+            obj.sample_group = str(self.sample_groups[idx])
+            return obj
         except FatalDatasetConfigError:
             raise
         except torch.cuda.OutOfMemoryError:
@@ -1102,6 +1287,7 @@ def robust_collate_fn(data_list):
             "graph_batch": None,
             "labels": None,
             "sids": None,
+            "sample_groups": None,
             "years": None,
             "quality": None,
             "failed_items": failed_items,
@@ -1110,6 +1296,9 @@ def robust_collate_fn(data_list):
         }
 
     sids = [d.sid for d in valid_items]
+    sample_groups = [
+        str(getattr(d, "sample_group", d.sid)) for d in valid_items
+    ]
     api_aug_types = [getattr(d, "api_aug_type", "none") for d in valid_items]
     graph_aug_types = [getattr(d, "graph_aug_type", "none") for d in valid_items]
     manifest_aug_types = [getattr(d, "manifest_aug_type", "none") for d in valid_items]
@@ -1124,12 +1313,26 @@ def robust_collate_fn(data_list):
     observable_signals = {key: [] for key in OBSERVABLE_SIGNAL_FIELDS}
     observable_errors = {key: [] for key in OBSERVABLE_ERROR_FIELDS}
     observable_versions: list[str] = []
+    graph_budget_values: list[int] = []
+    graph_node_counts: list[int] = []
     node_offset = 0
     api_offset = 0
 
     for sample_idx, d in enumerate(valid_items):
         gd = Data(x=d.x, edge_index=d.edge_index, y=d.y)
         gd.sensitive_mask = d.sensitive_mask
+        graph_budget = torch.as_tensor(
+            getattr(d, "graph_encoder_budget_max_nodes", 0),
+            dtype=torch.long,
+            device=d.x.device,
+        ).view(-1)[:1]
+        gd.graph_encoder_budget_max_nodes = graph_budget
+        graph_budget_values.append(
+            int(graph_budget.detach().cpu().item())
+            if graph_budget.numel() == 1
+            else 0
+        )
+        graph_node_counts.append(int(d.x.size(0)))
         graph_list.append(gd)
 
         n_api = int(d.api_ids.numel())
@@ -1174,6 +1377,23 @@ def robust_collate_fn(data_list):
         api_offset += n_api
 
     graph_batch = Batch.from_data_list(graph_list)
+    if (
+        graph_budget_values
+        and graph_budget_values[0] > 0
+        and all(value == graph_budget_values[0] for value in graph_budget_values)
+        and all(
+            count <= graph_budget_values[0] for count in graph_node_counts
+        )
+    ):
+        # CPU-only proof that every graph was already constrained by the same
+        # dataset budget. The encoder consumes this runtime marker after the
+        # batch moves to GPU, avoiding per-graph scalar synchronization and
+        # identity keep-index construction. PT payloads are unchanged.
+        graph_batch.graph_encoder_budget_contract = [
+            1,
+            int(graph_budget_values[0]),
+            list(graph_node_counts),
+        ]
     device = graph_batch.x.device
     graph_batch.api_ids = torch.cat(api_ids_all).long() if api_ids_all else torch.empty((0,), dtype=torch.long, device=device)
     graph_batch.api_type_ids = torch.cat(api_type_all).long() if api_type_all else torch.empty((0,), dtype=torch.long, device=device)
@@ -1220,6 +1440,7 @@ def robust_collate_fn(data_list):
         "graph_batch": graph_batch,
         "labels": labels,
         "sids": sids,
+        "sample_groups": sample_groups,
         "api_aug_types": api_aug_types,
         "graph_aug_types": graph_aug_types,
         "manifest_aug_types": manifest_aug_types,

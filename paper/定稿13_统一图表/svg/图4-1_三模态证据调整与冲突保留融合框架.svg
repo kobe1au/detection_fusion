@@ -58,8 +58,8 @@
 <text x="1415.0" y="221.86" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="24" font-weight="400" fill="#111111">κ</text>
 <line x1="1055" y1="415" x2="1055" y2="470" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
 <rect x="920" y="480" width="270" height="145" rx="8" fill="#F4F4F4" stroke="#333333" stroke-width="2"/>
-<text x="1055.0" y="544.4599999999999" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="24" font-weight="600" fill="#111111">Yager规则融合</text>
-<text x="1055.0" y="576.8599999999999" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="24" font-weight="400" fill="#111111">冲突计入不确定性</text>
+<text x="1055.0" y="544.4599999999999" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="24" font-weight="600" fill="#111111">条件意见路由</text>
+<text x="1055.0" y="576.8599999999999" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="24" font-weight="400" fill="#111111">π分配与argmax风险</text>
 <line x1="1190" y1="552" x2="1270" y2="552" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
 <rect x="1280" y="480" width="270" height="145" rx="8" fill="#EDEDED" stroke="#333333" stroke-width="2"/>
 <text x="1415.0" y="544.4599999999999" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="24" font-weight="600" fill="#111111">融合输出</text>

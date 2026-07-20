@@ -3,100 +3,242 @@ defaults:
 
 method:
   name: evidential_trusted_fusion
+  protocol_id: competence_degradation_consensus_crc_v1
 
 train:
   exp_name: evidential_trusted_fusion
 
 fusion:
-  # The global opinion router is the decision path during both encoder training
-  # and evaluation. It is refined on the independent calibration split after
-  # model selection; no classical combination rule is used as a hidden fallback.
+  # Encoder training, I1 fitting, route fitting, risk fitting, temperature
+  # fitting, and I3 decision
+  # calibration are separated. No classical combination rule is used
+  # as a hidden fallback.
   combination: routed
   routing:
     enabled: true
-    # Atomic switches keep the router ablation interpretable: learned residual
-    # routing, disagreement features, encoder-stage training, and post-hoc
-    # refinement can each be disabled without changing the opinion path.
     mode: learned
-    use_disagreement: true
-    train_end_to_end: true
+    route_conflict_enabled: true
+    risk_conflict_enabled: true
+    # Encoder training uses an alive-only uniform route. The log-odds prior is
+    # activated only after I1 fitting, so raw integrity is never treated as a
+    # cross-modality calibrated correctness probability.
+    train_end_to_end: false
     posthoc_refine: true
-    # Smooth gate initialization: close to the reliability prior while keeping
-    # usable gradients for both increasing and decreasing abstention mass.
-    initial_known_retention: 0.99
-    # Branch-correctness routing is complemented by the proper scoring loss of
-    # the final mixture. A single final temperature is then fitted on clean
-    # post-hoc calibration data; neither setting adds a tuned scalar weight.
-    use_fused_prediction_loss: true
-    target_loss_weight: 1.0
+    # pi is fitted by the conditional mixture NLL. u is a separate monotone
+    # estimate of the final-threshold malware-FN indicator. I3 later multiplies
+    # that event by its acceptance decision on a disjoint calibration split.
     prediction_loss_weight: 1.0
+    # The deployed router is fitted only by the proper mixture NLL. A
+    # source-level subset oracle is not part of the main method because the
+    # source/scenario identity is unavailable at inference; it remains an
+    # explicit optional add-on experiment.
+    route_oracle_loss_weight: 0.0
+    route_oracle_temperature: 1.0
+    subset_oracle_loss_weight: 0.0
+    subset_oracle_temperature: 1.0
+    # Preserve perturb-type/strength balance and add a stateless soft
+    # worst-group term. Treating every severity as its own group prevents a
+    # catastrophic s0.9 view from being hidden by four easier strengths of the
+    # same perturbation. No scenario identity is consumed at inference.
+    group_robust_objective:
+      enabled: true
+      taxonomy: perturb_type_strength_v1
+      soft_worst_weight: 0.25
+      temperature: 0.10
+      apply_to: [routing_distribution]
+    risk_mode: learned
+    risk_target: threshold_malware_false_negative
+    risk_loss_weight: 1.0
+    risk_loss: bce
+    # This is an explicit scenario prior, not a consequence of how many
+    # synthetic views happen to be generated. Dedicated 0.7/0.3 and 0.3/0.7
+    # cells test its sensitivity.
+    scenario_objective_weights:
+      clean: 0.5
+      perturb: 0.5
+    # Regularize operative scales (not raw softplus coordinates) so the
+    # deterministic full-batch route/risk problems have finite optima instead
+    # of drifting toward hard routing or an infinitely separated FN head.
+    route_effective_l2: 0.001
+    risk_effective_l2: 0.001
+    max_effective_parameter: 25.0
+    # Refuse to fit u if the selected cutoff leaves too little FN support.
+    # The guard is applied separately to clean and aggregate perturb views.
+    risk_support:
+      enabled: true
+      min_positive_events: 5
+      min_negative_events: 5
+      min_positive_groups: 3
+    initial_risk: 0.10
     final_temperature_scaling: true
-    acceptance_score_mode: product
-  branch_competence_prior:
-    enabled: false
+    acceptance_score_mode: fused_risk
   # These factors belong to the linear-probability comparison path. The routed
-  # path consumes relation evidence through the calibrated reliability once;
-  # disagreement is handled jointly by the global router and unknown mass.
+  # path uses intrinsic calibrated reliability once; cross-branch disagreement
+  # is handled only by I2's explicit route penalty and FN-risk head.
   use_support_discount: false
   use_conflict_discount: false
   use_confidence_proxy: false
   reliability_calibration:
-    # I1 combines observable branch quality with learned EDL certainty. Only
-    # API-Graph structural support is used as monotone relation evidence;
-    # Manifest-Code semantic relations remain diagnostic-only.
-    # Missing counterpart relations add no support bonus; they are not encoded
-    # as either observed conflict or artificial perfect agreement.
-    missing_relation_support: 0.0
-    # Joint is a dependent auxiliary representation, not a fourth evidence
-    # source, so it must not affect formal reliability fitting or early stopping.
+    # I1 estimates P(branch correct) from branch-local quality, a fold-local
+    # class-conditional embedding-density score, prediction margin, and a
+    # predicted-class intercept. No other modality or perturbation identity is
+    # consumed. The clean density reference is refitted inside every OOF fit.
+    method: monotonic_correctness
     branches: [api, graph, manifest]
-    use_relation_evidence: true
-    use_evidential_uncertainty: true
-    # Align the clean calibration view's mean reliability with its observed
-    # branch accuracy. Degradation response is imposed separately below.
-    group_mean_alignment: true
-    # Use the fixed 4/4/2/5 feature superset for API/Graph/Manifest/Joint;
-    # feature ablations zero-mask slots instead of changing topology or RNG.
-    # This layout is intentionally incompatible with pre-change checkpoints,
-    # which must be retrained under the staged-checkpoint lifecycle.
     use_model_visibility: true
-  visible_integrity_modifier:
-    enabled: true
-    # Parameter-free deployment modifier:
-    # M_m(x) = min(1, effective_integrity_m(x) / median_cal(effective_integrity_m)).
-    mode: relative_effective
+    use_embedding_density: true
+    embedding_dims: {api: 128, graph: 128, manifest: 128}
+    embedding_density_variance_shrinkage: 0.10
+    embedding_density_reference_quantile: 0.95
+    embedding_density_min_class_samples: 8
+    use_prediction_margin: true
+    use_predicted_class_feature: true
+    # I1 is fitted in two ordered phases. Clean competence uses only clean
+    # rows; the frozen degradation head then receives a pre-registered balance
+    # of clean, branch-local completeness and branch-local semantic views.
+    objective_weights:
+      clean: 0.50
+      completeness: 0.25
+      semantic: 0.25
+    require_all_objective_families: true
   probability_calibration:
     enabled: false
     weight: 0.0
 
 loss:
-  # Observable integrity weights branch auxiliary supervision. This is not a
-  # fitted reliability probability and remains fixed in the no-I1 module run.
-  integrity_weighted_aux: true
+  # Available branches receive equal supervised weight. Continuous integrity
+  # weighting is a training ablation, not part of I1.
+  auxiliary_weight_mode: alive_masked_uniform
   evidential_loss_weight: 0.05
 
 calibration:
-  # Degraded views supervise the post-hoc router only. Reliability calibrators
-  # use the clean view, while the explicit integrity modifier supplies the
-  # monotone degradation response.
+  # I1 uses explicit branch-local completeness corruptions plus the matching
+  # single-branch semantic view, which is identifiable through its own
+  # embedding-density score. Joint semantic corruption remains I2-only.
+  # Canonical package-isolation groups remain intact across every OOF view.
   perturb_strengths: [0.1, 0.3, 0.5, 0.7, 0.9]
-  epochs: 60
-  patience: 8
+  # I2 sees all three pairwise completeness failures symmetrically. This switch
+  # is explicit so their contribution can be removed in one independent cell.
+  include_pairwise_completeness_views: true
+  # Each post-hoc stage is a deterministic full-batch numerical fit and restores
+  # its minimum observed objective. Convex I1 must satisfy the declared
+  # convergence/improvement checks; non-convex route/risk fits retain explicit
+  # convergence diagnostics without turning a missing plateau into a false
+  # numerical failure.
+  stage_optimization:
+    default:
+      optimizer: adam
+      weight_decay: 0.0
+      grad_clip: 5.0
+      convergence_tolerance: 1.0e-6
+      convergence_patience: 25
+      gradient_tolerance: 1.0e-5
+      minimum_relative_improvement: 0.0
+      log_every: 25
+      require_convergence: false
+      lr_scheduler_patience: 50
+      lr_scheduler_factor: 0.5
+      min_lr: 1.0e-6
+    reliability:
+      optimizer: lbfgs
+      lr: 1.0
+      # Seed-42 folds empirically needed up to 91 accepted LBFGS iterations
+      # under the pre-registered 1e-7 plateau rule.  The I1 fast path now
+      # materializes branch features once, so this safety cap no longer
+      # repeats the fusion stack and does not change the fitted objective.
+      max_steps: 150
+      min_steps: 3
+      convergence_tolerance: 1.0e-7
+      convergence_patience: 3
+      gradient_tolerance: 1.0e-5
+      minimum_relative_improvement: 1.0e-4
+      log_every: 5
+      require_convergence: true
+      lbfgs_history_size: 20
+    reliability_competence:
+      optimizer: lbfgs
+      lr: 1.0
+      max_steps: 100
+      min_steps: 3
+      convergence_tolerance: 1.0e-7
+      convergence_patience: 3
+      gradient_tolerance: 1.0e-5
+      minimum_relative_improvement: 1.0e-4
+      log_every: 5
+      require_convergence: true
+      lbfgs_history_size: 20
+    reliability_degradation:
+      optimizer: lbfgs
+      lr: 1.0
+      max_steps: 100
+      min_steps: 3
+      convergence_tolerance: 1.0e-7
+      convergence_patience: 3
+      gradient_tolerance: 1.0e-5
+      minimum_relative_improvement: 1.0e-4
+      log_every: 5
+      require_convergence: true
+      lbfgs_history_size: 20
+    routing_distribution:
+      optimizer: lbfgs
+      lr: 1.0
+      max_steps: 200
+      min_steps: 3
+      convergence_tolerance: 1.0e-6
+      convergence_patience: 5
+      gradient_tolerance: 1.0e-5
+      minimum_relative_improvement: 1.0e-4
+      # Non-convex routing keeps the restored minimum even when the finite
+      # iteration budget ends before the plateau heuristic. Scale guards and
+      # effective L2 remain hard failures; a missing plateau is diagnostic.
+      require_convergence: false
+      lbfgs_history_size: 20
+    routing_risk:
+      optimizer: lbfgs
+      lr: 1.0
+      max_steps: 150
+      min_steps: 3
+      convergence_tolerance: 1.0e-6
+      convergence_patience: 5
+      gradient_tolerance: 1.0e-5
+      minimum_relative_improvement: 1.0e-4
+      require_convergence: false
+      lbfgs_history_size: 20
+  # Outer-route/inner-I1 nested cross-fitting gives every stage all post-hoc
+  # identities while keeping every target row unseen by all of its upstream
+  # fitted modules. Encoders are evaluated once and their logits stay cached.
+  cross_fitting:
+    # Formal I1 -> I2 runs must never fall back to in-sample stacking.
+    required: true
+    enabled: true
+    mode: nested
+    num_folds: 5
 
-# Fit the final binary decision boundary only on the post-hoc validation
-# subset. The disjoint decision-calibration subset then refits I3 using these
-# fixed predictions, so neither choice consults the test set.
+# Fit the canonical raw-log-odds decision boundary only on upstream-OOF rows
+# from the post-hoc validation subset, then map it through the deployable scalar
+# temperature for reporting. The disjoint decision-calibration subset refits I3
+# using the fixed raw decision, so neither choice consults the test set.
 classification_threshold:
   enabled: true
   objective: macro_f1
-  min_malware_recall: 0.90
+  selection_rule: macro_f1_unconstrained_v1
+  # Classification optimizes utility; the disjoint I3 layer below owns the
+  # malware-FN risk constraint. A second validation-only recall constraint did
+  # not generalize and obscured the responsibility of the two stages.
 
 selective_prediction:
   enabled: true
   mode: risk_control
   threshold_score: model_acceptance
-  risk_target: malware_fn_rate_after_rejection
+  # CRC controls accepted malware predictions that are false negatives,
+  # divided by every malware sample. This is not the FNR conditional on
+  # accepted malware, which is reported separately without a guarantee.
+  risk_target: accepted_fn_risk_among_malware
   risk_level: 0.05
+  # The 25% decision-calibration split contains roughly 360 malware samples in
+  # the current validation CSV.  Pre-register a useful floor well above the
+  # mathematical reject-all feasibility minimum of 19 at alpha=0.05.
+  min_calibration_malware: 100
   # Fail explicitly when the calibration split is too small for the requested
   # finite-sample malware-FN risk bound instead of silently returning a
   # threshold with no feasible guarantee.

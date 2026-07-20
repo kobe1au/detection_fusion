@@ -16,6 +16,10 @@ train:
 calibration:
   epochs: 1
 
+# Explicit three-branch smoke path: API, Graph, and Manifest only.
+fusion:
+  combination: linear
+
 eval:
   run_test: false
   run_robust_test: false

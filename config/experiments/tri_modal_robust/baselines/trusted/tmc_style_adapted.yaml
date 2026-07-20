@@ -1,0 +1,32 @@
+defaults:
+  - _evidential_base.yaml
+
+method:
+  name: tmc_style_adapted
+  protocol_id: tmc_style_adapted_v1
+
+train:
+  exp_name: baseline_tmc_style_adapted
+
+fusion:
+  # TMC-style adapted comparison under the common APK encoders: view-specific
+  # Dirichlet opinions followed by the reduced Dempster combination rule.
+  combination: dempster
+  opinion_source: evidential
+  routing:
+    enabled: false
+    final_temperature_scaling: false
+
+loss:
+  # Retains the TMC-style sum of three view-wise and one fused Dirichlet
+  # expected-CE objectives, but does not claim an exact paper reproduction.
+  objective: tmc
+  label_smoothing: 0.0
+  branch_aux_weight: 0.0
+  reliability_calibration_weight: 0.0
+  probability_calibration_weight: 0.0
+  evidential_loss_weight: 0.0
+  auxiliary_weight_mode: unmasked_uniform
+  tmc:
+    anneal_epochs: 10
+    mask_unavailable_views: true

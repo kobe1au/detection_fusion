@@ -1,0 +1,16 @@
+defaults:
+  - ../../evidential_trusted_fusion.yaml
+
+method:
+  name: i2_router_risk_prior
+
+train:
+  exp_name: i2_router_risk_prior
+
+fusion:
+  routing:
+    # Atomic u ablation: retain learned pi but replace its learned risk head with
+    # the deterministic I1 reliability deficit.
+    risk_mode: reliability_prior
+    risk_target: reliability_deficit_score
+    risk_loss_weight: 0.0

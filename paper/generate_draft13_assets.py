@@ -126,7 +126,7 @@ def figure_1_1() -> str:
 
     box(p, 115, 335, 390, 125, ["第3章", "三模态可信度评估"], fill=API, font_size=26)
     box(p, 605, 335, 390, 125, ["第4章", "可信证据融合"], fill=GRAPH, font_size=26)
-    box(p, 1095, 335, 390, 125, ["第5章", "类别条件共形拒识"], fill=MAN, font_size=26)
+    box(p, 1095, 335, 390, 125, ["第5章", "恶意漏报风险控制"], fill=MAN, font_size=26)
     arrow(p, 505, 397.5, 595, 397.5)
     arrow(p, 995, 397.5, 1085, 397.5)
 
@@ -294,7 +294,7 @@ def figure_4_1() -> str:
     box(p, 1280, 135, 270, 125, ["组合前模态冲突", "κ"], fill="#FFFFFF", font_size=24)
 
     arrow(p, 1055, 415, 1055, 470)
-    box(p, 920, 480, 270, 145, ["全局意见路由", "类别支持与未知质量"], fill=GRAY, font_size=24)
+    box(p, 920, 480, 270, 145, ["条件意见路由", "π分配与argmax风险"], fill=GRAY, font_size=24)
     arrow(p, 1190, 552, 1270, 552)
     box(p, 1280, 480, 270, 145, ["融合输出", "pᶠ，uᶠ"], fill=ACCENT, font_size=24)
     return svg_end(p)
@@ -306,14 +306,14 @@ def figure_4_2_optional() -> str:
     box(p, 70, 215, 260, 150, ["多模态证据", "共同支持与冲突"], fill=GRAY)
     arrow(p, 330, 290, 455, 290)
     box(p, 470, 115, 330, 150, ["Dempster规则", "归一化非冲突证据"], fill="#FFFFFF")
-    box(p, 470, 355, 330, 150, ["全局意见路由", "学习样本级路由权重"], fill="#FFFFFF")
+    box(p, 470, 355, 330, 150, ["条件意见路由", "学习样本级路由权重"], fill="#FFFFFF")
     poly_arrow(p, [(400, 290), (400, 190), (460, 190)])
     poly_arrow(p, [(400, 290), (400, 430), (460, 430)])
     box(p, 920, 115, 330, 150, ["类别支持增强", "冲突影响被弱化"], fill=GRAY)
     box(p, 920, 355, 330, 150, ["不确定性提高", "保留模态分歧"], fill=GRAY)
     arrow(p, 800, 190, 910, 190)
     arrow(p, 800, 430, 910, 430)
-    box(p, 1360, 355, 180, 150, ["本文采用", "全局意见路由"], fill=ACCENT)
+    box(p, 1360, 355, 180, 150, ["本文采用", "条件意见路由"], fill=ACCENT)
     arrow(p, 1250, 430, 1350, 430)
     return svg_end(p)
 
@@ -382,7 +382,7 @@ CAPTIONS = {
     "图3-1_三模态可观测证据与可信度评估框架": ("图3-1 三模态可观测证据与可信度评估框架", "Figure 3-1 Observable Evidence and Trustworthiness Assessment Framework"),
     "图3-2_三模态可信度评估流程": ("图3-2 三模态可信度评估流程", "Figure 3-2 Trustworthiness Assessment Process of the Three Modalities"),
     "图4-1_三模态证据调整与冲突保留融合框架": ("图4-1 三模态证据调整与冲突保留融合框架", "Figure 4-1 Evidence Adjustment and Conflict-preserving Fusion Framework"),
-    "图4-2_冲突处理方式对比_可选": ("图4-2 Dempster融合与全局意见路由对比", "Figure 4-2 Comparison of Dempster Fusion and Global Opinion Routing"),
+    "图4-2_冲突处理方式对比_可选": ("图4-2 Dempster融合与条件意见路由对比", "Figure 4-2 Comparison of Dempster Fusion and Conditional Opinion Routing"),
     "图5-1_类别条件共形预测与拒识流程": ("图5-1 类别条件共形预测与拒识流程", "Figure 5-1 Class-conditional Conformal Prediction and Rejection Process"),
 }
 
@@ -556,7 +556,7 @@ def add_blank_experiment_tables(doc: Document) -> None:
         ("表6-4 不同可信融合方法的对比结果", "Table 6-4 Comparison of Trustworthy Fusion Methods", ["方法", "Macro-F1", "AURC", "Brier", "ECE"], [5.4, 2.4, 2.4, 2.4, 2.4], 7),
         ("表6-5 关键模块分析结果", "Table 6-5 Analysis Results of Key Modules", ["实验设置", "Macro-F1", "AURC", "ECE", "说明"], [4.7, 2.2, 2.2, 2.2, 4.3], 7),
         ("表6-6 自然低可信子集检测结果", "Table 6-6 Detection Results on Naturally Low-confidence Subsets", ["方法", "低完整性", "低支持", "高冲突", "低接受度"], [4.4, 2.7, 2.7, 2.7, 2.7], 7),
-        ("表6-7 类别条件共形拒识结果", "Table 6-7 Results of Class-conditional Conformal Rejection", ["方法", "接受率", "经验覆盖率", "选择性风险", "恶意漏报数"], [4.4, 2.6, 3.0, 3.0, 3.0], 6),
+        ("表6-7 恶意漏报风险控制结果", "Table 6-7 Results of Malware False-Negative Risk Control", ["方法", "接受率", "经验覆盖率", "选择性风险", "恶意漏报数"], [4.4, 2.6, 3.0, 3.0, 3.0], 6),
     ]
     for spec_idx, (zh, en, headers, widths, row_count) in enumerate(specs):
         if spec_idx > 0:
