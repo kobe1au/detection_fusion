@@ -33,13 +33,6 @@ if not math.isclose(
 def bounded_final_temperature(
     raw_temperature: torch.Tensor,
 ) -> torch.Tensor:
-    """Map an unconstrained scalar to a bounded positive temperature.
-
-    raw_temperature == 0 maps exactly to T == 1.  The mapping is smooth
-    and its deployed range is [FINAL_TEMPERATURE_MIN,
-    FINAL_TEMPERATURE_MAX] up to floating-point saturation.
-    """
-
     if raw_temperature.numel() != 1:
         raise ValueError(
             "bounded_final_temperature expects exactly one scalar"
@@ -47,6 +40,34 @@ def bounded_final_temperature(
 
     log_temperature = (
         _LOG_TEMPERATURE_CENTER
-        + _LOG_TEMPERATURE_RADIUS * torch.tanh(raw_temperature)
+        + _LOG_TEMPERATURE_RADIUS
+        * torch.tanh(raw_temperature)
     )
-    return torch.exp(log_temperature)
+
+    return torch.exp(log_temperature).clamp(
+        min=FINAL_TEMPERATURE_MIN,
+        max=FINAL_TEMPERATURE_MAX,
+    )
+
+def raw_final_temperature_coordinate(temperature: float) -> float:
+    """Convert a deployable temperature to its unconstrained coordinate."""
+
+    value = float(temperature)
+    if not math.isfinite(value):
+        raise ValueError("Final temperature must be finite")
+
+    # tanh 的精确端点对应无穷大坐标，因此 override 使用开区间。
+    if not FINAL_TEMPERATURE_MIN < value < FINAL_TEMPERATURE_MAX:
+        raise ValueError(
+            "Final-temperature override must lie strictly within "
+            f"({FINAL_TEMPERATURE_MIN}, {FINAL_TEMPERATURE_MAX})"
+        )
+
+    normalized = (
+        math.log(value) - _LOG_TEMPERATURE_CENTER
+    ) / _LOG_TEMPERATURE_RADIUS
+
+    if not -1.0 < normalized < 1.0:
+        raise ValueError("Final-temperature inverse coordinate is invalid")
+
+    return math.atanh(normalized)

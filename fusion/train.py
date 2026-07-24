@@ -50,6 +50,7 @@ from fusion.temperature import (
     FINAL_TEMPERATURE_MAX,
     FINAL_TEMPERATURE_MIN,
     bounded_final_temperature,
+    raw_final_temperature_coordinate,
 )
 from fusion.model import TriModalRobustModel
 from fusion.perturbations import EVAL_PERTURB_TYPES
@@ -5667,11 +5668,11 @@ def _fit_routed_final_temperature(
     if not math.isfinite(fitted_temperature):
         raise RuntimeError("Routed final temperature is non-finite")
 
-    bound_tolerance = 1.0e-6
+    # bound_tolerance = 1.0e-6
     if not (
-        FINAL_TEMPERATURE_MIN - bound_tolerance
+        FINAL_TEMPERATURE_MIN
         <= fitted_temperature
-        <= FINAL_TEMPERATURE_MAX + bound_tolerance
+        <= FINAL_TEMPERATURE_MAX
     ):
         raise RuntimeError(
             "Routed final temperature escaped its declared bounds: "
@@ -9869,6 +9870,7 @@ _METHOD_IMPLEMENTATION_FILES = (
     "pt_schema.py",
     "quality.py",
     "reliability_calibration.py",
+    "temperature.py", 
     "semantic_categories.py",
     "evidential.py",
     "opinion_router.py",
@@ -10990,7 +10992,10 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                     "with opinion-fusion final-temperature scaling enabled"
                 )
             with torch.no_grad():
-                parameters[0].fill_(math.log(final_temperature_override))
+                # parameters[0].fill_(math.log(final_temperature_override))
+                parameters[0].fill_(
+                    raw_final_temperature_coordinate(final_temperature_override)
+                )
             logger.info(
                 "eval_final_temperature_override=%.6f",
                 final_temperature_override,

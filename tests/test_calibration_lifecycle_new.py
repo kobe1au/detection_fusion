@@ -5,6 +5,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from fusion.temperature import (
+    FINAL_TEMPERATURE_MAX,
+    FINAL_TEMPERATURE_MIN,
+    bounded_final_temperature,
+    raw_final_temperature_coordinate,
+)
+
 from fusion.train import (
     CHECKPOINT_STAGE_ENCODER_SELECTED,
     CHECKPOINT_STAGE_PIPELINE_FITTED,
@@ -64,9 +71,16 @@ class _FinalTemperatureOnlyFusion(torch.nn.Module):
         return [self.log_final_temperature]
 
     def forward(self, api, graph, manifest, evidence):
-        raw = F.log_softmax((api + graph + manifest) / 3.0, dim=-1)
+        raw = F.log_softmax(
+            (api + graph + manifest) / 3.0,
+            dim=-1,
+        )
+        temperature = bounded_final_temperature(
+            self.log_final_temperature
+        )
         calibrated = F.log_softmax(
-            raw / self.log_final_temperature.exp(), dim=-1
+            raw / temperature,
+            dim=-1,
         )
         return {
             "uncalibrated_final_log_prob": raw,
