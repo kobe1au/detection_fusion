@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fusion.constants import AvailabilityIndex, GateConstants
+from fusion.temperature import bounded_final_temperature
 from fusion.evidential import (
     EVIDENCE_BRANCHES,
     COMBINATION_RULES,
@@ -325,6 +326,12 @@ class DiscountProbabilityFusion(nn.Module):
             raise ValueError(
                 "fusion.combination=routed requires fusion.routing.enabled=true"
             )
+        # self.log_final_temperature = (
+        #     nn.Parameter(torch.zeros(()))
+        #     if uses_opinion_combination
+        #     and bool(routing_cfg.get("final_temperature_scaling", False))
+        #     else None
+        # )
         self.log_final_temperature = (
             nn.Parameter(torch.zeros(()))
             if uses_opinion_combination
@@ -409,10 +416,14 @@ class DiscountProbabilityFusion(nn.Module):
         """Return the scalar opinion-output calibration parameter, if enabled."""
         return [] if self.log_final_temperature is None else [self.log_final_temperature]
 
+    # def final_temperature(self) -> torch.Tensor | None:
+    #     if self.log_final_temperature is None:
+    #         return None
+    #     return self.log_final_temperature.exp()
     def final_temperature(self) -> torch.Tensor | None:
         if self.log_final_temperature is None:
             return None
-        return self.log_final_temperature.exp()
+        return bounded_final_temperature(self.log_final_temperature)
 
     @property
     def calibration_active(self) -> bool:

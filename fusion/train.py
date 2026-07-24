@@ -46,6 +46,11 @@ from fusion.dataset import (
     prepare_robust_batch,
     robust_collate_fn,
 )
+from fusion.temperature import (
+    FINAL_TEMPERATURE_MAX,
+    FINAL_TEMPERATURE_MIN,
+    bounded_final_temperature,
+)
 from fusion.model import TriModalRobustModel
 from fusion.perturbations import EVAL_PERTURB_TYPES
 from fusion.reliability_calibration import (
@@ -5616,8 +5621,13 @@ def _fit_routed_final_temperature(
 
         def _temperature_closure() -> torch.Tensor:
             temperature_optimizer.zero_grad(set_to_none=True)
+            # calibrated = F.log_softmax(
+            #     raw_log_prob / log_temperature.exp(),
+            #     dim=-1,
+            # )
+            temperature = bounded_final_temperature(log_temperature)
             calibrated = F.log_softmax(
-                raw_log_prob / log_temperature.exp(),
+                raw_log_prob / temperature,
                 dim=-1,
             )
             objective = F.nll_loss(calibrated, temperature_labels)
@@ -5634,9 +5644,15 @@ def _fit_routed_final_temperature(
         log_temperature.requires_grad_(previous_requires_grad)
 
     with torch.no_grad():
-        fitted_temperature = float(log_temperature.exp().item())
+        # fitted_temperature = float(log_temperature.exp().item())
+        # calibrated = F.log_softmax(
+        #     raw_log_prob / log_temperature.exp(),
+        #     dim=-1,
+        # )
+        temperature = bounded_final_temperature(log_temperature)
+        fitted_temperature = float(temperature.item())
         calibrated = F.log_softmax(
-            raw_log_prob / log_temperature.exp(),
+            raw_log_prob / temperature,
             dim=-1,
         )
         nll_after = float(F.nll_loss(calibrated, temperature_labels).item())
@@ -5646,8 +5662,23 @@ def _fit_routed_final_temperature(
             log_temperature.zero_()
             fitted_temperature = 1.0
             nll_after = nll_before
-    if not math.isfinite(fitted_temperature) or fitted_temperature <= 0.0:
-        raise RuntimeError("Routed final temperature is non-finite or non-positive")
+    # if not math.isfinite(fitted_temperature) or fitted_temperature <= 0.0:
+    #     raise RuntimeError("Routed final temperature is non-finite or non-positive")
+    if not math.isfinite(fitted_temperature):
+        raise RuntimeError("Routed final temperature is non-finite")
+
+    bound_tolerance = 1.0e-6
+    if not (
+        FINAL_TEMPERATURE_MIN - bound_tolerance
+        <= fitted_temperature
+        <= FINAL_TEMPERATURE_MAX + bound_tolerance
+    ):
+        raise RuntimeError(
+            "Routed final temperature escaped its declared bounds: "
+            f"temperature={fitted_temperature:.9g}, "
+            f"bounds=[{FINAL_TEMPERATURE_MIN}, "
+            f"{FINAL_TEMPERATURE_MAX}]"
+        )
     return {
         "enabled": True,
         "temperature": fitted_temperature,
@@ -6973,8 +7004,15 @@ def fit_posthoc_calibration(
         ) / max(1.0e-12, abs(step_losses[0]))
         if optimization["require_convergence"] and not converged:
             raise RuntimeError(
-                f"Post-hoc calibration stage {stage_name} failed to converge within "
-                f"{optimization['max_steps']} steps; best_loss={best_loss:.6f}"
+                f"Post-hoc calibration stage {stage_name} did not satisfy the "
+                f"restored-state convergence requirement; "
+                f"provisional_stop_reason={provisional_stop_reason}, "
+                f"final_stop_reason={stop_reason}, "
+                f"final_grad_inf_norm={final_grad_inf_norm:.6g}, "
+                f"gradient_tolerance={optimization['gradient_tolerance']:.6g}, "
+                f"best_loss={best_loss:.9g}, "
+                f"total_steps={total_steps}, "
+                f"max_steps={optimization['max_steps']}"
             )
         if (
             optimization["require_convergence"]
@@ -6991,7 +7029,6 @@ def fit_posthoc_calibration(
             "name": stage_name,
             "epochs_ran": total_steps,
             "best_epoch": best_step,
-            # "stopped_early": bool(converged),
             "stopped_early": bool(stopped_early),
             "plateau_detected": bool(plateau_detected),
             "restored_gradient_converged": bool(converged),

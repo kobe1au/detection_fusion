@@ -11,6 +11,7 @@ from fusion.train import (
     PIPELINE_ARTIFACT_SCHEMA_VERSION,
     _calibration_subset_identity,
     _fit_routed_final_temperature,
+    _resolve_restored_stage_convergence,
     _decision_calibration_signature,
     _decision_calibration_data_identity,
     _file_sha256,
@@ -99,6 +100,62 @@ class _FinalTemperatureOnlyModel(torch.nn.Module):
         outputs["fusion_availability"] = graph.evidence
         outputs["selective_eligible"] = graph.evidence[:, :3].gt(0).any(dim=-1)
         return outputs["final_logits"], outputs
+
+
+def test_restored_gradient_rejects_nonstationary_plateau():
+    converged, reason = _resolve_restored_stage_convergence(
+        provisional_stop_reason="objective_plateau",
+        final_grad_inf_norm=1.0e-3,
+        gradient_tolerance=1.0e-5,
+    )
+
+    assert converged is False
+    assert reason == "objective_plateau_nonstationary"
+
+
+def test_restored_gradient_accepts_stationary_best():
+    converged, reason = _resolve_restored_stage_convergence(
+        provisional_stop_reason="max_steps",
+        final_grad_inf_norm=1.0e-7,
+        gradient_tolerance=1.0e-5,
+    )
+
+    assert converged is True
+    assert reason == "restored_best_gradient_tolerance"
+
+
+@pytest.mark.parametrize(
+    ("final_grad_inf_norm", "gradient_tolerance"),
+    [
+        (float("nan"), 1.0e-5),
+        (float("inf"), 1.0e-5),
+        (1.0e-4, 0.0),
+        (1.0e-4, -1.0e-5),
+    ],
+)
+def test_restored_convergence_rejects_invalid_gradient_state(
+    final_grad_inf_norm: float,
+    gradient_tolerance: float,
+):
+    converged, reason = _resolve_restored_stage_convergence(
+        provisional_stop_reason="max_steps",
+        final_grad_inf_norm=final_grad_inf_norm,
+        gradient_tolerance=gradient_tolerance,
+    )
+
+    assert converged is False
+    assert reason == "restored_best_invalid_gradient"
+
+
+def test_provisional_gradient_is_rechecked_after_restore():
+    converged, reason = _resolve_restored_stage_convergence(
+        provisional_stop_reason="gradient_tolerance",
+        final_grad_inf_norm=1.0e-3,
+        gradient_tolerance=1.0e-5,
+    )
+
+    assert converged is False
+    assert reason == "provisional_gradient_not_valid_at_restored_best"
 
 
 def test_final_temperature_temporarily_enables_grad_and_restores_freeze_state():
