@@ -5686,6 +5686,15 @@ def _fit_routed_final_temperature(
         "num_clean_samples": int(temperature_labels.numel()),
         "nll_before": nll_before,
         "nll_after": nll_after,
+        "temperature_min": FINAL_TEMPERATURE_MIN,
+        "temperature_max": FINAL_TEMPERATURE_MAX,
+        "temperature_parameterization": "bounded_log_tanh",
+        "temperature_near_lower_bound": bool(
+            fitted_temperature <= FINAL_TEMPERATURE_MIN * 1.01
+        ),
+        "temperature_near_upper_bound": bool(
+            fitted_temperature >= FINAL_TEMPERATURE_MAX / 1.01
+        ),
     }
 
 
@@ -9870,7 +9879,7 @@ _METHOD_IMPLEMENTATION_FILES = (
     "pt_schema.py",
     "quality.py",
     "reliability_calibration.py",
-    "temperature.py", 
+    "temperature.py",
     "semantic_categories.py",
     "evidential.py",
     "opinion_router.py",
@@ -10543,10 +10552,17 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
             )
         if (
             not math.isfinite(final_temperature_override)
-            or final_temperature_override <= 0.0
+            or not (
+                FINAL_TEMPERATURE_MIN
+                < final_temperature_override
+                < FINAL_TEMPERATURE_MAX
+            )
         ):
             raise ValueError(
-                "eval.final_temperature_override must be finite and positive"
+                "eval.final_temperature_override must be finite "
+                "and lie strictly within "
+                f"({FINAL_TEMPERATURE_MIN}, "
+                f"{FINAL_TEMPERATURE_MAX})"
             )
         if (
             classification_threshold_enabled or selective_enabled
