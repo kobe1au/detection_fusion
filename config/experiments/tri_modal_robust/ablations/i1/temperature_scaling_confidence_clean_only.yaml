@@ -18,8 +18,6 @@ fusion:
     temperature_fit_source: clean_only
     initial_temperature: 1.0
     branches: [api, graph, manifest]
-    use_model_visibility: false
-    use_embedding_density: false
+    use_evidential_certainty: false
     use_prediction_margin: false
-    use_predicted_class_feature: false
-    apply_alive_mask: true
+    use_predicted_class_intercept: false

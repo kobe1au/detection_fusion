@@ -38,3 +38,21 @@ def test_quality_aware_fusion_masks_unavailable_branch():
     )
     assert torch.allclose(fused, expected)
     assert weights[0, 1].item() == 0.0
+
+
+def test_quality_aware_fusion_all_dead_returns_explicit_uniform_prediction():
+    branch_logits = [
+        torch.tensor([[9.0, -4.0]]),
+        torch.tensor([[-3.0, 7.0]]),
+        torch.tensor([[5.0, 2.0]]),
+    ]
+
+    fused, weights, _ = quality_aware_logit_fusion(
+        branch_logits,
+        torch.zeros(1, 3),
+        temperature=10.0,
+    )
+
+    assert torch.equal(fused, torch.zeros(1, 2))
+    assert torch.equal(torch.softmax(fused, dim=-1), torch.full((1, 2), 0.5))
+    assert torch.allclose(weights, torch.full((1, 3), 1.0 / 3.0))

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections import OrderedDict
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
-from fusion.evidence import build_evidence
+from fusion.evidence import build_fusion_availability_and_diagnostics
 
-from fusion.constants import ArchitectureConstants, EvidenceIndex
+from fusion.constants import ArchitectureConstants, AvailabilityIndex
 from fusion.discount_fusion import DiscountProbabilityFusion
 from fusion.gates import (
     DenseTriModalEmbeddingGate,
@@ -20,15 +22,10 @@ from torch_geometric.utils import softmax
 
 
 TRI_MODAL_FUSION_MODES = {
-    "api",
     "api_only",
-    "graph",
     "graph_only",
-    "manifest",
     "manifest_only",
-    "api_graph",
     "api_graph_concat",
-    "api_graph_manifest_concat",
     "tri_modal_concat",
     "tri_modal_fixed_gate",
     "tri_modal_quality_fusion",
@@ -36,11 +33,8 @@ TRI_MODAL_FUSION_MODES = {
     "discount_probability",
 }
 
-API_GRAPH_CONCAT_FUSION_MODES = {"api_graph", "api_graph_concat"}
-TRI_MODAL_CONCAT_FUSION_MODES = {
-    "api_graph_manifest_concat",
-    "tri_modal_concat",
-}
+API_GRAPH_CONCAT_FUSION_MODES = {"api_graph_concat"}
+TRI_MODAL_CONCAT_FUSION_MODES = {"tri_modal_concat"}
 
 
 # ── fusion-mode dispatch helpers ──────────────────────────────────────
@@ -83,8 +77,9 @@ def quality_aware_logit_fusion(
     ).clamp_min(1.0e-8)
     uniform = torch.full_like(diagnostic_weights, 1.0 / float(len(logits_by_branch)))
     diagnostic_weights = torch.where(has_source, diagnostic_weights, uniform)
-    fallback = logits.mean(dim=1)
-    fused = torch.where(has_source, fused, fallback)
+    # No branch is observable in the all-dead endpoint. Returning head-bias
+    # logits would manufacture class evidence from absent modalities.
+    fused = torch.where(has_source, fused, torch.zeros_like(fused))
     return fused, diagnostic_weights, energy
 
 
@@ -114,7 +109,6 @@ def _fusion_api_graph_concat(model, batch_size, device, dtype, tensors, extra):
     logits = model.api_graph_concat_head(tensors["api_graph_concat_input"])
     gate = torch.zeros((batch_size, 3), device=device, dtype=dtype)
     gate[:, :2] = 0.5
-    extra["concat_logits_aux"] = logits
     return logits, gate, extra
 
 
@@ -127,13 +121,12 @@ def _fusion_tri_concat(model, batch_size, device, dtype, tensors, extra):
     gate = torch.full(
         (batch_size, 3), 1.0 / 3.0, device=device, dtype=dtype
     )
-    extra["concat_logits_aux"] = logits
     return logits, gate, extra
 
 
 def _fusion_quality_aware(model, batch_size, device, dtype, tensors, extra):
     """Adapt QMF energy-aware late fusion to the three APK modalities."""
-    evidence, diagnostics = build_evidence(
+    availability, diagnostics = build_fusion_availability_and_diagnostics(
         tensors["graph_data"],
         tensors["api_logits"],
         tensors["graph_logits"],
@@ -141,17 +134,15 @@ def _fusion_quality_aware(model, batch_size, device, dtype, tensors, extra):
         tensors["api_emb"],
         tensors["graph_emb"],
         tensors["manifest_emb"],
-        use_consistency_evidence=False,
-        use_conflict_evidence=False,
-        use_perturbation_evidence=False,
+        materialize_diagnostics=not model.training,
     )
     extra.update(diagnostics)
-    extra["gate_evidence"] = evidence.detach()
+    extra["fusion_availability"] = availability.detach()
     alive = torch.stack(
         [
-            evidence[:, EvidenceIndex.API_ALIVE],
-            evidence[:, EvidenceIndex.GRAPH_ALIVE],
-            evidence[:, EvidenceIndex.MANIFEST_ALIVE],
+            availability[:, AvailabilityIndex.API_ALIVE],
+            availability[:, AvailabilityIndex.GRAPH_ALIVE],
+            availability[:, AvailabilityIndex.MANIFEST_ALIVE],
         ],
         dim=-1,
     )
@@ -168,13 +159,12 @@ def _fusion_quality_aware(model, batch_size, device, dtype, tensors, extra):
     for index, name in enumerate(("api", "graph", "manifest")):
         extra[f"qmf_energy_{name}"] = energy[:, index]
         extra[f"fusion_weight_{name}"] = weights3[:, index]
-    extra["gate_prior_enabled"] = False
     return logits, gate, extra
 
 
 def _fusion_dense_embedding_gate(model, batch_size, device, dtype, tensors, extra):
     """Adapted dense embedding-gated three-branch late-fusion baseline."""
-    evidence, diagnostics = build_evidence(
+    availability, diagnostics = build_fusion_availability_and_diagnostics(
         tensors["graph_data"],
         tensors["api_logits"],
         tensors["graph_logits"],
@@ -182,17 +172,15 @@ def _fusion_dense_embedding_gate(model, batch_size, device, dtype, tensors, extr
         tensors["api_emb"],
         tensors["graph_emb"],
         tensors["manifest_emb"],
-        use_consistency_evidence=False,
-        use_conflict_evidence=False,
-        use_perturbation_evidence=False,
+        materialize_diagnostics=not model.training,
     )
     extra.update(diagnostics)
-    extra["gate_evidence"] = evidence.detach()
+    extra["fusion_availability"] = availability.detach()
     alive = torch.stack(
         [
-            evidence[:, EvidenceIndex.API_ALIVE],
-            evidence[:, EvidenceIndex.GRAPH_ALIVE],
-            evidence[:, EvidenceIndex.MANIFEST_ALIVE],
+            availability[:, AvailabilityIndex.API_ALIVE],
+            availability[:, AvailabilityIndex.GRAPH_ALIVE],
+            availability[:, AvailabilityIndex.MANIFEST_ALIVE],
         ],
         dim=-1,
     )
@@ -218,24 +206,14 @@ def _fusion_dense_embedding_gate(model, batch_size, device, dtype, tensors, extr
     )
     gate = weights3.to(dtype=dtype)
     extra["dense_embedding_gate_scores"] = gate_scores
-    extra["dense_embedding_gate_active"] = torch.ones(
-        (batch_size,), device=device, dtype=dtype
-    )
-    extra["dense_embedding_gate_detached"] = torch.full(
-        (batch_size,),
-        float(model.dense_embedding_gate.detach_embeddings),
-        device=device,
-        dtype=dtype,
-    )
     for index, name in enumerate(("api", "graph", "manifest")):
         extra[f"fusion_weight_{name}"] = weights3[:, index]
-    extra["gate_prior_enabled"] = False
     return logits, gate, extra
 
 
 def _fusion_fixed_gate(model, batch_size, device, dtype, tensors, extra):
     """Canonical equal-weight API/Graph/Manifest late fusion."""
-    evidence, diagnostics = build_evidence(
+    availability, diagnostics = build_fusion_availability_and_diagnostics(
         tensors["graph_data"],
         tensors["api_logits"],
         tensors["graph_logits"],
@@ -243,22 +221,26 @@ def _fusion_fixed_gate(model, batch_size, device, dtype, tensors, extra):
         tensors["api_emb"],
         tensors["graph_emb"],
         tensors["manifest_emb"],
-        use_consistency_evidence=model.use_consistency_evidence,
-        use_conflict_evidence=model.use_conflict_evidence,
-        use_perturbation_evidence=model.use_perturbation_evidence,
+        materialize_diagnostics=not model.training,
     )
     extra.update(diagnostics)
-    extra["gate_evidence"] = evidence.detach()
+    extra["fusion_availability"] = availability.detach()
 
     gate_weights = torch.full(
         (batch_size, 3), 1.0 / 3.0, device=device, dtype=dtype
     )
-    extra["gate_prior_enabled"] = False
-
+    alive = torch.stack(
+        [
+            availability[:, AvailabilityIndex.API_ALIVE],
+            availability[:, AvailabilityIndex.GRAPH_ALIVE],
+            availability[:, AvailabilityIndex.MANIFEST_ALIVE],
+        ],
+        dim=-1,
+    ).to(device=device, dtype=dtype)
     logits = (
-        gate_weights[:, 0:1] * tensors["api_logits"]
-        + gate_weights[:, 1:2] * tensors["graph_logits"]
-        + gate_weights[:, 2:3] * tensors["manifest_logits"]
+        gate_weights[:, 0:1] * alive[:, 0:1] * tensors["api_logits"]
+        + gate_weights[:, 1:2] * alive[:, 1:2] * tensors["graph_logits"]
+        + gate_weights[:, 2:3] * alive[:, 2:3] * tensors["manifest_logits"]
     )
     return logits, gate_weights, extra
 
@@ -269,7 +251,7 @@ def _fusion_discount_probability(model, batch_size, device, dtype, tensors, extr
         raise RuntimeError(
             "discount_probability fusion requires an initialized discount fusion module"
         )
-    evidence, diagnostics = build_evidence(
+    availability, diagnostics = build_fusion_availability_and_diagnostics(
         tensors["graph_data"],
         tensors["api_logits"],
         tensors["graph_logits"],
@@ -277,38 +259,25 @@ def _fusion_discount_probability(model, batch_size, device, dtype, tensors, extr
         tensors["api_emb"],
         tensors["graph_emb"],
         tensors["manifest_emb"],
-        use_consistency_evidence=True,
-        use_conflict_evidence=True,
-        use_perturbation_evidence=False,
+        materialize_diagnostics=not model.training,
     )
     extra.update(diagnostics)
-    extra["gate_evidence"] = evidence.detach()
+    extra["fusion_availability"] = availability.detach()
     fusion_outputs = model.discount_fusion(
         tensors["api_logits"],
         tensors["graph_logits"],
         tensors["manifest_logits"],
-        evidence,
-        embeddings={
-            "api": tensors["api_emb"],
-            "graph": tensors["graph_emb"],
-            "manifest": tensors["manifest_emb"],
-        },
+        availability,
     )
     extra.update(fusion_outputs)
-    extra["gate_prior_enabled"] = False
     return fusion_outputs["final_logits"], fusion_outputs["fusion_weights"], extra
 
 
 FUSION_DISPATCH: dict[str, callable] = {
-    "api": _fusion_single_api,
     "api_only": _fusion_single_api,
-    "graph": _fusion_single_graph,
     "graph_only": _fusion_single_graph,
-    "manifest": _fusion_single_manifest,
     "manifest_only": _fusion_single_manifest,
-    "api_graph": _fusion_api_graph_concat,
     "api_graph_concat": _fusion_api_graph_concat,
-    "api_graph_manifest_concat": _fusion_tri_concat,
     "tri_modal_concat": _fusion_tri_concat,
     "tri_modal_fixed_gate": _fusion_fixed_gate,
     "tri_modal_quality_fusion": _fusion_quality_aware,
@@ -547,9 +516,6 @@ class TriModalRobustModel(nn.Module):
         quality_fusion_temperature: float = 10.0,
         gate_hidden_dim: int = 128,
         gate_detach: bool = True,
-        use_consistency_evidence: bool = True,
-        use_conflict_evidence: bool = True,
-        use_perturbation_evidence: bool = False,
         discount_fusion_config: dict | None = None,
     ):
         super().__init__()
@@ -570,13 +536,6 @@ class TriModalRobustModel(nn.Module):
             raise ValueError("quality_fusion_temperature must be finite and positive")
         self.quality_fusion_temperature = float(quality_fusion_temperature)
         self.gate_detach = bool(gate_detach)
-        self.use_consistency_evidence = bool(use_consistency_evidence)
-        self.use_conflict_evidence = bool(use_conflict_evidence)
-        if use_perturbation_evidence:
-            raise ValueError(
-                "Synthetic pert_* metadata is diagnostic-only and cannot be enabled in TriModalRobustModel."
-            )
-        self.use_perturbation_evidence = False
         self.api_encoder = ApiSequenceEncoder(
             num_hash_buckets=api_num_hash_buckets,
             type_vocab_size=api_type_vocab_size,
@@ -651,14 +610,7 @@ class TriModalRobustModel(nn.Module):
             else None
         )
         self.discount_fusion = (
-            DiscountProbabilityFusion(
-                discount_fusion_config,
-                embedding_dims={
-                    "api": self.api_emb_dim,
-                    "graph": self.graph_emb_dim,
-                    "manifest": self.manifest_emb_dim,
-                },
-            )
+            DiscountProbabilityFusion(discount_fusion_config)
             if self.fusion_mode == "discount_probability"
             else None
         )
@@ -668,6 +620,171 @@ class TriModalRobustModel(nn.Module):
         if self.discount_fusion is None:
             return []
         return self.discount_fusion.calibration_parameters()
+
+    def _encoder_stage_modules(self) -> tuple[tuple[str, nn.Module], ...]:
+        """Return the modules whose learned state belongs to Stage-1.
+
+        The three encoders and their branch heads are always optimized by the
+        common encoder-stage objective.  Fusion-specific trainable modules are
+        included only for the modes that instantiate and optimize them during
+        that same stage.  ``discount_fusion`` is deliberately absent: its I1,
+        I2, decision-risk, and temperature state is reserved for the later
+        post-hoc lifecycle and is reconstructed from the current pipeline
+        configuration before fitting.
+
+        Keeping this as an explicit module partition also preserves any module
+        buffers needed by Stage-1 without admitting unrelated model buffers.
+        """
+
+        modules: list[tuple[str, nn.Module]] = [
+            ("api_encoder", self.api_encoder),
+            ("graph_encoder", self.graph_encoder),
+            ("manifest_encoder", self.manifest_encoder),
+            ("api_head", self.api_head),
+            ("graph_head", self.graph_head),
+            ("manifest_head", self.manifest_head),
+        ]
+        if self.api_graph_concat_head is not None:
+            modules.append(("api_graph_concat_head", self.api_graph_concat_head))
+        if self.tri_concat_head is not None:
+            modules.append(("tri_concat_head", self.tri_concat_head))
+        if self.dense_embedding_gate is not None:
+            modules.append(("dense_embedding_gate", self.dense_embedding_gate))
+
+        # Fail closed if a future fusion mode adds a Stage-1 parameter without
+        # declaring its owning module above.  The training loop freezes exactly
+        # ``encoder_training_frozen_parameters``; the complement must therefore
+        # equal this artifact partition rather than being silently discarded.
+        frozen_ids = {id(parameter) for parameter in self.encoder_training_frozen_parameters()}
+        expected_stage_parameters = {
+            name: parameter
+            for name, parameter in self.named_parameters()
+            if id(parameter) not in frozen_ids
+        }
+        included_parameter_ids = {
+            id(parameter)
+            for _module_name, module in modules
+            for parameter in module.parameters()
+        }
+        missing = sorted(
+            name
+            for name, parameter in expected_stage_parameters.items()
+            if id(parameter) not in included_parameter_ids
+        )
+        included_frozen = sorted(
+            name
+            for name, parameter in self.named_parameters()
+            if id(parameter) in included_parameter_ids and id(parameter) in frozen_ids
+        )
+        if missing or included_frozen:
+            raise RuntimeError(
+                "Encoder-stage module partition disagrees with the training "
+                "freeze policy: "
+                f"missing_trainable={missing}, included_posthoc={included_frozen}"
+            )
+        return tuple(modules)
+
+    def encoder_stage_state_keys(self) -> tuple[str, ...]:
+        """Return the exact, ordered key contract for a Stage-1 artifact."""
+
+        keys: list[str] = []
+        for module_name, module in self._encoder_stage_modules():
+            keys.extend(
+                f"{module_name}.{local_key}" for local_key in module.state_dict()
+            )
+        if len(keys) != len(set(keys)):
+            raise RuntimeError("Encoder-stage state contains duplicate keys")
+        return tuple(keys)
+
+    def encoder_stage_state_dict(self) -> OrderedDict[str, torch.Tensor]:
+        """Materialize an independent Stage-1-only state dictionary.
+
+        Values are cloned so the artifact cannot change later if the live model
+        is modified.  Device and dtype are preserved, matching ``state_dict``;
+        callers may serialize it directly or move tensors to CPU explicitly.
+        """
+
+        state: OrderedDict[str, torch.Tensor] = OrderedDict()
+        for module_name, module in self._encoder_stage_modules():
+            for local_key, value in module.state_dict().items():
+                if not isinstance(value, torch.Tensor):
+                    raise TypeError(
+                        "Encoder-stage artifacts support tensor parameters and "
+                        f"buffers only; {module_name}.{local_key} has type "
+                        f"{type(value).__name__}"
+                    )
+                state[f"{module_name}.{local_key}"] = value.detach().clone()
+        expected = self.encoder_stage_state_keys()
+        if tuple(state) != expected:
+            raise RuntimeError("Encoder-stage state order disagrees with its key contract")
+        return state
+
+    def load_encoder_stage_state_dict(
+        self,
+        state: Mapping[str, torch.Tensor],
+    ) -> None:
+        """Strictly load an encoder-stage artifact into the current model.
+
+        Missing, extra, non-tensor, and shape-incompatible values are rejected
+        before any live parameter is changed.  Each declared module is then
+        loaded with PyTorch's own ``strict=True`` contract; this method never
+        relies on ``strict=False`` to hide lifecycle or architecture drift.
+        """
+
+        if not isinstance(state, Mapping):
+            raise TypeError("encoder-stage state must be a mapping")
+        if any(not isinstance(key, str) for key in state):
+            raise TypeError("encoder-stage state keys must be strings")
+
+        expected_keys = self.encoder_stage_state_keys()
+        expected_set = set(expected_keys)
+        actual_set = set(state)
+        missing = sorted(expected_set - actual_set)
+        unexpected = sorted(actual_set - expected_set)
+        if missing or unexpected:
+            raise ValueError(
+                "Encoder-stage state keys disagree with the current model: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+
+        current_state = self.state_dict()
+        invalid_types: list[str] = []
+        shape_mismatches: dict[str, dict[str, tuple[int, ...]]] = {}
+        for key in expected_keys:
+            value = state[key]
+            if not isinstance(value, torch.Tensor):
+                invalid_types.append(f"{key}:{type(value).__name__}")
+                continue
+            expected_shape = tuple(current_state[key].shape)
+            actual_shape = tuple(value.shape)
+            if actual_shape != expected_shape:
+                shape_mismatches[key] = {
+                    "expected": expected_shape,
+                    "actual": actual_shape,
+                }
+        if invalid_types:
+            raise TypeError(
+                "Encoder-stage state values must be tensors: "
+                + ", ".join(invalid_types)
+            )
+        if shape_mismatches:
+            raise ValueError(
+                "Encoder-stage state tensor shapes disagree with the current "
+                f"model: {shape_mismatches}"
+            )
+
+        # All global validation is complete, so a failure cannot leave a
+        # partially loaded artifact merely because a later module had a bad key
+        # or shape.  Local dictionaries have their prefixes removed and retain
+        # the exact key set returned by each owning module.
+        for module_name, module in self._encoder_stage_modules():
+            prefix = f"{module_name}."
+            local_state = OrderedDict(
+                (key[len(prefix) :], state[key])
+                for key in expected_keys
+                if key.startswith(prefix)
+            )
+            module.load_state_dict(local_state, strict=True)
 
     def encoder_training_frozen_parameters(self) -> list[nn.Parameter]:
         """Parameters that must remain untouched during encoder training."""
@@ -710,16 +827,15 @@ class TriModalRobustModel(nn.Module):
     def _availability_mask(
         graph_data,
         name: str,
-        legacy_quality_name: str,
         batch_size: int,
         device,
         dtype,
     ) -> torch.Tensor:
         value = getattr(graph_data, name, None)
         if not isinstance(value, torch.Tensor):
-            value = getattr(graph_data, legacy_quality_name, None)
-        if not isinstance(value, torch.Tensor):
-            return torch.ones((batch_size, 1), device=device, dtype=dtype)
+            raise ValueError(
+                f"Current dataset batch is missing mandatory availability mask {name!r}"
+            )
         value = value.to(device=device, dtype=dtype).view(batch_size, -1)
         if value.size(1) == 0:
             return torch.zeros((batch_size, 1), device=device, dtype=dtype)
@@ -728,7 +844,6 @@ class TriModalRobustModel(nn.Module):
     def forward(
         self,
         graph_data,
-        return_features: bool = False,
     ):
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
@@ -740,13 +855,13 @@ class TriModalRobustModel(nn.Module):
         manifest_emb = self.manifest_encoder(manifest_x)
 
         api_available = self._availability_mask(
-            graph_data, "api_alive", "q_api", batch_size, device, dtype
+            graph_data, "api_alive", batch_size, device, dtype
         )
         graph_available = self._availability_mask(
-            graph_data, "graph_alive", "q_graph", batch_size, device, dtype
+            graph_data, "graph_alive", batch_size, device, dtype
         )
         manifest_available = self._availability_mask(
-            graph_data, "manifest_alive", "q_manifest", batch_size, device, dtype
+            graph_data, "manifest_alive", batch_size, device, dtype
         )
         api_logits = self.api_head(api_emb)
         graph_logits = self.graph_head(graph_emb)
@@ -810,26 +925,35 @@ class TriModalRobustModel(nn.Module):
         primary_available = torch.cat(
             [api_available, graph_available, manifest_available], dim=-1
         ).bool()
-        if self.fusion_mode in {"api", "api_only"}:
+        if self.fusion_mode == "api_only":
             selective_eligible = primary_available[:, 0]
-        elif self.fusion_mode in {"graph", "graph_only"}:
+        elif self.fusion_mode == "graph_only":
             selective_eligible = primary_available[:, 1]
-        elif self.fusion_mode in {"manifest", "manifest_only"}:
+        elif self.fusion_mode == "manifest_only":
             selective_eligible = primary_available[:, 2]
-        elif self.fusion_mode in {"api_graph", "api_graph_concat"}:
+        elif self.fusion_mode == "api_graph_concat":
             selective_eligible = primary_available[:, :2].any(dim=-1)
         else:
             selective_eligible = primary_available.any(dim=-1)
+        if self.fusion_mode != "discount_probability":
+            # Canonical logit baselines use cross entropy, so zero logits are
+            # the explicit uniform-predictive fallback when every branch that
+            # the method consumes is unavailable. The routed evidential path
+            # already returns normalized log probabilities and must retain its
+            # own log(1 / K) fallback.
+            logits = torch.where(
+                selective_eligible.unsqueeze(-1),
+                logits,
+                torch.zeros_like(logits),
+            )
         # Explicitly describe availability of the branches consumed by this
         # fusion mode. Evaluation must not infer it from unrelated live inputs.
         extra["selective_eligible"] = selective_eligible
 
-        extra["gate_weights_train"] = gate_weights
         extra["gate_weights"] = gate_weights.detach()
-        extra.setdefault("gate_prior_enabled", False)
 
-        if "api_confidence" not in extra and not self.training:
-            _, diagnostics = build_evidence(
+        if "api_alive" not in extra and not self.training:
+            _, diagnostics = build_fusion_availability_and_diagnostics(
                 graph_data,
                 api_logits,
                 graph_logits,
@@ -837,17 +961,8 @@ class TriModalRobustModel(nn.Module):
                 api_emb,
                 graph_emb,
                 manifest_emb,
-                use_consistency_evidence=self.use_consistency_evidence,
-                use_conflict_evidence=self.use_conflict_evidence,
-                use_perturbation_evidence=self.use_perturbation_evidence,
-                diagnostics_only=True,
+                materialize_diagnostics=True,
             )
             extra.update(diagnostics)
-
-        if return_features:
-            extra["api_emb"] = api_emb
-            extra["graph_emb"] = graph_emb
-            extra["manifest_emb"] = manifest_emb
-            extra.update(concat_features)
 
         return logits, extra

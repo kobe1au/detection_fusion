@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
+from fusion.constants import VALIDATION_HOLDOUT_FRACTION
 from paper.baselines.common import (
     binary_metrics,
     concat_long_from_sources,
@@ -293,7 +294,11 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--validation-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=VALIDATION_HOLDOUT_FRACTION,
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     args = parser.parse_args()

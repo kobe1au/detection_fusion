@@ -27,6 +27,28 @@ def test_output_directory_collision_requires_explicit_overwrite(tmp_path: Path):
         prepare_output_directory(out_dir)
 
     assert prepare_output_directory(out_dir, overwrite=True) == out_dir
+    assert not (out_dir / "summary.yaml").exists()
+
+
+def test_output_overwrite_preserves_explicit_source_artifacts(tmp_path: Path):
+    out_dir = tmp_path / "experiment" / "42"
+    out_dir.mkdir(parents=True)
+    encoder = out_dir / "best_encoder_selected.pt"
+    pipeline = out_dir / "best_tri_modal_robust.pt"
+    summary = out_dir / "summary.yaml"
+    encoder.write_bytes(b"encoder")
+    pipeline.write_bytes(b"pipeline")
+    summary.write_text("stale: true\n", encoding="utf-8")
+
+    prepare_output_directory(
+        out_dir,
+        overwrite=True,
+        preserve_paths={encoder, pipeline},
+    )
+
+    assert encoder.read_bytes() == b"encoder"
+    assert pipeline.read_bytes() == b"pipeline"
+    assert not summary.exists()
 
 
 def test_overlay_semantics_do_not_depend_on_name_or_directory(tmp_path: Path):
@@ -77,21 +99,21 @@ def test_evidential_objectives_reject_softmax_fixed_opinions(relative_config: st
 
 
 @pytest.mark.parametrize(
-    ("path", "value"),
+    ("path", "value", "expected_error"),
     [
-        (("use_support_discount",), True),
-        (("detach_discount",), False),
-        (("detach_confidence_proxy",), False),
-        (("acceptance_aggregation",), "min"),
-        (("fallback",), "bogus"),
-        (("use_reliability_acceptance",), False),
-        (("confidence_proxy", "temperature_api"), 2.0),
-        (("support_factor", "manifest_support_base"), 0.8),
-        (("conflict_factor", "min_value"), 0.2),
+        (("use_support_discount",), True, "Removed fusion/I1"),
+        (("detach_discount",), False, "Removed fusion/I1"),
+        (("detach_confidence_proxy",), False, "Removed fusion/I1"),
+        (("acceptance_aggregation",), "min", "unsupported"),
+        (("fallback",), "bogus", "Removed fusion/I1"),
+        (("use_reliability_acceptance",), False, "unsupported"),
+        (("confidence_proxy", "temperature_api"), 2.0, "Removed fusion/I1"),
+        (("support_factor", "manifest_support_base"), 0.8, "Removed fusion/I1"),
+        (("conflict_factor", "min_value"), 0.2, "Removed fusion/I1"),
     ],
 )
-def test_routed_mode_rejects_non_neutral_linear_only_settings(
-    path: tuple[str, ...], value: object
+def test_removed_linear_fusion_settings_fail_fast(
+    path: tuple[str, ...], value: object, expected_error: str
 ):
     cfg = load_config_path(EXPERIMENT_ROOT / "evidential_trusted_fusion.yaml")
     cfg = copy.deepcopy(cfg)
@@ -100,7 +122,7 @@ def test_routed_mode_rejects_non_neutral_linear_only_settings(
         target = target.setdefault(key, {})
     target[path[-1]] = value
 
-    with pytest.raises(ValueError, match="does not consume"):
+    with pytest.raises(ValueError, match=expected_error):
         build_model(cfg, feature_dim=16)
 
 
@@ -110,7 +132,6 @@ def test_routed_mode_rejects_non_neutral_linear_only_settings(
         ("model", ("joint_emb_dim",), 32),
         ("fusion", ("linear_use_joint_branch",), False),
         ("loss", ("branch_aux_weights", "joint"), 0.0),
-        ("model", ("gate", "apply_alive_mask"), True),
     ],
 )
 def test_removed_joint_configuration_fails_fast(
@@ -128,20 +149,29 @@ def test_removed_joint_configuration_fails_fast(
         build_model(cfg, feature_dim=16)
 
 
+def test_removed_gate_input_switch_fails_fast():
+    cfg = copy.deepcopy(
+        load_config_path(EXPERIMENT_ROOT / "evidential_trusted_fusion.yaml")
+    )
+    cfg["model"].setdefault("gate", {})["apply_alive_mask"] = True
+
+    with pytest.raises(ValueError, match="Removed model.gate input switches"):
+        build_model(cfg, feature_dim=16)
+
+
 def test_graph_encoder_budget_accounting_cannot_be_disabled():
     cfg = load_config_path(EXPERIMENT_ROOT / "evidential_trusted_fusion.yaml")
     cfg = copy.deepcopy(cfg)
     cfg["model"]["graph_encoder"]["account_for_encoder_budget"] = False
 
-    with pytest.raises(ValueError, match="encoder-only truncation"):
+    with pytest.raises(ValueError, match="Removed model.graph_encoder settings"):
         build_model(cfg, feature_dim=16)
 
 
-def test_nested_graph_budget_is_shared_by_dataset_and_encoder():
+def test_top_level_graph_budget_is_shared_by_dataset_and_encoder():
     cfg = load_config_path(EXPERIMENT_ROOT / "evidential_trusted_fusion.yaml")
     cfg = copy.deepcopy(cfg)
-    del cfg["model"]["max_nodes_gnn"]
-    cfg["model"]["graph_encoder"]["max_nodes"] = 64
+    cfg["model"]["max_nodes_gnn"] = 64
 
     kwargs = _dataset_common_kwargs(cfg, is_train=False)
     model = build_model(cfg, feature_dim=16)
@@ -150,14 +180,37 @@ def test_nested_graph_budget_is_shared_by_dataset_and_encoder():
     assert model.graph_encoder.max_nodes == 64
 
 
-def test_conflicting_graph_budget_aliases_fail_at_startup():
+def test_removed_nested_graph_budget_alias_fails_at_startup():
     cfg = load_config_path(EXPERIMENT_ROOT / "evidential_trusted_fusion.yaml")
     cfg = copy.deepcopy(cfg)
     cfg["model"]["graph_encoder"]["max_nodes"] = 64
 
-    with pytest.raises(ValueError, match="Conflicting graph budgets"):
+    with pytest.raises(ValueError, match="Removed model.graph_encoder settings"):
         _dataset_common_kwargs(cfg, is_train=False)
-    with pytest.raises(ValueError, match="Conflicting graph budgets"):
+    with pytest.raises(ValueError, match="Removed model.graph_encoder settings"):
+        build_model(cfg, feature_dim=16)
+
+
+def test_missing_top_level_graph_budget_fails_at_startup():
+    cfg = load_config_path(EXPERIMENT_ROOT / "evidential_trusted_fusion.yaml")
+    cfg = copy.deepcopy(cfg)
+    del cfg["model"]["max_nodes_gnn"]
+
+    with pytest.raises(ValueError, match=r"model\.max_nodes_gnn.*required"):
+        _dataset_common_kwargs(cfg, is_train=False)
+    with pytest.raises(ValueError, match=r"model\.max_nodes_gnn.*required"):
+        build_model(cfg, feature_dim=16)
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, float("nan"), True])
+def test_graph_budget_requires_a_positive_integer(value: object):
+    cfg = load_config_path(EXPERIMENT_ROOT / "evidential_trusted_fusion.yaml")
+    cfg = copy.deepcopy(cfg)
+    cfg["model"]["max_nodes_gnn"] = value
+
+    with pytest.raises(ValueError, match=r"model\.max_nodes_gnn"):
+        _dataset_common_kwargs(cfg, is_train=False)
+    with pytest.raises(ValueError, match=r"model\.max_nodes_gnn"):
         build_model(cfg, feature_dim=16)
 
 

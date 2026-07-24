@@ -16,24 +16,14 @@ METHOD_TARGETS = {
     "qmf_energy": "qmf_energy",
 }
 
-I2_MECHANISM_TARGETS = {
+FUSION_RULE_TARGETS = {
     "dempster_rule_only": "dempster",
     "cumulative_subjective_logic": "cumulative",
     "log_pool": "log_pool",
     "conflict_weighted_opinion": "conflict_weighted_opinion",
 }
 
-FORMAL_TARGETS = {**METHOD_TARGETS, **I2_MECHANISM_TARGETS}
-
-BASELINE_TARGETS = FORMAL_TARGETS
-
-NATURAL_TARGETS = {
-    "ours": "natural_ours",
-    "tmc": "natural_tmc",
-    "ecml": "natural_ecml",
-    "qmf_energy": "natural_qmf_energy",
-    "conflict_weighted_opinion": "natural_conflict_weighted_opinion",
-}
+FORMAL_TARGETS = {**METHOD_TARGETS, **FUSION_RULE_TARGETS}
 
 
 def run_target(target: str, extra_config: str | None, dry_run: bool) -> None:
@@ -49,13 +39,13 @@ def run_target(target: str, extra_config: str | None, dry_run: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run paper-level shared-encoder method baselines and controlled "
-            "I2 fusion-mechanism comparisons."
+            "Run paper-level method baselines and complete fusion-rule "
+            "comparisons under the common protocol."
         )
     )
     parser.add_argument(
         "--method",
-        choices=["all", *BASELINE_TARGETS.keys()],
+        choices=["all", *FORMAL_TARGETS.keys()],
         default="all",
         help="Paper comparison to run.",
     )
@@ -70,7 +60,7 @@ def main() -> None:
     methods = list(FORMAL_TARGETS) if args.method == "all" else [args.method]
     extra_config = str(args.extra_config).strip() or None
     for method in methods:
-        run_target(BASELINE_TARGETS[method], extra_config, bool(args.dry_run))
+        run_target(FORMAL_TARGETS[method], extra_config, bool(args.dry_run))
 
 
 if __name__ == "__main__":

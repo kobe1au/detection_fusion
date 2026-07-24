@@ -1,6 +1,9 @@
 defaults:
   - ../../base_tri_modal_robust.yaml
 
+encoder_stage:
+  protocol_id: qmf_energy_component_stage1_v1
+
 method:
   name: qmf_energy_component
   protocol_id: qmf_energy_v1
@@ -15,18 +18,14 @@ model:
 
 fusion:
   mode: model_dispatch
-  use_reliability_discount: false
-  use_support_discount: false
-  use_conflict_discount: false
-  use_confidence_proxy: false
+  use_i1_reliability: false
   reliability_calibration:
     enabled: false
-  probability_calibration:
-    enabled: false
-
 calibration:
   enabled: false
   holdout_enabled: true
+  role_assignment_path: labels/validation_roles_protocol_v1.json
+  require_role_assignment: true
 
 selective_prediction:
   enabled: false

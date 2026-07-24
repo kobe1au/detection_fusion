@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 
 import pytest
@@ -7,12 +8,15 @@ import torch.nn.functional as F
 from fusion.train import (
     CHECKPOINT_STAGE_ENCODER_SELECTED,
     CHECKPOINT_STAGE_PIPELINE_FITTED,
+    PIPELINE_ARTIFACT_SCHEMA_VERSION,
     _calibration_subset_identity,
     _fit_routed_final_temperature,
     _decision_calibration_signature,
     _decision_calibration_data_identity,
     _file_sha256,
     _load_eval_checkpoint,
+    _pipeline_decision_metadata_sha256,
+    _state_dict_sha256,
     _resolve_refit_decision_calibration,
     build_run_identity,
     compute_branch_reliability_metrics,
@@ -42,7 +46,6 @@ class _CalibrationGraph:
 
 class _FinalTemperatureOnlyFusion(torch.nn.Module):
     combination = "routed"
-    temperature_parameters = None
 
     def __init__(self):
         super().__init__()
@@ -51,9 +54,6 @@ class _FinalTemperatureOnlyFusion(torch.nn.Module):
         )
 
     def reliability_calibration_parameters(self):
-        return []
-
-    def probability_calibration_parameters(self):
         return []
 
     def routing_calibration_parameters(self):
@@ -88,7 +88,7 @@ class _FinalTemperatureOnlyModel(torch.nn.Module):
     def set_calibration_active(self, enabled: bool):
         self.calibration_active = bool(enabled)
 
-    def forward(self, graph, return_features=False):
+    def forward(self, graph):
         batch_size = graph.evidence.size(0)
         logits = graph.evidence.new_tensor(
             [[4.0, -4.0], [4.0, -4.0], [-4.0, 4.0], [4.0, -4.0]]
@@ -96,7 +96,8 @@ class _FinalTemperatureOnlyModel(torch.nn.Module):
         outputs = self.discount_fusion(logits, logits, logits, graph.evidence)
         for name in ("api", "graph", "manifest"):
             outputs[f"{name}_logits_aux"] = logits
-        outputs["gate_evidence"] = graph.evidence
+        outputs["fusion_availability"] = graph.evidence
+        outputs["selective_eligible"] = graph.evidence[:, :3].gt(0).any(dim=-1)
         return outputs["final_logits"], outputs
 
 
@@ -240,10 +241,15 @@ def test_oof_payload_rejects_lossy_or_nonfinite_labels(label: object):
 
 def test_evaluate_uses_raw_cutoff_when_temperature_probability_saturates():
     class SaturatedBinaryModel(torch.nn.Module):
-        def forward(self, graph, return_features=False):
+        def forward(self, graph):
             raw = F.log_softmax(graph.evidence.new_tensor([[0.0, 0.5]]), dim=-1)
             final = F.log_softmax(raw / 1.0e-8, dim=-1)
-            return final, {"uncalibrated_final_log_prob": raw}
+            return final, {
+                "uncalibrated_final_log_prob": raw,
+                "selective_eligible": torch.ones(
+                    raw.size(0), dtype=torch.bool, device=raw.device
+                ),
+            }
 
     loader = [
         {
@@ -286,7 +292,16 @@ def test_posthoc_calibration_supports_final_temperature_only_stage():
         torch.device("cpu"),
         False,
         {
-            "calibration": {"enabled": True, "epochs": 1},
+            "calibration": {
+                "enabled": True,
+                "stage_optimization": {
+                    "default": {
+                        "max_steps": 1,
+                        "min_steps": 1,
+                        "require_convergence": False,
+                    }
+                },
+            },
             "fusion": {},
         },
     )
@@ -334,14 +349,20 @@ def _write_staged_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
         },
         encoder_path,
     )
-    torch.save(
-        {
-            "checkpoint_stage": CHECKPOINT_STAGE_PIPELINE_FITTED,
-            "encoder_checkpoint_path": encoder_path.name,
-            "model": {"opinion_router.weight": torch.tensor([9.0])},
-        },
-        pipeline_path,
+    pipeline_model = {"opinion_router.weight": torch.tensor([9.0])}
+    pipeline = {
+        "checkpoint_stage": CHECKPOINT_STAGE_PIPELINE_FITTED,
+        "pipeline_artifact_schema_version": PIPELINE_ARTIFACT_SCHEMA_VERSION,
+        "encoder_checkpoint_path": encoder_path.name,
+        "encoder_checkpoint_sha256": _file_sha256(encoder_path),
+        "model": pipeline_model,
+        "pipeline_model_state_sha256": _state_dict_sha256(pipeline_model),
+        "classification_threshold": {"threshold": 0.5},
+    }
+    pipeline["pipeline_decision_metadata_sha256"] = (
+        _pipeline_decision_metadata_sha256(pipeline)
     )
+    torch.save(pipeline, pipeline_path)
     return encoder_path, pipeline_path
 
 
@@ -383,14 +404,41 @@ def test_checkpoint_stage_and_pipeline_link_are_mandatory(tmp_path):
         validate_checkpoint_stage({"model": {}})
 
     pipeline_path = tmp_path / "pipeline_without_encoder_link.pt"
+    pipeline_model = {"placeholder.weight": torch.tensor([1.0])}
     torch.save(
         {
             "checkpoint_stage": CHECKPOINT_STAGE_PIPELINE_FITTED,
-            "model": {},
+            "pipeline_artifact_schema_version": PIPELINE_ARTIFACT_SCHEMA_VERSION,
+            "model": pipeline_model,
+            "pipeline_model_state_sha256": _state_dict_sha256(pipeline_model),
         },
         pipeline_path,
     )
     with pytest.raises(ValueError, match="does not link"):
+        _load_eval_checkpoint(
+            pipeline_path,
+            refit_posthoc_calibration=True,
+            map_location="cpu",
+        )
+
+    encoder_path = tmp_path / "encoder_without_link_hash.pt"
+    torch.save(
+        {"checkpoint_stage": CHECKPOINT_STAGE_ENCODER_SELECTED, "model": {}},
+        encoder_path,
+    )
+    pipeline_path = tmp_path / "pipeline_without_encoder_hash.pt"
+    pipeline_model = {"placeholder.weight": torch.tensor([1.0])}
+    torch.save(
+        {
+            "checkpoint_stage": CHECKPOINT_STAGE_PIPELINE_FITTED,
+            "pipeline_artifact_schema_version": PIPELINE_ARTIFACT_SCHEMA_VERSION,
+            "encoder_checkpoint_path": encoder_path.name,
+            "model": pipeline_model,
+            "pipeline_model_state_sha256": _state_dict_sha256(pipeline_model),
+        },
+        pipeline_path,
+    )
+    with pytest.raises(ValueError, match="encoder_checkpoint_sha256"):
         _load_eval_checkpoint(
             pipeline_path,
             refit_posthoc_calibration=True,
@@ -445,6 +493,86 @@ def test_pipeline_encoder_link_verifies_portable_artifact_hash(tmp_path):
             pipeline_path,
             refit_posthoc_calibration=True,
             map_location="cpu",
+        )
+
+
+def test_pipeline_model_state_hash_is_mandatory_and_verified(tmp_path):
+    _, pipeline_path = _write_staged_checkpoints(tmp_path)
+    checkpoint = torch.load(pipeline_path, map_location="cpu", weights_only=True)
+    checkpoint["model"]["opinion_router.weight"] = torch.tensor([10.0])
+    torch.save(checkpoint, pipeline_path)
+
+    with pytest.raises(ValueError, match="model-state hash mismatch"):
+        _load_eval_checkpoint(
+            pipeline_path,
+            refit_posthoc_calibration=False,
+            map_location="cpu",
+        )
+
+
+def test_pipeline_decision_metadata_hash_is_mandatory_and_verified(tmp_path):
+    _, pipeline_path = _write_staged_checkpoints(tmp_path)
+    checkpoint = torch.load(pipeline_path, map_location="cpu", weights_only=True)
+    checkpoint.pop("pipeline_decision_metadata_sha256")
+    torch.save(checkpoint, pipeline_path)
+
+    with pytest.raises(ValueError, match="pipeline_decision_metadata_sha256"):
+        _load_eval_checkpoint(
+            pipeline_path,
+            refit_posthoc_calibration=False,
+            map_location="cpu",
+        )
+
+    _, pipeline_path = _write_staged_checkpoints(tmp_path)
+    checkpoint = torch.load(pipeline_path, map_location="cpu", weights_only=True)
+    checkpoint["classification_threshold"]["threshold"] = 0.75
+    torch.save(checkpoint, pipeline_path)
+
+    with pytest.raises(ValueError, match="decision-metadata hash mismatch"):
+        _load_eval_checkpoint(
+            pipeline_path,
+            refit_posthoc_calibration=False,
+            map_location="cpu",
+        )
+
+
+def test_pipeline_decision_metadata_hash_covers_oof_rows(tmp_path):
+    _, pipeline_path = _write_staged_checkpoints(tmp_path)
+    checkpoint = torch.load(pipeline_path, map_location="cpu", weights_only=True)
+    checkpoint["posthoc_oof_clean_rows"] = [
+        {
+            "sid": "sample-a",
+            "group": "package:a",
+            "label": 1,
+            "raw_log_prob": [-2.0, -0.14541345786885906],
+        }
+    ]
+    checkpoint["posthoc_oof_clean_rows_schema_version"] = 1
+    checkpoint["pipeline_decision_metadata_sha256"] = (
+        _pipeline_decision_metadata_sha256(checkpoint)
+    )
+    torch.save(checkpoint, pipeline_path)
+
+    checkpoint["posthoc_oof_clean_rows"][0]["label"] = 0
+    torch.save(checkpoint, pipeline_path)
+    with pytest.raises(ValueError, match="decision-metadata hash mismatch"):
+        _load_eval_checkpoint(
+            pipeline_path,
+            refit_posthoc_calibration=False,
+            map_location="cpu",
+        )
+
+
+def test_pipeline_decision_metadata_hash_distinguishes_infinity_and_none():
+    infinite = {"conformal_thresholds": {"q_malware": float("inf")}}
+    absent = {"conformal_thresholds": {"q_malware": None}}
+    assert _pipeline_decision_metadata_sha256(infinite) != (
+        _pipeline_decision_metadata_sha256(absent)
+    )
+
+    with pytest.raises(ValueError, match="not canonically serializable"):
+        _pipeline_decision_metadata_sha256(
+            {"conformal_thresholds": {"q_malware": float("nan")}}
         )
 
 
@@ -515,10 +643,8 @@ def test_decision_signature_rejects_reusing_threshold_at_new_risk_level():
             checkpoint,
             refit_decision_calibration=False,
         )
-    changed_score = {
-        **_decision_cfg(0.05),
-        "fusion": {"acceptance_aggregation": "min"},
-    }
+    changed_score = copy.deepcopy(_decision_cfg(0.05))
+    changed_score["selective_prediction"]["threshold_score"] = "msp"
     with pytest.raises(ValueError, match="Selective-decision settings differ"):
         validate_checkpoint_decision_signature(
             changed_score,
@@ -623,14 +749,17 @@ def test_decision_data_identity_hashes_rows_groups_classes_and_csv(tmp_path):
         )
 
 
-def test_i1_correctness_and_i2_error_risk_metrics_are_reported():
+def test_i1_correctness_and_i2_threshold_fn_risk_metrics_are_reported():
     rows = [
         {
             "routing_active": 1,
             "routing_has_available": 1,
             "routing_risk_probability": 0.2,
             "routing_mixture_pred": 1,
-            "label": 1,
+            "label": 0,
+            "pred": 0,
+            "routing_risk_decision_threshold_active": 1,
+            "routing_risk_target_threshold_malware_false_negative": 1,
             "api_alive": 1,
             "graph_alive": 1,
             "manifest_alive": 1,
@@ -646,7 +775,10 @@ def test_i1_correctness_and_i2_error_risk_metrics_are_reported():
             "routing_has_available": 1,
             "routing_risk_probability": 0.8,
             "routing_mixture_pred": 1,
-            "label": 0,
+            "label": 1,
+            "pred": 0,
+            "routing_risk_decision_threshold_active": 1,
+            "routing_risk_target_threshold_malware_false_negative": 1,
             "api_alive": 1,
             "graph_alive": 0,
             "manifest_alive": 1,
@@ -668,6 +800,7 @@ def test_i1_correctness_and_i2_error_risk_metrics_are_reported():
     assert metrics["graph_reliability_brier"] == pytest.approx(0.09)
     assert metrics["manifest_reliability_brier"] == pytest.approx(0.05)
     assert metrics["routing_risk_count"] == 2
+    assert metrics["routing_risk_target"] == "threshold_malware_false_negative"
     assert metrics["routing_risk_brier"] == pytest.approx(0.04)
     assert metrics["routing_risk_mean"] == pytest.approx(0.5)
     assert metrics["routing_mixture_error_rate"] == pytest.approx(0.5)
@@ -687,6 +820,9 @@ def test_all_missing_rows_are_excluded_from_i2_risk_metrics_and_counted():
                 "routing_risk_probability": 0.2,
                 "routing_mixture_pred": 0,
                 "label": 0,
+                "pred": 0,
+                "routing_risk_decision_threshold_active": 1,
+                "routing_risk_target_threshold_malware_false_negative": 1,
             },
             {
                 "routing_active": 1,
@@ -694,6 +830,9 @@ def test_all_missing_rows_are_excluded_from_i2_risk_metrics_and_counted():
                 "routing_risk_probability": 0.8,
                 "routing_mixture_pred": 0,
                 "label": 1,
+                "pred": 0,
+                "routing_risk_decision_threshold_active": 1,
+                "routing_risk_target_threshold_malware_false_negative": 1,
             },
             {
                 "routing_active": 1,
@@ -771,7 +910,12 @@ def test_classification_threshold_requires_both_classes(label):
 
 def _risk_rows(num_malware: int) -> list[dict]:
     return [
-        {"acceptance_score": 0.9, "label": 1, "pred": 1}
+        {
+            "acceptance_score": 0.9,
+            "label": 1,
+            "pred": 1,
+            "selective_eligible": 1,
+        }
         for _ in range(num_malware)
     ]
 

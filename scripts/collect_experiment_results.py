@@ -11,7 +11,7 @@ import yaml
 
 
 BRANCHES = ("api", "graph", "manifest")
-METRIC_SUMMARY_SCHEMA_VERSION = 5
+METRIC_SUMMARY_SCHEMA_VERSION = 10
 
 SCALAR_TYPES = (str, int, float, bool, type(None))
 
@@ -330,12 +330,10 @@ def _summary_metric_rows(
         summary.get("val_conformal_calibration"),
     )
     _add_metric_row(rows, identity, "test", "test", summary.get("test"))
-    for section in ("val_robust", "robust"):
-        nested = summary.get(section) or {}
-        if not isinstance(nested, dict):
-            continue
-        for scenario, metrics in nested.items():
-            _add_metric_row(rows, identity, section, str(scenario), metrics)
+    robust = summary.get("robust") or {}
+    if isinstance(robust, dict):
+        for scenario, metrics in robust.items():
+            _add_metric_row(rows, identity, "robust", str(scenario), metrics)
     extra_eval = summary.get("extra_eval") or {}
     if isinstance(extra_eval, dict):
         for scenario, metrics in extra_eval.items():

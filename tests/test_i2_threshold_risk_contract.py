@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fusion.losses import compute_posthoc_calibration_loss
+from fusion.losses import routing_risk_per_sample_loss, routing_risk_target
 from fusion.opinion_router import GlobalOpinionRouter
 from fusion.train import (
     compute_branch_reliability_metrics,
@@ -26,14 +26,10 @@ def _risk_only_config(
     raw_cutoff: float,
 ) -> dict:
     return {
-        "reliability_calibration": {"weight": 0.0},
-        "probability_calibration": {"weight": 0.0},
         "routing": {
             "enabled": True,
             "posthoc_refine": True,
-            "calibration_weight": 1.0,
             "prediction_loss_weight": 0.0,
-            "route_oracle_loss_weight": 0.0,
             "risk_loss_weight": 1.0,
             "risk_loss": "bce",
             "risk_target": target,
@@ -63,23 +59,32 @@ def test_threshold_fn_loss_masks_malware_predictions_and_has_finite_gradients():
         "routing_risk_training_logit": risk_training_logit,
     }
 
-    loss, diagnostics = compute_posthoc_calibration_loss(
+    config = _risk_only_config(
+        "threshold_malware_false_negative",
+        raw_cutoff=0.0,
+    )["routing"]
+    target, valid, loss_type, target_type = routing_risk_target(
         outputs,
         labels,
-        torch.zeros(4, 1),
-        _risk_only_config(
-            "threshold_malware_false_negative",
-            raw_cutoff=0.0,
-        ),
+        config,
     )
+    per_row = routing_risk_per_sample_loss(
+        outputs["routing_risk_probability"],
+        risk_training_logit,
+        target,
+        valid,
+        loss_type=loss_type,
+    )
+    loss = per_row[valid].mean()
     expected = F.binary_cross_entropy_with_logits(
         risk_training_logit[[0, 2]],
         torch.tensor([1.0, 0.0]),
     )
 
     assert torch.allclose(loss, expected)
-    assert diagnostics["routing_risk_training_sample_count"] == 2
-    assert diagnostics["routing_risk_error_rate"] == pytest.approx(0.5)
+    assert target_type == "threshold_malware_false_negative"
+    assert int(valid.sum()) == 2
+    assert target[valid].mean().item() == pytest.approx(0.5)
 
     loss.backward()
     assert risk_training_logit.grad is not None
@@ -97,22 +102,13 @@ def _router_inputs(
     dict[str, torch.Tensor],
     dict[str, torch.Tensor],
     dict[str, torch.Tensor],
-    dict[str, torch.Tensor],
 ]:
-    probability = torch.tensor(malware_probabilities, dtype=torch.float32)
-    uncertainty = torch.full_like(probability, 0.2)
-    belief = torch.stack(
-        [
-            1.0 - probability - uncertainty / 2.0,
-            probability - uncertainty / 2.0,
-        ],
-        dim=-1,
-    )
+    malware = torch.tensor(malware_probabilities, dtype=torch.float32)
+    probability = torch.stack([1.0 - malware, malware], dim=-1)
     return (
-        {name: belief.clone() for name in BRANCHES},
-        {name: uncertainty.clone() for name in BRANCHES},
-        {name: torch.full_like(probability, 0.8) for name in BRANCHES},
-        {name: torch.ones_like(probability) for name in BRANCHES},
+        {name: probability.clone() for name in BRANCHES},
+        {name: torch.full_like(malware, 0.8) for name in BRANCHES},
+        {name: torch.ones_like(malware) for name in BRANCHES},
     )
 
 
@@ -161,26 +157,6 @@ def _risk_metric_row(
 @pytest.mark.parametrize(
     ("target", "rows"),
     [
-        (
-            "threshold_classification_error",
-            [
-                # False positive is an error for this target.
-                _risk_metric_row(
-                    label=0,
-                    pred=1,
-                    mixture_pred=0,
-                    risk=0.8,
-                    target="threshold_classification_error",
-                ),
-                _risk_metric_row(
-                    label=1,
-                    pred=1,
-                    mixture_pred=0,
-                    risk=0.2,
-                    target="threshold_classification_error",
-                ),
-            ],
-        ),
         (
             "threshold_malware_false_negative",
             [

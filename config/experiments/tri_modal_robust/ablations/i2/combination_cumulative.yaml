@@ -1,19 +1,28 @@
 defaults:
   - ../../evidential_trusted_fusion.yaml
 
+# This rule is active during Stage-1 and therefore defines a complete
+# comparison method, not a post-hoc-only I2 ablation.
+encoder_stage:
+  protocol_id: fixed_evidential_rule_stage1_v1
+
 method:
-  name: i2_combination_cumulative
+  name: fusion_rule_cumulative
 
 train:
-  exp_name: i2_combination_cumulative
+  exp_name: fusion_rule_cumulative
 
 fusion:
-  # Fair no-I2 control: retain evidential branch opinions and I1 trust
-  # discounting, but replace the learned route/risk components with the
-  # same fixed cumulative opinion-fusion rule for every sample.
+  # Complete comparison using the same branch architecture and I1 trust
+  # mechanism, with cumulative opinion fusion active in both Stage-1 and the
+  # fitted pipeline.
   combination: cumulative
   routing:
     enabled: false
-    acceptance_score_mode: product
     # Equal one-scalar output calibration across all opinion rules.
     final_temperature_scaling: true
+
+# Fusion-rule cells compare forced classification only. I3 is evaluated
+# separately on the frozen primary method.
+selective_prediction:
+  enabled: false

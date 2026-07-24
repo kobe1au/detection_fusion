@@ -18,6 +18,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+from fusion.constants import VALIDATION_HOLDOUT_FRACTION
 from fusion.utils import strict_binary_integer, strict_finite_integer
 
 
@@ -84,7 +85,7 @@ def enforce_formal_split_completeness(
 def validation_selection_indices(
     frame: pd.DataFrame,
     *,
-    calibration_fraction: float = 0.5,
+    calibration_fraction: float = VALIDATION_HOLDOUT_FRACTION,
     seed: int = 42,
 ) -> tuple[list[int], dict[str, Any]]:
     """Return the same group-stratified checkpoint-selection split as Full."""
@@ -110,12 +111,29 @@ def validation_selection_indices(
     validated_labels = _strict_binary_label_series(
         frame["label"], context="validation selection frame"
     ).tolist()
+    year_col = next(
+        (name for name in ("year", "Year", "vt_year", "dex_year") if name in frame.columns),
+        None,
+    )
+    if year_col is None:
+        raise ValueError(
+            "Formal baseline validation selection requires a year column so "
+            "it matches the main year-label/package-group protocol"
+        )
+    validated_years = [
+        strict_finite_integer(
+            value,
+            field_name=f"validation selection year at row {index}",
+        )
+        for index, value in frame[year_col].items()
+    ]
 
     class FrameView:
         def __init__(self) -> None:
             self.sample_sids = sids
             self.sample_groups = groups
             self.sample_labels = validated_labels
+            self.sample_years = validated_years
 
         def __len__(self) -> int:
             return len(self.sample_sids)
@@ -129,6 +147,7 @@ def validation_selection_indices(
             "calibration": {
                 "validation_fraction": float(calibration_fraction),
                 "split_seed": int(seed),
+                "stratified_group_split": True,
             },
         },
         FrameView(),

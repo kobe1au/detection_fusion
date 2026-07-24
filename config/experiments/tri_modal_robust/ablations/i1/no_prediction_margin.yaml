@@ -9,5 +9,5 @@ train:
 
 fusion:
   reliability_calibration:
-    # Fixed topology: mask only the branch-local confidence margin.
+    # Vacuity-only continuous signal.
     use_prediction_margin: false

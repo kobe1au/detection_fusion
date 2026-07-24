@@ -1,10 +1,9 @@
-"""Modality-independence regression tests for input-level truncation + guardrails.
+"""Modality-independence regressions for input truncation and intrinsic I1.
 
-The evidential fusion (I2) treats API / Graph / Manifest as independent evidence
-sources. These tests pin that the budget truncation of one modality does not
-depend on another modality's fields. Observable relation evidence is allowed as
-I2 metadata only, while switches that feed one modality's features into another
-encoder are rejected for evidential combination rules.
+The final protocol treats API / Graph / Manifest as separate evidence sources.
+Budget truncation of one modality must not depend on another modality, and I1
+must derive each branch's reliability features only from that branch's
+Dirichlet opinion. Cross-modal relations are consumed by I2 conflict, never I1.
 """
 
 import copy
@@ -15,10 +14,9 @@ import torch.nn as nn
 from torch_geometric.data import Batch, Data
 
 from fusion import graph_encoders
-from fusion.constants import EvidenceIndex
 from fusion.dataset import RobustTriModalDataset, apply_graph_encoder_budget
 from fusion.graph_encoders import GraphEncoderGCN, truncate_per_graph
-from fusion.reliability_calibration import build_monotonic_reliability_features
+from fusion.reliability_calibration import build_reliability_features
 from fusion.train import build_model
 
 
@@ -46,9 +44,8 @@ def test_limit_api_events_keeps_sensitive_and_preserves_order():
     # Both sensitive events (ids 14, 15) survive even though they are last.
     assert 14 in kept and 15 in kept
     assert kept == sorted(kept)  # original API event order preserved
-    # Encoder-budget bookkeeping unchanged.
-    assert out["api_event_count_before_encoder_budget"] == 6
-    assert out["api_event_count_after_encoder_budget"] == 3
+    assert "api_encoder_coverage" not in out
+    assert "api_event_count_before_encoder_budget" not in out
 
 
 def test_limit_api_events_is_independent_of_graph_fields():
@@ -115,10 +112,9 @@ def test_truncate_per_graph_is_independent_of_api_alignment():
 def test_dataset_graph_budget_is_exposed_as_encoder_contract():
     data = {
         "x": torch.zeros((2, 3), dtype=torch.float32),
-        "graph_integrity": 1.0,
     }
 
-    out = apply_graph_encoder_budget(data, 5, "alignment")
+    out = apply_graph_encoder_budget(data, 5)
 
     assert out["graph_encoder_budget_max_nodes"] == 5
 
@@ -275,6 +271,7 @@ def _cfg(combination, *, behavior_hint=False):
     return {
         "model": {
             "fusion_mode": "discount_probability",
+            "max_nodes_gnn": 64,
             "graph_encoder": {"type": "gatv2", "use_behavior_hint": behavior_hint},
         },
         "fusion": {
@@ -285,27 +282,35 @@ def _cfg(combination, *, behavior_hint=False):
     }
 
 
-def test_i1_features_are_independent_of_cross_modal_relation_evidence():
-    base = torch.ones(2, EvidenceIndex.BASE_DIM)
-    changed = base.clone()
-    changed[:, EvidenceIndex.API_GRAPH_ANCHOR_SUPPORT] = torch.tensor([0.0, 0.2])
-    changed[:, EvidenceIndex.MANIFEST_CODE_SUPPORT] = torch.tensor([0.1, 0.3])
-    changed[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = torch.tensor([0.8, 1.0])
-    changed[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = torch.tensor([0.7, 0.9])
-    branch_probabilities = {
-        name: torch.tensor([[0.8, 0.2], [0.3, 0.7]])
-        for name in ("api", "graph", "manifest")
+def test_i1_features_are_branch_local_and_accept_no_cross_modal_metadata():
+    base_alpha = {
+        "api": torch.tensor([[5.0, 1.0], [1.0, 3.0]]),
+        "graph": torch.tensor([[2.0, 4.0], [3.0, 1.0]]),
+        "manifest": torch.tensor([[1.0, 2.0], [6.0, 1.0]]),
     }
+    changed_alpha = {name: value.clone() for name, value in base_alpha.items()}
+    changed_alpha["graph"] = torch.tensor([[12.0, 1.0], [1.0, 9.0]])
+    changed_alpha["manifest"] = torch.tensor([[1.0, 10.0], [8.0, 1.0]])
 
-    base_features, _ = build_monotonic_reliability_features(
-        base, branch_probabilities=branch_probabilities
+    base_features = build_reliability_features(base_alpha)
+    changed_features = build_reliability_features(changed_alpha)
+
+    # Changing every peer opinion cannot alter the API branch's intrinsic
+    # certainty / margin / predicted-class features.
+    torch.testing.assert_close(
+        base_features["api"], changed_features["api"], rtol=0.0, atol=0.0
     )
-    changed_features, _ = build_monotonic_reliability_features(
-        changed, branch_probabilities=branch_probabilities
+    assert not torch.equal(base_features["graph"], changed_features["graph"])
+    assert not torch.equal(
+        base_features["manifest"], changed_features["manifest"]
     )
 
-    for branch in ("api", "graph", "manifest"):
-        assert torch.equal(base_features[branch], changed_features[branch])
+    # The lean I1 API intentionally has no quality/perturbation argument.
+    with pytest.raises(TypeError):
+        build_reliability_features(  # type: ignore[call-arg]
+            base_alpha,
+            quality_diagnostics={"api_integrity": torch.ones(2)},
+        )
 
 
 def test_build_model_rejects_behavior_hint_under_evidential_combination():
@@ -313,7 +318,6 @@ def test_build_model_rejects_behavior_hint_under_evidential_combination():
         build_model(_cfg("dempster", behavior_hint=True), feature_dim=515)
 
 
-def test_build_model_allows_coupling_switches_under_linear_combination():
-    # Linear comparison fusion is explicitly allowed to couple modalities.
-    model = build_model(_cfg("linear", behavior_hint=True), feature_dim=515)
-    assert model is not None
+def test_build_model_rejects_removed_linear_combination():
+    with pytest.raises(ValueError, match="combination.*routed"):
+        build_model(_cfg("linear", behavior_hint=False), feature_dim=515)

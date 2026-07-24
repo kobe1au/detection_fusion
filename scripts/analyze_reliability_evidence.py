@@ -7,111 +7,30 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fusion.utils import strict_binary_integer
-
-
 MODALITY_BRANCHES = ("api", "graph", "manifest")
 BRANCHES = MODALITY_BRANCHES
 
-EVIDENCE_FIELDS = (
-    "api_integrity",
-    "api_encoder_coverage",
-    "api_total_pipeline_coverage",
-    "api_extractor_coverage",
-    "api_runtime_encoder_coverage",
-    "effective_api_integrity",
-    "graph_integrity",
-    "graph_encoder_coverage",
-    "effective_graph_integrity",
-    "manifest_integrity",
-    "effective_manifest_integrity",
-    "code_integrity",
-    "api_graph_anchor_support",
-    "manifest_code_support",
-    "manifest_to_code_conflict",
-    "code_to_manifest_conflict",
-    "predictive_conflict",
-    "predictive_conflict_max",
-    "raw_conflict",
-    "acceptance_score",
-    "discount_api",
-    "discount_graph",
-    "discount_manifest",
-    "fusion_weight_api",
-    "fusion_weight_graph",
-    "fusion_weight_manifest",
-    "api_alive",
-    "graph_alive",
-    "manifest_alive",
-    "api_graph_support_applicable",
-    "manifest_code_relation_applicable",
-    "api_manifest_relation_applicable",
-    "graph_manifest_relation_applicable",
-)
+EVIDENCE_FIELDS = tuple(
+    f"{signal}_{branch}"
+    for branch in BRANCHES
+    for signal in (
+        "evidential_certainty",
+        "prediction_margin",
+        "predicted_malware_indicator",
+        "predicted_reliability",
+    )
+) + tuple(f"{branch}_alive" for branch in BRANCHES)
 
 EVIDENCE_BIN_SPECS = {
-    "api_integrity": ("api",),
-    "api_encoder_coverage": ("api",),
-    "api_total_pipeline_coverage": ("api",),
-    "api_extractor_coverage": ("api",),
-    "api_runtime_encoder_coverage": ("api",),
-    "effective_api_integrity": ("api",),
-    "graph_integrity": ("graph",),
-    "graph_encoder_coverage": ("graph",),
-    "effective_graph_integrity": ("graph",),
-    "manifest_integrity": ("manifest",),
-    "effective_manifest_integrity": ("manifest",),
-    "code_integrity": ("api", "graph"),
-    "api_graph_anchor_support": ("api", "graph"),
-    "manifest_code_support": ("manifest",),
-    "manifest_to_code_conflict": ("manifest",),
-    "code_to_manifest_conflict": ("api", "graph"),
-    "max_manifest_code_conflict": ("api", "graph", "manifest"),
-    "predictive_conflict": ("api", "graph", "manifest"),
-    "predictive_conflict_max": ("api", "graph", "manifest"),
-    "raw_conflict": ("api", "graph", "manifest"),
-    "discount_api": ("api",),
-    "discount_graph": ("graph",),
-    "discount_manifest": ("manifest",),
-    "min_modality_discount": ("api", "graph", "manifest"),
-    "mean_modality_discount": ("api", "graph", "manifest"),
-}
-
-NATURAL_SUBSET_SPECS = {
-    "api_low_integrity": ("api_integrity", "low"),
-    "api_low_encoder_coverage": ("api_encoder_coverage", "low"),
-    "api_low_effective_integrity": ("effective_api_integrity", "low"),
-    "graph_low_integrity": ("graph_integrity", "low"),
-    "graph_low_encoder_coverage": ("graph_encoder_coverage", "low"),
-    "graph_low_effective_integrity": ("effective_graph_integrity", "low"),
-    "manifest_low_integrity": ("manifest_integrity", "low"),
-    "manifest_low_effective_integrity": ("effective_manifest_integrity", "low"),
-    "code_low_integrity": ("code_integrity", "low"),
-    "api_graph_low_support": ("api_graph_anchor_support", "low"),
-    "manifest_code_low_support": ("manifest_code_support", "low"),
-    "manifest_to_code_high_conflict": ("manifest_to_code_conflict", "high"),
-    "code_to_manifest_high_conflict": ("code_to_manifest_conflict", "high"),
-    "max_manifest_code_high_conflict": ("max_manifest_code_conflict", "high"),
-    "predictive_high_conflict": ("predictive_conflict", "high"),
-    "raw_high_conflict": ("raw_conflict", "high"),
-    "api_low_trust": ("discount_api", "low"),
-    "graph_low_trust": ("discount_graph", "low"),
-    "manifest_low_trust": ("discount_manifest", "low"),
-    "min_modality_low_trust": ("min_modality_discount", "low"),
-    "mean_modality_low_trust": ("mean_modality_discount", "low"),
-    "low_acceptance": ("acceptance_score", "low"),
-}
-
-NATURAL_MISSING_SPECS = {
-    "api_naturally_missing": "api_alive",
-    "graph_naturally_missing": "graph_alive",
-    "manifest_naturally_missing": "manifest_alive",
+    f"{signal}_{branch}": (branch,)
+    for branch in BRANCHES
+    for signal in ("evidential_certainty", "prediction_margin")
 }
 
 FILTER_COLUMNS = ("experiment", "seed", "split", "diagnostic_file")
@@ -290,14 +209,9 @@ def reliability_signal_diagnostics_table(
     permutations: int = 100,
     random_seed: int = 42,
 ) -> pd.DataFrame:
-    """Compare calibrated reliability with its component signals and shuffles."""
+    """Compare I1 reliability with certainty, margin, and shuffled controls."""
     if permutations <= 0:
         raise ValueError("permutations must be positive")
-    intrinsic_keys = {
-        "api": "api_integrity",
-        "graph": "graph_integrity",
-        "manifest": "manifest_integrity",
-    }
     records: list[dict[str, Any]] = []
     group_columns = [
         column
@@ -326,28 +240,28 @@ def reliability_signal_diagnostics_table(
             )
             native_auc = _safe_auc(correctness, reliability)
 
-            intrinsic_auc = float("nan")
-            intrinsic_key = intrinsic_keys[branch]
-            if intrinsic_key in group_frame.columns:
-                component = group_frame.loc[data.index, intrinsic_key].apply(
-                    pd.to_numeric, errors="coerce"
-                )
-                mask = component.notna().to_numpy()
-                if mask.any():
-                    intrinsic_auc = _safe_auc(
-                        correctness[mask], component.to_numpy(dtype=float)[mask]
-                    )
-
             certainty_auc = float("nan")
-            uncertainty_key = f"uncertainty_proxy_{branch}"
-            if uncertainty_key in group_frame.columns:
-                component = group_frame.loc[data.index, uncertainty_key].apply(
+            certainty_key = f"evidential_certainty_{branch}"
+            if certainty_key in group_frame.columns:
+                component = group_frame.loc[data.index, certainty_key].apply(
                     pd.to_numeric, errors="coerce"
                 )
                 mask = component.notna().to_numpy()
                 if mask.any():
                     certainty_auc = _safe_auc(
-                        correctness[mask], 1.0 - component.to_numpy(dtype=float)[mask]
+                        correctness[mask], component.to_numpy(dtype=float)[mask]
+                    )
+
+            margin_auc = float("nan")
+            margin_key = f"prediction_margin_{branch}"
+            if margin_key in group_frame.columns:
+                component = group_frame.loc[data.index, margin_key].apply(
+                    pd.to_numeric, errors="coerce"
+                )
+                mask = component.notna().to_numpy()
+                if mask.any():
+                    margin_auc = _safe_auc(
+                        correctness[mask], component.to_numpy(dtype=float)[mask]
                     )
 
             shuffled_mean = float(np.nanmean(shuffled_auc))
@@ -357,8 +271,8 @@ def reliability_signal_diagnostics_table(
                     "branch": branch,
                     "count": int(reliability.size),
                     "reliability_auc": native_auc,
-                    "intrinsic_integrity_auc": intrinsic_auc,
                     "evidential_certainty_auc": certainty_auc,
+                    "prediction_margin_auc": margin_auc,
                     "shuffled_reliability_auc_mean": shuffled_mean,
                     "shuffled_reliability_auc_std": float(np.nanstd(shuffled_auc)),
                     "reliability_permutation_gap": float(native_auc - shuffled_mean),
@@ -406,27 +320,6 @@ def evidence_group_table(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame.from_records(records)
 
 
-def _with_derived_evidence(frame: pd.DataFrame) -> pd.DataFrame:
-    out = frame.copy()
-    conflict_columns = [
-        column
-        for column in ("manifest_to_code_conflict", "code_to_manifest_conflict")
-        if column in out.columns
-    ]
-    if conflict_columns:
-        out["max_manifest_code_conflict"] = out[conflict_columns].max(axis=1)
-    discount_columns = [
-        column
-        for column in ("discount_api", "discount_graph", "discount_manifest")
-        if column in out.columns
-    ]
-    if discount_columns:
-        numeric_discounts = out[discount_columns].apply(pd.to_numeric, errors="coerce")
-        out["min_modality_discount"] = numeric_discounts.min(axis=1)
-        out["mean_modality_discount"] = numeric_discounts.mean(axis=1)
-    return out
-
-
 def _tercile_labels(values: pd.Series) -> pd.Series:
     labels = pd.Series(index=values.index, dtype="object")
     valid = pd.to_numeric(values, errors="coerce").dropna()
@@ -463,7 +356,6 @@ def _assign_evidence_bins(
 
 def evidence_bin_effects_table(frame: pd.DataFrame, bin_scope: str = "global") -> pd.DataFrame:
     records: list[dict[str, Any]] = []
-    frame = _with_derived_evidence(frame)
     group_columns = ["experiment", "seed", "diagnostic_file", "split"]
     available_groups = [column for column in group_columns if column in frame.columns]
     for evidence, branches in EVIDENCE_BIN_SPECS.items():
@@ -518,177 +410,6 @@ def evidence_bin_effects_table(frame: pd.DataFrame, bin_scope: str = "global") -
                         - branch_record["branch_accuracy"]
                     )
                 records.append(branch_record)
-    return pd.DataFrame.from_records(records)
-
-
-def _classification_metrics_for_frame(frame: pd.DataFrame) -> dict[str, Any]:
-    required = {"label", "prob_malware", "pred"}
-    if frame.empty or not required.issubset(frame.columns):
-        return {}
-    data = frame[list(required)].copy()
-    for column in required:
-        data[column] = pd.to_numeric(data[column], errors="coerce")
-    data = data.dropna()
-    if data.empty:
-        return {}
-    valid_index = data.index
-    labels_arr = np.asarray(
-        [
-            strict_binary_integer(value, field_name="analysis label")
-            for value in data["label"].tolist()
-        ],
-        dtype=np.int64,
-    )
-    probs_arr = data["prob_malware"].clip(0.0, 1.0).to_numpy(dtype=float)
-    preds_arr = np.asarray(
-        [
-            strict_binary_integer(value, field_name="analysis prediction")
-            for value in data["pred"].tolist()
-        ],
-        dtype=np.int64,
-    )
-    confidence = np.maximum(probs_arr, 1.0 - probs_arr)
-    correctness = (preds_arr == labels_arr).astype(float)
-    auc_defined = _auc_defined(labels_arr.astype(float))
-    ap_defined = _ap_defined(labels_arr.astype(float))
-    out: dict[str, Any] = {
-        "count": int(labels_arr.size),
-        "positive_rate": float(labels_arr.mean()) if labels_arr.size else float("nan"),
-        "acc": float(accuracy_score(labels_arr, preds_arr)),
-        "error_rate": float(1.0 - accuracy_score(labels_arr, preds_arr)),
-        "macro_f1": float(f1_score(labels_arr, preds_arr, average="macro", zero_division=0)),
-        "brier": float(np.mean((probs_arr - labels_arr.astype(float)) ** 2)),
-        "ece_10": _ece(confidence, correctness, bins=10),
-        "mean_confidence": float(confidence.mean()),
-        "confidence_accuracy_gap": float(confidence.mean() - correctness.mean()),
-        "auc_defined": int(auc_defined),
-        "auc": _safe_auc(labels_arr.astype(float), probs_arr),
-        "ap_defined": int(ap_defined),
-        "ap": _safe_ap(labels_arr.astype(float), probs_arr),
-    }
-    malware_mask = labels_arr == 1
-    if malware_mask.any():
-        out["malware_fn_rate"] = float(((preds_arr == 0) & malware_mask).sum() / malware_mask.sum())
-    if "acceptance_score" in frame.columns:
-        acceptance = pd.to_numeric(frame.loc[valid_index, "acceptance_score"], errors="coerce")
-        if acceptance.notna().any():
-            out["acceptance_score_mean"] = float(acceptance.dropna().mean())
-    if "rejected" in frame.columns:
-        rejected = pd.to_numeric(frame.loc[valid_index, "rejected"], errors="coerce")
-        if rejected.notna().any():
-            rejected_bool = rejected.fillna(1.0).to_numpy(dtype=float) >= 0.5
-            accepted_bool = ~rejected_bool
-            out["rejection_rate"] = float(rejected_bool.mean())
-            out["accepted_rate"] = float(accepted_bool.mean())
-            out["accepted_count"] = int(accepted_bool.sum())
-            if accepted_bool.any():
-                accepted_errors = (preds_arr[accepted_bool] != labels_arr[accepted_bool]).astype(float)
-                out["selective_risk"] = float(accepted_errors.mean())
-                out["selective_acc"] = float(1.0 - accepted_errors.mean())
-                out["selective_macro_f1"] = float(
-                    f1_score(
-                        labels_arr[accepted_bool],
-                        preds_arr[accepted_bool],
-                        average="macro",
-                        zero_division=0,
-                    )
-                )
-                accepted_malware = accepted_bool & malware_mask
-                if malware_mask.any():
-                    out["accepted_fn_risk_among_malware"] = float(
-                        ((preds_arr == 0) & accepted_malware).sum()
-                        / malware_mask.sum()
-                    )
-                if accepted_malware.any():
-                    out["fn_rate_given_accepted_malware"] = float(
-                        ((preds_arr == 0) & accepted_malware).sum() / accepted_malware.sum()
-                    )
-            else:
-                out["selective_risk"] = float("nan")
-                out["selective_acc"] = float("nan")
-                out["selective_macro_f1"] = float("nan")
-    return out
-
-
-def natural_degradation_subset_table(
-    frame: pd.DataFrame,
-    quantile: float = 1.0 / 3.0,
-    min_count: int = 10,
-) -> pd.DataFrame:
-    """Evaluate clean, naturally low-quality evidence subsets without perturbing samples."""
-    if not (0.0 < quantile < 0.5):
-        raise ValueError("quantile must be in (0, 0.5)")
-    records: list[dict[str, Any]] = []
-    frame = _with_derived_evidence(frame)
-    group_columns = ["experiment", "seed", "diagnostic_file", "split"]
-    available_groups = [column for column in group_columns if column in frame.columns]
-    numeric_columns = [
-        *{spec[0] for spec in NATURAL_SUBSET_SPECS.values()},
-        *NATURAL_MISSING_SPECS.values(),
-        "label",
-        "prob_malware",
-        "pred",
-        "acceptance_score",
-        "rejected",
-    ]
-    numeric = _to_numeric(frame, [column for column in numeric_columns if column in frame.columns])
-    for group, group_frame in numeric.groupby(available_groups, dropna=False):
-        group_values = group if isinstance(group, tuple) else (group,)
-        base = dict(zip(available_groups, group_values))
-
-        for subset_name, (evidence, direction) in NATURAL_SUBSET_SPECS.items():
-            if evidence not in group_frame.columns:
-                continue
-            values = pd.to_numeric(group_frame[evidence], errors="coerce")
-            valid = values.dropna()
-            if valid.empty:
-                continue
-            threshold = float(valid.quantile(quantile if direction == "low" else 1.0 - quantile))
-            mask = values <= threshold if direction == "low" else values >= threshold
-            subset = group_frame[mask.fillna(False)]
-            if len(subset) < min_count:
-                continue
-            metrics = _classification_metrics_for_frame(subset)
-            if not metrics:
-                continue
-            records.append(
-                {
-                    **base,
-                    "subset": subset_name,
-                    "subset_type": "natural_evidence_quantile",
-                    "evidence": evidence,
-                    "direction": direction,
-                    "quantile": float(quantile),
-                    "threshold": threshold,
-                    "evidence_mean": float(values[mask].mean()),
-                    **metrics,
-                }
-            )
-
-        for subset_name, alive_column in NATURAL_MISSING_SPECS.items():
-            if alive_column not in group_frame.columns:
-                continue
-            values = pd.to_numeric(group_frame[alive_column], errors="coerce")
-            mask = values < 0.5
-            subset = group_frame[mask.fillna(False)]
-            if len(subset) < min_count:
-                continue
-            metrics = _classification_metrics_for_frame(subset)
-            if not metrics:
-                continue
-            records.append(
-                {
-                    **base,
-                    "subset": subset_name,
-                    "subset_type": "natural_missing_modality",
-                    "evidence": alive_column,
-                    "direction": "missing",
-                    "quantile": float("nan"),
-                    "threshold": 0.5,
-                    "evidence_mean": float(values[mask].mean()),
-                    **metrics,
-                }
-            )
     return pd.DataFrame.from_records(records)
 
 
@@ -798,7 +519,10 @@ def _write_csv(frame: pd.DataFrame, path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Analyze observable evidence and branch reliability diagnostics."
+        description=(
+            "Analyze intrinsic I1 certainty/margin signals and calibrated "
+            "branch-reliability diagnostics."
+        )
     )
     parser.add_argument("--results-root", default="results/tri_modal_robust")
     parser.add_argument("--diagnostics", nargs="*", default=None)
@@ -816,18 +540,6 @@ def main() -> None:
             "Use one evidence-binning threshold globally after filtering, or "
             "separate thresholds inside each experiment/seed/split group."
         ),
-    )
-    parser.add_argument(
-        "--natural-subset-quantile",
-        type=float,
-        default=1.0 / 3.0,
-        help="Bottom/top quantile used for natural degradation subset cuts.",
-    )
-    parser.add_argument(
-        "--natural-subset-min-count",
-        type=int,
-        default=10,
-        help="Minimum samples required before writing a natural subset row.",
     )
     parser.add_argument(
         "--reliability-permutations",
@@ -849,7 +561,6 @@ def main() -> None:
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_reliability_signal_diagnostics.csv", index=False)
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_evidence_groups.csv", index=False)
         pd.DataFrame().to_csv(Path(args.out_dir) / "i1_evidence_bin_effects.csv", index=False)
-        pd.DataFrame().to_csv(Path(args.out_dir) / "natural_degradation_subsets.csv", index=False)
         return
 
     numeric_columns = [
@@ -879,14 +590,6 @@ def main() -> None:
     _write_csv(
         evidence_bin_effects_table(frame, bin_scope=args.bin_scope),
         Path(args.out_dir) / "i1_evidence_bin_effects.csv",
-    )
-    _write_csv(
-        natural_degradation_subset_table(
-            frame,
-            quantile=float(args.natural_subset_quantile),
-            min_count=int(args.natural_subset_min_count),
-        ),
-        Path(args.out_dir) / "natural_degradation_subsets.csv",
     )
     write_reliability_diagrams(frame, Path(args.figures_dir))
 

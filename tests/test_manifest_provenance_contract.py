@@ -10,6 +10,12 @@ import torch
 import yaml
 
 from fusion.dataset import FatalDatasetConfigError, RobustTriModalDataset
+from fusion.manifest_features import load_manifest_vocab
+from scripts.build_tri_modal_pts_direct import (
+    _build_fingerprint,
+    _fingerprint_config,
+    _load_direct_config,
+)
 from scripts import migrate_manifest_vocab_pts as migration
 from tests.pt_factory import save_current_pt
 
@@ -19,6 +25,8 @@ EXPECTED_PROVENANCE = {
     "manifest_train_csv_sha256": "b" * 64,
     "manifest_train_sample_ids_sha256": "c" * 64,
 }
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _sid(char: str) -> str:
@@ -107,6 +115,43 @@ def test_later_pt_provenance_mismatch_is_fatal_not_dummy(tmp_path: Path):
         match="PT Manifest provenance does not match",
     ):
         dataset[1]
+
+
+def test_expected_pt_build_fingerprint_is_strict(tmp_path: Path):
+    sid = _sid("f")
+    pt_dir = tmp_path / "pts"
+    pt_dir.mkdir()
+    _write_current_pt(pt_dir / f"{sid}.pt", marker=1.0)
+    csv_path = tmp_path / "labels.csv"
+    _write_csv(csv_path, [sid])
+
+    with pytest.raises(FatalDatasetConfigError, match="build fingerprint"):
+        RobustTriModalDataset(
+            str(pt_dir),
+            str(csv_path),
+            is_train=False,
+            manifest_dim=16,
+            expected_pt_build_fingerprint="f" * 64,
+        )
+
+
+def test_main_config_pt_fingerprint_matches_canonical_build_inputs():
+    build_cfg = _load_direct_config(ROOT / "config" / "build_pts.yaml")
+    vocab = load_manifest_vocab(
+        ROOT / "config" / "manifest_vocab.yaml",
+        require_train_metadata=True,
+        allow_empty=False,
+    )
+    actual = _build_fingerprint(_fingerprint_config(build_cfg), vocab)
+    with (ROOT / "config" / "experiments" / "tri_modal_robust" /
+          "base_tri_modal_robust.yaml").open(encoding="utf-8") as handle:
+        expected = str(
+            (yaml.safe_load(handle) or {})["data"][
+                "expected_pt_build_fingerprint"
+            ]
+        )
+
+    assert expected == actual
 
 
 def test_renamed_pt_is_rejected_by_migration_and_dataset(tmp_path: Path):

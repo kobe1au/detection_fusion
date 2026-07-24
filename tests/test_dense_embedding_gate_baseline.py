@@ -83,9 +83,9 @@ def _model_batch() -> Batch:
     batch.q_graph = torch.ones(2, 1)
     batch.q_manifest = torch.ones(2, 1)
     batch.q_align = torch.ones(2, 1)
-    batch.pert_api = torch.zeros(2, 1)
-    batch.pert_graph = torch.zeros(2, 1)
-    batch.pert_manifest = torch.zeros(2, 1)
+    batch.api_alive = torch.ones(2, 1)
+    batch.graph_alive = torch.ones(2, 1)
+    batch.manifest_alive = torch.ones(2, 1)
     return batch
 
 
@@ -165,15 +165,15 @@ def test_dense_embedding_model_mode_fuses_only_alive_branches():
     assert extra["gate_weights"].shape == (2, 3)
     assert torch.allclose(extra["gate_weights"].sum(dim=-1), torch.ones(2))
 
-    batch.q_graph.zero_()
+    batch.graph_alive.zero_()
     _, graph_dead = model(batch)
     assert torch.equal(graph_dead["gate_weights"][:, 1], torch.zeros(2))
     assert torch.allclose(
         graph_dead["gate_weights"].sum(dim=-1), torch.ones(2)
     )
 
-    batch.q_api.zero_()
-    batch.q_manifest.zero_()
+    batch.api_alive.zero_()
+    batch.manifest_alive.zero_()
     all_dead_logits, all_dead = model(batch)
     assert torch.equal(all_dead["gate_weights"], torch.zeros(2, 3))
     assert torch.equal(all_dead_logits, torch.zeros(2, 2))
@@ -184,10 +184,11 @@ def test_dense_embedding_model_mode_fuses_only_alive_branches():
     # Eligibility follows the branches actually consumed by a baseline, not
     # unrelated modalities that happen to remain present in the APK payload.
     model.fusion_mode = "api_only"
-    batch.q_api.zero_()
-    batch.q_graph.fill_(1.0)
-    batch.q_manifest.fill_(1.0)
-    _, api_only = model(batch)
+    batch.api_alive.zero_()
+    batch.graph_alive.fill_(1.0)
+    batch.manifest_alive.fill_(1.0)
+    api_only_logits, api_only = model(batch)
+    assert torch.equal(api_only_logits, torch.zeros(2, 2))
     assert torch.equal(
         api_only["selective_eligible"], torch.zeros(2, dtype=torch.bool)
     )
@@ -200,9 +201,9 @@ def test_dense_embedding_gate_adapted_config_has_independent_identity_and_i3_bud
     assert cfg["method"]["protocol_id"] == "dense_embedding_gate_adapted_v1"
     assert cfg["model"]["fusion_mode"] == "tri_modal_dense_embedding_gate"
     assert cfg["model"]["gate"]["detach"] is False
-    assert cfg["model"]["gate"]["use_consistency_evidence"] is False
-    assert cfg["model"]["gate"]["use_conflict_evidence"] is False
-    assert cfg["model"]["gate"]["use_perturbation_evidence"] is False
+    assert "use_consistency_evidence" not in cfg["model"]["gate"]
+    assert "use_conflict_evidence" not in cfg["model"]["gate"]
+    assert "use_perturbation_evidence" not in cfg["model"]["gate"]
     assert "apply_alive_mask" not in cfg["model"]["gate"]
     assert cfg["loss"]["auxiliary_weight_mode"] == "alive_masked_uniform"
     assert cfg["calibration"]["enabled"] is False
@@ -226,12 +227,12 @@ def test_dense_embedding_gate_adapted_config_has_independent_identity_and_i3_bud
 
     pseudo_switch = copy.deepcopy(cfg)
     pseudo_switch["model"]["gate"]["apply_alive_mask"] = False
-    with pytest.raises(ValueError, match="Joint branch.*removed"):
+    with pytest.raises(ValueError, match="Removed model.gate input switches"):
         build_model(pseudo_switch, feature_dim=16)
 
     silent_evidence_switch = copy.deepcopy(cfg)
     silent_evidence_switch["model"]["gate"]["use_conflict_evidence"] = True
-    with pytest.raises(ValueError, match="silent no-ops"):
+    with pytest.raises(ValueError, match="Removed model.gate input switches"):
         build_model(silent_evidence_switch, feature_dim=16)
 
 
@@ -264,12 +265,9 @@ def test_non_discount_models_reject_only_discount_specific_selective_scores():
 def test_prior_only_uses_explicit_fixed_odds_beta_without_trainable_route(beta: float):
     router = GlobalOpinionRouter(mode="prior_only", fixed_prior_beta=beta)
     reliability = torch.tensor([0.90, 0.60, 0.20])
-    beliefs = {
-        name: torch.tensor([[0.45, 0.45]])
+    branch_probabilities = {
+        name: torch.tensor([[0.50, 0.50]])
         for name in ("api", "graph", "manifest")
-    }
-    uncertainties = {
-        name: torch.tensor([0.10]) for name in ("api", "graph", "manifest")
     }
     reliabilities = {
         name: reliability[index : index + 1]
@@ -280,8 +278,7 @@ def test_prior_only_uses_explicit_fixed_odds_beta_without_trainable_route(beta: 
     }
 
     outputs = router(
-        beliefs,
-        uncertainties,
+        branch_probabilities,
         reliabilities,
         alive,
         learned_active=True,
@@ -314,4 +311,4 @@ def test_fixed_prior_beta_appendix_configs_are_not_learned_router_cells():
         assert routing["mode"] == "prior_only"
         assert routing["fixed_prior_beta"] == pytest.approx(expected)
         assert routing["prediction_loss_weight"] == 0.0
-        assert routing["route_oracle_loss_weight"] == 0.0
+        assert "route_oracle_loss_weight" not in routing

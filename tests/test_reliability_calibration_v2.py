@@ -1,419 +1,426 @@
+from __future__ import annotations
+
+import math
+
 import pytest
 import torch
 
-from fusion.constants import EvidenceIndex
+import fusion.reliability_calibration as reliability_module
 from fusion.reliability_calibration import (
-    ClassConditionalEmbeddingDensity,
-    CleanCompetenceHead,
-    MonotonicReliabilityCalibrator,
-    NonnegativeDegradationPenalty,
+    BRANCH_NAMES,
+    MONOTONIC_CORRECTNESS_METHOD,
     RELIABILITY_FEATURE_LAYOUT,
+    RELIABILITY_FEATURE_NAMES,
+    TEMPERATURE_SCALING_CONFIDENCE_METHOD,
+    BranchTemperatureScalingConfidenceCalibrator,
+    MonotonicBranchCorrectnessCalibrator,
+    MonotonicReliabilityCalibrator,
+    build_reliability_features,
+    normalize_reliability_calibration_method,
 )
 
 
-BRANCHES = ("api", "graph", "manifest")
+def _alphas(
+    alpha: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    value = (
+        torch.tensor([[5.0, 1.0], [1.0, 5.0]])
+        if alpha is None
+        else alpha
+    )
+    return {branch: value.clone() for branch in BRANCH_NAMES}
 
 
-def _evidence(batch_size: int = 1) -> torch.Tensor:
-    evidence = torch.ones(batch_size, EvidenceIndex.BASE_DIM)
-    evidence[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 0.0
-    evidence[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 0.0
-    return evidence
+def _features(
+    alpha: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    return build_reliability_features(_alphas(alpha))
 
 
-def _probabilities(value=(0.8, 0.2)) -> dict[str, torch.Tensor]:
-    return {
-        name: torch.tensor([value], dtype=torch.float32)
-        for name in BRANCHES
+def _alive(
+    batch_size: int = 2,
+    *,
+    dead_branch: str | None = None,
+) -> dict[str, torch.Tensor]:
+    result = {
+        branch: torch.ones(batch_size, dtype=torch.float32)
+        for branch in BRANCH_NAMES
     }
+    if dead_branch is not None:
+        result[dead_branch] = torch.zeros(batch_size, dtype=torch.float32)
+    return result
 
 
-def _branch_logits(value=(2.0, -2.0)) -> dict[str, torch.Tensor]:
-    return {
-        name: torch.tensor([value], dtype=torch.float32)
-        for name in BRANCHES
-    }
+def _raw_softplus(value: float) -> float:
+    return math.log(math.expm1(float(value)))
 
 
-def _calibrator(**kwargs) -> MonotonicReliabilityCalibrator:
-    return MonotonicReliabilityCalibrator(
-        use_model_visibility=True,
-        **kwargs,
+def test_formal_i1_feature_layout_is_exact_and_branch_local():
+    expected = (
+        "evidential_certainty",
+        "prediction_margin",
+        "predicted_malware_indicator",
     )
-
-
-def _embedding_density_calibrator() -> MonotonicReliabilityCalibrator:
-    return MonotonicReliabilityCalibrator(
-        use_model_visibility=True,
-        use_embedding_density=True,
-        embedding_dims={name: 2 for name in BRANCHES},
-        embedding_density_min_class_samples=2,
-    )
-
-
-def _clean_embedding_reference():
-    labels = torch.tensor([0, 0, 0, 1, 1, 1])
-    embeddings = torch.tensor(
-        [
-            [0.0, 0.0],
-            [0.1, -0.1],
-            [-0.1, 0.1],
-            [4.0, 4.0],
-            [4.1, 3.9],
-            [3.9, 4.1],
-        ],
-        dtype=torch.float32,
-    )
-    return labels, {name: embeddings.clone() for name in BRANCHES}
-
-
-def test_i1_separates_clean_competence_and_degradation_parameters():
-    calibrator = _calibrator()
-    competence = calibrator.competence_parameters()
-    degradation = calibrator.degradation_parameters()
-    assert competence
-    assert degradation
-    assert {id(value) for value in competence}.isdisjoint(
-        {id(value) for value in degradation}
-    )
-    for branch in BRANCHES:
-        module = calibrator.branches[branch]
-        assert isinstance(module.competence, CleanCompetenceHead)
-        assert isinstance(module.degradation, NonnegativeDegradationPenalty)
-        assert [id(value) for value in calibrator.branch_parameters(branch)] == [
-            *[
-                id(value)
-                for value in calibrator.branch_competence_parameters(branch)
-            ],
-            *[
-                id(value)
-                for value in calibrator.branch_degradation_parameters(branch)
-            ],
-        ]
-
-
-def test_i1_has_exact_branch_local_feature_layouts():
+    assert RELIABILITY_FEATURE_NAMES == expected
     assert RELIABILITY_FEATURE_LAYOUT == {
-        "api": (
-            "effective_quality_deficit",
-            "embedding_tail_q50",
-            "embedding_tail_q80",
-            "embedding_tail_q95",
-            "prediction_margin",
-            "predicted_malware_indicator",
-        ),
-        "graph": (
-            "effective_quality_deficit",
-            "embedding_tail_q50",
-            "embedding_tail_q80",
-            "embedding_tail_q95",
-            "prediction_margin",
-            "predicted_malware_indicator",
-        ),
-        "manifest": (
-            "effective_quality_deficit",
-            "embedding_tail_q50",
-            "embedding_tail_q80",
-            "embedding_tail_q95",
-            "prediction_margin",
-            "predicted_malware_indicator",
-        ),
-    }
-    assert {name: len(layout) for name, layout in RELIABILITY_FEATURE_LAYOUT.items()} == {
-        "api": 6,
-        "graph": 6,
-        "manifest": 6,
+        branch: expected for branch in BRANCH_NAMES
     }
 
 
-def test_i1_requires_branch_probabilities_and_bounds_outputs():
-    calibrator = _calibrator()
-    with pytest.raises(ValueError, match="branch_probabilities"):
-        calibrator(_evidence())
+def test_feature_builder_uses_exact_binary_dirichlet_definitions():
+    alpha = torch.tensor(
+        [
+            [1.0, 1.0],
+            [5.0, 1.0],
+            [1.0, 5.0],
+        ]
+    )
+    features = build_reliability_features(_alphas(alpha))
+    for branch in BRANCH_NAMES:
+        assert features[branch].shape == (3, 3)
+        assert features[branch][:, 0].tolist() == pytest.approx(
+            [0.0, 2.0 / 3.0, 2.0 / 3.0]
+        )
+        assert features[branch][:, 1].tolist() == pytest.approx(
+            [0.0, 2.0 / 3.0, 2.0 / 3.0]
+        )
+        assert features[branch][:, 2].tolist() == [0.0, 0.0, 1.0]
 
-    outputs = calibrator(_evidence(), branch_probabilities=_probabilities())
-    for name in BRANCHES:
-        reliability = outputs[f"predicted_reliability_{name}"]
-        assert reliability.shape == (1,)
-        assert ((0.0 <= reliability) & (reliability <= 1.0)).all()
-        assert outputs[f"reliability_features_superset_{name}"].shape[-1] == len(
-            RELIABILITY_FEATURE_LAYOUT[name]
+
+def test_feature_builder_has_no_cross_branch_dependency():
+    base = _alphas()
+    changed = _alphas()
+    changed["graph"] = torch.tensor([[50.0, 1.0], [1.0, 50.0]])
+    base_features = build_reliability_features(base)
+    changed_features = build_reliability_features(changed)
+
+    assert torch.equal(base_features["api"], changed_features["api"])
+    assert torch.equal(base_features["manifest"], changed_features["manifest"])
+    assert not torch.equal(base_features["graph"], changed_features["graph"])
+
+
+@pytest.mark.parametrize(
+    ("bad_alpha", "message"),
+    [
+        (torch.ones(2, 3), "binary shape"),
+        (torch.tensor([[0.9, 1.1]]), "concentration >= 1"),
+        (torch.tensor([[1.0, float("nan")]]), "non-finite"),
+    ],
+)
+def test_feature_builder_rejects_non_evidential_or_nonbinary_alpha(
+    bad_alpha: torch.Tensor,
+    message: str,
+):
+    alpha = _alphas(torch.ones(bad_alpha.size(0), 2))
+    alpha["api"] = bad_alpha
+    with pytest.raises(ValueError, match=message):
+        build_reliability_features(alpha)
+
+
+def test_feature_builder_requires_exact_three_branch_mapping():
+    alpha = _alphas()
+    alpha.pop("manifest")
+    with pytest.raises(ValueError, match="exactly"):
+        build_reliability_features(alpha)
+
+    alpha = _alphas()
+    alpha["other"] = alpha["api"]
+    with pytest.raises(ValueError, match="unknown"):
+        build_reliability_features(alpha)
+
+
+def test_each_branch_owns_disjoint_correctness_parameters():
+    calibrator = MonotonicReliabilityCalibrator()
+    branch_parameter_ids = {
+        branch: {id(parameter) for parameter in calibrator.branch_parameters(branch)}
+        for branch in BRANCH_NAMES
+    }
+    assert all(branch_parameter_ids.values())
+    for left_index, left in enumerate(BRANCH_NAMES):
+        for right in BRANCH_NAMES[left_index + 1 :]:
+            assert branch_parameter_ids[left].isdisjoint(
+                branch_parameter_ids[right]
+            )
+    assert all(
+        isinstance(
+            calibrator.branches[branch],
+            MonotonicBranchCorrectnessCalibrator,
         )
-        assert outputs[f"competence_design_{name}"].shape == (1, 4)
-        assert outputs[f"degradation_design_{name}"].shape == (1, 5)
-        assert torch.all(
-            outputs[f"predicted_reliability_logit_{name}"]
-            <= outputs[f"clean_competence_logit_{name}"]
-        )
-        assert outputs[f"degradation_penalty_{name}"].item() == pytest.approx(0.0)
+        for branch in BRANCH_NAMES
+    )
+
+
+def test_continuous_coefficients_are_positive_and_reliability_is_monotone():
+    branch = MonotonicBranchCorrectnessCalibrator(
+        use_predicted_class_intercept=False
+    )
+    weights = branch.effective_continuous_weights()
+    assert set(weights) == {"evidential_certainty", "prediction_margin"}
+    assert all(float(weight.detach()) > 0.0 for weight in weights.values())
+
+    low = torch.tensor([[0.1, 0.2, 0.0]])
+    higher_certainty = torch.tensor([[0.9, 0.2, 0.0]])
+    higher_margin = torch.tensor([[0.1, 0.8, 0.0]])
+    assert branch(higher_certainty).item() > branch(low).item()
+    assert branch(higher_margin).item() > branch(low).item()
+
+
+def test_continuous_feature_gradients_are_nonnegative_by_construction():
+    branch = MonotonicBranchCorrectnessCalibrator()
+    features = torch.tensor(
+        [[0.2, 0.3, 0.0], [0.6, 0.8, 1.0]],
+        requires_grad=True,
+    )
+    branch.forward_logit(features).sum().backward()
+    assert features.grad is not None
+    assert torch.all(features.grad[:, :2] > 0.0)
+
+
+def test_predicted_class_intercept_is_optional_and_signed():
+    enabled = MonotonicBranchCorrectnessCalibrator(
+        use_predicted_class_intercept=True
+    )
+    assert enabled.predicted_class_intercept is not None
+    with torch.no_grad():
+        enabled.predicted_class_intercept.fill_(-1.25)
+    benign = torch.tensor([[0.5, 0.5, 0.0]])
+    malware = torch.tensor([[0.5, 0.5, 1.0]])
+    assert (
+        enabled.forward_logit(malware) - enabled.forward_logit(benign)
+    ).item() == pytest.approx(-1.25)
+
+    disabled = MonotonicBranchCorrectnessCalibrator(
+        use_predicted_class_intercept=False
+    )
+    assert disabled.predicted_class_intercept is None
+    assert torch.equal(
+        disabled.forward_logit(benign),
+        disabled.forward_logit(malware),
+    )
+    assert "predicted_class_intercept" not in disabled.state_dict()
+
+
+def test_alive_is_a_hard_output_mask_not_a_learned_feature():
+    calibrator = MonotonicReliabilityCalibrator()
+    features = _features()
+    alive = _alive()
+    alive["api"] = torch.tensor([1.0, 0.0])
+    outputs = calibrator(features, alive=alive)
+
+    raw_probability = torch.sigmoid(
+        outputs["predicted_reliability_logit_api"]
+    )
+    assert raw_probability[1].item() > 0.0
+    assert outputs["predicted_reliability_api"][1].item() == 0.0
+    assert torch.allclose(
+        outputs["predicted_reliability_api"],
+        raw_probability * alive["api"],
+    )
+    assert outputs["reliability_features_api"].shape == (2, 3)
+
+
+def test_calibrator_outputs_sigmoid_correctness_probabilities_for_all_branches():
+    calibrator = MonotonicReliabilityCalibrator()
+    outputs = calibrator(_features(), alive=_alive())
+    for branch in BRANCH_NAMES:
+        probability = outputs[f"predicted_reliability_{branch}"]
+        raw_logit = outputs[f"predicted_reliability_logit_{branch}"]
+        assert torch.allclose(probability, torch.sigmoid(raw_logit))
+        assert torch.all((probability >= 0.0) & (probability <= 1.0))
         assert torch.equal(
-            outputs[f"predicted_reliability_{name}"],
-            outputs[f"clean_competence_{name}"],
+            outputs[f"reliability_features_{branch}"],
+            _features()[branch],
         )
 
 
-def test_reliability_probability_is_sigmoid_of_exported_raw_logit():
-    calibrator = _calibrator()
-    outputs = calibrator(_evidence(), branch_probabilities=_probabilities())
+@pytest.mark.parametrize(
+    ("mutator", "message"),
+    [
+        (
+            lambda feature, alive: feature["api"].__setitem__(
+                (0, 0), 1.1
+            ),
+            "within",
+        ),
+        (
+            lambda feature, alive: feature["api"].__setitem__(
+                (0, 2), 0.5
+            ),
+            "binary",
+        ),
+        (
+            lambda feature, alive: alive["api"].__setitem__(0, 0.5),
+            "hard binary",
+        ),
+    ],
+)
+def test_calibrator_rejects_invalid_features_and_soft_alive_masks(
+    mutator,
+    message: str,
+):
+    feature = _features()
+    alive = _alive()
+    mutator(feature, alive)
+    with pytest.raises(ValueError, match=message):
+        MonotonicReliabilityCalibrator()(feature, alive=alive)
 
-    for name in BRANCHES:
-        expected = torch.sigmoid(outputs[f"predicted_reliability_logit_{name}"])
-        assert torch.allclose(
-            outputs[f"predicted_reliability_{name}"],
-            expected * outputs[f"alive_{name}"],
-        )
+
+def test_nonfinite_parameters_fail_closed():
+    branch = MonotonicBranchCorrectnessCalibrator()
+    with torch.no_grad():
+        branch.raw_continuous_weights[0] = float("nan")
+    with pytest.raises(RuntimeError, match="remain finite"):
+        branch(torch.tensor([[0.5, 0.5, 0.0]]))
 
 
-def test_i1_prediction_margin_is_strictly_positive_monotone():
-    calibrator = _calibrator()
-    low = _probabilities((0.55, 0.45))
-    high = _probabilities((0.90, 0.10))
-
-    low_output = calibrator(_evidence(), branch_probabilities=low)
-    high_output = calibrator(_evidence(), branch_probabilities=high)
-
-    for name in BRANCHES:
-        assert high_output[f"prediction_margin_{name}"].item() == pytest.approx(
-            0.8
-        )
-        assert low_output[f"prediction_margin_{name}"].item() == pytest.approx(
-            0.1
+def test_new_checkpoint_round_trip_is_strict_and_old_topology_is_rejected():
+    source = MonotonicReliabilityCalibrator()
+    with torch.no_grad():
+        source.branches["api"].bias.fill_(1.5)
+        source.branches["graph"].raw_continuous_weights.fill_(
+            _raw_softplus(0.75)
         )
         assert (
-            high_output[f"predicted_reliability_{name}"]
-            > low_output[f"predicted_reliability_{name}"]
-        ).all()
+            source.branches["manifest"].predicted_class_intercept is not None
+        )
+        source.branches["manifest"].predicted_class_intercept.fill_(-0.4)
+
+    restored = MonotonicReliabilityCalibrator()
+    incompatible = restored.load_state_dict(source.state_dict(), strict=True)
+    assert incompatible.missing_keys == []
+    assert incompatible.unexpected_keys == []
+    for name, value in source.state_dict().items():
+        assert torch.equal(value, restored.state_dict()[name])
+
+    old_state = dict(source.state_dict())
+    old_state["branches.api.competence.bias"] = torch.tensor(0.0)
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        restored.load_state_dict(old_state, strict=True)
 
 
-def test_i1_supports_predicted_class_conditional_correctness():
-    calibrator = _calibrator()
-    with torch.no_grad():
-        calibrator.branches["api"].competence.predicted_class_weight.fill_(1.0)
-
-    predicted_benign = _probabilities((0.8, 0.2))
-    predicted_malware = _probabilities((0.2, 0.8))
-    benign_output = calibrator(
-        _evidence(), branch_probabilities=predicted_benign
+def test_removed_quality_and_two_stage_apis_do_not_exist():
+    removed = (
+        "CleanCompetenceHead",
+        "NonnegativeDegradationPenalty",
+        "build_monotonic_reliability_features",
+        "fit_nonnegative_observable_degradation",
+        "fit_class_conditional_nonnegative_observable_degradation",
     )
-    malware_output = calibrator(
-        _evidence(), branch_probabilities=predicted_malware
-    )
-
-    # Both examples have the same margin. Only the learned signed class offset
-    # differs, proving that one scalar output can be class-conditional.
-    assert benign_output["prediction_margin_api"].item() == pytest.approx(
-        malware_output["prediction_margin_api"].item()
-    )
-    assert benign_output["predicted_malware_indicator_api"].item() == 0.0
-    assert malware_output["predicted_malware_indicator_api"].item() == 1.0
-    assert (
-        malware_output["predicted_reliability_api"]
-        > benign_output["predicted_reliability_api"]
-    ).all()
-
-
-def test_i1_api_features_are_independent_of_graph_availability():
-    calibrator = _calibrator()
-    complete = _evidence()
-    graph_missing = complete.clone()
-    graph_missing[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
-    graph_missing[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.0
-    graph_missing[:, EvidenceIndex.CODE_INTEGRITY] = 0.0
-    probabilities = _probabilities()
-
-    complete_output = calibrator(
-        complete, branch_probabilities=probabilities
-    )
-    missing_output = calibrator(
-        graph_missing, branch_probabilities=probabilities
-    )
-
-    assert torch.equal(
-        complete_output["reliability_features_superset_api"],
-        missing_output["reliability_features_superset_api"],
-    )
-    assert torch.equal(
-        complete_output["predicted_reliability_api"],
-        missing_output["predicted_reliability_api"],
-    )
-
-
-def test_effective_quality_deficit_can_only_reduce_reliability():
-    calibrator = _calibrator()
-    evidence = _evidence(2)
-    evidence[1, EvidenceIndex.API_INTEGRITY] = 0.5
-    evidence[1, EvidenceIndex.API_ENCODER_COVERAGE] = 0.5
-    probabilities = {
-        name: value.expand(2, -1).clone()
-        for name, value in _probabilities((0.8, 0.2)).items()
-    }
-    outputs = calibrator(evidence, branch_probabilities=probabilities)
-
-    assert outputs["clean_competence_api"][0].item() == pytest.approx(
-        outputs["clean_competence_api"][1].item()
-    )
-    assert outputs["effective_quality_deficit_api"].tolist() == pytest.approx(
-        [0.0, 0.75]
-    )
-    assert (
-        outputs["degradation_quality_penalty_api"][1]
-        > outputs["degradation_quality_penalty_api"][0]
-    )
-    assert (
-        outputs["predicted_reliability_api"][1]
-        < outputs["predicted_reliability_api"][0]
-    )
-
-
-def test_degradation_penalty_has_no_bias_and_detaches_clean_competence():
-    calibrator = _calibrator()
-    branch = calibrator.branches["api"]
-    assert not hasattr(branch.degradation, "bias")
-    features = torch.tensor([[0.5, 0.2, 0.4, 0.8, 0.9, 1.0]])
-    outputs = branch.forward_components(features)
-    outputs["degradation_penalty"].sum().backward()
-
-    assert all(parameter.grad is None for parameter in branch.competence_parameters())
     assert all(
-        parameter.grad is not None for parameter in branch.degradation_parameters()
+        not hasattr(reliability_module, name)
+        for name in removed
     )
-    weights = branch.degradation.effective_weights()
-    assert weights["quality"].item() > 0.0
-    assert (weights["tail"] > 0.0).all()
-    assert weights["high_confidence_ood"].item() > 0.0
 
 
-def test_embedding_density_requires_a_fitted_reference():
-    calibrator = _embedding_density_calibrator()
-    with pytest.raises(RuntimeError, match="reference is not fitted"):
-        calibrator(
-            _evidence(),
-            branch_probabilities=_probabilities(),
-            branch_logits=_branch_logits(),
-            branch_embeddings={
-                name: torch.zeros(1, 2) for name in BRANCHES
-            },
+def _branch_logits(logits: torch.Tensor) -> dict[str, torch.Tensor]:
+    return {
+        "api": logits,
+        "graph": logits.flip(dims=(-1,)),
+        "manifest": logits * 0.5,
+    }
+
+
+def test_temperature_comparator_is_exact_max_softmax_and_alive_masked():
+    logits = torch.tensor([[3.0, -1.0], [-0.5, 1.5]])
+    calibrator = BranchTemperatureScalingConfidenceCalibrator()
+    with torch.no_grad():
+        for branch in BRANCH_NAMES:
+            calibrator.log_temperatures[branch].fill_(math.log(2.0))
+    alive = _alive(2, dead_branch="manifest")
+    outputs = calibrator(_branch_logits(logits), alive=alive)
+
+    expected = torch.softmax(logits / 2.0, dim=-1).amax(dim=-1)
+    assert torch.allclose(outputs["predicted_reliability_api"], expected)
+    assert torch.equal(
+        outputs["predicted_reliability_manifest"],
+        torch.zeros(2),
+    )
+    assert torch.allclose(
+        outputs["reliability_temperature_api"],
+        torch.full((2,), 2.0),
+    )
+    assert torch.equal(
+        outputs["temperature_scaling_confidence_baseline_active"],
+        torch.ones(2),
+    )
+
+
+def test_temperature_comparator_branch_nll_fits_one_positive_scalar():
+    logits = torch.tensor(
+        [
+            [8.0, -8.0],
+            [8.0, -8.0],
+            [8.0, -8.0],
+            [8.0, -8.0],
+            [-8.0, 8.0],
+            [-8.0, 8.0],
+            [-8.0, 8.0],
+            [-8.0, 8.0],
+        ]
+    )
+    labels = torch.tensor([0, 0, 0, 1, 1, 1, 1, 0])
+    alive = torch.ones(labels.numel())
+    calibrator = BranchTemperatureScalingConfidenceCalibrator()
+    before = float(
+        calibrator.branch_nll("api", logits, labels, alive).detach()
+    )
+    optimizer = torch.optim.LBFGS(
+        calibrator.branch_parameters("api"),
+        lr=1.0,
+        max_iter=50,
+        line_search_fn="strong_wolfe",
+    )
+
+    def closure() -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=True)
+        loss = calibrator.branch_nll("api", logits, labels, alive)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    after = float(
+        calibrator.branch_nll("api", logits, labels, alive).detach()
+    )
+    assert after < before
+    assert float(calibrator.temperature("api").detach()) > 1.0
+
+
+def test_temperature_comparator_rejects_branch_with_no_alive_rows():
+    calibrator = BranchTemperatureScalingConfidenceCalibrator()
+    with pytest.raises(ValueError, match="no alive rows"):
+        calibrator.branch_nll(
+            "api",
+            torch.tensor([[1.0, -1.0]]),
+            torch.tensor([0]),
+            torch.tensor([0.0]),
         )
 
 
-def test_embedding_density_is_branch_local_and_monotone_in_typicality():
-    calibrator = _embedding_density_calibrator()
-    labels, clean_embeddings = _clean_embedding_reference()
-    calibrator.fit_embedding_references(
-        clean_embeddings,
-        labels,
-        _evidence(labels.numel()),
-    )
-
-    evidence = _evidence(2)
-    probabilities = _probabilities((0.8, 0.2))
-    probabilities = {
-        name: value.expand(2, -1).clone()
-        for name, value in probabilities.items()
-    }
-    query = {
-        name: torch.tensor([[0.0, 0.0], [0.0, 0.0]])
-        for name in BRANCHES
-    }
-    query["api"][1] = torch.tensor([20.0, 20.0])
-    outputs = calibrator(
-        evidence,
-        branch_probabilities=probabilities,
-        branch_logits={
-            name: torch.tensor([[2.0, -2.0], [2.0, -2.0]])
-            for name in BRANCHES
-        },
-        branch_embeddings=query,
-    )
-
-    assert (
-        outputs["embedding_in_distribution_score_api"][0]
-        > outputs["embedding_in_distribution_score_api"][1]
-    )
-    assert (
-        outputs["predicted_reliability_api"][0]
-        > outputs["predicted_reliability_api"][1]
-    )
-    assert outputs["embedding_tail_q95_api"][0] < outputs[
-        "embedding_tail_q95_api"
-    ][1]
-    assert outputs["degradation_tail_penalty_api"][0] < outputs[
-        "degradation_tail_penalty_api"
-    ][1]
-    assert outputs["degradation_high_confidence_ood_penalty_api"][0] < outputs[
-        "degradation_high_confidence_ood_penalty_api"
-    ][1]
-    for name in ("graph", "manifest"):
-        assert torch.equal(
-            outputs[f"embedding_in_distribution_score_{name}"][0],
-            outputs[f"embedding_in_distribution_score_{name}"][1],
-        )
-        assert torch.equal(
-            outputs[f"predicted_reliability_{name}"][0],
-            outputs[f"predicted_reliability_{name}"][1],
+def test_temperature_comparator_fails_closed_on_underflowed_temperature():
+    calibrator = BranchTemperatureScalingConfidenceCalibrator()
+    with torch.no_grad():
+        calibrator.log_temperatures["api"].fill_(-1.0e30)
+    with pytest.raises(ValueError, match="finite positive"):
+        calibrator.branch_nll(
+            "api",
+            torch.tensor([[1.0, -1.0]]),
+            torch.tensor([0]),
+            torch.tensor([1.0]),
         )
 
 
-def test_embedding_density_selects_reference_with_raw_logit_argmax():
-    calibrator = _embedding_density_calibrator()
-    labels, clean_embeddings = _clean_embedding_reference()
-    calibrator.fit_embedding_references(
-        clean_embeddings,
-        labels,
-        _evidence(labels.numel()),
-    )
-    # A ReLU evidential transform would turn both negative logits into zero
-    # evidence and produce a 0.5/0.5 opinion tie. I1 correctness is defined by
-    # raw-logit argmax, so density must still select class 1's clean reference.
-    tied_opinion = _probabilities((0.5, 0.5))
-    raw_class_one = _branch_logits((-2.0, -1.0))
-    class_one_query = {
-        name: torch.tensor([[4.0, 4.0]]) for name in BRANCHES
-    }
-    outputs = calibrator(
-        _evidence(),
-        branch_probabilities=tied_opinion,
-        branch_logits=raw_class_one,
-        branch_embeddings=class_one_query,
-    )
-    for name in BRANCHES:
-        assert outputs[f"predicted_malware_indicator_{name}"].item() == 1.0
-        assert outputs[f"embedding_in_distribution_score_{name}"].item() > 0.9
+@pytest.mark.parametrize(
+    "value",
+    [MONOTONIC_CORRECTNESS_METHOD, TEMPERATURE_SCALING_CONFIDENCE_METHOD],
+)
+def test_canonical_method_names_are_stable(value: str):
+    assert normalize_reliability_calibration_method(value) == value
 
 
-def test_embedding_density_constant_reference_is_finite_and_checkpointable():
-    reference = ClassConditionalEmbeddingDensity(
-        2,
-        min_class_samples=2,
-    )
-    embeddings = torch.tensor(
-        [[0.0, 0.0], [0.0, 0.0], [1.0, 1.0], [1.0, 1.0]]
-    )
-    labels = torch.tensor([0, 0, 1, 1])
-    reference.fit(embeddings, labels, torch.ones(4, dtype=torch.bool))
-    score, distance = reference(
-        torch.tensor([[0.0, 0.0], [10.0, 10.0]]),
-        torch.tensor([0, 1]),
-    )
-    assert torch.isfinite(score).all()
-    assert torch.isfinite(distance).all()
-    assert ((0.0 <= score) & (score <= 1.0)).all()
-    tail = reference.tail_basis(distance, torch.tensor([0, 1]))
-    assert torch.isfinite(tail).all()
-    assert tail.shape == (2, 3)
-    assert ((0.0 <= tail) & (tail <= 1.0)).all()
-    assert torch.all(
-        reference.distance_quantiles[:, 1:]
-        >= reference.distance_quantiles[:, :-1]
-    )
-
-    clone = ClassConditionalEmbeddingDensity(2, min_class_samples=2)
-    clone.load_state_dict(reference.state_dict(), strict=True)
-    clone_score, clone_distance = clone(
-        torch.tensor([[0.0, 0.0], [10.0, 10.0]]),
-        torch.tensor([0, 1]),
-    )
-    assert torch.equal(score, clone_score)
-    assert torch.equal(distance, clone_distance)
-    clone_tail = clone.tail_basis(clone_distance, torch.tensor([0, 1]))
-    assert torch.equal(tail, clone_tail)
+@pytest.mark.parametrize(
+    "removed_alias",
+    ["monotonic", "learned_correctness", "temperature"],
+)
+def test_removed_method_aliases_fail_closed(removed_alias: str):
+    with pytest.raises(ValueError, match="must be one of"):
+        normalize_reliability_calibration_method(removed_alias)

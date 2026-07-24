@@ -3,7 +3,17 @@ defaults:
 
 method:
   name: evidential_trusted_fusion
-  protocol_id: competence_degradation_consensus_crc_v1
+  protocol_id: intrinsic_opinion_reliability_router_crc_v2
+
+# Stage-1 is deliberately independent of the fitted I1/I2/I3 stack.  Set mode
+# to reuse (or pass --encoder-checkpoint) while iterating on post-hoc logic;
+# the artifact identity guard rejects any changed encoder/data/training protocol.
+encoder_stage:
+  mode: fit
+  protocol_id: neutral_alive_uniform_clean_stage1_v2
+  checkpoint_path: null
+  expected_sha256: null
+  strict_identity: true
 
 train:
   exp_name: evidential_trusted_fusion
@@ -20,32 +30,13 @@ fusion:
     route_conflict_enabled: true
     risk_conflict_enabled: true
     # Encoder training uses an alive-only uniform route. The log-odds prior is
-    # activated only after I1 fitting, so raw integrity is never treated as a
-    # cross-modality calibrated correctness probability.
-    train_end_to_end: false
+    # activated only after I1 fitting, so hard availability is never mistaken
+    # for a calibrated correctness probability.
     posthoc_refine: true
-    # pi is fitted by the conditional mixture NLL. u is a separate monotone
-    # estimate of the final-threshold malware-FN indicator. I3 later multiplies
-    # that event by its acceptance decision on a disjoint calibration split.
+    # pi is fitted by conditional mixture NLL. u is a separate monotone
+    # estimate of the final-threshold malware-FN indicator. I3 later controls
+    # accepted FN risk on a disjoint calibration split.
     prediction_loss_weight: 1.0
-    # The deployed router is fitted only by the proper mixture NLL. A
-    # source-level subset oracle is not part of the main method because the
-    # source/scenario identity is unavailable at inference; it remains an
-    # explicit optional add-on experiment.
-    route_oracle_loss_weight: 0.0
-    route_oracle_temperature: 1.0
-    subset_oracle_loss_weight: 0.0
-    subset_oracle_temperature: 1.0
-    # Preserve perturb-type/strength balance and add a stateless soft
-    # worst-group term. Treating every severity as its own group prevents a
-    # catastrophic s0.9 view from being hidden by four easier strengths of the
-    # same perturbation. No scenario identity is consumed at inference.
-    group_robust_objective:
-      enabled: true
-      taxonomy: perturb_type_strength_v1
-      soft_worst_weight: 0.25
-      temperature: 0.10
-      apply_to: [routing_distribution]
     risk_mode: learned
     risk_target: threshold_malware_false_negative
     risk_loss_weight: 1.0
@@ -71,58 +62,52 @@ fusion:
       min_positive_groups: 3
     initial_risk: 0.10
     final_temperature_scaling: true
-    acceptance_score_mode: fused_risk
-  # These factors belong to the linear-probability comparison path. The routed
-  # path uses intrinsic calibrated reliability once; cross-branch disagreement
-  # is handled only by I2's explicit route penalty and FN-risk head.
-  use_support_discount: false
-  use_conflict_discount: false
-  use_confidence_proxy: false
   reliability_calibration:
-    # I1 estimates P(branch correct) from branch-local quality, a fold-local
-    # class-conditional embedding-density score, prediction margin, and a
-    # predicted-class intercept. No other modality or perturbation identity is
-    # consumed. The clean density reference is refitted inside every OOF fit.
+    # I1 estimates P(branch correct) from one branch opinion only:
+    # evidential certainty, decision margin and an optional class intercept.
+    # Perturbation metadata, pre-transform counts, integrity heuristics and
+    # every other modality are excluded by construction.
     method: monotonic_correctness
     branches: [api, graph, manifest]
-    use_model_visibility: true
-    use_embedding_density: true
-    embedding_dims: {api: 128, graph: 128, manifest: 128}
-    embedding_density_variance_shrinkage: 0.10
-    embedding_density_reference_quantile: 0.95
-    embedding_density_min_class_samples: 8
+    use_evidential_certainty: true
     use_prediction_margin: true
-    use_predicted_class_feature: true
-    # I1 is fitted in two ordered phases. Clean competence uses only clean
-    # rows; the frozen degradation head then receives a pre-registered balance
-    # of clean, branch-local completeness and branch-local semantic views.
-    objective_weights:
+    use_predicted_class_intercept: true
+    loss: bce
+    # Explicit fit-population prior. Scenario metadata only balances rows and
+    # is never exposed to the model.
+    scenario_objective_weights:
       clean: 0.50
-      completeness: 0.25
-      semantic: 0.25
-    require_all_objective_families: true
-  probability_calibration:
-    enabled: false
-    weight: 0.0
-
+      perturb: 0.50
 loss:
-  # Available branches receive equal supervised weight. Continuous integrity
-  # weighting is a training ablation, not part of I1.
+  # Available branches receive equal supervised weight.
   auxiliary_weight_mode: alive_masked_uniform
   evidential_loss_weight: 0.05
 
 calibration:
-  # I1 uses explicit branch-local completeness corruptions plus the matching
-  # single-branch semantic view, which is identifiable through its own
-  # embedding-density score. Joint semantic corruption remains I2-only.
-  # Canonical package-isolation groups remain intact across every OOF view.
-  perturb_strengths: [0.1, 0.3, 0.5, 0.7, 0.9]
-  # I2 sees all three pairwise completeness failures symmetrically. This switch
-  # is explicit so their contribution can be removed in one independent cell.
-  include_pairwise_completeness_views: true
+  # Fractions are nested: reserve 60% of val as the joint post-hoc/I3
+  # holdout, then give 5/12 of that holdout to I3. The resulting shares of the
+  # original validation set are 40% checkpoint / 35% I1-I2 / 25% I3.
+  validation_fraction: 0.60
+  conformal_fraction: 0.4166666666666667
+  # Freeze the identities assigned to checkpoint selection, post-hoc fitting,
+  # and I3. Future budget edits cannot silently change the Stage-1 checkpoint.
+  role_assignment_path: labels/validation_roles_protocol_v1.json
+  require_role_assignment: true
+  # Post-hoc fitting is intentionally compact: clean is supplied separately;
+  # these three representative mechanisms use the middle three strengths; and
+  # the three whole-modality missing views are added once automatically. Thus
+  # The shared post-hoc pool has 13 sources in total. I2 consumes all of them;
+  # I1 filters to clean plus each branch's own registered partial-degradation
+  # views; scenario metadata balances the rows but is never an I1 input.
+  # Eval keeps an independent five-point curve and mechanism-held-out suite.
+  fit_perturbations:
+    - api_event_dropout
+    - graph_sparsify
+    - manifest_permission_mask
+  perturb_strengths: [0.3, 0.5, 0.7]
   # Each post-hoc stage is a deterministic full-batch numerical fit and restores
-  # its minimum observed objective. Convex I1 must satisfy the declared
-  # convergence/improvement checks; non-convex route/risk fits retain explicit
+  # its minimum observed objective. Structurally monotone I1 must satisfy the
+  # declared convergence/improvement checks; route/risk fits retain explicit
   # convergence diagnostics without turning a missing plateau into a false
   # numerical failure.
   stage_optimization:
@@ -147,30 +132,6 @@ calibration:
       # materializes branch features once, so this safety cap no longer
       # repeats the fusion stack and does not change the fitted objective.
       max_steps: 150
-      min_steps: 3
-      convergence_tolerance: 1.0e-7
-      convergence_patience: 3
-      gradient_tolerance: 1.0e-5
-      minimum_relative_improvement: 1.0e-4
-      log_every: 5
-      require_convergence: true
-      lbfgs_history_size: 20
-    reliability_competence:
-      optimizer: lbfgs
-      lr: 1.0
-      max_steps: 100
-      min_steps: 3
-      convergence_tolerance: 1.0e-7
-      convergence_patience: 3
-      gradient_tolerance: 1.0e-5
-      minimum_relative_improvement: 1.0e-4
-      log_every: 5
-      require_convergence: true
-      lbfgs_history_size: 20
-    reliability_degradation:
-      optimizer: lbfgs
-      lr: 1.0
-      max_steps: 100
       min_steps: 3
       convergence_tolerance: 1.0e-7
       convergence_patience: 3

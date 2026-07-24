@@ -1,16 +1,25 @@
 defaults:
   - ../../evidential_trusted_fusion.yaml
 
+# This rule is active during Stage-1 and therefore defines a complete
+# comparison method, not a post-hoc-only I2 ablation.
+encoder_stage:
+  protocol_id: fixed_evidential_rule_stage1_v1
+
 method:
-  name: i2_combination_log_pool
+  name: fusion_rule_log_pool
 
 train:
-  exp_name: i2_combination_log_pool
+  exp_name: fusion_rule_log_pool
 
 fusion:
   combination: log_pool
   routing:
     enabled: false
-    acceptance_score_mode: product
     # Equal one-scalar output calibration across all opinion rules.
     final_temperature_scaling: true
+
+# Fusion-rule cells compare forced classification only. I3 is evaluated
+# separately on the frozen primary method.
+selective_prediction:
+  enabled: false

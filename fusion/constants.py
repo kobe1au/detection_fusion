@@ -5,42 +5,29 @@ class ArchitectureConstants:
     GATE_HIDDEN_DIM = 128
 
 
-class QualityConstants:
-    API_COUNT_NORM = 128.0
-    API_DIVERSITY_SCALE = 2.0
-    API_COUNT_WEIGHT = 0.35
-    API_DIVERSITY_WEIGHT = 0.25
-    API_COVERAGE_WEIGHT = 0.25
-    API_TYPE_WEIGHT = 0.15
-
-    GRAPH_NODE_NORM = 32.0
-    GRAPH_NODE_WEIGHT = 0.35
-    GRAPH_EDGE_WEIGHT = 0.35
-    GRAPH_FEATURE_WEIGHT = 0.30
-
 class GateConstants:
     EPS = 1e-8
 
 
-class EvidenceIndex:
-    API_INTEGRITY = 0
-    GRAPH_INTEGRITY = 1
-    MANIFEST_INTEGRITY = 2
-    CODE_INTEGRITY = 3
-    API_GRAPH_ANCHOR_SUPPORT = 4
-    MANIFEST_CODE_SUPPORT = 5
-    MANIFEST_TO_CODE_CONFLICT = 6
-    CODE_TO_MANIFEST_CONFLICT = 7
-    API_ALIVE = 8
-    GRAPH_ALIVE = 9
-    MANIFEST_ALIVE = 10
-    API_ENCODER_COVERAGE = 11
-    GRAPH_ENCODER_COVERAGE = 12
+class AvailabilityIndex:
+    """Exact model-facing fusion input: one hard availability bit per branch."""
 
-    BASE_DIM = 13
+    API_ALIVE = 0
+    GRAPH_ALIVE = 1
+    MANIFEST_ALIVE = 2
+
+    BASE_DIM = 3
+
+
+# Formal validation-budget protocol. ``VALIDATION_HOLDOUT_FRACTION`` is the
+# fraction reserved jointly for post-hoc fitting and I3; the second value is
+# conditional on that holdout. Together they produce a 40/35/25 split of the
+# original validation set (checkpoint / post-hoc / I3).
+VALIDATION_HOLDOUT_FRACTION = 0.60
+CONFORMAL_WITHIN_HOLDOUT_FRACTION = 5.0 / 12.0
 
 class TriModalConfigDefaults:
-    """Stable defaults for the lean observable-reliability pipeline.
+    """Stable defaults for the lean intrinsic-reliability pipeline.
 
     YAML experiment files should contain paths, experiment names, and the few
     mechanism switches being studied. Architecture defaults and invariant
@@ -52,13 +39,11 @@ class TriModalConfigDefaults:
         "data": {
             "max_failed_ratio": 0.0,
             "max_api_events_per_sample": 2048,
-            "graph_semantic_source": "alignment",
             "strict_split_integrity": True,
             "strict_partition_isolation": True,
             "allow_pt_superset": True,
         },
         "train": {
-            "tuning_mode": False,
             "deterministic": True,
             "strict_deterministic": False,
             "device": "auto",
@@ -72,7 +57,15 @@ class TriModalConfigDefaults:
             "grad_clip": 1.0,
             "grad_accum_steps": 1,
             "label_smoothing": 0.0,
-            "checkpoint_metric": "clean_macro_f1",
+        },
+        # Stage-1 is a separately versioned, reusable artifact.  Post-hoc I1,
+        # I2 and I3 changes must not silently retrain or mutate the encoders.
+        "encoder_stage": {
+            "mode": "fit",
+            "protocol_id": "neutral_alive_uniform_clean_stage1_v2",
+            "checkpoint_path": None,
+            "expected_sha256": None,
+            "strict_identity": True,
         },
         "model": {
             "num_classes": 2,
@@ -97,7 +90,6 @@ class TriModalConfigDefaults:
                 "layers": 2,
                 "use_behavior_hint": False,
                 "drop_extracted_behavior_hints": True,
-                "account_for_encoder_budget": True,
             },
             "manifest_encoder": {
                 "enabled": True,
@@ -114,69 +106,32 @@ class TriModalConfigDefaults:
             "gate": {
                 "hidden_dim": 128,
                 "detach": True,
-                "use_consistency_evidence": True,
-                "use_conflict_evidence": True,
-                "use_perturbation_evidence": False,
             },
         },
         "fusion": {
             "mode": "discount_probability",
-            "detach_discount": True,
-            "detach_confidence_proxy": True,
-            "use_confidence_proxy": True,
-            "use_reliability_discount": True,
-            "weight_sharpening_gamma": 1.0,
-            "use_support_discount": True,
-            "use_conflict_discount": True,
+            "evidence_activation": "softplus",
+            "use_i1_reliability": True,
             "use_hard_alive_mask": True,
-            "acceptance_aggregation": "product",
             "force_fp32_decision": True,
             "min_discount": 1.0e-6,
-            "fallback": "uniform",
-            "confidence_proxy": {
-                "type": "entropy_margin",
-                "temperature_api": 1.0,
-                "temperature_graph": 1.0,
-                "temperature_manifest": 1.0,
-            },
             "reliability_calibration": {
                 "enabled": True,
                 "method": "monotonic_correctness",
-                "use_model_visibility": True,
-                "use_embedding_density": False,
-                "embedding_density_variance_shrinkage": 0.10,
-                "embedding_density_reference_quantile": 0.95,
-                "embedding_density_min_class_samples": 8,
+                "use_evidential_certainty": True,
                 "use_prediction_margin": True,
-                "use_predicted_class_feature": True,
-                "objective_weights": {
+                "use_predicted_class_intercept": True,
+                "scenario_objective_weights": {
                     "clean": 0.50,
-                    "completeness": 0.25,
-                    "semantic": 0.25,
+                    "perturb": 0.50,
                 },
-                "require_all_objective_families": False,
-                "apply_alive_mask": True,
                 "loss": "bce",
-                "weight": 1.0,
             },
             "routing": {
                 "enabled": False,
                 "mode": "learned",
-                "calibration_weight": 1.0,
-                "train_end_to_end": False,
                 "posthoc_refine": True,
                 "prediction_loss_weight": 1.0,
-                "route_oracle_loss_weight": 0.0,
-                "route_oracle_temperature": 1.0,
-                "subset_oracle_loss_weight": 0.0,
-                "subset_oracle_temperature": 1.0,
-                "group_robust_objective": {
-                    "enabled": False,
-                    "taxonomy": "perturb_type_v1",
-                    "soft_worst_weight": 0.0,
-                    "temperature": 0.1,
-                    "apply_to": ["routing_distribution"],
-                },
                 "route_conflict_enabled": True,
                 "risk_conflict_enabled": True,
                 "risk_mode": "learned",
@@ -184,52 +139,39 @@ class TriModalConfigDefaults:
                 "risk_loss": "bce",
                 "initial_risk": 0.10,
                 "final_temperature_scaling": False,
-                "acceptance_score_mode": "product",
-            },
-            "probability_calibration": {
-                "enabled": True,
-                "weight": 1.0,
-            },
-            "support_factor": {
-                "manifest_support_base": 0.5,
-                "code_anchor_base": 0.5,
-            },
-            "conflict_factor": {
-                "min_value": 0.05,
             },
         },
         "loss": {
             "branch_aux_weight": 0.25,
+            "evidential_loss_weight": 0.05,
             "branch_aux_weights": {
                 "api": 1.0,
                 "graph": 1.0,
                 "manifest": 1.0,
             },
-            # The auxiliary branch loss is weighted by observable integrity,
-            # not by the fitted branch-correctness calibrator. The explicit
-            # mode makes availability masking an independently testable choice.
-            "auxiliary_weight_mode": "integrity",
-            "min_aux_weight": 0.2,
-            "detach_reliability_for_aux": True,
-            "reliability_calibration_weight": 0.0,
-            "probability_calibration_weight": 0.0,
+            # Clean Stage-1 supervises every available branch equally.
+            "auxiliary_weight_mode": "alive_masked_uniform",
             "evidential": {
                 "anneal_epochs": 10,
-                "evidence_activation": "softplus",
                 "branches": ["api", "graph", "manifest"],
                 "class_weight": "balanced",
             },
         },
         "calibration": {
             "enabled": True,
-            "validation_fraction": 0.5,
-            "conformal_fraction": 0.5,
+            "validation_fraction": VALIDATION_HOLDOUT_FRACTION,
+            "conformal_fraction": CONFORMAL_WITHIN_HOLDOUT_FRACTION,
             "split_seed": 42,
             "stratified_group_split": True,
-            # Route-only pairwise completeness views are opt-in because they
-            # add three full transformed copies per configured strength.
-            "include_pairwise_completeness_views": False,
-            "epochs": 30,
+            # Post-hoc I1/I2 fitting uses a compact, explicitly declared set
+            # of representative mechanisms. Evaluation owns its independent
+            # five-strength stress suite below.
+            "fit_perturbations": [
+                "api_event_dropout",
+                "graph_sparsify",
+                "manifest_permission_mask",
+            ],
+            "perturb_strengths": [0.3, 0.5, 0.7],
             "lr": 0.001,
             "weight_decay": 0.0,
             "grad_clip": 5.0,
@@ -249,27 +191,17 @@ class TriModalConfigDefaults:
             "min_calibration_malware": 1,
             "require_feasible": False,
         },
-        "robust": {
-            "train_aug": True,
-            "perturb_prob": 0.5,
-            "perturb_strengths": [0.1, 0.3, 0.5],
-        },
         "eval": {
             "run_test": True,
             "run_robust_test": True,
-            "robust_val": {"enabled": False},
             "perturb_strengths": [0.1, 0.3, 0.5, 0.7, 0.9],
             "perturb_tests": [
                 "clean",
-                "api_degraded",
-                "graph_degraded",
-                "api_graph_degraded",
-                "manifest_degraded",
-                "all_degraded",
-                "api_semantic_corrupted",
-                "graph_semantic_corrupted",
-                "manifest_semantic_corrupted",
-                "all_semantic_corrupted",
+                # Canonical five-point curves. The middle three strengths are
+                # used by post-hoc fitting; 0.1 and 0.9 audit extrapolation.
+                "api_event_dropout",
+                "graph_sparsify",
+                "manifest_permission_mask",
                 "api_missing",
                 "graph_missing",
                 "manifest_missing",

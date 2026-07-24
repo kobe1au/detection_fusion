@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import copy
 import csv
+import math
 import random
 from pathlib import Path
 
@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from torch_geometric.data import Batch, Data
 
 import fusion.perturbations as perturbations_module
-from fusion.constants import EvidenceIndex
+from fusion.constants import AvailabilityIndex
 from fusion.dataset import (
     FatalDatasetConfigError,
     RobustTriModalDataset,
@@ -20,16 +20,12 @@ from fusion.dataset import (
     robust_collate_fn,
 )
 from fusion.losses import compute_robust_loss
-from fusion.quality import compute_align_quality
 from fusion.manifest_features import DEFAULT_CATEGORIES, load_manifest_vocab, vectorize_manifest_record
 from fusion.model import ApiSequenceEncoder, TriModalRobustModel
 from fusion.train import (
     _dataset_common_kwargs,
     _json_compatible,
     _metrics,
-    _normalize_robust_val_scenarios,
-    checkpoint_score,
-    checkpoint_requires_robust_validation,
     enforce_failed_ratio,
     load_config_path,
     run as run_training,
@@ -41,7 +37,6 @@ from fusion.semantic_categories import (
     DEFAULT_API_TYPE_ID_TO_CATEGORY,
     SEMANTIC_CATEGORIES,
     api_semantic_counts_from_type_ids,
-    graph_semantic_counts_from_method_api_edges,
     validate_api_type_mapping,
 )
 from scripts.build_tri_modal_pts_direct import (
@@ -55,18 +50,12 @@ from scripts.build_tri_modal_pts_direct import (
 from fusion.quality import OBSERVABLE_REQUIRED_FIELDS, OBSERVABLE_SCHEMA_VERSION
 from fusion.perturbations import (
     EVAL_PERTURB_TYPES,
-    apply_api_category_dropout,
     apply_api_event_dropout,
-    apply_api_feature_noise,
     apply_api_missing,
-    apply_graph_feature_obfuscation,
     apply_graph_sparsify,
     apply_perturbation,
     apply_graph_missing,
-    apply_manifest_component_mask,
-    apply_manifest_feature_noise,
     apply_manifest_missing,
-    apply_manifest_permission_injection,
     apply_manifest_permission_mask,
 )
 from tests.pt_factory import current_pt_payload, save_current_pt
@@ -101,7 +90,7 @@ def test_metrics_mark_auc_and_ap_undefined_for_single_class():
     assert metrics["ap"] != metrics["ap"]
 
 
-def test_probability_calibration_is_independent_of_operating_threshold():
+def test_confidence_metrics_are_independent_of_operating_threshold():
     metrics = _metrics(
         labels=[0, 1],
         probs=[0.4, 0.4],
@@ -138,79 +127,6 @@ def test_internal_isolation_groups_use_package_or_sample_id():
     assert groups[3] != groups[0]
 
 
-def test_checkpoint_score_clean_and_robust_composite():
-    clean = {"macro_f1": 0.9}
-    robust = {
-        "api_graph": {"macro_f1": 0.8},
-        "manifest": {"macro_f1": 0.7},
-    }
-    loaders = [
-        {"name": "api_graph", "weight": 0.4},
-        {"name": "manifest", "weight": 0.2},
-    ]
-
-    clean_score, clean_name = checkpoint_score(
-        {"train": {"checkpoint_metric": "clean_macro_f1"}},
-        clean,
-        robust,
-        loaders,
-    )
-    assert clean_name == "clean_macro_f1"
-    assert clean_score == pytest.approx(0.9)
-
-    robust_score, robust_name = checkpoint_score(
-        {
-            "train": {"checkpoint_metric": "robust_composite"},
-            "eval": {"robust_val": {"clean_weight": 0.4}},
-        },
-        clean,
-        robust,
-        loaders,
-    )
-    assert robust_name == "robust_composite"
-    assert robust_score == pytest.approx((0.4 * 0.9 + 0.4 * 0.8 + 0.2 * 0.7) / 1.0)
-
-
-def test_epoch_robust_validation_is_only_required_for_robust_checkpoint_metric():
-    assert checkpoint_requires_robust_validation(
-        {"train": {"checkpoint_metric": "robust_composite"}}
-    )
-    assert not checkpoint_requires_robust_validation(
-        {
-            "train": {"checkpoint_metric": "clean_macro_f1"},
-            "eval": {"robust_val": {"enabled": True}},
-        }
-    )
-
-
-def test_checkpoint_score_robust_composite_requires_robust_loaders():
-    with pytest.raises(ValueError, match="robust_val.enabled=true"):
-        checkpoint_score(
-            {"train": {"checkpoint_metric": "robust_composite"}},
-            {"macro_f1": 0.9},
-            {},
-            [],
-        )
-
-
-def test_robust_val_scenarios_reject_duplicates_and_invalid_strength():
-    with pytest.raises(ValueError, match="Duplicate"):
-        _normalize_robust_val_scenarios(
-            [
-                {"name": "same", "perturb_type": "api_degraded", "strength": 0.5, "weight": 0.5},
-                {"name": "same", "perturb_type": "graph_degraded", "strength": 0.5, "weight": 0.5},
-            ]
-        )
-    with pytest.raises(ValueError, match=r"within \[0, 1\]"):
-        _normalize_robust_val_scenarios(
-            [{"name": "bad", "perturb_type": "api_degraded", "strength": 1.5, "weight": 1.0}]
-        )
-    with pytest.raises(ValueError, match="unsupported perturb_type"):
-        _normalize_robust_val_scenarios(
-            [{"name": "bad", "perturb_type": "unknown_degradation", "strength": 0.5, "weight": 1.0}]
-        )
-
-
 def test_config_loader_allows_shared_parent_defaults(tmp_path: Path):
     parent = tmp_path / "parent.yaml"
     left = tmp_path / "left.yaml"
@@ -243,23 +159,33 @@ def test_unknown_data_and_builder_settings_fail_fast(tmp_path: Path):
         _load_direct_config(path)
 
 
-def test_tuning_mode_forbids_test_evaluation():
-    with pytest.raises(ValueError, match="forbids test evaluation"):
-        run_training(
-            {
-                "train": {
-                    "tuning_mode": True,
-                    "checkpoint_metric": "robust_composite",
-                    "device": "cpu",
-                },
-                "data": {},
-                "eval": {
-                    "run_test": True,
-                    "run_robust_test": True,
-                    "robust_val": {"enabled": True},
-                },
-            }
-        )
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {"train": {"tuning_mode": True}},
+            "Removed Stage-1 tuning settings",
+        ),
+        (
+            {"train": {"checkpoint_metric": "robust_composite"}},
+            "Removed Stage-1 tuning settings",
+        ),
+        (
+            {"eval": {"robust_val": {"enabled": True}}},
+            "eval.robust_val was removed",
+        ),
+    ],
+)
+def test_removed_stage1_tuning_settings_fail_at_config_load(
+    tmp_path: Path,
+    payload: dict,
+    message: str,
+):
+    path = tmp_path / "removed_stage1_tuning.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_config_path(path)
 
 
 def test_posthoc_calibration_requires_discount_probability_fusion():
@@ -271,18 +197,6 @@ def test_posthoc_calibration_requires_discount_probability_fusion():
                 "model": {"fusion_mode": "tri_modal_fixed_gate"},
                 "fusion": {"mode": "model_dispatch"},
                 "calibration": {"enabled": True},
-                "eval": {"run_test": False, "run_robust_test": False},
-            }
-        )
-
-
-def test_perturbation_evidence_is_forbidden_in_model_path():
-    with pytest.raises(ValueError, match="diagnostic-only"):
-        run_training(
-            {
-                "train": {"device": "cpu"},
-                "data": {},
-                "model": {"gate": {"use_perturbation_evidence": True}},
                 "eval": {"run_test": False, "run_robust_test": False},
             }
         )
@@ -307,11 +221,11 @@ def test_eval_only_requires_checkpoint_path():
 def test_eval_only_checkpoint_config_rejects_semantic_mismatch():
     saved = {
         "model": {"fusion_mode": "tri_modal_fixed_gate", "graph_encoder": {"use_behavior_hint": False}},
-        "data": {"graph_semantic_source": "alignment"},
+        "data": {},
     }
     current = {
         "model": {"fusion_mode": "tri_modal_fixed_gate", "graph_encoder": {"use_behavior_hint": True}},
-        "data": {"graph_semantic_source": "alignment"},
+        "data": {},
     }
     with pytest.raises(ValueError, match="changes model/data semantics"):
         validate_eval_checkpoint_config(current, saved)
@@ -437,13 +351,9 @@ def test_robust_model_forward_and_loss():
     batch.manifest_x = torch.rand(2, 32)
     batch.manifest_category_counts = torch.rand(2, 12)
     batch.manifest_stats = torch.rand(2, 11)
-    batch.q_api = torch.ones(2, 1)
-    batch.q_graph = torch.ones(2, 1)
-    batch.q_manifest = torch.ones(2, 1)
-    batch.q_align = torch.ones(2, 1) * 0.8
-    batch.pert_api = torch.zeros(2, 1)
-    batch.pert_graph = torch.zeros(2, 1)
-    batch.pert_manifest = torch.zeros(2, 1)
+    batch.api_alive = torch.ones(2, 1)
+    batch.graph_alive = torch.ones(2, 1)
+    batch.manifest_alive = torch.ones(2, 1)
 
     model = TriModalRobustModel(
         in_feat_dim=16,
@@ -465,7 +375,8 @@ def test_robust_model_forward_and_loss():
         manifest_hidden_dim=64,
         discount_fusion_config={"combination": "dempster"},
     )
-    logits, extra = model(batch, return_features=True)
+    model.eval()
+    logits, extra = model(batch)
     loss, parts = compute_robust_loss(
         logits,
         torch.tensor([0, 1]),
@@ -475,36 +386,25 @@ def test_robust_model_forward_and_loss():
     assert logits.shape == (2, 2)
     assert extra["fusion_weights"].shape == (2, 3)
     assert torch.allclose(extra["fusion_weights"].sum(dim=-1), torch.ones(2))
-    assert extra["gate_evidence"].shape == (2, EvidenceIndex.BASE_DIM)
-    assert torch.allclose(extra["gate_evidence"][:, 4], extra["api_graph_anchor_support"])
-    assert "api_graph_consistency" not in extra
+    assert extra["fusion_availability"].shape == (
+        2,
+        AvailabilityIndex.BASE_DIM,
+    )
+    assert torch.equal(extra["fusion_availability"], torch.ones(2, 3))
+    assert "api_integrity" not in extra
+    assert "api_encoder_coverage" not in extra
+    assert "api_graph_anchor_support" not in extra
     assert "api_semantic_logits" not in extra
-    assert extra["manifest_to_code_conflict"].shape == (2,)
-    assert extra["code_to_manifest_conflict"].shape == (2,)
+    assert "manifest_to_code_conflict" not in extra
+    assert "code_to_manifest_conflict" not in extra
     assert torch.isfinite(loss)
     assert parts["branch_aux_weight"] == 0.05
     assert "cross_source_consistency_weight" not in parts
     assert "gate_prior_weight" not in parts
 
-    batch.q_api = torch.full((2, 1), 0.8)
-    batch.pert_api = torch.full((2, 1), 0.5)
-    _, observable_extra = model(batch, return_features=False)
-    assert torch.allclose(
-        observable_extra["api_integrity"], torch.full((2,), 0.8)
-    )
-    assert "pert_api" not in observable_extra
-    assert torch.allclose(observable_extra["gate_uses_perturbation_evidence"], torch.zeros(2))
-
-    with pytest.raises(ValueError, match="diagnostic-only"):
-        TriModalRobustModel(
-            in_feat_dim=16,
-            fusion_mode="discount_probability",
-            use_perturbation_evidence=True,
-        )
-
     missing_api_batch = batch.clone()
-    missing_api_batch.q_api = torch.zeros(2, 1)
-    _, missing_api_extra = model(missing_api_batch, return_features=True)
+    missing_api_batch.api_alive = torch.zeros(2, 1)
+    _, missing_api_extra = model(missing_api_batch)
     assert torch.allclose(
         missing_api_extra["fusion_weights"][:, 0],
         torch.zeros(2),
@@ -516,13 +416,13 @@ def test_robust_model_forward_and_loss():
         atol=1e-5,
     )
     missing_graph_batch = batch.clone()
-    missing_graph_batch.q_graph = torch.zeros(2, 1)
-    _, missing_graph_extra = model(missing_graph_batch, return_features=True)
+    missing_graph_batch.graph_alive = torch.zeros(2, 1)
+    _, missing_graph_extra = model(missing_graph_batch)
     assert torch.equal(missing_graph_extra["fusion_weights"][:, 1], torch.zeros(2))
 
     missing_manifest_batch = batch.clone()
-    missing_manifest_batch.q_manifest = torch.zeros(2, 1)
-    _, missing_manifest_extra = model(missing_manifest_batch, return_features=True)
+    missing_manifest_batch.manifest_alive = torch.zeros(2, 1)
+    _, missing_manifest_extra = model(missing_manifest_batch)
     assert torch.equal(
         missing_manifest_extra["fusion_weights"][:, 2], torch.zeros(2)
     )
@@ -653,13 +553,44 @@ def test_robust_dataset_collate(tmp_path: Path, monkeypatch):
     )
     batch = next(iter(DataLoader(dataset, batch_size=1, collate_fn=robust_collate_fn)))
     graph = batch["graph_batch"]
+    assert set(graph.keys()) == {
+        "x",
+        "edge_index",
+        "sensitive_mask",
+        "batch",
+        "ptr",
+        "graph_encoder_budget_max_nodes",
+        "graph_encoder_budget_contract",
+        "api_ids",
+        "api_type_ids",
+        "api_sensitive_mask",
+        "api_batch",
+        "manifest_x",
+        "api_alive",
+        "graph_alive",
+        "manifest_alive",
+    }
     assert graph.manifest_x.shape == (1, 16)
-    assert graph.q_manifest.shape == (1, 1)
+    assert not hasattr(graph, "q_manifest")
     assert graph.api_ids.numel() == 3
-    assert graph.api_semantic_category_counts.shape == (1, 12)
-    assert graph.graph_semantic_category_counts.shape == (1, 12)
-    assert graph.api_category_counts.shape == (1, 12)
-    assert graph.graph_semantic_category_counts.sum().item() == 2.0
+    assert graph.api_type_ids.numel() == 3
+    assert graph.api_sensitive_mask.numel() == 3
+    for removed_field in (
+        "api_method_index",
+        "api_in_graph_mask",
+        "method_api_edge_index",
+        "api_semantic_category_counts",
+        "graph_semantic_category_counts",
+        "api_category_counts",
+        "graph_category_counts",
+        "real_node_mask",
+        "real_num_nodes",
+        "manifest_permission_ids",
+        "manifest_intent_ids",
+        "manifest_category_counts",
+        "manifest_stats",
+    ):
+        assert not hasattr(graph, removed_field)
     assert graph.graph_encoder_budget_max_nodes.view(-1).tolist() == [8]
     assert graph.graph_encoder_budget_contract == [1, 8, [3]]
     assert graph.to(torch.device("cpu")).graph_encoder_budget_contract == [1, 8, [3]]
@@ -793,7 +724,9 @@ def test_dataset_allows_pt_superset_for_real_failure_slice(tmp_path: Path):
     assert dataset.sample_sids == ["selected"]
 
 
-def test_all_ghost_graph_has_integrity_but_is_not_alive(tmp_path: Path):
+def test_all_ghost_graph_is_not_alive_and_transports_no_runtime_quality_fields(
+    tmp_path: Path,
+):
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     sid = "ghost"
@@ -821,17 +754,20 @@ def test_all_ghost_graph_has_integrity_but_is_not_alive(tmp_path: Path):
         str(csv_path),
         is_train=False,
         manifest_dim=16,
-        eval_perturb_type="graph_node_feature_mask",
+        eval_perturb_type="graph_sparsify",
         eval_perturb_strength=0.5,
     )[0]
-    assert data.real_num_nodes.item() == 0
-    assert data.graph_integrity.item() > 0.0
     assert data.graph_alive.item() == 0.0
-    assert data.q_align.item() == 0.0
-    assert data.method_api_edge_index.numel() == 0
+    assert not hasattr(data, "graph_integrity")
+    assert not hasattr(data, "q_align")
+    assert not hasattr(data, "real_num_nodes")
+    assert not hasattr(data, "real_node_mask")
+    assert not hasattr(data, "method_api_edge_index")
 
 
-def test_multidex_api_limit_is_sample_level_and_preserves_alignment(tmp_path: Path):
+def test_multidex_api_limit_is_sample_level_and_keeps_encoder_vectors_aligned(
+    tmp_path: Path,
+):
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     sid = "sample2"
@@ -882,24 +818,27 @@ def test_multidex_api_limit_is_sample_level_and_preserves_alignment(tmp_path: Pa
         max_api_events_per_sample=3,
     )
     graph = next(iter(DataLoader(dataset, batch_size=1, collate_fn=robust_collate_fn)))["graph_batch"]
-    # All 4 events are sensitive and the budget (3) forces a drop; the sensitive
-    # tier keeps a contiguous prefix (indices 0,1,2 -> ids 1,2,3) and the
-    # API<->graph alignment is remapped consistently.
+    # All 4 events are sensitive and the budget (3) forces a drop. The three
+    # API-encoder vectors retain the same contiguous prefix.
     assert graph.api_ids.tolist() == [1, 2, 3]
-    assert graph.method_api_edge_index[1].tolist() == [0, 1, 2]
-    assert graph.method_api_edge_index[0].tolist() == [0, 1, 2]
-    assert graph.graph_semantic_category_counts.sum().item() == 3.0
-    assert graph.api_event_count_before_encoder_budget.item() == pytest.approx(4.0)
-    assert graph.api_event_count_after_encoder_budget.item() == pytest.approx(3.0)
-    assert graph.api_runtime_encoder_coverage.item() == pytest.approx(0.75)
-    assert graph.api_encoder_coverage.item() == pytest.approx(0.75)
-    assert graph.api_truncated_by_encoder_budget.item() == pytest.approx(1.0)
+    assert graph.api_type_ids.tolist() == [1, 2, 3]
+    assert graph.api_sensitive_mask.tolist() == [1.0, 1.0, 1.0]
+    assert not hasattr(graph, "method_api_edge_index")
+    assert not hasattr(graph, "graph_semantic_category_counts")
+    assert not hasattr(graph, "api_runtime_encoder_coverage")
+    assert not hasattr(graph, "api_encoder_coverage")
 
 
 def test_manifest_perturbation_uses_payload_vocab_dims(tmp_path: Path):
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     sid = "sample_manifest_dims"
+    manifest_stats = torch.ones(11)
+    manifest_stats[0] = math.log1p(2) / 6.0
+    manifest_x = torch.zeros(32)
+    manifest_x[:3] = 1.0
+    manifest_x[3:15] = 1.0 / 12.0
+    manifest_x[15:26] = manifest_stats
     save_current_pt(
         pt_dir / f"{sid}.pt",
         {
@@ -912,15 +851,17 @@ def test_manifest_perturbation_uses_payload_vocab_dims(tmp_path: Path):
             "api_method_index": torch.tensor([0, 1], dtype=torch.long),
             "api_in_graph_mask": torch.ones(2),
             "method_api_edge_index": torch.tensor([[0, 1], [0, 1]], dtype=torch.long),
-            "manifest_x": torch.ones(16),
+            "manifest_x": manifest_x,
             "manifest_permission_dim": 2,
             "manifest_intent_dim": 1,
+            "manifest_permission_ids": torch.tensor([1, 2]),
+            "manifest_intent_ids": torch.tensor([1]),
             "manifest_category_counts": torch.ones(12),
-            "manifest_stats": torch.ones(11),
+            "manifest_stats": manifest_stats,
             "q_manifest": torch.tensor([1.0]),
             "pert_manifest": torch.tensor([0.0]),
         },
-        manifest_dim=16,
+        manifest_dim=32,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -932,7 +873,7 @@ def test_manifest_perturbation_uses_payload_vocab_dims(tmp_path: Path):
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        manifest_dim=16,
+        manifest_dim=32,
         manifest_permission_dim=128,
         manifest_intent_dim=64,
         eval_perturb_type="manifest_permission_mask",
@@ -1010,11 +951,7 @@ def test_dataset_rejects_non_current_pt_schema_version(tmp_path: Path):
 def test_removed_legacy_loss_weights_are_rejected():
     logits = torch.zeros(2, 2, requires_grad=True)
     labels = torch.tensor([0, 1], dtype=torch.long)
-    extra = {
-        "gate_weights_train": torch.full(
-            (2, 3), 1.0 / 3.0, requires_grad=True
-        )
-    }
+    extra = {}
     for cfg in (
         {"gate_prior_weight": 0.0},
         {"cross_source_consistency_weight": 0.0},
@@ -1025,60 +962,33 @@ def test_removed_legacy_loss_weights_are_rejected():
 
 
 def _perturbation_sample():
+    manifest_stats = torch.ones(11)
+    manifest_stats[0] = math.log1p(4) / 6.0
+    manifest_x = torch.zeros(32)
+    manifest_x[:4] = 1.0
+    manifest_x[4:6] = 1.0
+    manifest_x[6:18] = 1.0 / 12.0
+    manifest_x[18:29] = manifest_stats
     return {
         "api_ids": torch.tensor([1, 2, 3], dtype=torch.long),
         "api_type_ids": torch.tensor([1, 2, 3], dtype=torch.long),
         "api_sensitive_mask": torch.ones(3),
-        "api_method_index": torch.tensor([0, 1, 2], dtype=torch.long),
-        "api_in_graph_mask": torch.ones(3),
-        "method_api_edge_index": torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long),
-        "mask": torch.ones(3, 3),
-        "api_semantic_category_counts": torch.ones(12),
-        "api_category_counts": torch.ones(12),
         "x": torch.randn(3, 8),
         "edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
         "sensitive_mask": torch.ones(3, dtype=torch.uint8),
-        "graph_semantic_category_counts": torch.ones(12),
-        "graph_category_counts": torch.ones(12),
-        "graph_semantic_source": "alignment",
-        "manifest_x": torch.ones(16),
+        "manifest_x": manifest_x,
         "manifest_permission_ids": torch.tensor([1, 2, 3, 4], dtype=torch.long),
-        "manifest_intent_ids": torch.tensor([1, 2], dtype=torch.long),
         "manifest_permission_category_map": torch.ones((4, 12)),
-        "manifest_intent_category_map": torch.ones((2, 12)),
-        "manifest_component_category_counts": torch.zeros(12),
         "manifest_category_counts": torch.ones(12),
-        "manifest_stats": torch.ones(11),
+        "manifest_stats": manifest_stats,
         "manifest_permission_dim": 4,
         "manifest_intent_dim": 2,
         "manifest_feature_dim": 0,
-        "q_api": 1.0,
-        "q_graph": 1.0,
-        "q_manifest": 1.0,
-        "q_align": 0.8,
-        "pert_api": 0.0,
-        "pert_graph": 0.0,
-        "pert_manifest": 0.0,
-        "real_num_nodes": 3,
     }
 
 
-def _assert_nested_perturbation_equal(actual, expected, path="root"):
-    assert type(actual) is type(expected), path
-    if isinstance(expected, dict):
-        assert set(actual) == set(expected), path
-        for key in expected:
-            _assert_nested_perturbation_equal(
-                actual[key], expected[key], f"{path}.{key}"
-            )
-    elif isinstance(expected, torch.Tensor):
-        assert torch.equal(actual, expected), path
-    else:
-        assert actual == expected, path
-
-
-def test_each_nonclean_perturbation_materializes_observables_once(monkeypatch):
-    original_refresh = perturbations_module.refresh_observable_signals
+def test_each_nonclean_perturbation_refreshes_hard_availability_once(monkeypatch):
+    original_refresh = perturbations_module.refresh_hard_availability
     refresh_count = 0
 
     def counted_refresh(data):
@@ -1087,7 +997,7 @@ def test_each_nonclean_perturbation_materializes_observables_once(monkeypatch):
         return original_refresh(data)
 
     monkeypatch.setattr(
-        perturbations_module, "refresh_observable_signals", counted_refresh
+        perturbations_module, "refresh_hard_availability", counted_refresh
     )
     perturb_types = sorted(
         value for value in EVAL_PERTURB_TYPES if value not in {None, "clean"}
@@ -1100,182 +1010,70 @@ def test_each_nonclean_perturbation_materializes_observables_once(monkeypatch):
         assert refresh_count - before == 1, perturb_type
 
 
-@pytest.mark.parametrize(
-    ("compound", "sequential"),
-    [
-        ("api_graph_degraded", ("api_degraded", "graph_degraded")),
-        ("api_manifest_degraded", ("api_degraded", "manifest_degraded")),
-        ("graph_manifest_degraded", ("graph_degraded", "manifest_degraded")),
-        (
-            "all_degraded",
-            ("api_degraded", "graph_degraded", "manifest_degraded"),
-        ),
-        (
-            "all_semantic_corrupted",
-            (
-                "api_semantic_corrupted",
-                "graph_semantic_corrupted",
-                "manifest_semantic_corrupted",
-            ),
-        ),
-    ],
-)
-def test_compound_single_refresh_matches_sequential_materialization(
-    compound, sequential
-):
-    """One final refresh must preserve every legacy sequential output field."""
-
-    seed = 12031
-    random.seed(seed)
-    torch.manual_seed(seed)
-    actual = apply_perturbation(
-        copy.deepcopy(_perturbation_sample()), compound, 0.5
-    )
-
-    random.seed(seed)
-    torch.manual_seed(seed)
-    expected = copy.deepcopy(_perturbation_sample())
-    for perturb_type in sequential:
-        expected = apply_perturbation(expected, perturb_type, 0.5)
-
-    _assert_nested_perturbation_equal(actual, expected)
-
-
-def test_api_missing_sets_q_align_zero():
-    data = apply_api_missing(_perturbation_sample())
-    assert data["q_api"] == 0.0
+def test_api_missing_sets_hard_availability_zero():
+    original = _perturbation_sample()
+    graph_x = original["x"].clone()
+    graph_edges = original["edge_index"].clone()
+    data = apply_api_missing(original)
     assert data["api_alive"] == 0.0
-    assert data["api_integrity"] == 0.0
-    assert data["code_integrity"] == 0.0
-    assert data["pert_api"] == 1.0
-    assert data["q_align"] == 0.0
-    assert data["graph_semantic_category_counts"].sum().item() == 0.0
+    assert data["api_ids"].numel() == 0
+    assert data["api_type_ids"].numel() == 0
+    assert data["api_sensitive_mask"].numel() == 0
+    assert torch.equal(data["x"], graph_x)
+    assert torch.equal(data["edge_index"], graph_edges)
 
 
-def test_api_event_dropout_removes_tokens_and_remaps_edges():
+def test_api_event_dropout_keeps_only_api_encoder_vectors_aligned():
     torch.manual_seed(0)
     data = _perturbation_sample()
+    graph_x = data["x"].clone()
+    graph_edges = data["edge_index"].clone()
     data["api_ids"] = torch.tensor([10, 11, 12, 13], dtype=torch.long)
     data["api_type_ids"] = torch.tensor([1, 2, 3, 4], dtype=torch.long)
-    data["api_sensitive_mask"] = torch.ones(4)
-    data["api_method_index"] = torch.tensor([0, 1, 2, 0], dtype=torch.long)
-    data["api_in_graph_mask"] = torch.ones(4)
-    data["method_api_edge_index"] = torch.tensor([[0, 1, 2, 0], [0, 1, 2, 3]], dtype=torch.long)
-    data["mask"] = torch.ones(3, 4)
+    data["api_sensitive_mask"] = torch.tensor([0.0, 1.0, 0.0, 1.0])
 
     out = apply_api_event_dropout(data, 0.5)
-    assert out["api_ids"].numel() == 2
-    assert out["api_type_ids"].numel() == 2
-    assert out["mask"].shape == (3, 2)
-    assert out["method_api_edge_index"].size(1) == 2
-    assert out["method_api_edge_index"][1].max().item() < out["api_ids"].numel()
-    assert out["q_api"] < 1.0
-    assert out["q_api"] > 0.0
-    assert out["q_align"] <= 0.8
-    expected_graph_counts = graph_semantic_counts_from_method_api_edges(
-        out["api_type_ids"], out["method_api_edge_index"]
-    )
-    assert torch.equal(out["graph_semantic_category_counts"], expected_graph_counts)
-    assert out["graph_semantic_category_counts"].sum().item() == 2.0
+    for key in ("api_ids", "api_type_ids", "api_sensitive_mask"):
+        assert out[key].numel() == 2
+    expected_by_id = {
+        10: (1, 0.0),
+        11: (2, 1.0),
+        12: (3, 0.0),
+        13: (4, 1.0),
+    }
+    for api_id, api_type, sensitive in zip(
+        out["api_ids"].tolist(),
+        out["api_type_ids"].tolist(),
+        out["api_sensitive_mask"].tolist(),
+    ):
+        assert (api_type, sensitive) == expected_by_id[api_id]
+    assert out["api_alive"] == 1.0
+    assert torch.equal(out["x"], graph_x)
+    assert torch.equal(out["edge_index"], graph_edges)
 
 
-def test_api_category_dropout_refreshes_graph_alignment_semantics():
-    torch.manual_seed(3)
-    out = apply_api_category_dropout(_perturbation_sample(), 0.5)
-    expected_graph_counts = graph_semantic_counts_from_method_api_edges(
-        out["api_type_ids"], out["method_api_edge_index"]
-    )
-
-    assert torch.equal(out["graph_semantic_category_counts"], expected_graph_counts)
-    assert torch.equal(out["graph_category_counts"], expected_graph_counts)
-
-
-def test_api_feature_noise_updates_semantics_and_graph_alignment():
-    torch.manual_seed(7)
+def test_api_event_dropout_rejects_misaligned_side_tensors():
     data = _perturbation_sample()
-    original_ids = data["api_ids"].clone()
-    original_types = data["api_type_ids"].clone()
-    out = apply_api_feature_noise(data, 1.0)
-    expected_api_counts = api_semantic_counts_from_type_ids(out["api_type_ids"])
-    expected_graph_counts = graph_semantic_counts_from_method_api_edges(
-        out["api_type_ids"], out["method_api_edge_index"]
-    )
-
-    assert torch.all(out["api_ids"] != original_ids)
-    assert not torch.equal(out["api_type_ids"], original_types)
-    assert torch.equal(out["api_semantic_category_counts"], expected_api_counts)
-    assert torch.equal(out["graph_semantic_category_counts"], expected_graph_counts)
+    data["api_type_ids"] = data["api_type_ids"][:2]
+    with pytest.raises(ValueError, match="api_type_ids.*length 2.*expected 3"):
+        apply_api_event_dropout(data, 0.5)
 
 
-def test_sensitive_api_dropout_is_noop_when_no_sensitive_events_exist():
-    data = _perturbation_sample()
-    data["api_sensitive_mask"] = torch.zeros_like(data["api_sensitive_mask"])
-    before = data["api_ids"].clone()
-    out = apply_api_event_dropout(data, 1.0, sensitive_only=True)
-    assert torch.equal(out["api_ids"], before)
-    assert out["pert_api"] == 0.0
-
-
-def test_graph_missing_sets_q_align_zero():
+def test_graph_missing_sets_hard_availability_zero():
     data = apply_graph_missing(_perturbation_sample())
-    assert data["q_graph"] == 0.0
     assert data["graph_alive"] == 0.0
-    assert data["graph_integrity"] == 0.0
-    assert data["code_integrity"] == 0.0
-    assert data["pert_graph"] == 1.0
-    assert data["q_align"] == 0.0
-
-
-def test_align_quality_requires_explicit_method_api_edges():
-    assert compute_align_quality(
-        1.0,
-        1.0,
-        torch.empty((2, 0), dtype=torch.long),
-        num_nodes=4,
-        num_api=4,
-    ) == 0.0
-    aligned = compute_align_quality(
-        1.0,
-        1.0,
-        torch.tensor([[0, 1], [0, 2]], dtype=torch.long),
-        num_nodes=4,
-        num_api=4,
-    )
-    assert 0.0 < aligned < 1.0
-
-
-def test_graph_degradation_preserves_category_counts():
-    """Graph structural perturbations (obfuscation, sparsify, etc.) no longer
-    artificially degrade semantic category counts.  Only graph quality drops;
-    the category counts are tied to method_api_edge_index which is unchanged
-    by structural edits."""
-    torch.manual_seed(0)
-    data = _perturbation_sample()
-    before = data["graph_semantic_category_counts"].clone()
-    out = apply_graph_feature_obfuscation(data, 0.5)
-    # Category counts must NOT change — only structural quality is affected.
-    assert torch.equal(before, out["graph_semantic_category_counts"])
-    assert torch.equal(out["graph_semantic_category_counts"], out["graph_category_counts"])
 
 
 def test_graph_sparsify_strength_one_removes_all_edges():
     data = _perturbation_sample()
     out = apply_graph_sparsify(data, 1.0)
     assert out["edge_index"].numel() == 0
-    assert out["pert_graph"] == pytest.approx(1.0)
-
-
-def test_aggregate_graph_degradation_retries_noop_operations():
-    data = _perturbation_sample()
-    data["edge_index"] = torch.empty((2, 0), dtype=torch.long)
-    out = apply_perturbation(data, "graph_degraded", 0.5)
-    assert out["pert_graph"] > 0.0
+    assert out["graph_alive"] == 1.0
 
 
 def test_manifest_perturbation_updates_feature_vector_and_semantic_counts():
     """Manifest perturbations must keep feature vectors and category-count
-    evidence in sync. Otherwise gate diagnostics would see stale consistency
-    evidence under manifest_degraded tests."""
+    evidence in sync under the controlled permission-mask view."""
     data = _perturbation_sample()
     before = data["manifest_category_counts"].clone()
     before_x = data["manifest_x"].clone()
@@ -1283,80 +1081,78 @@ def test_manifest_perturbation_updates_feature_vector_and_semantic_counts():
     assert not torch.equal(before, data["manifest_category_counts"])
     # The feature vector IS modified.
     assert not torch.equal(before_x, data["manifest_x"])
-    assert data["q_manifest"] == 1.0
-    assert data["pert_manifest"] == pytest.approx(0.5)
+    assert data["manifest_alive"] == 1.0
+    expected_count_stat = math.log1p(data["manifest_permission_ids"].numel()) / 6.0
+    stats_start = 4 + 2 + 0 + 12
+    assert data["manifest_stats"][0].item() == pytest.approx(expected_count_stat)
+    assert data["manifest_x"][stats_start].item() == pytest.approx(
+        expected_count_stat
+    )
+    assert data["manifest_permission_count"] == data["manifest_permission_ids"].numel()
 
 
-def test_sparse_manifest_mask_and_injection_always_change_eligible_positions():
+def test_sparse_manifest_permission_mask_changes_an_eligible_position():
     data = _perturbation_sample()
-    data["manifest_x"] = torch.zeros(32)
+    data["manifest_x"] = torch.zeros(64)
     data["manifest_x"][[1, 7]] = 1.0
     data["manifest_permission_dim"] = 16
     data["manifest_permission_ids"] = torch.tensor([2, 8], dtype=torch.long)
     data["manifest_permission_category_map"] = torch.ones((16, 12))
+    data["manifest_stats"][0] = math.log1p(2) / 6.0
+    stats_start = 16 + 2 + 0 + 12
+    data["manifest_x"][stats_start : stats_start + 11] = data["manifest_stats"]
     masked = apply_manifest_permission_mask(data, 0.5)
     assert int((masked["manifest_x"][:16] > 0).sum().item()) == 1
     assert masked["manifest_permission_ids"].numel() == 1
-    assert masked["pert_manifest"] == pytest.approx(0.5)
+    expected = math.log1p(1) / 6.0
+    assert masked["manifest_stats"][0].item() == pytest.approx(expected)
+    assert masked["manifest_x"][stats_start].item() == pytest.approx(expected)
 
-    injected = apply_manifest_permission_injection(masked, 0.5)
-    assert int((injected["manifest_x"][:16] > 0).sum().item()) > 1
-    assert injected["manifest_permission_ids"].numel() > 1
+
+def test_permission_mask_removes_count_side_channel_without_vocab_hits():
+    data = _perturbation_sample()
+    data["manifest_x"][:4] = 0.0
+    data["manifest_permission_ids"] = torch.empty(0, dtype=torch.long)
+    data["manifest_stats"][0] = math.log1p(3) / 6.0
+    stats_start = 4 + 2 + 0 + 12
+    data["manifest_x"][stats_start] = data["manifest_stats"][0]
+
+    out = apply_manifest_permission_mask(data, 1.0)
+
+    assert out["manifest_permission_ids"].numel() == 0
+    assert out["manifest_permission_count"] == 0
+    assert out["manifest_stats"][0].item() == 0.0
+    assert out["manifest_x"][stats_start].item() == 0.0
+    assert out["manifest_alive"] in {0.0, 1.0}
 
 
 def test_manifest_permission_mask_updates_semantic_counts_when_mapping_is_available():
     data = _perturbation_sample()
-    data["manifest_x"] = torch.zeros(8)
+    data["manifest_x"] = torch.zeros(32)
     data["manifest_x"][0] = 1.0
     data["manifest_permission_dim"] = 2
+    data["manifest_intent_dim"] = 0
+    data["manifest_feature_dim"] = 0
     data["manifest_permission_ids"] = torch.tensor([1], dtype=torch.long)
     data["manifest_category_counts"] = torch.zeros(12)
     data["manifest_category_counts"][0] = 1.0
     mapping = torch.zeros(2, 12)
     mapping[0, 0] = 1.0
     data["manifest_permission_category_map"] = mapping
+    data["manifest_stats"][0] = math.log1p(1) / 6.0
+    stats_start = 2 + 12
+    data["manifest_x"][stats_start : stats_start + 11] = data["manifest_stats"]
     out = apply_manifest_permission_mask(data, 1.0)
     assert out["manifest_category_counts"][0].item() == 0.0
-
-
-def test_manifest_feature_noise_does_not_modify_padding():
-    data = _perturbation_sample()
-    data["manifest_x"] = torch.zeros(64)
-    data["manifest_permission_dim"] = 4
-    data["manifest_intent_dim"] = 3
-    data["manifest_feature_dim"] = 2
-    data["manifest_stats"] = torch.ones(2)
-    raw_dim = 4 + 3 + 2 + 12 + 2
-    out = apply_manifest_feature_noise(data, 1.0)
-    assert torch.equal(out["manifest_x"][raw_dim:], torch.zeros(64 - raw_dim))
+    assert out["manifest_stats"][0].item() == 0.0
+    assert out["manifest_x"][stats_start].item() == 0.0
 
 
 def test_zero_strength_degradation_is_noop():
     perturb_types = [
         "api_event_dropout",
-        "api_sensitive_event_dropout",
-        "api_category_dropout",
-        "api_feature_noise",
         "graph_sparsify",
-        "graph_local_break",
-        "graph_feature_obfuscation",
-        "graph_node_feature_mask",
         "manifest_permission_mask",
-        "manifest_permission_injection",
-        "manifest_intent_mask",
-        "manifest_component_mask",
-        "manifest_feature_noise",
-        "api_degraded",
-        "api_semantic_corrupted",
-        "graph_degraded",
-        "graph_semantic_corrupted",
-        "manifest_degraded",
-        "manifest_semantic_corrupted",
-        "api_graph_degraded",
-        "api_manifest_degraded",
-        "graph_manifest_degraded",
-        "all_degraded",
-        "all_semantic_corrupted",
     ]
     for perturb_type in perturb_types:
         data = _perturbation_sample()
@@ -1373,48 +1169,17 @@ def test_zero_strength_degradation_is_noop():
                 assert actual == expected, perturb_type
 
 
-def test_aggregate_completeness_and_semantic_corruptions_are_separated():
-    torch.manual_seed(7)
-    scenarios = {
-        "api_degraded": (
-            {"api_event_dropout", "api_category_dropout"},
-            "api_aug_type",
-            "pert_api",
-        ),
-        "graph_degraded": (
-            {"graph_sparsify", "graph_node_feature_mask"},
-            "graph_aug_type",
-            "pert_graph",
-        ),
-        "manifest_degraded": (
-            {
-                "manifest_permission_mask",
-                "manifest_intent_mask",
-                "manifest_component_mask",
-            },
-            "manifest_aug_type",
-            "pert_manifest",
-        ),
-        "api_semantic_corrupted": (
-            {"api_feature_noise"},
-            "api_aug_type",
-            "pert_api",
-        ),
-        "graph_semantic_corrupted": (
-            {"graph_local_break", "graph_feature_obfuscation"},
-            "graph_aug_type",
-            "pert_graph",
-        ),
-        "manifest_semantic_corrupted": (
-            {"manifest_permission_injection", "manifest_feature_noise"},
-            "manifest_aug_type",
-            "pert_manifest",
-        ),
+def test_only_formal_controlled_perturbations_are_public():
+    assert EVAL_PERTURB_TYPES == {
+        None,
+        "clean",
+        "api_event_dropout",
+        "graph_sparsify",
+        "manifest_permission_mask",
+        "api_missing",
+        "graph_missing",
+        "manifest_missing",
     }
-    for perturb_type, (allowed, diagnostic_key, perturbation_key) in scenarios.items():
-        out = apply_perturbation(_perturbation_sample(), perturb_type, 0.5)
-        assert out[diagnostic_key] in allowed
-        assert float(out[perturbation_key]) > 0.0
 
 
 def test_eval_perturbation_is_deterministic_per_sample(tmp_path: Path):
@@ -1423,76 +1188,31 @@ def test_eval_perturbation_is_deterministic_per_sample(tmp_path: Path):
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        robust_aug=False,
         manifest_dim=16,
         manifest_stats_dim=11,
-        eval_perturb_type="all_degraded",
+        eval_perturb_type="api_event_dropout",
         eval_perturb_strength=0.5,
     )
     first = dataset[0]
     second = dataset[0]
     assert first.api_aug_type == second.api_aug_type
-    assert first.graph_aug_type == second.graph_aug_type
-    assert first.manifest_aug_type == second.manifest_aug_type
     assert torch.equal(first.api_ids, second.api_ids)
-    assert torch.equal(first.edge_index, second.edge_index)
-    assert torch.equal(first.manifest_x, second.manifest_x)
     stronger = RobustTriModalDataset(
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        robust_aug=False,
         manifest_dim=16,
         manifest_stats_dim=11,
-        eval_perturb_type="all_degraded",
+        eval_perturb_type="api_event_dropout",
         eval_perturb_strength=0.9,
     )[0]
     assert first.api_aug_type == stronger.api_aug_type
-    assert first.graph_aug_type == stronger.graph_aug_type
-    assert first.manifest_aug_type == stronger.manifest_aug_type
 
 
-def test_manifest_component_mask_uses_vector_layout_stats_offset():
-    data = _perturbation_sample()
-    data["manifest_x"] = torch.ones(256)
-    data["manifest_stats"] = torch.ones(11)
-    data["manifest_permission_dim"] = 128
-    data["manifest_intent_dim"] = 64
-    data["manifest_feature_dim"] = 32
-    out = apply_manifest_component_mask(data, 1.0)
-    stats_start = 128 + 64 + 32 + 12
-    component_indices = torch.tensor([1, 2, 3, 4, 9, 10])
-    non_component_indices = torch.tensor([0, 5, 6, 7, 8])
-    stats_segment = out["manifest_x"][stats_start : stats_start + 11]
-    assert stats_segment[component_indices].sum().item() == 0.0
-    assert stats_segment[non_component_indices].sum().item() == 5.0
-    assert out["manifest_x"][247:].sum().item() == 9.0
-
-
-def test_manifest_component_mask_updates_component_semantic_counts():
-    data = _perturbation_sample()
-    data["manifest_x"] = torch.ones(256)
-    data["manifest_stats"] = torch.ones(11)
-    data["manifest_permission_dim"] = 128
-    data["manifest_intent_dim"] = 64
-    data["manifest_feature_dim"] = 32
-    component_counts = torch.zeros(12)
-    component_counts[7] = 1.0
-    component_counts[8] = 1.0
-    data["manifest_component_category_counts"] = component_counts
-    data["manifest_category_counts"] = component_counts.clone()
-    out = apply_manifest_component_mask(data, 1.0)
-    assert out["manifest_category_counts"].sum().item() == 0.0
-    assert out["manifest_component_category_counts"].sum().item() == 0.0
-
-
-def test_manifest_missing_zeroes_manifest_counts_and_q_manifest():
+def test_manifest_missing_zeroes_manifest_counts_and_availability():
     data = apply_manifest_missing(_perturbation_sample())
     assert data["manifest_category_counts"].sum().item() == 0.0
-    assert data["q_manifest"] == 0.0
     assert data["manifest_alive"] == 0.0
-    assert data["manifest_integrity"] == 0.0
-    assert data["pert_manifest"] == 1.0
 
 
 def test_removed_cross_source_and_semantic_losses_are_not_supported():
@@ -1738,19 +1458,8 @@ def test_failed_ratio_guard_rejects_empty_and_all_failed_evaluation():
         enforce_failed_ratio({"num_eval": 0, "num_failed": 3}, cfg, "all_failed")
 
 
-# ---------------------------------------------------------------------------
-# P0.2: graph_semantic_source ablation switch
-# ---------------------------------------------------------------------------
-
-
 def _make_graph_source_pt(tmp_path: Path, sid: str = "graph_src_sample"):
-    """Build a tiny .pt with 4 API events but only 2 of them aligned to the
-    graph via method_api_edge_index. The alignment vs. full-API distinction
-    must be observable.
-
-    API type_ids: [1=telephony, 2=sms, 3=location, 6=network]
-    method_api_edge_index[1] = [0, 3]  -> only telephony + network are aligned.
-    """
+    """Build a tiny current-schema PT used by dataset contract tests."""
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir(parents=True, exist_ok=True)
     save_current_pt(
@@ -1781,73 +1490,6 @@ def _make_graph_source_pt(tmp_path: Path, sid: str = "graph_src_sample"):
         writer.writeheader()
         writer.writerow({"id": sid, "label": 1, "year": 2024})
     return pt_dir, csv_path
-
-
-def _load_single_sample(pt_dir: Path, csv_path: Path, graph_semantic_source: str):
-    dataset = RobustTriModalDataset(
-        str(pt_dir),
-        str(csv_path),
-        is_train=False,
-        robust_aug=False,
-        manifest_dim=16,
-        manifest_category_dim=12,
-        manifest_stats_dim=11,
-        graph_semantic_source=graph_semantic_source,
-    )
-    batch = next(iter(DataLoader(dataset, batch_size=1, collate_fn=robust_collate_fn)))
-    return batch["graph_batch"]
-
-
-def test_graph_semantic_source_alignment_uses_method_api_edges(tmp_path: Path):
-    pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="graph_align")
-    graph = _load_single_sample(pt_dir, csv_path, "alignment")
-    api_counts = graph.api_semantic_category_counts[0]
-    graph_counts = graph.graph_semantic_category_counts[0]
-    # API sees telephony, sms, location, network (4 categories).
-    assert api_counts[CATEGORY_TO_INDEX["telephony"]].item() == 1.0
-    assert api_counts[CATEGORY_TO_INDEX["sms"]].item() == 1.0
-    assert api_counts[CATEGORY_TO_INDEX["location"]].item() == 1.0
-    assert api_counts[CATEGORY_TO_INDEX["network"]].item() == 1.0
-    # Graph alignment only retains the two anchored events: telephony, network.
-    assert graph_counts[CATEGORY_TO_INDEX["telephony"]].item() == 1.0
-    assert graph_counts[CATEGORY_TO_INDEX["network"]].item() == 1.0
-    assert graph_counts[CATEGORY_TO_INDEX["sms"]].item() == 0.0
-    assert graph_counts[CATEGORY_TO_INDEX["location"]].item() == 0.0
-    # Alignment and full-API must NOT agree on this sample.
-    assert not torch.equal(api_counts, graph_counts)
-
-
-def test_graph_semantic_source_full_api_copies_api_counts(tmp_path: Path):
-    pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="graph_full_api")
-    graph = _load_single_sample(pt_dir, csv_path, "full_api")
-    api_counts = graph.api_semantic_category_counts[0]
-    graph_counts = graph.graph_semantic_category_counts[0]
-    assert torch.equal(api_counts, graph_counts)
-    # Sanity: with the same sample, alignment yields a different distribution.
-    graph_align = _load_single_sample(pt_dir, csv_path, "alignment").graph_semantic_category_counts[0]
-    assert not torch.equal(graph_counts, graph_align)
-
-
-def test_graph_semantic_source_zero_returns_all_zeros(tmp_path: Path):
-    pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="graph_zero")
-    graph = _load_single_sample(pt_dir, csv_path, "zero")
-    assert torch.all(graph.graph_semantic_category_counts == 0.0)
-    # API counts must still be populated — only the graph branch is zeroed.
-    assert graph.api_semantic_category_counts.abs().sum().item() > 0.0
-
-
-def test_graph_semantic_source_rejects_invalid_value(tmp_path: Path):
-    pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="graph_bad_src")
-    with pytest.raises(ValueError, match="Unsupported graph_semantic_source"):
-        RobustTriModalDataset(
-            str(pt_dir),
-            str(csv_path),
-            is_train=False,
-            manifest_dim=16,
-            manifest_category_dim=12,
-            manifest_stats_dim=11,
-            graph_semantic_source="not_a_real_source",
-        )
 
 
 # ── gradient-flow & empty-input integration tests ──────────────────────
@@ -1882,6 +1524,9 @@ def test_dense_embedding_gate_receives_gradient():
     batch.q_graph = torch.ones(2, 1)
     batch.q_manifest = torch.ones(2, 1)
     batch.q_align = torch.ones(2, 1) * 0.8
+    batch.api_alive = torch.ones(2, 1)
+    batch.graph_alive = torch.ones(2, 1)
+    batch.manifest_alive = torch.ones(2, 1)
     batch.pert_api = torch.zeros(2, 1)
     batch.pert_graph = torch.zeros(2, 1)
     batch.pert_manifest = torch.zeros(2, 1)
@@ -1909,7 +1554,7 @@ def test_dense_embedding_gate_receives_gradient():
     gate_params = list(model.dense_embedding_gate.parameters())
     assert gate_params
 
-    logits, extra = model(batch, return_features=True)
+    logits, extra = model(batch)
     loss, _ = compute_robust_loss(
         logits,
         torch.tensor([0, 1]),
@@ -1956,6 +1601,9 @@ def test_empty_api_and_zero_node_graph_forward():
     batch.q_graph = torch.ones(2, 1)
     batch.q_manifest = torch.ones(2, 1)
     batch.q_align = torch.ones(2, 1) * 0.8
+    batch.api_alive = torch.zeros(2, 1)
+    batch.graph_alive = torch.ones(2, 1)
+    batch.manifest_alive = torch.ones(2, 1)
     batch.pert_api = torch.zeros(2, 1)
     batch.pert_graph = torch.zeros(2, 1)
     batch.pert_manifest = torch.zeros(2, 1)
@@ -1980,7 +1628,7 @@ def test_empty_api_and_zero_node_graph_forward():
         manifest_hidden_dim=64,
     )
 
-    logits, extra = model(batch, return_features=True)
+    logits, extra = model(batch)
     assert logits.shape == (2, 2), "output shape must be (batch, num_classes)"
     assert torch.isfinite(logits).all(), "logits must be finite with empty API"
     assert extra["gate_weights"].shape == (2, 3)
@@ -1992,8 +1640,9 @@ def test_empty_api_and_zero_node_graph_forward():
     batch_zero.edge_index = torch.empty((2, 0), dtype=torch.long)
     batch_zero.batch = torch.empty((0,), dtype=torch.long)
     batch_zero.sensitive_mask = torch.empty((0,), dtype=torch.uint8)
+    batch_zero.graph_alive = torch.zeros(2, 1)
 
-    logits_zero, extra_zero = model(batch_zero, return_features=True)
+    logits_zero, extra_zero = model(batch_zero)
     assert logits_zero.shape == (2, 2)
     assert torch.isfinite(logits_zero).all(), "logits must be finite with zero-node graph"
     assert extra_zero["gate_weights"].shape == (2, 3)

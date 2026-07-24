@@ -18,11 +18,7 @@ model:
     # the three encoders, using training labels only. Missing branches remain
     # hard-masked before the alive-only softmax.
     detach: false
-    # This adapted baseline gates raw branch embeddings plus availability only;
-    # none of the proposed method's handcrafted relation evidence is consumed.
-    use_consistency_evidence: false
-    use_conflict_evidence: false
-    use_perturbation_evidence: false
+    # This adapted baseline gates raw branch embeddings plus availability only.
 
 loss:
   branch_aux_weight: 0.25
@@ -32,7 +28,7 @@ loss:
     graph: 1.0
     manifest: 1.0
 
-# Give the classifier the same 50/25/25 validation budget and the same I3 CRC
+# Give the classifier the same 40/35/25 validation budget and the same I3 CRC
 # threshold protocol as the proposed method. The black-box gate has no learned
 # u head, so strict MSP is the pre-registered, domain-standard acceptance score.
 classification_threshold:

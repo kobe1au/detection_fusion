@@ -16,10 +16,9 @@ from paper.baselines.common import (
     validation_selection_indices,
 )
 from paper.run_trusted_fusion_baselines import (
+    FUSION_RULE_TARGETS,
     FORMAL_TARGETS,
-    I2_MECHANISM_TARGETS,
     METHOD_TARGETS,
-    NATURAL_TARGETS,
 )
 
 
@@ -28,6 +27,7 @@ def test_paper_validation_selection_matches_disjoint_group_holdout():
         {
             "sha256": [f"sha-{index}" for index in range(20)],
             "label": [index % 2 for index in range(20)],
+            "year": [2020 + index % 2 for index in range(20)],
             "pkg_name": [f"pkg-{index // 2}" for index in range(20)],
         }
     )
@@ -43,6 +43,23 @@ def test_paper_validation_selection_matches_disjoint_group_holdout():
     selection_groups = set(frame.iloc[selection]["pkg_name"])
     calibration_groups = set(frame.iloc[calibration]["pkg_name"])
     assert selection_groups.isdisjoint(calibration_groups)
+
+
+def test_paper_validation_selection_defaults_to_formal_40_percent_budget():
+    frame = pd.DataFrame(
+        {
+            "sha256": [f"sha-{index}" for index in range(20)],
+            "label": [index % 2 for index in range(20)],
+            "year": [2020 + index % 2 for index in range(20)],
+            "pkg_name": [f"pkg-{index // 2}" for index in range(20)],
+        }
+    )
+
+    selection, summary = validation_selection_indices(frame, seed=42)
+
+    assert summary["validation_fraction"] == pytest.approx(0.60)
+    assert summary["selection_fraction_of_validation"] == pytest.approx(0.40)
+    assert len(selection) == 8
 
 
 def test_maldozer_empty_api_sequence_is_padding_only(tmp_path):
@@ -75,20 +92,20 @@ def test_mamadroid_empty_api_sequence_has_no_artificial_state_occupancy():
     assert features[-1] == pytest.approx(0.0)
 
 
-def test_paper_targets_separate_method_baselines_from_i2_mechanisms():
+def test_paper_targets_separate_method_baselines_from_fusion_rules():
     assert METHOD_TARGETS == {
         "ours": "final",
         "tmc": "tmc",
         "ecml": "ecml",
         "qmf_energy": "qmf_energy",
     }
-    assert I2_MECHANISM_TARGETS == {
+    assert FUSION_RULE_TARGETS == {
         "dempster_rule_only": "dempster",
         "cumulative_subjective_logic": "cumulative",
         "log_pool": "log_pool",
         "conflict_weighted_opinion": "conflict_weighted_opinion",
     }
-    assert FORMAL_TARGETS == {**METHOD_TARGETS, **I2_MECHANISM_TARGETS}
+    assert FORMAL_TARGETS == {**METHOD_TARGETS, **FUSION_RULE_TARGETS}
 
 
 def test_paper_targets_have_no_removed_style_or_adapted_entrypoints():
@@ -97,13 +114,6 @@ def test_paper_targets_have_no_removed_style_or_adapted_entrypoints():
         "style" not in token and "adapted" not in token
         for token in formal_tokens
     )
-    assert NATURAL_TARGETS == {
-        "ours": "natural_ours",
-        "tmc": "natural_tmc",
-        "ecml": "natural_ecml",
-        "qmf_energy": "natural_qmf_energy",
-        "conflict_weighted_opinion": "natural_conflict_weighted_opinion",
-    }
 
 
 def test_paper_label_reader_rejects_duplicate_samples(tmp_path):

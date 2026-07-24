@@ -3,9 +3,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from fusion.constants import EvidenceIndex
+from fusion.constants import AvailabilityIndex
 from fusion.discount_fusion import DiscountProbabilityFusion
-from fusion.losses import compute_posthoc_calibration_loss, routing_soft_oracle_loss
+from fusion.losses import (
+    routing_mixture_log_prob,
+    routing_risk_per_sample_loss,
+    routing_risk_target,
+)
 from fusion.train import build_run_identity
 
 
@@ -18,11 +22,15 @@ class _FixedReliabilityCalibrator(torch.nn.Module):
         self.values = values
 
     def forward(
-        self, evidence: torch.Tensor, *_args, **_kwargs
+        self,
+        branch_features: dict[str, torch.Tensor],
+        *_args,
+        **_kwargs,
     ) -> dict[str, torch.Tensor]:
+        reference = branch_features[BRANCHES[0]]
         outputs = {
-            f"predicted_reliability_{name}": evidence.new_full(
-                (evidence.size(0),), value
+            f"predicted_reliability_{name}": reference.new_full(
+                (reference.size(0),), value
             )
             for name, value in zip(BRANCHES, self.values)
         }
@@ -30,20 +38,12 @@ class _FixedReliabilityCalibrator(torch.nn.Module):
 
 
 def _evidence(batch_size: int = 2, *, all_missing: bool = False) -> torch.Tensor:
-    evidence = torch.ones(batch_size, EvidenceIndex.BASE_DIM)
-    evidence[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 0.0
-    evidence[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 0.0
+    evidence = torch.ones(batch_size, AvailabilityIndex.BASE_DIM)
     if all_missing:
         for index in (
-            EvidenceIndex.API_ALIVE,
-            EvidenceIndex.GRAPH_ALIVE,
-            EvidenceIndex.MANIFEST_ALIVE,
-        ):
-            evidence[:, index] = 0.0
-        for index in (
-            EvidenceIndex.API_INTEGRITY,
-            EvidenceIndex.GRAPH_INTEGRITY,
-            EvidenceIndex.MANIFEST_INTEGRITY,
+            AvailabilityIndex.API_ALIVE,
+            AvailabilityIndex.GRAPH_ALIVE,
+            AvailabilityIndex.MANIFEST_ALIVE,
         ):
             evidence[:, index] = 0.0
     return evidence
@@ -57,26 +57,31 @@ def _logits() -> tuple[torch.Tensor, ...]:
     )
 
 
-def _fusion(**routing_overrides) -> DiscountProbabilityFusion:
+def _fusion(
+    *,
+    use_i1_reliability: bool = True,
+    **routing_overrides,
+) -> DiscountProbabilityFusion:
     routing = {
         "enabled": True,
         "mode": "learned",
         "risk_mode": "learned",
-        "train_end_to_end": False,
         "posthoc_refine": True,
         "prediction_loss_weight": 1.0,
         "risk_loss_weight": 1.0,
-        "acceptance_score_mode": "fused_risk",
         **routing_overrides,
     }
-    return DiscountProbabilityFusion(
+    fusion = DiscountProbabilityFusion(
         {
             "combination": "routed",
+            "use_i1_reliability": use_i1_reliability,
             "routing": routing,
             "reliability_calibration": {"enabled": False},
-            "probability_calibration": {"enabled": False},
         }
     )
+    assert fusion.opinion_router is not None
+    fusion.opinion_router.set_risk_decision_threshold(0.0)
+    return fusion
 
 
 def _with_aux(outputs: dict[str, torch.Tensor], logits: tuple[torch.Tensor, ...]):
@@ -90,22 +95,75 @@ def _stage_config(
     *,
     prediction: float,
     risk: float,
-    route_oracle: float = 0.0,
-    route_oracle_temperature: float = 1.0,
 ) -> dict:
     return {
-        "reliability_calibration": {"weight": 0.0},
-        "probability_calibration": {"weight": 0.0},
         "routing": {
             "enabled": True,
             "posthoc_refine": True,
-            "calibration_weight": 1.0,
             "prediction_loss_weight": prediction,
-            "route_oracle_loss_weight": route_oracle,
-            "route_oracle_temperature": route_oracle_temperature,
             "risk_loss_weight": risk,
             "risk_loss": "bce",
+            "risk_target": "threshold_malware_false_negative",
+            "classification_log_odds_threshold": 0.0,
         },
+    }
+
+
+def _direct_stage_loss(
+    outputs: dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    config: dict,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    routing = config["routing"]
+    mixture_log_prob = routing_mixture_log_prob(outputs)
+    valid = outputs["routing_has_available"].view(-1).bool()
+    prediction_weight = float(routing["prediction_loss_weight"])
+    risk_weight = float(routing["risk_loss_weight"])
+    prediction_loss = (
+        mixture_log_prob.sum() * 0.0
+        if prediction_weight > 0.0
+        else mixture_log_prob.new_zeros(())
+    )
+    if prediction_weight > 0.0:
+        per_row = torch.nn.functional.nll_loss(
+            mixture_log_prob, labels, reduction="none"
+        )
+        prediction_loss = (
+            per_row[valid].mean() if bool(valid.any()) else per_row.sum() * 0.0
+        )
+    risk_training_logit = outputs["routing_risk_training_logit"]
+    risk_loss = (
+        risk_training_logit.sum() * 0.0
+        if risk_weight > 0.0
+        else mixture_log_prob.new_zeros(())
+    )
+    risk_valid = torch.zeros_like(valid)
+    if risk_weight > 0.0:
+        target, risk_valid, loss_type, _ = routing_risk_target(
+            outputs,
+            labels,
+            routing,
+            mixture_log_prob=mixture_log_prob,
+            valid_routing=valid,
+        )
+        per_row = routing_risk_per_sample_loss(
+            outputs["routing_risk_probability"],
+            risk_training_logit,
+            target,
+            risk_valid,
+            loss_type=loss_type,
+        )
+        risk_loss = (
+            per_row[risk_valid].mean()
+            if bool(risk_valid.any())
+            else per_row.sum() * 0.0
+        )
+    total = prediction_weight * prediction_loss + risk_weight * risk_loss
+    return total, {
+        "routing_prediction_loss": float(prediction_loss.detach()),
+        "routing_risk_loss": float(risk_loss.detach()),
+        "routing_valid_sample_count": int(valid.sum()),
+        "routing_risk_training_sample_count": int(risk_valid.sum()),
     }
 
 
@@ -122,8 +180,20 @@ def test_final_classifier_is_mixture_and_is_independent_of_risk_probability():
     assert torch.allclose(low_risk["final_prob"], low_risk["routing_mixture_prob"])
     assert torch.allclose(high_risk["final_prob"], high_risk["routing_mixture_prob"])
     assert torch.allclose(low_risk["final_prob"], high_risk["final_prob"])
-    assert torch.all(high_risk["routing_risk_probability"] > low_risk["routing_risk_probability"])
-    assert torch.all(high_risk["acceptance_score"] < low_risk["acceptance_score"])
+    predicted_malware = high_risk["routing_risk_predicted_malware"].bool()
+    assert torch.equal(predicted_malware, torch.tensor([False, True]))
+    assert torch.all(
+        high_risk["routing_risk_probability"][~predicted_malware]
+        > low_risk["routing_risk_probability"][~predicted_malware]
+    )
+    assert torch.equal(
+        high_risk["routing_risk_probability"][predicted_malware],
+        torch.zeros(1),
+    )
+    assert torch.all(
+        high_risk["acceptance_score"][~predicted_malware]
+        < low_risk["acceptance_score"][~predicted_malware]
+    )
 
 
 def test_route_nll_does_not_update_risk_parameters():
@@ -131,10 +201,9 @@ def test_route_nll_does_not_update_risk_parameters():
     fusion.set_calibration_active(True)
     logits = _logits()
     outputs = _with_aux(fusion(*logits, _evidence()), logits)
-    loss, diagnostics = compute_posthoc_calibration_loss(
+    loss, diagnostics = _direct_stage_loss(
         outputs,
         torch.tensor([0, 1]),
-        _evidence(),
         _stage_config(prediction=1.0, risk=0.0),
     )
     loss.backward()
@@ -160,19 +229,13 @@ def test_route_prior_uses_positive_learnable_common_log_odds_scale():
         for parameter in fusion.routing_risk_parameters()
     )
 
-    evidence = _evidence()
-    reliability = torch.tensor([0.90, 0.60, 0.20])
-    for index, value in zip(
-        (
-            EvidenceIndex.API_INTEGRITY,
-            EvidenceIndex.GRAPH_INTEGRITY,
-            EvidenceIndex.MANIFEST_INTEGRITY,
-        ),
-        reliability,
-    ):
-        evidence[:, index] = value
+    reliability_values = (0.90, 0.60, 0.20)
+    fusion.reliability_calibrator = _FixedReliabilityCalibrator(
+        reliability_values
+    )
     fusion.set_calibration_active(True)
-    outputs = fusion(*_logits(), evidence)
+    outputs = fusion(*_logits(), _evidence())
+    reliability = torch.tensor(reliability_values)
     expected = torch.softmax(torch.logit(reliability), dim=-1).expand(2, -1)
     assert torch.allclose(
         outputs["routing_prior_branch_distribution"], expected, atol=1.0e-6
@@ -186,15 +249,6 @@ def test_route_prior_uses_positive_learnable_common_log_odds_scale():
 def test_encoder_training_route_is_uniform_over_alive_branches():
     fusion = _fusion()
     evidence = _evidence()
-    for index, value in zip(
-        (
-            EvidenceIndex.API_INTEGRITY,
-            EvidenceIndex.GRAPH_INTEGRITY,
-            EvidenceIndex.MANIFEST_INTEGRITY,
-        ),
-        (0.95, 0.35, 0.05),
-    ):
-        evidence[:, index] = value
 
     outputs = fusion(*_logits(), evidence)
     expected = torch.full((2, 3), 1.0 / 3.0)
@@ -207,8 +261,7 @@ def test_encoder_training_route_is_uniform_over_alive_branches():
     )
 
     missing = evidence.clone()
-    missing[:, EvidenceIndex.GRAPH_ALIVE] = 0.0
-    missing[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.0
+    missing[:, AvailabilityIndex.GRAPH_ALIVE] = 0.0
     missing_outputs = fusion(*_logits(), missing)
     expected_missing = torch.tensor([[0.5, 0.0, 0.5]]).expand(2, -1)
     assert torch.allclose(
@@ -222,7 +275,7 @@ def test_encoder_training_route_is_uniform_over_alive_branches():
     )
 
 
-def test_posthoc_route_uses_fitted_i1_instead_of_raw_integrity():
+def test_posthoc_route_uses_fitted_i1_reliability():
     fusion = _fusion(route_conflict_enabled=False)
     fitted_reliability = (0.20, 0.50, 0.80)
     fusion.reliability_calibrator = _FixedReliabilityCalibrator(
@@ -230,20 +283,7 @@ def test_posthoc_route_uses_fitted_i1_instead_of_raw_integrity():
     )
     fusion.set_calibration_active(True)
 
-    evidence = _evidence()
-    # Reverse the raw-integrity ordering so this test fails if the routed path
-    # bypasses I1 after calibration.
-    for index, value in zip(
-        (
-            EvidenceIndex.API_INTEGRITY,
-            EvidenceIndex.GRAPH_INTEGRITY,
-            EvidenceIndex.MANIFEST_INTEGRITY,
-        ),
-        (0.95, 0.50, 0.05),
-    ):
-        evidence[:, index] = value
-
-    outputs = fusion(*_logits(), evidence)
+    outputs = fusion(*_logits(), _evidence())
     expected = torch.softmax(
         torch.logit(torch.tensor(fitted_reliability)), dim=-1
     ).expand(2, -1)
@@ -255,88 +295,115 @@ def test_posthoc_route_uses_fitted_i1_instead_of_raw_integrity():
     assert outputs["routing_prefit_uniform_prior_active"].sum().item() == 0.0
 
 
-def test_route_soft_oracle_is_detached_and_respects_alive_mask():
-    route_scores = torch.tensor(
-        [[0.60, 0.25, 0.15], [0.60, 0.25, 0.15]], requires_grad=True
-    )
-    route_distribution = torch.softmax(route_scores, dim=-1)
-    branch_probabilities = {
-        "api": torch.tensor([[0.90, 0.10], [0.01, 0.99]]),
-        "graph": torch.tensor([[0.20, 0.80], [0.20, 0.80]]),
-        "manifest": torch.tensor([[0.10, 0.90], [0.80, 0.20]]),
-    }
-    outputs = {
-        "routing_branch_distribution": route_distribution,
-        "routing_scores": route_scores,
-    }
-    branch_log_probabilities = []
-    for name, probability in branch_probabilities.items():
-        log_probability = probability.log().requires_grad_()
-        outputs[f"calibrated_log_prob_{name}"] = log_probability
-        branch_log_probabilities.append(log_probability)
-    evidence = _evidence()
-    evidence[1, EvidenceIndex.API_ALIVE] = 0.0
-
-    loss, diagnostics = routing_soft_oracle_loss(
-        outputs,
-        torch.tensor([0, 1]),
-        evidence,
-        temperature=0.5,
-    )
-    loss.backward()
-
-    assert diagnostics["routing_route_oracle_valid_sample_count"].item() == 2
-    assert diagnostics["routing_route_oracle_top1_agreement"].item() == pytest.approx(
-        0.5
-    )
-    assert route_scores.grad is not None
-    assert route_scores.grad[0, 0] < 0.0
-    assert route_scores.grad[1, 1] < 0.0
-    assert all(value.grad is None for value in branch_log_probabilities)
-
-
-def test_route_soft_oracle_retains_gradient_for_collapsed_branch():
-    route_scores = torch.tensor([[20.0, -20.0, -20.0]], requires_grad=True)
-    outputs = {
-        "routing_scores": route_scores,
-        "routing_branch_distribution": torch.softmax(route_scores, dim=-1),
-        "calibrated_log_prob_api": torch.tensor([[-0.01, -5.0]]),
-        "calibrated_log_prob_graph": torch.tensor([[-5.0, -0.01]]),
-        "calibrated_log_prob_manifest": torch.tensor([[-0.01, -5.0]]),
-    }
-
-    loss, _ = routing_soft_oracle_loss(
-        outputs,
-        torch.tensor([1]),
-        _evidence(batch_size=1),
-        temperature=0.01,
-    )
-    loss.backward()
-
-    assert route_scores.grad is not None
-    assert route_scores.grad[0, 1].item() < -0.99
-
-
-def test_route_soft_oracle_updates_only_route_parameters():
+def test_router_consumes_normalized_branch_probabilities_without_uncertainty_api():
     fusion = _fusion()
+    outputs = fusion(*_logits(), _evidence())
+
+    for name in BRANCHES:
+        probability = outputs[f"routing_input_probability_{name}"]
+        torch.testing.assert_close(
+            probability.sum(dim=-1),
+            torch.ones(probability.size(0)),
+        )
+        assert f"routing_input_belief_{name}" not in outputs
+        assert f"routing_input_uncertainty_{name}" not in outputs
+
+
+def test_fusion_exports_exactly_the_three_risk_feature_semantics():
+    fitted_reliability = (0.90, 0.55, 0.25)
+    fusion = _fusion()
+    fusion.reliability_calibrator = _FixedReliabilityCalibrator(
+        fitted_reliability
+    )
     fusion.set_calibration_active(True)
+    outputs = fusion(*_logits(), _evidence())
+
+    distribution = outputs["routing_branch_distribution"].detach()
+    reliability = distribution.new_tensor(fitted_reliability).unsqueeze(0)
+    expected_deficit = 1.0 - (distribution * reliability).sum(dim=-1)
+    torch.testing.assert_close(
+        outputs["routing_risk_reliability_deficit"],
+        expected_deficit,
+    )
+
+    mixture = outputs["routing_mixture_prob"].detach()
+    raw_log_odds = mixture[:, 1].log() - mixture[:, 0].log()
+    expected_boundary = torch.where(
+        raw_log_odds >= 0.0,
+        torch.zeros_like(raw_log_odds),
+        2.0 * torch.sigmoid(raw_log_odds),
+    )
+    torch.testing.assert_close(
+        outputs["routing_risk_decision_boundary_proximity"],
+        expected_boundary,
+    )
+
+    branch_conflicts = torch.stack(
+        [
+            outputs[f"routing_cross_modal_conflict_{name}"]
+            for name in BRANCHES
+        ],
+        dim=-1,
+    )
+    torch.testing.assert_close(
+        outputs["routing_risk_global_cross_modal_conflict"],
+        branch_conflicts.mean(dim=-1),
+    )
+    for removed_key in (
+        "routing_risk_uncertainty_burden",
+        "routing_risk_structural_conflict",
+        "routing_risk_missing_fraction",
+        "routing_mean_disagreement",
+    ):
+        assert removed_key not in outputs
+
+
+def test_disabled_risk_features_share_effective_weights_in_loss_and_deployment():
+    fusion = _fusion(
+        use_i1_reliability=False,
+        risk_conflict_enabled=False,
+    )
+    fusion.set_calibration_active(True)
+    router = fusion.opinion_router
+    assert router is not None
     logits = _logits()
     outputs = _with_aux(fusion(*logits, _evidence()), logits)
-    loss, diagnostics = compute_posthoc_calibration_loss(
+
+    effective_weights = router.effective_risk_feature_weights()
+    assert effective_weights.numel() == 3
+    assert effective_weights[0].item() == pytest.approx(0.0)
+    assert effective_weights[2].item() == pytest.approx(0.0)
+    assert effective_weights[1].item() > 0.0
+    assert torch.equal(
+        outputs["routing_risk_reliability_deficit"],
+        torch.zeros(2),
+    )
+    assert torch.equal(
+        outputs["routing_risk_global_cross_modal_conflict"],
+        torch.zeros(2),
+    )
+    expected_logit = (
+        router.risk_bias
+        + effective_weights[1]
+        * outputs["routing_risk_decision_boundary_proximity"]
+    )
+    torch.testing.assert_close(
+        outputs["routing_risk_training_logit"],
+        expected_logit,
+    )
+
+    loss, diagnostics = _direct_stage_loss(
         outputs,
         torch.tensor([0, 1]),
-        _evidence(),
-        _stage_config(prediction=0.0, route_oracle=0.5, risk=0.0),
+        _stage_config(prediction=0.0, risk=1.0),
     )
     loss.backward()
-
-    assert diagnostics["routing_route_oracle_loss"] > 0.0
-    assert diagnostics["routing_route_oracle_loss_weight"] == pytest.approx(0.5)
-    assert any(
-        parameter.grad is not None
-        for parameter in fusion.routing_distribution_parameters()
-    )
-    assert all(parameter.grad is None for parameter in fusion.routing_risk_parameters())
+    assert diagnostics["routing_risk_loss"] > 0.0
+    gradient = router.raw_risk_feature_weights.grad
+    assert gradient is not None
+    assert gradient[0].item() == pytest.approx(0.0, abs=1.0e-12)
+    assert gradient[2].item() == pytest.approx(0.0, abs=1.0e-12)
+    assert gradient[1].item() != pytest.approx(0.0, abs=1.0e-12)
 
 
 def test_risk_bce_does_not_update_route_parameters():
@@ -344,10 +411,9 @@ def test_risk_bce_does_not_update_route_parameters():
     fusion.set_calibration_active(True)
     logits = _logits()
     outputs = _with_aux(fusion(*logits, _evidence()), logits)
-    loss, diagnostics = compute_posthoc_calibration_loss(
+    loss, diagnostics = _direct_stage_loss(
         outputs,
         torch.tensor([0, 1]),
-        _evidence(),
         _stage_config(prediction=0.0, risk=1.0),
     )
     loss.backward()
@@ -363,10 +429,9 @@ def test_all_missing_samples_are_masked_from_proper_losses_but_forced_rejected()
     logits = _logits()
     evidence = _evidence(all_missing=True)
     outputs = _with_aux(fusion(*logits, evidence), logits)
-    loss, diagnostics = compute_posthoc_calibration_loss(
+    loss, diagnostics = _direct_stage_loss(
         outputs,
         torch.tensor([0, 1]),
-        evidence,
         _stage_config(prediction=1.0, risk=1.0),
     )
     loss.backward()
@@ -374,6 +439,14 @@ def test_all_missing_samples_are_masked_from_proper_losses_but_forced_rejected()
     assert diagnostics["routing_valid_sample_count"] == 0
     assert loss.item() == pytest.approx(0.0)
     assert torch.equal(outputs["routing_has_available"], torch.zeros(2))
+    assert torch.equal(
+        outputs["routing_branch_distribution"],
+        torch.zeros(2, 3),
+    )
+    torch.testing.assert_close(
+        outputs["routing_mixture_prob"],
+        torch.full((2, 2), 0.5),
+    )
     assert torch.equal(outputs["routing_risk_probability"], torch.ones(2))
     assert torch.equal(outputs["acceptance_score"], torch.zeros(2))
 
@@ -406,6 +479,8 @@ def test_static_route_and_learned_risk_are_independent_modes():
         ("target_loss_weight", 1.0),
         ("mass_constraint", "hard"),
         ("hidden_dim", 8),
+        ("train_end_to_end", False),
+        ("acceptance_score_mode", "fused_risk"),
     ],
 )
 def test_removed_i2_v1_keys_fail_fast(removed_key, value):
@@ -418,7 +493,7 @@ def test_learned_components_cannot_disable_posthoc_refinement():
         _fusion(posthoc_refine=False)
 
 
-def test_run_identity_reports_v2_route_and_risk_semantics():
+def test_run_identity_reports_route_and_risk_semantics():
     cfg = {
         "method": {"name": "v2"},
         "model": {"fusion_mode": "discount_probability"},
@@ -433,20 +508,28 @@ def test_run_identity_reports_v2_route_and_risk_semantics():
                 "prediction_loss_weight": 1.0,
                 "risk_loss_weight": 1.0,
                 "risk_loss": "bce",
-                "acceptance_score_mode": "fused_risk",
             },
             "reliability_calibration": {
                 "enabled": True,
+                "use_evidential_certainty": True,
                 "use_prediction_margin": True,
-                "use_predicted_class_feature": True,
+                "use_predicted_class_intercept": True,
             },
         },
-        "calibration": {"enabled": True},
+        "calibration": {
+            "enabled": True,
+            "fit_perturbations": [
+                "api_event_dropout",
+                "graph_sparsify",
+                "manifest_permission_mask",
+            ],
+            "perturb_strengths": [0.3, 0.5, 0.7],
+        },
     }
     identity = build_run_identity(cfg, "v2", 42)
     assert identity["routing_mode"] == "learned"
     assert identity["routing_risk_mode"] == "learned"
     assert identity["routing_route_conflict_enabled"] is True
     assert identity["routing_risk_conflict_enabled"] is False
-    assert identity["routing_acceptance_score_mode"] == "fused_risk"
+    assert "routing_acceptance_score_mode" not in identity
     assert "routing_mass_constraint" not in identity

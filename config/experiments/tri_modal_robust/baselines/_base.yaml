@@ -1,26 +1,27 @@
 defaults:
   - ../base_tri_modal_robust.yaml
 
+# Baselines train their own active comparison head/fusion path in Stage-1;
+# they must not be described as the main method's alive-uniform Stage-1.
+encoder_stage:
+  protocol_id: comparison_method_specific_stage1_v1
+
 model:
   fusion_mode: tri_modal_concat
 
 fusion:
   mode: model_dispatch
-  use_reliability_discount: false
-  use_support_discount: false
-  use_conflict_discount: false
-  use_confidence_proxy: false
+  use_i1_reliability: false
   use_hard_alive_mask: false
   reliability_calibration:
     enabled: false
-  probability_calibration:
-    enabled: false
-
 calibration:
   enabled: false
   # Keep checkpoint selection on the same validation subset as the proposed
   # method even though these baselines do not fit post-hoc calibration.
   holdout_enabled: true
+  role_assignment_path: labels/validation_roles_protocol_v1.json
+  require_role_assignment: true
 
 selective_prediction:
   enabled: false

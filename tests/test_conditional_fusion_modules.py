@@ -40,6 +40,15 @@ def _batch() -> Batch:
     batch.q_graph = torch.ones(2, 1)
     batch.q_manifest = torch.ones(2, 1)
     batch.q_align = torch.ones(2, 1)
+    for name in ("api_alive", "graph_alive", "manifest_alive"):
+        setattr(batch, name, torch.ones(2, 1))
+    for name in (
+        "api_integrity",
+        "graph_integrity",
+        "manifest_integrity",
+        "code_integrity",
+    ):
+        setattr(batch, name, torch.ones(2, 1))
     return batch
 
 
@@ -62,6 +71,11 @@ def _model(fusion_mode: str) -> TriModalRobustModel:
         manifest_in_dim=32,
         manifest_emb_dim=16,
         manifest_hidden_dim=32,
+        discount_fusion_config=(
+            {"combination": "dempster"}
+            if fusion_mode == "discount_probability"
+            else None
+        ),
     )
 
 
@@ -87,23 +101,24 @@ def test_every_formal_fusion_mode_owns_only_its_specialized_module_and_forwards(
     assert any(key.startswith("discount_fusion.") for key in state_keys) is needs_discount
 
     with torch.no_grad():
-        logits, extra = model(_batch(), return_features=True)
+        logits, extra = model(_batch())
     assert logits.shape == (2, 2)
     assert extra["gate_weights"].shape == (2, 3)
     assert torch.isfinite(logits).all()
+    assert "api_emb_for_concat" not in extra
+    assert "graph_emb_for_concat" not in extra
+    assert "manifest_emb_for_concat" not in extra
+    assert "api_graph_concat_input" not in extra
+    assert "tri_modal_concat_input" not in extra
 
-    if needs_api_graph_concat:
-        assert extra["api_graph_concat_input"].shape == (2, 32)
-        assert "tri_modal_concat_input" not in extra
-    elif needs_tri_concat:
-        assert extra["tri_modal_concat_input"].shape == (2, 48)
-        assert "api_graph_concat_input" not in extra
-    else:
-        assert "api_emb_for_concat" not in extra
-        assert "graph_emb_for_concat" not in extra
-        assert "manifest_emb_for_concat" not in extra
-        assert "api_graph_concat_input" not in extra
-        assert "tri_modal_concat_input" not in extra
+
+@pytest.mark.parametrize(
+    "removed_alias",
+    ("api", "graph", "manifest", "api_graph", "api_graph_manifest_concat"),
+)
+def test_removed_fusion_mode_aliases_are_rejected(removed_alias: str):
+    with pytest.raises(ValueError, match="Unsupported tri-modal fusion_mode"):
+        _model(removed_alias)
 
 
 def test_non_discount_modes_expose_no_posthoc_parameters_and_reject_activation():
@@ -161,16 +176,33 @@ def test_specialized_handlers_fail_clearly_when_their_module_is_absent(
 
 def test_concat_inputs_mask_unavailable_branch_embeddings():
     batch = _batch()
-    batch.q_api.zero_()
+    batch.api_alive.zero_()
     api_graph_model = _model("api_graph_concat")
     tri_model = _model("tri_modal_concat")
 
-    with torch.no_grad():
-        _, api_graph = api_graph_model(batch, return_features=True)
-        _, tri = tri_model(batch, return_features=True)
+    captured: dict[str, torch.Tensor] = {}
+
+    def capture(name: str):
+        def hook(_module, args):
+            captured[name] = args[0].detach().clone()
+
+        return hook
+
+    api_handle = api_graph_model.api_graph_concat_head.register_forward_pre_hook(
+        capture("api_graph")
+    )
+    tri_handle = tri_model.tri_concat_head.register_forward_pre_hook(
+        capture("tri")
+    )
+    try:
+        with torch.no_grad():
+            api_graph_model(batch)
+            tri_model(batch)
+    finally:
+        api_handle.remove()
+        tri_handle.remove()
 
     assert torch.equal(
-        api_graph["api_graph_concat_input"][:, :16], torch.zeros(2, 16)
+        captured["api_graph"][:, :16], torch.zeros(2, 16)
     )
-    assert torch.equal(tri["tri_modal_concat_input"][:, :16], torch.zeros(2, 16))
-
+    assert torch.equal(captured["tri"][:, :16], torch.zeros(2, 16))

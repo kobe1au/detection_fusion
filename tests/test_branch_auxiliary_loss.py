@@ -1,7 +1,8 @@
+import pytest
 import torch
 import torch.nn.functional as F
 
-from fusion.constants import EvidenceIndex
+from fusion.constants import AvailabilityIndex
 from fusion.losses import (
     compute_branch_auxiliary_loss,
     resolve_auxiliary_weight_mode,
@@ -15,38 +16,20 @@ def _outputs(batch_size: int = 2) -> dict[str, torch.Tensor]:
     }
 
 
-def _evidence(batch_size: int = 2) -> torch.Tensor:
-    evidence = torch.ones(batch_size, EvidenceIndex.BASE_DIM)
-    evidence[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 0.0
-    evidence[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 0.0
-    return evidence
+def _availability(batch_size: int = 2) -> torch.Tensor:
+    return torch.ones(batch_size, AvailabilityIndex.BASE_DIM)
 
 
 def test_branch_auxiliary_loss_missing_modality_zero():
-    evidence = _evidence()
-    evidence[:, EvidenceIndex.API_ALIVE] = 0.0
+    availability = _availability()
+    availability[:, AvailabilityIndex.API_ALIVE] = 0.0
     _, diagnostics = compute_branch_auxiliary_loss(
-        _outputs(), torch.tensor([0, 1]), evidence, {"min_aux_weight": 0.2}
+        _outputs(),
+        torch.tensor([0, 1]),
+        availability,
+        {"auxiliary_weight_mode": "alive_masked_uniform"},
     )
     assert torch.equal(diagnostics["aux_weight_api"], torch.zeros(2))
-
-
-def test_branch_auxiliary_loss_low_integrity_has_min_weight():
-    evidence = _evidence(1)
-    evidence[:, EvidenceIndex.GRAPH_INTEGRITY] = 0.0
-    _, diagnostics = compute_branch_auxiliary_loss(
-        _outputs(1), torch.tensor([0]), evidence, {"min_aux_weight": 0.2}
-    )
-    assert torch.allclose(diagnostics["aux_weight_graph"], torch.tensor([0.2]))
-
-
-def test_branch_auxiliary_loss_detaches_integrity():
-    evidence = _evidence(2).requires_grad_()
-    loss, _ = compute_branch_auxiliary_loss(
-        _outputs(), torch.tensor([0, 1]), evidence, {"detach_reliability_for_aux": True}
-    )
-    loss.backward()
-    assert evidence.grad is None
 
 
 def test_branch_auxiliary_loss_averages_active_branches():
@@ -54,7 +37,10 @@ def test_branch_auxiliary_loss_averages_active_branches():
     labels = torch.tensor([0, 1])
 
     loss, diagnostics = compute_branch_auxiliary_loss(
-        outputs, labels, _evidence(2), {"min_aux_weight": 0.2}
+        outputs,
+        labels,
+        _availability(2),
+        {"auxiliary_weight_mode": "alive_masked_uniform"},
     )
 
     expected = torch.stack(
@@ -71,8 +57,8 @@ def test_branch_auxiliary_loss_exposes_exactly_three_branch_weights():
     loss, diagnostics = compute_branch_auxiliary_loss(
         outputs,
         labels,
-        _evidence(2),
-        {"min_aux_weight": 0.2},
+        _availability(2),
+        {"auxiliary_weight_mode": "alive_masked_uniform"},
     )
 
     expected = torch.stack(
@@ -99,7 +85,7 @@ def test_branch_aux_weights_change_relative_branch_contribution():
     loss, _ = compute_branch_auxiliary_loss(
         outputs,
         labels,
-        _evidence(2),
+        _availability(2),
         {
             "branch_aux_weights": {
                 "api": 3.0,
@@ -115,36 +101,33 @@ def test_branch_aux_weights_change_relative_branch_contribution():
     assert torch.allclose(loss, expected)
 
 
-def test_alive_masked_uniform_removes_only_continuous_integrity_weight():
-    evidence = _evidence(2)
-    evidence[:, EvidenceIndex.API_INTEGRITY] = torch.tensor([0.0, 0.7])
-    evidence[0, EvidenceIndex.API_ALIVE] = 0.0
+def test_alive_masked_uniform_uses_only_hard_availability():
+    availability = _availability(2)
+    availability[0, AvailabilityIndex.API_ALIVE] = 0.0
 
     _, diagnostics = compute_branch_auxiliary_loss(
         _outputs(2),
         torch.tensor([0, 1]),
-        evidence,
+        availability,
         {"auxiliary_weight_mode": "alive_masked_uniform"},
     )
 
     assert torch.equal(diagnostics["aux_weight_api"], torch.tensor([0.0, 1.0]))
-    assert diagnostics["aux_uses_integrity_weight"].item() == 0.0
     assert diagnostics["aux_uses_alive_mask"].item() == 1.0
 
 
 def test_unmasked_uniform_is_an_explicit_separate_control():
-    evidence = _evidence(1)
-    evidence[:, EvidenceIndex.API_ALIVE] = 0.0
+    availability = _availability(1)
+    availability[:, AvailabilityIndex.API_ALIVE] = 0.0
 
     _, diagnostics = compute_branch_auxiliary_loss(
         _outputs(1),
         torch.tensor([0]),
-        evidence,
+        availability,
         {"auxiliary_weight_mode": "unmasked_uniform"},
     )
 
     assert torch.equal(diagnostics["aux_weight_api"], torch.ones(1))
-    assert diagnostics["aux_uses_integrity_weight"].item() == 0.0
     assert diagnostics["aux_uses_alive_mask"].item() == 0.0
 
 
@@ -156,7 +139,16 @@ def test_auxiliary_weight_mode_resolution_uses_only_explicit_mode():
         == "alive_masked_uniform"
     )
     assert resolve_auxiliary_weight_mode({}) == "unmasked_uniform"
-    for removed_key in ("reliability_weighted_aux", "integrity_weighted_aux"):
+    with pytest.raises(ValueError, match="auxiliary_weight_mode"):
+        resolve_auxiliary_weight_mode(
+            {"auxiliary_weight_mode": "integrity"}
+        )
+    for removed_key in (
+        "reliability_weighted_aux",
+        "integrity_weighted_aux",
+        "min_aux_weight",
+        "detach_reliability_for_aux",
+    ):
         try:
             resolve_auxiliary_weight_mode({removed_key: False})
         except ValueError as exc:

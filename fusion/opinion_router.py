@@ -10,18 +10,11 @@ import torch.nn.functional as F
 ROUTING_BRANCHES = ("api", "graph", "manifest")
 RISK_FEATURE_NAMES = (
     "reliability_deficit",
-    "uncertainty_burden",
     "decision_boundary_proximity",
-    "structural_conflict",
-    "missing_fraction",
+    "global_cross_modal_conflict",
 )
 
-RISK_TARGETS = (
-    "mixture_argmax_error",
-    "threshold_classification_error",
-    "threshold_malware_false_negative",
-    "reliability_deficit_score",
-)
+RISK_TARGETS = ("threshold_malware_false_negative",)
 
 
 def _inverse_softplus(value: float) -> float:
@@ -35,19 +28,20 @@ class GlobalOpinionRouter(nn.Module):
 
     The class router ``pi`` and the decision-event risk score ``u`` have different
     statistical targets and are deliberately parameterised separately. Before
-    post-hoc fitting, ``pi`` is uniform over alive branches because raw extraction
-    integrity is not a cross-branch calibrated correctness probability:
+    post-hoc fitting, ``pi`` is uniform over alive branches because hard
+    availability is not a calibrated correctness probability:
 
-    * ``pi`` is trained by conditional-mixture NLL plus an optional detached
-      branch-NLL soft-oracle auxiliary objective.
+    * ``pi`` is trained only by conditional-mixture NLL.
     * ``u`` is trained by BCE/Brier against its explicitly configured event.
 
-    Predictive disagreement can affect a branch score only through the explicit
-    term ``-softplus(lambda_m) * d_m``.  The free residual never consumes class
-    probabilities or disagreement, so it cannot learn an opposite-sign copy of
-    that term.  Risk features all have the orientation "larger means riskier"
-    and use non-negative weights. Missing sources occupy fixed slots instead of
-    disappearing from an ``N_alive`` denominator.
+    The class-routing score is deliberately restricted to
+    ``beta * logit(reliability_m) - softplus(lambda_m) * conflict_m``.
+    ``conflict_m`` is the normalized JS divergence between branch ``m`` and the
+    reliability-weighted consensus of its alive peers, scaled by the peers'
+    mean reliability. The independent monotone risk head has exactly three
+    fixed features: routed reliability deficit, proximity to the deployed
+    classification boundary, and global cross-modal conflict. Raw evidential
+    uncertainty and missing fractions are intentionally not router inputs.
     """
 
     MODES = ("learned", "prior_only")
@@ -59,9 +53,10 @@ class GlobalOpinionRouter(nn.Module):
         route_conflict_enabled: bool = True,
         risk_conflict_enabled: bool = True,
         risk_mode: str = "learned",
-        risk_target: str = "mixture_argmax_error",
+        risk_target: str = "threshold_malware_false_negative",
         initial_risk: float = 0.10,
         fixed_prior_beta: float = 1.0,
+        reliability_input_enabled: bool = True,
     ):
         super().__init__()
         mode = str(mode).strip().lower()
@@ -70,6 +65,11 @@ class GlobalOpinionRouter(nn.Module):
         if not 0.0 < float(initial_risk) < 1.0:
             raise ValueError("routing initial_risk must be within (0, 1)")
         self.mode = mode
+        # This flag is owned by the fusion-level I1 ablation. When disabled,
+        # reliability must disappear from every I2 path (prior, peer consensus,
+        # and risk), rather than being replaced by an unidentifiable constant
+        # coefficient that is still optimized.
+        self.reliability_input_enabled = bool(reliability_input_enabled)
         fixed_prior_beta = float(fixed_prior_beta)
         if not math.isfinite(fixed_prior_beta) or fixed_prior_beta <= 0.0:
             raise ValueError("routing fixed_prior_beta must be finite and positive")
@@ -108,26 +108,6 @@ class GlobalOpinionRouter(nn.Module):
         # Persist the lifecycle flag in the buffer, but branch on this Python
         # shadow in forward to avoid a CUDA scalar ``.item()`` synchronization.
         self._risk_decision_threshold_active_shadow = False
-
-        # Per branch: opinion uncertainty and a missingness indicator. Reliability enters
-        # only through the common-scale log-odds prior below, so the free
-        # residual cannot cancel I1 as a direct function of that same input.
-        # Class probabilities and disagreement are intentionally absent as well.
-        residual_input_dim = len(ROUTING_BRANCHES) * 2
-        # The post-hoc identity pool is intentionally much smaller than the
-        # encoder-training set.  A single zero-initialised linear residual is
-        # therefore used instead of the former 6->H->3 MLP.  Omitting a bias is
-        # important: branch-specific intercepts would learn a second static
-        # competence prior on top of I1's calibrated correctness intercepts.
-        # Softmax is invariant to adding the same value to all logits. Learn
-        # only K-1 relative logits and fix the Manifest residual logit to zero,
-        # removing the otherwise exact per-feature common-row nullspace.
-        self.route_residual = nn.Linear(
-            residual_input_dim,
-            len(ROUTING_BRANCHES) - 1,
-            bias=False,
-        )
-        nn.init.zeros_(self.route_residual.weight)
 
         # I1 estimates P(branch prediction is correct). Its odds, rather than
         # the old log-probability, express the relative evidence for correctness
@@ -189,62 +169,202 @@ class GlobalOpinionRouter(nn.Module):
     def route_parameters(self) -> list[nn.Parameter]:
         if self.mode == "prior_only":
             return []
-        return [
-            *self.route_residual.parameters(),
-            self.raw_route_prior_beta,
-            self.raw_conflict_scale,
-        ]
+        parameters = (
+            [self.raw_route_prior_beta]
+            if self.reliability_input_enabled
+            else []
+        )
+        if self.route_conflict_enabled:
+            parameters.append(self.raw_conflict_scale)
+        return parameters
 
     def risk_parameters(self) -> list[nn.Parameter]:
         if self.risk_mode != "learned":
             return []
         return [self.raw_risk_feature_weights, self.risk_bias]
 
+    def effective_risk_feature_weights(self) -> torch.Tensor:
+        """Return the exact deployed non-negative risk coefficients."""
+
+        weights = F.softplus(self.raw_risk_feature_weights)
+        feature_mask = weights.new_tensor(
+            [
+                float(self.reliability_input_enabled),
+                1.0,
+                float(self.risk_conflict_enabled),
+            ]
+        )
+        return weights * feature_mask
+
     def route_effective_l2(self) -> torch.Tensor:
-        """L2 penalty in the router's operative parameterization.
+        """Fixed-four-slot L2 penalty in the operative parameterization.
 
         Penalizing raw softplus coordinates would make the regularizer depend
         on an arbitrary reparameterization and would not prevent the effective
-        odds/conflict scales from drifting toward hard routing.
+        odds/conflict scales from drifting toward hard routing. Disabled slots
+        remain explicit zeros so ablations do not change the regularizer's
+        denominator.
         """
 
         if self.mode != "learned":
             return self.raw_route_prior_beta.new_zeros(())
-        beta = F.softplus(self.raw_route_prior_beta)
-        conflict = F.softplus(self.raw_conflict_scale)
-        residual = self.route_residual.weight
-        return torch.cat(
-            [beta.view(-1), conflict.view(-1), residual.reshape(-1)]
-        ).square().mean()
+        beta = (
+            F.softplus(self.raw_route_prior_beta)
+            if self.reliability_input_enabled
+            else self.raw_route_prior_beta.new_zeros(())
+        )
+        conflict = (
+            F.softplus(self.raw_conflict_scale)
+            if self.route_conflict_enabled
+            else torch.zeros_like(self.raw_conflict_scale)
+        )
+        return torch.cat([beta.view(-1), conflict.view(-1)]).square().mean()
 
     def risk_effective_l2(self) -> torch.Tensor:
-        """L2 penalty on effective monotone risk coefficients and intercept."""
+        """Fixed-four-slot L2 on effective risk coefficients and intercept."""
 
         if self.risk_mode != "learned":
             return self.risk_bias.new_zeros(())
-        weights = F.softplus(self.raw_risk_feature_weights)
-        return torch.cat([weights.view(-1), self.risk_bias.view(-1)]).square().mean()
+        effective_weights = self.effective_risk_feature_weights()
+        return torch.cat(
+            [effective_weights.view(-1), self.risk_bias.view(-1)]
+        ).square().mean()
 
     def effective_parameter_diagnostics(self) -> dict[str, float]:
         """Return cold-path scale diagnostics for convergence audits."""
 
         with torch.no_grad():
-            beta = float(F.softplus(self.raw_route_prior_beta).detach().cpu())
-            conflict = F.softplus(self.raw_conflict_scale).detach().cpu()
-            risk = F.softplus(self.raw_risk_feature_weights).detach().cpu()
-            residual = self.route_residual.weight.detach().cpu()
+            learned_route = self.mode == "learned"
+            learned_risk = self.risk_mode == "learned"
+            reliability_prior_active = bool(
+                self.reliability_input_enabled
+                and self.mode in {"learned", "prior_only"}
+            )
+            beta = float(
+                (
+                    F.softplus(self.raw_route_prior_beta)
+                    if learned_route and reliability_prior_active
+                    else self._fixed_prior_beta
+                    if reliability_prior_active
+                    else self.raw_route_prior_beta.new_zeros(())
+                )
+                .detach()
+                .cpu()
+            )
+            conflict = (
+                F.softplus(self.raw_conflict_scale).detach().cpu()
+                if learned_route and self.route_conflict_enabled
+                else torch.zeros_like(self.raw_conflict_scale.detach().cpu())
+            )
+            risk = (
+                self.effective_risk_feature_weights().detach().cpu()
+                if learned_risk
+                else torch.zeros_like(
+                    self.raw_risk_feature_weights.detach().cpu()
+                )
+            )
             return {
                 "route_prior_beta": beta,
                 "route_conflict_scale_max": float(conflict.max()),
-                "route_residual_abs_max": float(residual.abs().max()),
                 "risk_feature_weight_max": float(risk.max()),
-                "risk_bias_abs": float(self.risk_bias.detach().abs().cpu()),
+                "risk_bias_abs": (
+                    float(self.risk_bias.detach().abs().cpu())
+                    if learned_risk
+                    else 0.0
+                ),
+            }
+
+    def effective_parameter_details(self) -> dict[str, object]:
+        """Return named deployed I2 coefficients for scientific diagnostics.
+
+        ``effective_parameter_diagnostics`` intentionally stays flat because it
+        is consumed by the numerical scale guard. This richer view records the
+        exact deployed route equation and every remaining monotone coefficient.
+        """
+
+        with torch.no_grad():
+            learned_route = self.mode == "learned"
+            reliability_prior_active = bool(self.reliability_input_enabled)
+            learned_risk = self.risk_mode == "learned"
+            conflict_tensor = (
+                F.softplus(self.raw_conflict_scale).detach().cpu()
+                if learned_route and self.route_conflict_enabled
+                else torch.zeros_like(self.raw_conflict_scale.detach().cpu())
+            )
+            risk_tensor = (
+                self.effective_risk_feature_weights().detach().cpu()
+                if learned_risk
+                else torch.zeros_like(
+                    self.raw_risk_feature_weights.detach().cpu()
+                )
+            )
+            if learned_route and self.route_conflict_enabled:
+                route_semantics = (
+                    "beta_logit_reliability_minus_nonnegative_consensus_conflict"
+                    if reliability_prior_active
+                    else "negative_nonnegative_consensus_conflict"
+                )
+            elif reliability_prior_active:
+                route_semantics = "beta_logit_reliability"
+            else:
+                route_semantics = "alive_masked_uniform"
+            return {
+                "route_mode": self.mode,
+                "route_reliability_input_enabled": reliability_prior_active,
+                "route_conflict_enabled": bool(self.route_conflict_enabled),
+                "route_conflict_active": bool(
+                    learned_route and self.route_conflict_enabled
+                ),
+                "route_prior_beta": float(
+                    (
+                        F.softplus(self.raw_route_prior_beta)
+                        if learned_route and reliability_prior_active
+                        else self._fixed_prior_beta
+                        if reliability_prior_active
+                        else self.raw_route_prior_beta.new_zeros(())
+                    )
+                    .detach()
+                    .cpu()
+                ),
+                "route_conflict_scale": {
+                    branch: float(value)
+                    for branch, value in zip(
+                        ROUTING_BRANCHES, conflict_tensor.tolist()
+                    )
+                },
+                "route_score_semantics": route_semantics,
+                "risk_mode": self.risk_mode,
+                "risk_conflict_enabled": bool(self.risk_conflict_enabled),
+                "risk_conflict_active": bool(
+                    learned_risk and self.risk_conflict_enabled
+                ),
+                "risk_head_semantics": (
+                    "monotone_logistic_features"
+                    if learned_risk
+                    else "reliability_deficit_probability"
+                    if self.risk_mode == "reliability_prior"
+                    else "disabled"
+                ),
+                "risk_feature_weights": (
+                    {
+                        feature: float(value)
+                        for feature, value in zip(
+                            RISK_FEATURE_NAMES, risk_tensor.tolist()
+                        )
+                    }
+                    if learned_risk
+                    else {}
+                ),
+                "risk_bias": (
+                    float(self.risk_bias.detach().cpu())
+                    if learned_risk
+                    else None
+                ),
             }
 
     def prepare_route_inputs(
         self,
-        beliefs: dict[str, torch.Tensor],
-        uncertainties: dict[str, torch.Tensor],
+        branch_probabilities: dict[str, torch.Tensor],
         reliability: dict[str, torch.Tensor],
         alive: dict[str, torch.Tensor],
         *,
@@ -257,51 +377,115 @@ class GlobalOpinionRouter(nn.Module):
         and reuse them across optimizer evaluations through
         :meth:`forward_prepared`.  Ordinary end-to-end callers should keep
         using :meth:`forward`, which preserves gradients to the supplied
-        opinions and reliability values.
+        branch probabilities and reliability values.
         """
         if not 0.0 < float(eps) < 0.5:
             raise ValueError("routing eps must be within (0, 0.5)")
 
-        reference = beliefs[ROUTING_BRANCHES[0]]
+        missing_probability = [
+            name for name in ROUTING_BRANCHES if name not in branch_probabilities
+        ]
+        missing_reliability = [
+            name for name in ROUTING_BRANCHES if name not in reliability
+        ]
+        missing_alive = [name for name in ROUTING_BRANCHES if name not in alive]
+        if missing_probability or missing_reliability or missing_alive:
+            raise ValueError(
+                "routing inputs must contain api/graph/manifest; "
+                f"missing_probabilities={missing_probability}, "
+                f"missing_reliability={missing_reliability}, "
+                f"missing_alive={missing_alive}"
+            )
+
+        reference = branch_probabilities[ROUTING_BRANCHES[0]]
+        if not reference.is_floating_point():
+            raise ValueError("routing branch probabilities must be floating point")
         if reference.ndim != 2 or reference.size(-1) != 2:
-            raise ValueError("I2-v2 routing is defined for binary [B, 2] beliefs")
+            raise ValueError(
+                "I2 routing is defined for binary branch probabilities [B, 2]"
+            )
         batch_size, num_classes = reference.shape
+        probability_eps = max(
+            float(eps),
+            float(torch.finfo(reference.dtype).tiny),
+        )
 
-        reliability_stack = torch.stack(
-            [reliability[name].view(-1) for name in ROUTING_BRANCHES], dim=-1
-        ).to(device=reference.device, dtype=reference.dtype).clamp(0.0, 1.0)
-        uncertainty_stack = torch.stack(
-            [uncertainties[name].view(-1) for name in ROUTING_BRANCHES], dim=-1
-        ).to(device=reference.device, dtype=reference.dtype).clamp(0.0, 1.0)
-        alive_stack = torch.stack(
-            [alive[name].view(-1) for name in ROUTING_BRANCHES], dim=-1
-        ).to(device=reference.device, dtype=reference.dtype).clamp(0.0, 1.0)
-        if any(value.shape != (batch_size, len(ROUTING_BRANCHES)) for value in (
-            reliability_stack,
-            uncertainty_stack,
-            alive_stack,
-        )):
-            raise ValueError("routing reliability/uncertainty/alive batch shapes disagree")
-
-        expected_probabilities: list[torch.Tensor] = []
+        probability_values: list[torch.Tensor] = []
         for name in ROUTING_BRANCHES:
-            belief = beliefs[name].to(device=reference.device, dtype=reference.dtype)
-            uncertainty = uncertainties[name].view(-1, 1).to(
+            probability = branch_probabilities[name].to(
                 device=reference.device, dtype=reference.dtype
             )
-            if belief.shape != reference.shape:
-                raise ValueError("all routed beliefs must have the same [B, C] shape")
-            expected_probabilities.append(
-                (belief + uncertainty / float(num_classes)).clamp(0.0, 1.0)
-            )
-        probability_stack = torch.stack(expected_probabilities, dim=1)
-        malware_probability = probability_stack[:, :, 1]
+            if probability.shape != reference.shape:
+                raise ValueError(
+                    "all routed branch probabilities must have the same [B, 2] shape"
+                )
+            if not bool(torch.isfinite(probability).all().item()) or bool(
+                (probability < 0.0).any().item()
+            ):
+                raise ValueError(
+                    f"branch probability {name!r} must be finite and non-negative"
+                )
+            mass = probability.sum(dim=-1, keepdim=True)
+            if bool((mass <= float(eps)).any().item()):
+                raise ValueError(
+                    f"branch probability {name!r} must have positive class mass"
+                )
+            if not bool(
+                torch.isclose(
+                    mass,
+                    torch.ones_like(mass),
+                    rtol=1.0e-4,
+                    atol=max(float(eps), 1.0e-6),
+                )
+                .all()
+                .item()
+            ):
+                raise ValueError(
+                    f"branch probability {name!r} must sum to one; "
+                    "raw evidential belief mass is not a routing probability"
+                )
+            # Remove harmless floating-point drift after enforcing the semantic
+            # probability contract. Deliberately do not turn arbitrary
+            # non-unit masses into probabilities.
+            probability_values.append(probability / mass)
+        probability_stack = torch.stack(probability_values, dim=1)
 
-        # Observed disagreement and branch-local outlier distance. Missing
-        # placeholder logits are masked before either quantity is constructed.
-        pairwise_matrix = (
-            malware_probability.unsqueeze(-1) - malware_probability.unsqueeze(-2)
-        ).abs()
+        input_reliability_stack = torch.stack(
+            [reliability[name].view(-1) for name in ROUTING_BRANCHES], dim=-1
+        ).to(device=reference.device, dtype=reference.dtype)
+        alive_stack = torch.stack(
+            [alive[name].view(-1) for name in ROUTING_BRANCHES], dim=-1
+        ).to(device=reference.device, dtype=reference.dtype)
+        expected_stack_shape = (batch_size, len(ROUTING_BRANCHES))
+        if input_reliability_stack.shape != expected_stack_shape:
+            raise ValueError("routing reliability batch shape disagrees with probabilities")
+        if alive_stack.shape != expected_stack_shape:
+            raise ValueError("routing alive batch shape disagrees with probabilities")
+        if not bool(torch.isfinite(input_reliability_stack).all().item()) or bool(
+            (
+                (input_reliability_stack < 0.0)
+                | (input_reliability_stack > 1.0)
+            ).any().item()
+        ):
+            raise ValueError("routing reliability must be finite and within [0, 1]")
+        if not bool(torch.isfinite(alive_stack).all().item()) or bool(
+            ((alive_stack < 0.0) | (alive_stack > 1.0)).any().item()
+        ):
+            raise ValueError("routing alive values must be finite and within [0, 1]")
+        if bool(((alive_stack != 0.0) & (alive_stack != 1.0)).any().item()):
+            raise ValueError(
+                "routing alive values must be hard binary availability masks"
+            )
+
+        reliability_stack = (
+            input_reliability_stack
+            if self.reliability_input_enabled
+            else torch.ones_like(input_reliability_stack)
+        )
+
+        # Each branch is compared only with the reliability-weighted consensus
+        # of its alive peers. Dead placeholder probabilities are masked before
+        # either the consensus or the conflict is constructed.
         eye = torch.eye(
             len(ROUTING_BRANCHES), device=reference.device, dtype=reference.dtype
         ).unsqueeze(0)
@@ -310,34 +494,30 @@ class GlobalOpinionRouter(nn.Module):
         )
         peer_count = peer_availability.sum(dim=-1)
 
-        # I2 compares each branch with the consensus of its *reliable* peers.
-        # The previous unweighted mean absolute disagreement was branch-aware,
-        # but treated a weak peer exactly like a well-calibrated one.  That
-        # symmetry is undesirable when one modality is semantically corrupted:
-        # two trustworthy peers should provide stronger counter-evidence than
-        # two already doubtful peers.  I1 values are detached by the post-hoc
-        # lifecycle before route fitting, so this construction introduces no
-        # circular route -> reliability dependency.
         peer_reliability = reliability_stack.unsqueeze(1) * peer_availability
         peer_reliability_mass = peer_reliability.sum(dim=-1)
         peer_consensus_probability = (
             peer_reliability.unsqueeze(-1) * probability_stack.unsqueeze(1)
-        ).sum(dim=2) / peer_reliability_mass.unsqueeze(-1).clamp_min(float(eps))
+        ).sum(dim=2) / peer_reliability_mass.unsqueeze(-1).clamp_min(
+            probability_eps
+        )
         peer_consensus_probability = torch.where(
             peer_reliability_mass.unsqueeze(-1) > 0.0,
             peer_consensus_probability,
             torch.full_like(peer_consensus_probability, 1.0 / float(num_classes)),
         )
-        branch_probability = probability_stack.clamp_min(float(eps))
+        branch_probability = probability_stack.clamp_min(probability_eps)
         branch_probability = branch_probability / branch_probability.sum(
             dim=-1, keepdim=True
-        ).clamp_min(float(eps))
-        consensus_probability = peer_consensus_probability.clamp_min(float(eps))
+        ).clamp_min(probability_eps)
+        consensus_probability = peer_consensus_probability.clamp_min(
+            probability_eps
+        )
         consensus_probability = consensus_probability / consensus_probability.sum(
             dim=-1, keepdim=True
-        ).clamp_min(float(eps))
+        ).clamp_min(probability_eps)
         js_midpoint = (0.5 * (branch_probability + consensus_probability)).clamp_min(
-            float(eps)
+            probability_eps
         )
         peer_consensus_js = 0.5 * (
             (
@@ -357,17 +537,24 @@ class GlobalOpinionRouter(nn.Module):
             peer_consensus_js,
             torch.zeros_like(peer_consensus_js),
         )
-        # Scale the normalized JS divergence by mean peer reliability.  With
-        # no peer, conflict is undefined and therefore contributes zero; the
-        # existing missing-fraction feature handles that case explicitly.
+        # Scale normalized JS by mean peer reliability. With no reliable peer,
+        # cross-modal conflict is undefined and contributes exactly zero.
         peer_consensus_support = (
             peer_reliability_mass / peer_count.clamp_min(1.0)
         ).clamp(0.0, 1.0)
-        observed_outlier_distance = (
+        reliability_weighted_cross_modal_conflict = (
             peer_consensus_js.clamp(0.0, 1.0)
             * peer_consensus_support
             * alive_stack
         )
+        # Normalize over the currently alive branches, not the fixed three-slot
+        # tensor. Dividing by three when a branch is missing would make this
+        # feature an implicit missing-ratio proxy, which is outside the final
+        # three-feature I2 risk contract.
+        global_cross_modal_conflict = (
+            reliability_weighted_cross_modal_conflict.sum(dim=-1)
+            / alive_stack.sum(dim=-1).clamp_min(1.0)
+        ).clamp(0.0, 1.0)
         routing_reliability = reliability_stack * alive_stack
         has_available = alive_stack.sum(dim=-1) > 0.0
         unavailable = alive_stack <= 0.0
@@ -378,65 +565,31 @@ class GlobalOpinionRouter(nn.Module):
         reliability_log_odds = torch.logit(
             reliability_stack.clamp(logit_eps, 1.0 - logit_eps)
         )
-        # Missingness, rather than raw availability, keeps the last three
-        # inputs exactly zero for the ordinary all-modalities-present case.
-        # Otherwise alive=[1,1,1] would let a bias-free linear layer synthesize
-        # an arbitrary static branch intercept and duplicate I1 competence.
-        residual_features = torch.cat(
-            [uncertainty_stack * alive_stack, 1.0 - alive_stack], dim=-1
-        )
-
         uniform_class = torch.full(
             (batch_size, num_classes),
             1.0 / float(num_classes),
             device=reference.device,
             dtype=reference.dtype,
         )
-        fixed_slots = float(len(ROUTING_BRANCHES))
-        alive_fraction = alive_stack.sum(dim=-1) / fixed_slots
-        missing_fraction = (1.0 - alive_fraction).clamp(0.0, 1.0)
-        pair_indices = ((0, 1), (0, 2), (1, 2))
-        pairwise_disagreement = torch.stack(
-            [pairwise_matrix[:, left, right] for left, right in pair_indices],
-            dim=-1,
-        )
-        pairwise_availability = torch.stack(
-            [
-                alive_stack[:, left] * alive_stack[:, right]
-                for left, right in pair_indices
-            ],
-            dim=-1,
-        )
-        observed_pairwise_disagreement = (
-            pairwise_disagreement * pairwise_availability
-        )
-        # Use a fixed three-pair denominator. Missing comparisons contribute
-        # neither false agreement nor a second missingness penalty; the
-        # explicit missing_fraction feature carries that information.
-        structural_pairwise_conflict = observed_pairwise_disagreement
-        structural_conflict = structural_pairwise_conflict.mean(dim=-1)
 
         return {
             "eps": float(eps),
             "probability_stack": probability_stack,
+            "input_reliability_stack": input_reliability_stack,
             "reliability_stack": reliability_stack,
-            "uncertainty_stack": uncertainty_stack,
             "alive_stack": alive_stack,
             "routing_reliability": routing_reliability,
             "has_available": has_available,
             "unavailable": unavailable,
             "reliability_log_odds": reliability_log_odds,
-            "residual_features": residual_features,
             "uniform_class": uniform_class,
-            "observed_outlier_distance": observed_outlier_distance,
+            "reliability_weighted_cross_modal_conflict": (
+                reliability_weighted_cross_modal_conflict
+            ),
+            "global_cross_modal_conflict": global_cross_modal_conflict,
             "peer_consensus_probability": peer_consensus_probability,
             "peer_consensus_support": peer_consensus_support,
             "peer_consensus_js": peer_consensus_js,
-            "alive_fraction": alive_fraction,
-            "missing_fraction": missing_fraction,
-            "observed_pairwise_disagreement": observed_pairwise_disagreement,
-            "structural_pairwise_conflict": structural_pairwise_conflict,
-            "structural_conflict": structural_conflict,
         }
 
     def forward_prepared(
@@ -450,24 +603,19 @@ class GlobalOpinionRouter(nn.Module):
         """Execute the parameter-dependent route/risk path on prepared input."""
         required_tensor_keys = (
             "probability_stack",
+            "input_reliability_stack",
             "reliability_stack",
-            "uncertainty_stack",
             "alive_stack",
             "routing_reliability",
             "has_available",
             "unavailable",
             "reliability_log_odds",
-            "residual_features",
             "uniform_class",
-            "observed_outlier_distance",
+            "reliability_weighted_cross_modal_conflict",
+            "global_cross_modal_conflict",
             "peer_consensus_probability",
             "peer_consensus_support",
             "peer_consensus_js",
-            "alive_fraction",
-            "missing_fraction",
-            "observed_pairwise_disagreement",
-            "structural_pairwise_conflict",
-            "structural_conflict",
         )
         missing = [
             key
@@ -493,50 +641,40 @@ class GlobalOpinionRouter(nn.Module):
             )
         batch_size, _, num_classes = probability_stack.shape
         reference = probability_stack[:, 0, :]
+        probability_eps = max(eps, float(torch.finfo(reference.dtype).tiny))
+        logit_eps = max(eps, float(torch.finfo(reference.dtype).eps))
 
+        input_reliability_stack = prepared["input_reliability_stack"]
         reliability_stack = prepared["reliability_stack"]
-        uncertainty_stack = prepared["uncertainty_stack"]
         alive_stack = prepared["alive_stack"]
         routing_reliability = prepared["routing_reliability"]
         has_available = prepared["has_available"]
         unavailable = prepared["unavailable"]
         reliability_log_odds = prepared["reliability_log_odds"]
-        residual_features = prepared["residual_features"]
         uniform_class = prepared["uniform_class"]
-        observed_outlier_distance = prepared["observed_outlier_distance"]
+        reliability_weighted_cross_modal_conflict = prepared[
+            "reliability_weighted_cross_modal_conflict"
+        ]
+        global_cross_modal_conflict = prepared["global_cross_modal_conflict"]
         peer_consensus_probability = prepared["peer_consensus_probability"]
         peer_consensus_support = prepared["peer_consensus_support"]
         peer_consensus_js = prepared["peer_consensus_js"]
-        alive_fraction = prepared["alive_fraction"]
-        missing_fraction = prepared["missing_fraction"]
-        observed_pairwise_disagreement = prepared[
-            "observed_pairwise_disagreement"
-        ]
-        structural_pairwise_conflict = prepared[
-            "structural_pairwise_conflict"
-        ]
-        structural_conflict = prepared["structural_conflict"]
         assert all(
             isinstance(value, torch.Tensor)
             for value in (
+                input_reliability_stack,
                 reliability_stack,
-                uncertainty_stack,
                 alive_stack,
                 routing_reliability,
                 has_available,
                 unavailable,
                 reliability_log_odds,
-                residual_features,
                 uniform_class,
-                observed_outlier_distance,
+                reliability_weighted_cross_modal_conflict,
+                global_cross_modal_conflict,
                 peer_consensus_probability,
                 peer_consensus_support,
                 peer_consensus_js,
-                alive_fraction,
-                missing_fraction,
-                observed_pairwise_disagreement,
-                structural_pairwise_conflict,
-                structural_conflict,
             )
         )
 
@@ -544,47 +682,55 @@ class GlobalOpinionRouter(nn.Module):
         if any(
             value.shape != expected_stack_shape
             for value in (
+                input_reliability_stack,
                 reliability_stack,
-                uncertainty_stack,
                 alive_stack,
                 routing_reliability,
                 unavailable,
                 reliability_log_odds,
-                observed_outlier_distance,
+                reliability_weighted_cross_modal_conflict,
             )
         ):
             raise ValueError("prepared routing stack shapes disagree")
-        if residual_features.shape != (
-            batch_size,
-            2 * len(ROUTING_BRANCHES),
-        ):
-            raise ValueError("prepared residual_features has an invalid shape")
         if has_available.shape != (batch_size,):
             raise ValueError("prepared has_available has an invalid shape")
+        if global_cross_modal_conflict.shape != (batch_size,):
+            raise ValueError(
+                "prepared global_cross_modal_conflict has an invalid shape"
+            )
 
-        learned_route_active = bool(learned_active and self.mode == "learned")
-        routing_outlier_distance = (
-            observed_outlier_distance
-            if self.route_conflict_enabled and learned_route_active
-            else torch.zeros_like(observed_outlier_distance)
+        learned_route_active = bool(
+            learned_active
+            and self.mode == "learned"
+            and (
+                self.reliability_input_enabled
+                or self.route_conflict_enabled
+            )
         )
-        learned_route_prior_beta = F.softplus(self.raw_route_prior_beta).to(
-            device=reference.device, dtype=reference.dtype
+        routing_conflict = (
+            reliability_weighted_cross_modal_conflict
+            if self.route_conflict_enabled and learned_route_active
+            else torch.zeros_like(reliability_weighted_cross_modal_conflict)
+        )
+        learned_route_prior_beta = (
+            F.softplus(self.raw_route_prior_beta).to(
+                device=reference.device, dtype=reference.dtype
+            )
+            if self.reliability_input_enabled
+            else torch.zeros((), device=reference.device, dtype=reference.dtype)
         )
         route_prior_beta = (
             self._fixed_prior_beta.to(
                 device=reference.device, dtype=reference.dtype
             )
-            if self.mode == "prior_only"
+            if self.mode == "prior_only" and self.reliability_input_enabled
             else learned_route_prior_beta
         )
         operative_route_prior_beta = (
             route_prior_beta if learned_route_active else route_prior_beta.detach()
         )
-        # ``learned_active`` is the post-hoc lifecycle switch, not merely a
-        # residual-network switch. Before I1 is fitted, the supplied values are
-        # raw integrity fallbacks whose near-one values would be explosively
-        # separated by log-odds. Use an alive-only neutral prior at that stage.
+        # ``learned_active`` is the post-hoc lifecycle switch. Before I1 is
+        # fitted, Stage-1 must use an alive-only neutral prior.
         if bool(learned_active):
             unmasked_prior_scores = (
                 operative_route_prior_beta * reliability_log_odds
@@ -600,22 +746,19 @@ class GlobalOpinionRouter(nn.Module):
             prior_branch_distribution,
             torch.zeros_like(prior_branch_distribution),
         )
-        if not learned_route_active:
-            route_residual = torch.zeros_like(routing_reliability)
-        else:
-            relative_residual = self.route_residual(residual_features)
-            route_residual = torch.cat(
-                [
-                    relative_residual,
-                    torch.zeros_like(relative_residual[:, :1]),
-                ],
-                dim=-1,
+        conflict_scale = (
+            F.softplus(self.raw_conflict_scale).to(
+                device=reference.device, dtype=reference.dtype
             )
-        conflict_scale = F.softplus(self.raw_conflict_scale).to(
-            device=reference.device, dtype=reference.dtype
+            if self.route_conflict_enabled and learned_route_active
+            else torch.zeros(
+                len(ROUTING_BRANCHES),
+                device=reference.device,
+                dtype=reference.dtype,
+            )
         )
-        conflict_penalty = routing_outlier_distance * conflict_scale.unsqueeze(0)
-        routing_scores = (prior_scores + route_residual - conflict_penalty).masked_fill(
+        conflict_penalty = routing_conflict * conflict_scale.unsqueeze(0)
+        routing_scores = (prior_scores - conflict_penalty).masked_fill(
             unavailable, torch.finfo(reference.dtype).min
         )
         if not learned_route_active:
@@ -654,7 +797,7 @@ class GlobalOpinionRouter(nn.Module):
                 )
             branch_distribution = torch.where(
                 has_available.unsqueeze(-1),
-                override / override_sum.clamp_min(float(eps)),
+                override / override_sum.clamp_min(probability_eps),
                 torch.zeros_like(override),
             )
 
@@ -664,27 +807,29 @@ class GlobalOpinionRouter(nn.Module):
         mixture_probability = torch.where(
             has_available.unsqueeze(-1), mixture_probability, uniform_class
         )
-        mixture_probability = mixture_probability.clamp_min(float(eps))
+        mixture_probability = mixture_probability.clamp_min(probability_eps)
         mixture_probability = mixture_probability / mixture_probability.sum(
             dim=-1, keepdim=True
-        ).clamp_min(float(eps))
+        ).clamp_min(probability_eps)
 
         if not compute_risk:
             # Route fitting has no gradient path through the independent risk
-            # head.  Return immediately after the conditional class mixture so
-            # thousands of optimizer evaluations do not rebuild five static
-            # risk features or synchronize the decision-threshold buffers.
+            # head. Return immediately after the conditional class mixture so
+            # optimizer evaluations do not rebuild the three static risk
+            # features or synchronize the decision-threshold buffers.
             return {
                 "branch_distribution": branch_distribution,
                 "prior_branch_distribution": prior_branch_distribution,
                 "mixture_probability": mixture_probability,
                 "routing_scores": routing_scores,
-                "route_residual": route_residual,
                 "routing_reliability": routing_reliability,
                 "reliability_log_odds": reliability_log_odds,
                 "route_prior_beta": route_prior_beta,
-                "observed_outlier_distance": observed_outlier_distance,
-                "routing_outlier_distance": routing_outlier_distance,
+                "reliability_weighted_cross_modal_conflict": (
+                    reliability_weighted_cross_modal_conflict
+                ),
+                "routing_cross_modal_conflict": routing_conflict,
+                "global_cross_modal_conflict": global_cross_modal_conflict,
                 "conflict_penalty_scale": conflict_scale,
                 "conflict_penalty": conflict_penalty,
                 "has_available": has_available.to(dtype=reference.dtype),
@@ -692,28 +837,17 @@ class GlobalOpinionRouter(nn.Module):
 
         # Fused-risk features are aligned with the route that is actually used.
         # Detaching pi/p_mix makes the risk loss incapable of changing the
-        # conditional class router. Missingness remains a fixed three-slot
-        # feature, so confidence cannot improve merely because N_alive shrank.
+        # conditional class router.
         risk_distribution = branch_distribution.detach()
         risk_mixture_probability = mixture_probability.detach()
         reliability_deficit = (
             1.0 - (risk_distribution * reliability_stack).sum(dim=-1)
         ).clamp(0.0, 1.0)
-        uncertainty_burden = (
-            risk_distribution * uncertainty_stack
-        ).sum(dim=-1).clamp(0.0, 1.0)
         raw_log_odds = (
-            risk_mixture_probability[:, 1].clamp_min(float(eps)).log()
-            - risk_mixture_probability[:, 0].clamp_min(float(eps)).log()
+            risk_mixture_probability[:, 1].clamp_min(probability_eps).log()
+            - risk_mixture_probability[:, 0].clamp_min(probability_eps).log()
         )
-        if (
-            self.risk_target
-            in {
-                "threshold_classification_error",
-                "threshold_malware_false_negative",
-            }
-            and self.risk_decision_threshold_active
-        ):
+        if self.risk_decision_threshold_active:
             decision_threshold = self._risk_decision_log_odds_threshold.to(
                 device=reference.device,
                 dtype=reference.dtype,
@@ -724,34 +858,27 @@ class GlobalOpinionRouter(nn.Module):
                 (), device=reference.device, dtype=reference.dtype
             )
         predicted_malware = raw_log_odds >= decision_threshold
-        if self.risk_target == "threshold_malware_false_negative":
-            # On the benign side, proximity increases monotonically towards
-            # the fixed malware boundary.  The event is impossible on the
-            # malware side and is gated to zero below.
-            decision_boundary_proximity = torch.where(
-                predicted_malware,
-                torch.zeros_like(raw_log_odds),
-                (2.0 * torch.sigmoid(raw_log_odds - decision_threshold)).clamp(
-                    0.0, 1.0
-                ),
-            )
-        else:
-            decision_boundary_proximity = torch.exp(
-                -(raw_log_odds - decision_threshold).abs()
-            ).clamp(0.0, 1.0)
+        # On the benign side, proximity increases monotonically towards the
+        # fixed malware boundary. The FN event is impossible on the malware
+        # side and is therefore gated to zero.
+        decision_boundary_proximity = torch.where(
+            predicted_malware,
+            torch.zeros_like(raw_log_odds),
+            (2.0 * torch.sigmoid(raw_log_odds - decision_threshold)).clamp(
+                0.0, 1.0
+            ),
+        )
 
         risk_conflict = (
-            structural_conflict
+            global_cross_modal_conflict
             if self.risk_conflict_enabled
-            else torch.zeros_like(structural_conflict)
+            else torch.zeros_like(global_cross_modal_conflict)
         )
         risk_features = torch.stack(
             [
                 reliability_deficit,
-                uncertainty_burden,
                 decision_boundary_proximity,
                 risk_conflict,
-                missing_fraction,
             ],
             dim=-1,
         )
@@ -760,24 +887,28 @@ class GlobalOpinionRouter(nn.Module):
         if self.risk_mode == "disabled" or (
             self.risk_mode == "learned" and not learned_risk_active
         ):
-            risk_probability = torch.zeros(batch_size, device=reference.device, dtype=reference.dtype)
+            risk_probability = torch.zeros(
+                batch_size,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
             risk_logit = torch.full_like(risk_probability, -torch.inf)
             risk_feature_weights = torch.zeros(
                 len(RISK_FEATURE_NAMES), device=reference.device, dtype=reference.dtype
             )
         elif self.risk_mode == "reliability_prior":
-            # Static no-learned-risk control: expected missing-or-incorrect
-            # source fraction under I1, with no fitted risk parameters.
+            # Static no-learned-risk control: routed unreliability under I1,
+            # with no fitted risk parameters.
             risk_probability = reliability_deficit
             risk_logit = torch.logit(
-                risk_probability.clamp(float(eps), 1.0 - float(eps))
+                risk_probability.clamp(logit_eps, 1.0 - logit_eps)
             )
             risk_feature_weights = torch.zeros(
                 len(RISK_FEATURE_NAMES), device=reference.device, dtype=reference.dtype
             )
-            risk_feature_weights[0] = 1.0
+            risk_feature_weights[0] = float(self.reliability_input_enabled)
         else:
-            risk_feature_weights = F.softplus(self.raw_risk_feature_weights).to(
+            risk_feature_weights = self.effective_risk_feature_weights().to(
                 device=reference.device, dtype=reference.dtype
             )
             risk_training_logit = self.risk_bias.to(
@@ -787,10 +918,7 @@ class GlobalOpinionRouter(nn.Module):
             risk_logit = risk_training_logit
         if self.risk_mode != "learned" or not learned_risk_active:
             risk_training_logit = risk_logit
-        if (
-            self.risk_target == "threshold_malware_false_negative"
-            and self.risk_decision_threshold_active
-        ):
+        if self.risk_decision_threshold_active:
             risk_probability = torch.where(
                 predicted_malware,
                 torch.zeros_like(risk_probability),
@@ -811,20 +939,16 @@ class GlobalOpinionRouter(nn.Module):
         )
 
         committed_mass = (1.0 - risk_probability).clamp(0.0, 1.0)
-        branch_weights = branch_distribution * committed_mass.unsqueeze(-1)
-        weights = torch.cat([branch_weights, risk_probability.unsqueeze(-1)], dim=-1)
         fused_belief = mixture_probability * committed_mass.unsqueeze(-1)
         fused_uncertainty = risk_probability
 
         return {
             "belief": fused_belief,
             "uncertainty": fused_uncertainty,
-            "weights": weights,
             "branch_distribution": branch_distribution,
             "prior_branch_distribution": prior_branch_distribution,
             "mixture_probability": mixture_probability,
             "routing_scores": routing_scores,
-            "route_residual": route_residual,
             "routing_reliability": routing_reliability,
             "reliability_log_odds": reliability_log_odds,
             "route_prior_beta": route_prior_beta,
@@ -832,13 +956,20 @@ class GlobalOpinionRouter(nn.Module):
                 device=reference.device, dtype=reference.dtype
             ),
             "prior_only_odds_beta_active": torch.full_like(
-                risk_probability, float(self.mode == "prior_only")
+                risk_probability,
+                float(self.mode == "prior_only" and self.reliability_input_enabled),
             ),
-            "observed_outlier_distance": observed_outlier_distance,
+            "route_reliability_input_enabled": torch.full_like(
+                risk_probability, float(self.reliability_input_enabled)
+            ),
             "peer_consensus_probability": peer_consensus_probability,
             "peer_consensus_support": peer_consensus_support,
             "peer_consensus_js": peer_consensus_js,
-            "routing_outlier_distance": routing_outlier_distance,
+            "reliability_weighted_cross_modal_conflict": (
+                reliability_weighted_cross_modal_conflict
+            ),
+            "routing_cross_modal_conflict": routing_conflict,
+            "global_cross_modal_conflict": global_cross_modal_conflict,
             "conflict_penalty_scale": conflict_scale,
             "conflict_penalty": conflict_penalty,
             "risk_probability": risk_probability,
@@ -847,7 +978,6 @@ class GlobalOpinionRouter(nn.Module):
             "risk_features": risk_features,
             "risk_feature_weights": risk_feature_weights,
             "risk_reliability_deficit": reliability_deficit,
-            "risk_uncertainty_burden": uncertainty_burden,
             "risk_decision_boundary_proximity": decision_boundary_proximity,
             "risk_predicted_malware": predicted_malware.to(reference.dtype),
             "risk_decision_log_odds_threshold": decision_threshold.expand(
@@ -857,13 +987,7 @@ class GlobalOpinionRouter(nn.Module):
                 risk_probability,
                 float(self.risk_decision_threshold_active),
             ),
-            "risk_structural_conflict": structural_conflict,
-            "risk_missing_fraction": missing_fraction,
-            "alive_fraction": alive_fraction,
-            "missing_fraction": missing_fraction,
-            "observed_pairwise_disagreement": observed_pairwise_disagreement,
-            "structural_pairwise_conflict": structural_pairwise_conflict,
-            "mean_disagreement": observed_pairwise_disagreement.mean(dim=-1),
+            "risk_global_cross_modal_conflict": risk_conflict,
             "has_available": has_available.to(dtype=reference.dtype),
             "committed_mass": committed_mass,
             "risk_mode_learned": torch.full_like(
@@ -902,8 +1026,7 @@ class GlobalOpinionRouter(nn.Module):
 
     def forward(
         self,
-        beliefs: dict[str, torch.Tensor],
-        uncertainties: dict[str, torch.Tensor],
+        branch_probabilities: dict[str, torch.Tensor],
         reliability: dict[str, torch.Tensor],
         alive: dict[str, torch.Tensor],
         *,
@@ -913,8 +1036,7 @@ class GlobalOpinionRouter(nn.Module):
         eps: float = 1.0e-6,
     ) -> dict[str, torch.Tensor]:
         prepared = self.prepare_route_inputs(
-            beliefs,
-            uncertainties,
+            branch_probabilities,
             reliability,
             alive,
             eps=eps,

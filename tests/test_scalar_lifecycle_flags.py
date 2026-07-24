@@ -4,17 +4,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fusion.constants import EvidenceIndex
+from fusion.constants import AvailabilityIndex
 from fusion.discount_fusion import DiscountProbabilityFusion
 from fusion.losses import compute_robust_loss
 from fusion.opinion_router import GlobalOpinionRouter
 
 
-def _evidence(rows: int) -> torch.Tensor:
-    evidence = torch.ones(rows, EvidenceIndex.BASE_DIM)
-    evidence[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 0.0
-    evidence[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 0.0
-    return evidence
+def _availability(rows: int) -> torch.Tensor:
+    return torch.ones(rows, AvailabilityIndex.BASE_DIM)
 
 
 def _fusion_inputs() -> list[torch.Tensor]:
@@ -28,7 +25,7 @@ def _fusion_inputs() -> list[torch.Tensor]:
 
 def _run_fusion(module: DiscountProbabilityFusion):
     inputs = _fusion_inputs()
-    outputs = module(*inputs, _evidence(3))
+    outputs = module(*inputs, _availability(3))
     loss = F.nll_loss(outputs["final_logits"], torch.tensor([0, 1, 0]))
     loss.backward()
     return outputs, [value.grad.detach().clone() for value in inputs]
@@ -74,18 +71,12 @@ def test_calibration_active_state_dict_roundtrip_restores_shadow_and_gradients(
 
 def _router_inputs():
     malware_probability = torch.tensor((0.2, 0.45, 0.8))
-    uncertainty = torch.full_like(malware_probability, 0.2)
     probability = torch.stack(
         (1.0 - malware_probability, malware_probability), dim=-1
     )
-    belief = probability * (1.0 - uncertainty).unsqueeze(-1)
     return (
         {
-            name: belief.clone().detach().requires_grad_(True)
-            for name in ("api", "graph", "manifest")
-        },
-        {
-            name: uncertainty.clone()
+            name: probability.clone().detach().requires_grad_(True)
             for name in ("api", "graph", "manifest")
         },
         {
@@ -100,10 +91,9 @@ def _router_inputs():
 
 
 def _run_router(module: GlobalOpinionRouter):
-    beliefs, uncertainties, reliabilities, alive = _router_inputs()
+    probabilities, reliabilities, alive = _router_inputs()
     outputs = module(
-        beliefs,
-        uncertainties,
+        probabilities,
         reliabilities,
         alive,
         learned_active=True,
@@ -113,7 +103,7 @@ def _run_router(module: GlobalOpinionRouter):
     ][:, 1].sum()
     loss.backward()
     input_gradients = {
-        name: value.grad.detach().clone() for name, value in beliefs.items()
+        name: value.grad.detach().clone() for name, value in probabilities.items()
     }
     parameter_gradients = {
         name: None if parameter.grad is None else parameter.grad.detach().clone()
@@ -128,7 +118,7 @@ def test_risk_threshold_state_dict_roundtrip_restores_shadow_and_gradients(
 ):
     kwargs = {
         "risk_mode": "learned",
-        "risk_target": "threshold_classification_error",
+        "risk_target": "threshold_malware_false_negative",
     }
     source = GlobalOpinionRouter(**kwargs)
     restored = GlobalOpinionRouter(**kwargs)

@@ -11,16 +11,9 @@ fusion:
   routing:
     mode: prior_only
     risk_mode: reliability_prior
-    risk_target: reliability_deficit_score
-    train_end_to_end: false
+    risk_target: threshold_malware_false_negative
     posthoc_refine: false
     prediction_loss_weight: 0.0
-    route_oracle_loss_weight: 0.0
-    subset_oracle_loss_weight: 0.0
-    subset_oracle_temperature: 1.0
-    group_robust_objective:
-      enabled: false
-      soft_worst_weight: 0.0
     risk_loss_weight: 0.0
 
 # I1 remains active; only learned pi/u components are removed.

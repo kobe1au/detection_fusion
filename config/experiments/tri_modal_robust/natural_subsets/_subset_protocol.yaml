@@ -1,0 +1,26 @@
+eval:
+  extra_sets:
+    - name: natural_branch_disagreement
+      csv: labels/natural_subsets/test_branch_disagreement.csv
+      allow_pt_superset: true
+      skip_if_empty: false
+    - name: diagnostic_api_only_wrong
+      csv: labels/natural_subsets/test_api_only_wrong.csv
+      allow_pt_superset: true
+      skip_if_empty: false
+    - name: diagnostic_graph_only_wrong
+      csv: labels/natural_subsets/test_graph_only_wrong.csv
+      allow_pt_superset: true
+      skip_if_empty: false
+    - name: diagnostic_manifest_only_wrong
+      csv: labels/natural_subsets/test_manifest_only_wrong.csv
+      allow_pt_superset: true
+      skip_if_empty: false
+    - name: natural_reliability_imbalance
+      csv: labels/natural_subsets/test_reliability_imbalance.csv
+      allow_pt_superset: true
+      skip_if_empty: false
+    - name: natural_high_cross_modal_conflict
+      csv: labels/natural_subsets/test_high_cross_modal_conflict.csv
+      allow_pt_superset: true
+      skip_if_empty: false

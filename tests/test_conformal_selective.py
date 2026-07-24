@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from fusion.train import (
+    _batch_selective_eligibility,
     _batch_selective_score,
     _row_selective_eligible,
     _selective_ranking_metrics,
@@ -19,7 +20,14 @@ from fusion.train import (
 def _rows(probs_labels):
     rows = []
     for p, y in probs_labels:
-        rows.append({"prob_malware": p, "label": y, "pred": int(p >= 0.5)})
+        rows.append(
+            {
+                "prob_malware": p,
+                "label": y,
+                "pred": int(p >= 0.5),
+                "selective_eligible": 1,
+            }
+        )
     return rows
 
 
@@ -65,10 +73,10 @@ def test_classification_threshold_rejects_removed_recall_constraint():
 
 def test_risk_coverage_curve_reports_exact_threshold_operating_points():
     rows = [
-        {"split": "test_clean", "acceptance_score": 0.9, "label": 1, "pred": 1},
-        {"split": "test_clean", "acceptance_score": 0.8, "label": 1, "pred": 0},
-        {"split": "test_clean", "acceptance_score": 0.7, "label": 0, "pred": 0},
-        {"split": "other", "acceptance_score": 0.6, "label": 0, "pred": 1},
+        {"split": "test_clean", "acceptance_score": 0.9, "label": 1, "pred": 1, "selective_eligible": 1},
+        {"split": "test_clean", "acceptance_score": 0.8, "label": 1, "pred": 0, "selective_eligible": 1},
+        {"split": "test_clean", "acceptance_score": 0.7, "label": 0, "pred": 0, "selective_eligible": 1},
+        {"split": "other", "acceptance_score": 0.6, "label": 0, "pred": 1, "selective_eligible": 1},
     ]
     curve = build_risk_coverage_curve(rows)
     clean = [point for point in curve if point["split"] == "test_clean"]
@@ -179,10 +187,10 @@ def test_conformal_metrics_empty_without_thresholds():
 
 def test_conformal_nonconformity_uses_raw_conflict_when_present():
     rows = [
-        {"prob_malware": 0.9, "label": 1, "pred": 1, "raw_conflict": 0.0},
-        {"prob_malware": 0.9, "label": 1, "pred": 1, "raw_conflict": 0.4},
-        {"prob_malware": 0.1, "label": 0, "pred": 0, "raw_conflict": 0.0},
-        {"prob_malware": 0.1, "label": 0, "pred": 0, "raw_conflict": 0.4},
+        {"prob_malware": 0.9, "label": 1, "pred": 1, "raw_conflict": 0.0, "selective_eligible": 1},
+        {"prob_malware": 0.9, "label": 1, "pred": 1, "raw_conflict": 0.4, "selective_eligible": 1},
+        {"prob_malware": 0.1, "label": 0, "pred": 0, "raw_conflict": 0.0, "selective_eligible": 1},
+        {"prob_malware": 0.1, "label": 0, "pred": 0, "raw_conflict": 0.4, "selective_eligible": 1},
     ]
     with_conflict = fit_conformal_thresholds(
         rows,
@@ -208,6 +216,19 @@ def test_conformal_nonconformity_uses_raw_conflict_when_present():
     assert with_conflict["q_benign"] > without_conflict["q_benign"]
 
 
+def test_conflict_aware_conformal_requires_current_raw_conflict_field():
+    with pytest.raises(ValueError, match="missing mandatory raw_conflict"):
+        fit_conformal_thresholds(
+            _rows([(0.9, 1), (0.1, 0)]),
+            {
+                "enabled": True,
+                "mode": "conformal",
+                "target_coverage": 0.5,
+                "use_raw_conflict": True,
+            },
+        )
+
+
 def test_conformal_defaults_to_probability_only_nonconformity():
     rows = _rows([(0.9, 1), (0.8, 1), (0.1, 0), (0.2, 0)])
     for row in rows:
@@ -220,8 +241,8 @@ def test_conformal_defaults_to_probability_only_nonconformity():
 
 def test_threshold_rejection_is_disabled_in_conformal_mode():
     rows = [
-        {"acceptance_score": 0.9, "label": 1, "pred": 1},
-        {"acceptance_score": 0.4, "label": 0, "pred": 1},
+        {"acceptance_score": 0.9, "label": 1, "pred": 1, "selective_eligible": 1},
+        {"acceptance_score": 0.4, "label": 0, "pred": 1, "selective_eligible": 1},
     ]
     assert fit_rejection_threshold(rows, {"enabled": True, "mode": "conformal"}) is None
     assert fit_rejection_threshold(rows, {"enabled": True, "mode": "threshold", "target_coverage": 0.5}) == pytest.approx(0.9)
@@ -236,6 +257,7 @@ def test_risk_control_maximizes_acceptance_under_malware_fn_bound():
             "label": 1,
             "pred": 0,
             "prob_malware": 0.1,
+            "selective_eligible": 1,
         }
         for _ in range(5)
     )
@@ -245,6 +267,7 @@ def test_risk_control_maximizes_acceptance_under_malware_fn_bound():
             "label": 1,
             "pred": 1,
             "prob_malware": 0.9,
+            "selective_eligible": 1,
         }
         for _ in range(45)
     )
@@ -254,6 +277,7 @@ def test_risk_control_maximizes_acceptance_under_malware_fn_bound():
             "label": 0,
             "pred": 0,
             "prob_malware": 0.1,
+            "selective_eligible": 1,
         }
         for _ in range(50)
     )
@@ -282,16 +306,16 @@ def test_risk_control_maximizes_acceptance_under_malware_fn_bound():
 
 def test_risk_control_strict_boundary_keeps_repeated_scores_atomic():
     rows = [
-        {"acceptance_score": 0.9, "label": 1, "pred": 1}
+        {"acceptance_score": 0.9, "label": 1, "pred": 1, "selective_eligible": 1}
         for _ in range(19)
     ]
     # This complete tie group must either be accepted or rejected.  Accepting
     # it would add a false negative and violate alpha=0.05.
     rows.extend(
         [
-            {"acceptance_score": 0.5, "label": 1, "pred": 0},
-            {"acceptance_score": 0.5, "label": 0, "pred": 0},
-            {"acceptance_score": 0.5, "label": 0, "pred": 0},
+            {"acceptance_score": 0.5, "label": 1, "pred": 0, "selective_eligible": 1},
+            {"acceptance_score": 0.5, "label": 0, "pred": 0, "selective_eligible": 1},
+            {"acceptance_score": 0.5, "label": 0, "pred": 0, "selective_eligible": 1},
         ]
     )
     thresholds = fit_risk_control_thresholds(
@@ -318,10 +342,12 @@ def test_risk_control_strict_boundary_keeps_repeated_scores_atomic():
 
 def test_risk_control_uses_the_minimum_feasible_boundary_not_next_accepted_score():
     rows = [
-        {"acceptance_score": 0.9, "label": 1, "pred": 1}
+        {"acceptance_score": 0.9, "label": 1, "pred": 1, "selective_eligible": 1}
         for _ in range(19)
     ]
-    rows.append({"acceptance_score": 0.2, "label": 1, "pred": 0})
+    rows.append(
+        {"acceptance_score": 0.2, "label": 1, "pred": 0, "selective_eligible": 1}
+    )
 
     thresholds = fit_risk_control_thresholds(
         rows,
@@ -337,15 +363,17 @@ def test_risk_control_uses_the_minimum_feasible_boundary_not_next_accepted_score
     assert thresholds["threshold"] == pytest.approx(0.2)
     # A future score between the rejected error and the smallest accepted
     # calibration score must remain accepted under the fitted strict rule.
-    probe = [{"acceptance_score": 0.5, "label": 0, "pred": 0}]
+    probe = [
+        {"acceptance_score": 0.5, "label": 0, "pred": 0, "selective_eligible": 1}
+    ]
     risk_control_selective_metrics(probe, thresholds)
     assert probe[0]["risk_control_accepted"] == 1
 
 
 def test_risk_control_evaluation_rejects_score_equal_to_threshold():
     rows = [
-        {"acceptance_score": 0.5, "label": 0, "pred": 0},
-        {"acceptance_score": 0.6, "label": 1, "pred": 1},
+        {"acceptance_score": 0.5, "label": 0, "pred": 0, "selective_eligible": 1},
+        {"acceptance_score": 0.6, "label": 1, "pred": 1, "selective_eligible": 1},
     ]
     metrics = risk_control_selective_metrics(
         rows,
@@ -376,10 +404,10 @@ def test_risk_control_evaluation_rejects_score_equal_to_threshold():
 
 def test_crc_risk_and_conditional_accepted_malware_fnr_are_not_conflated():
     rows = [
-        {"acceptance_score": 0.9, "label": 1, "pred": 1},
-        {"acceptance_score": 0.8, "label": 1, "pred": 0},
-        {"acceptance_score": 0.4, "label": 1, "pred": 1},
-        {"acceptance_score": 0.3, "label": 1, "pred": 0},
+        {"acceptance_score": 0.9, "label": 1, "pred": 1, "selective_eligible": 1},
+        {"acceptance_score": 0.8, "label": 1, "pred": 0, "selective_eligible": 1},
+        {"acceptance_score": 0.4, "label": 1, "pred": 1, "selective_eligible": 1},
+        {"acceptance_score": 0.3, "label": 1, "pred": 0, "selective_eligible": 1},
     ]
     metrics = risk_control_selective_metrics(
         rows,
@@ -482,7 +510,13 @@ def test_risk_control_rejects_removed_ambiguous_target_name():
 
 def test_risk_control_reports_when_finite_sample_target_is_infeasible():
     rows = [
-        {"acceptance_score": 0.9, "label": 1, "pred": 1, "prob_malware": 0.9}
+        {
+            "acceptance_score": 0.9,
+            "label": 1,
+            "pred": 1,
+            "prob_malware": 0.9,
+            "selective_eligible": 1,
+        }
         for _ in range(5)
     ]
     thresholds = fit_risk_control_thresholds(
@@ -496,7 +530,7 @@ def test_risk_control_reports_when_finite_sample_target_is_infeasible():
 
 def test_infeasible_crc_fallback_rejects_unseen_higher_scores():
     calibration = [
-        {"acceptance_score": 0.5, "label": 1, "pred": 1}
+        {"acceptance_score": 0.5, "label": 1, "pred": 1, "selective_eligible": 1}
         for _ in range(5)
     ]
     thresholds = fit_risk_control_thresholds(
@@ -506,7 +540,9 @@ def test_infeasible_crc_fallback_rejects_unseen_higher_scores():
 
     assert thresholds["feasible"] is False
     assert thresholds["threshold"] == 1.0
-    probe = [{"acceptance_score": 0.9, "label": 1, "pred": 0}]
+    probe = [
+        {"acceptance_score": 0.9, "label": 1, "pred": 0, "selective_eligible": 1}
+    ]
     metrics = risk_control_selective_metrics(probe, thresholds)
     assert metrics["risk_control_num_accepted"] == 0
     assert probe[0]["risk_control_rejected"] == 1
@@ -572,13 +608,19 @@ def test_target_aligned_aurc_does_not_charge_false_positives_to_fn_risk():
     assert metrics["malware_fn_risk_aurc_denominator"] == "all_malware"
 
 
-def test_alive_fallback_rejects_nonfinite_or_partial_values():
-    with pytest.raises(ValueError, match="finite binary"):
+def test_selective_eligible_is_mandatory_and_binary():
+    with pytest.raises(ValueError, match="missing mandatory"):
         _row_selective_eligible(
-            {"api_alive": float("nan"), "graph_alive": float("inf"), "manifest_alive": 0}
+            {"api_alive": 1, "graph_alive": 1, "manifest_alive": 1}
         )
-    with pytest.raises(ValueError, match="all three"):
-        _row_selective_eligible({"api_alive": 1})
+    with pytest.raises(ValueError, match="boolean or binary"):
+        _row_selective_eligible({"selective_eligible": float("nan")})
+    with pytest.raises(ValueError, match="missing mandatory tensor"):
+        _batch_selective_eligibility(
+            {},
+            batch_size=1,
+            device=torch.device("cpu"),
+        )
 
 
 def test_selective_helpers_do_not_truncate_fractional_binary_fields():

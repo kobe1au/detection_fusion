@@ -22,9 +22,9 @@ def _warn_implicit_encoder_truncation_once(max_nodes: int) -> None:
     warnings.warn(
         "Graph input exceeded encoder max_nodes="
         f"{int(max_nodes)} without graph_encoder_budget_max_nodes metadata; "
-        "the encoder is truncating implicitly, so dataset-side graph "
-        "coverage/integrity accounting cannot reflect the removed nodes. "
-        "Configure one shared dataset/encoder graph budget. This warning is "
+        "the encoder is truncating implicitly without the dataset-side "
+        "single-budget contract. Configure one shared dataset/encoder graph "
+        "budget. This warning is "
         "emitted once per process.",
         RuntimeWarning,
         stacklevel=3,
@@ -282,10 +282,8 @@ def truncate_per_graph(data, max_nodes: int, use_behavior_hint: bool = False):
         _warn_implicit_encoder_truncation_once(max_nodes)
 
     # Intrinsic, modality-independent priority: keep sensitive method nodes
-    # first (sensitivity is a property of the method itself). We deliberately do
-    # NOT prioritise by API alignment (method_api_edge_index): selecting graph
-    # nodes by their API links would duplicate API alignment information in the
-    # graph branch. Non-sensitive nodes
+    # first (sensitivity is a property of the method itself). No peer-modality
+    # metadata participates in graph selection. Non-sensitive nodes
     # keep their original (positional) order within each graph.
     sensitive_mask = getattr(data, "sensitive_mask", None)
     if isinstance(sensitive_mask, torch.Tensor) and sensitive_mask.numel() == num_nodes_total:

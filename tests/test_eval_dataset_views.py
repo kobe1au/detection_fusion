@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 import fusion.train as train_module
@@ -61,55 +62,6 @@ def test_eval_perturbation_views_share_validated_index_without_mutating_base():
     assert base.eval_perturb_strength == 0.0
 
 
-def test_robust_val_loaders_reuse_base_dataset_without_build_dataset(monkeypatch):
-    base = _validated_val_dataset_stub()
-    cfg = {
-        "eval": {
-            "robust_val": {
-                "enabled": True,
-                "scenarios": [
-                    {
-                        "name": "api_drop",
-                        "perturb_type": "api_event_dropout",
-                        "strength": 0.4,
-                        "weight": 1.0,
-                    },
-                    {
-                        "name": "graph_sparse",
-                        "perturb_type": "graph_sparsify",
-                        "strength": 0.6,
-                        "weight": 1.0,
-                    },
-                ],
-            }
-        },
-        "train": {},
-    }
-
-    def forbidden_build_dataset(*args, **kwargs):
-        raise AssertionError("validated eval views must not rebuild/rescan the dataset")
-
-    monkeypatch.setattr(train_module, "build_dataset", forbidden_build_dataset)
-    monkeypatch.setattr(
-        train_module,
-        "build_loader",
-        lambda cfg, dataset, is_train, **kwargs: dataset,
-    )
-
-    items = train_module.build_robust_val_loaders(cfg, base, [1])
-
-    assert [item["name"] for item in items] == ["api_drop", "graph_sparse"]
-    views = [item["loader"].dataset for item in items]
-    assert all(isinstance(item["loader"], Subset) for item in items)
-    assert all(item["loader"].indices == [1] for item in items)
-    assert all(view.samples is base.samples for view in views)
-    assert [view.eval_perturb_type for view in views] == [
-        "api_event_dropout",
-        "graph_sparsify",
-    ]
-    assert base.eval_perturb_type is None
-
-
 def test_robust_test_loaders_reuse_validated_test_dataset_and_preserve_sweep(monkeypatch):
     base = _validated_val_dataset_stub()
     cfg = {
@@ -118,7 +70,7 @@ def test_robust_test_loaders_reuse_validated_test_dataset_and_preserve_sweep(mon
                 "clean",
                 "api_event_dropout",
                 "api_missing",
-                "modality_dropout_graph",
+                "graph_missing",
             ],
             "perturb_strengths": [0.2, 0.7],
         },
@@ -143,7 +95,7 @@ def test_robust_test_loaders_reuse_validated_test_dataset_and_preserve_sweep(mon
         "api_event_dropout_s0.2",
         "api_event_dropout_s0.7",
         "api_missing",
-        "modality_dropout_graph",
+        "graph_missing",
     ]
     assert items[0]["loader"] is None
     views = [item["loader"] for item in items[1:]]
@@ -154,7 +106,7 @@ def test_robust_test_loaders_reuse_validated_test_dataset_and_preserve_sweep(mon
         "api_event_dropout",
         "api_event_dropout",
         "api_missing",
-        "modality_dropout_graph",
+        "graph_missing",
     ]
     assert [view.eval_perturb_strength for view in views] == [0.2, 0.7, 1.0, 1.0]
     assert all(is_train is False for _, is_train, _ in loader_calls)
@@ -163,12 +115,94 @@ def test_robust_test_loaders_reuse_validated_test_dataset_and_preserve_sweep(mon
     assert base.eval_perturb_strength == 0.0
 
 
+@pytest.mark.parametrize(
+    ("eval_cfg", "message"),
+    [
+        ({"perturb_tests": []}, "non-empty sequence"),
+        (
+            {"perturb_tests": ["clean", "clean"]},
+            "contains duplicates",
+        ),
+        (
+            {"perturb_tests": ["not_a_real_transform"]},
+            "unsupported mechanisms",
+        ),
+        (
+            {
+                "perturb_tests": ["clean"],
+                "perturb_strengths": [0.3, 0.3],
+            },
+            "contains duplicates",
+        ),
+        (
+            {
+                "perturb_tests": ["clean"],
+                "perturb_strengths": [0.3, 0.30000001],
+            },
+            "collide after result-key formatting",
+        ),
+        (
+            {
+                "perturb_tests": ["clean"],
+                "perturb_strengths": [],
+            },
+            "non-empty sequence",
+        ),
+        (
+            {
+                "perturb_tests": ["clean"],
+                "perturb_strengths": [True],
+            },
+            "not booleans",
+        ),
+        (
+            {
+                "perturb_tests": ["clean"],
+                "perturb_strengths": [1.1],
+            },
+            "within \\[0, 1\\]",
+        ),
+    ],
+)
+def test_robust_test_protocol_rejects_ambiguous_or_invalid_cells(eval_cfg, message):
+    with pytest.raises(ValueError, match=message):
+        train_module._normalize_robust_test_protocol(eval_cfg)
+
+
+def test_formal_robust_test_protocol_has_19_unique_result_cells():
+    cfg = train_module.load_config(
+        ["config/experiments/tri_modal_robust/seeds/seed_42.yaml"]
+    )
+    perturbations, strengths = train_module._normalize_robust_test_protocol(
+        cfg["eval"]
+    )
+
+    assert perturbations == [
+        "clean",
+        "api_event_dropout",
+        "graph_sparsify",
+        "manifest_permission_mask",
+        "api_missing",
+        "graph_missing",
+        "manifest_missing",
+    ]
+    assert strengths == [0.1, 0.3, 0.5, 0.7, 0.9]
+    assert train_module._robust_test_result_count(perturbations, strengths) == 19
+
+
 def test_reliability_loaders_reuse_base_dataset_and_keep_views_independent(monkeypatch):
     base = _validated_val_dataset_stub()
     cfg = {
-        "calibration": {"perturb_strengths": [0.5]},
+        "calibration": {
+            "fit_perturbations": [
+                "api_event_dropout",
+                "graph_sparsify",
+                "manifest_permission_mask",
+            ],
+            "perturb_strengths": [0.5],
+        },
         "fusion": {
-            "combination": "linear",
+            "combination": "dempster",
             "reliability_calibration": {"enabled": True},
         },
         "robust": {},

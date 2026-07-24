@@ -16,41 +16,31 @@ from torch_geometric.data import Batch, Data
 from fusion.perturbations import (
     EVAL_PERTURB_TYPES,
     apply_perturbation,
-    sample_training_perturbation,
 )
 from fusion.semantic_categories import (
     SEMANTIC_CATEGORY_DIM,
-    api_semantic_counts_from_type_ids,
-    graph_semantic_counts_from_method_api_edges,
     sanitize_semantic_counts,
 )
 from fusion.quality import (
-    OBSERVABLE_ERROR_FIELDS,
-    OBSERVABLE_NUMERIC_FIELDS,
     OBSERVABLE_REQUIRED_FIELDS,
     OBSERVABLE_SCHEMA_VERSION,
-    OBSERVABLE_SIGNAL_FIELDS,
-    compute_api_quality,
-    compute_graph_quality,
-    compute_align_quality,
-    refresh_observable_signals,
+    refresh_hard_availability,
 )
 from fusion.pt_schema import CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS, PT_SCHEMA_VERSION
-from fusion.utils import scalar_float, strict_binary_integer, strict_finite_integer
+from fusion.utils import strict_binary_integer, strict_finite_integer
 
 logger = logging.getLogger(__name__)
 
 
-VALID_GRAPH_SEMANTIC_SOURCES = ("alignment", "full_api", "zero")
-
-
 def apply_graph_encoder_budget(
     data: dict[str, Any],
-    max_nodes: int | None,
-    graph_semantic_source: str,
+    max_nodes: int,
 ) -> dict[str, Any]:
-    """Apply the model's per-sample graph budget before evidence is refreshed."""
-    runtime_budget = int(max_nodes) if max_nodes is not None and max_nodes > 0 else 0
+    """Apply the one declared dataset/encoder graph-node budget."""
+
+    if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes <= 0:
+        raise ValueError("max_nodes must be one positive integer")
+    runtime_budget = int(max_nodes)
     # Runtime-only contract consumed by the graph encoder.  It prevents a
     # silently different second truncation when dataset and encoder budgets
     # drift apart; no APK-derived PT field is changed or required.
@@ -59,11 +49,7 @@ def apply_graph_encoder_budget(
     if not isinstance(x, torch.Tensor) or x.ndim != 2:
         return data
     storage_nodes = int(x.size(0))
-    raw_integrity = float(data.get("graph_integrity", data.get("q_graph", 0.0)))
-    if max_nodes is None or max_nodes <= 0 or storage_nodes <= max_nodes:
-        data["graph_encoder_coverage"] = 1.0
-        data["graph_truncated_by_encoder_budget"] = 0.0
-        data["graph_integrity_before_encoder_budget"] = raw_integrity
+    if storage_nodes <= max_nodes:
         return data
 
     # Graph message passing is order-insensitive, so retain security-relevant
@@ -92,17 +78,21 @@ def apply_graph_encoder_budget(
     )
     keep = torch.cat(priority_parts, dim=0)[:max_nodes]
     keep = keep.sort().values.long()
-    mapping = torch.full((storage_nodes,), -1, dtype=torch.long)
-    mapping[keep] = torch.arange(max_nodes, dtype=torch.long)
+    mapping = torch.full(
+        (storage_nodes,), -1, dtype=torch.long, device=x.device
+    )
+    mapping[keep] = torch.arange(
+        max_nodes, dtype=torch.long, device=x.device
+    )
     data["x"] = x[keep]
-    for key in ("sensitive_mask", "real_node_mask", "mask"):
+    for key in ("sensitive_mask", "real_node_mask"):
         value = data.get(key)
         if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.size(0) == storage_nodes:
-            data[key] = value[keep]
+            data[key] = value[keep.to(value.device)]
 
     edge = data.get("edge_index")
     if isinstance(edge, torch.Tensor) and edge.ndim == 2 and edge.size(0) == 2:
-        edge = edge.long()
+        edge = edge.long().to(x.device)
         valid = (
             (edge[0] >= 0)
             & (edge[0] < storage_nodes)
@@ -115,80 +105,7 @@ def apply_graph_encoder_budget(
         retained = (src >= 0) & (dst >= 0)
         data["edge_index"] = torch.stack([src[retained], dst[retained]], dim=0)
 
-    method_edge = data.get("method_api_edge_index")
-    if isinstance(method_edge, torch.Tensor) and method_edge.ndim == 2 and method_edge.size(0) == 2:
-        method_edge = method_edge.long()
-        valid = (method_edge[0] >= 0) & (method_edge[0] < storage_nodes)
-        method_edge = method_edge[:, valid]
-        retained_src = mapping[method_edge[0]]
-        retained = retained_src >= 0
-        data["method_api_edge_index"] = torch.stack(
-            [retained_src[retained], method_edge[1, retained]], dim=0
-        )
-
-    api_method_index = data.get("api_method_index")
-    if isinstance(api_method_index, torch.Tensor):
-        api_method_index = api_method_index.long().view(-1)
-        valid = (api_method_index >= 0) & (api_method_index < storage_nodes)
-        mapped = torch.full_like(api_method_index, -1)
-        mapped[valid] = mapping[api_method_index[valid]]
-        data["api_method_index"] = mapped
-
-    api_ids = data.get("api_ids")
-    num_api = int(api_ids.numel()) if isinstance(api_ids, torch.Tensor) else 0
-    api_in_graph = torch.zeros((num_api,), dtype=torch.float32)
-    retained_method_edge = data.get("method_api_edge_index")
-    if (
-        isinstance(retained_method_edge, torch.Tensor)
-        and retained_method_edge.ndim == 2
-        and retained_method_edge.size(0) == 2
-        and retained_method_edge.numel() > 0
-    ):
-        dst = retained_method_edge[1].long()
-        dst = dst[(dst >= 0) & (dst < num_api)]
-        if dst.numel() > 0:
-            api_in_graph[dst.unique()] = 1.0
-    data["api_in_graph_mask"] = api_in_graph
-
-    api_types = data.get("api_type_ids")
-    if graph_semantic_source == "alignment":
-        data["graph_semantic_category_counts"] = graph_semantic_counts_from_method_api_edges(
-            api_types, data.get("method_api_edge_index")
-        )
-    elif graph_semantic_source == "full_api":
-        data["graph_semantic_category_counts"] = data["api_semantic_category_counts"].clone()
-    else:
-        data["graph_semantic_category_counts"] = torch.zeros(
-            (SEMANTIC_CATEGORY_DIM,), dtype=torch.float32
-        )
-    data["graph_category_counts"] = data["graph_semantic_category_counts"]
-
-    real_mask = data.get("real_node_mask")
-    data["real_num_nodes"] = (
-        int(real_mask.bool().sum().item())
-        if isinstance(real_mask, torch.Tensor)
-        else int(data["x"].size(0))
-    )
-    data["graph_encoder_coverage"] = float(max_nodes / storage_nodes)
-    data["graph_truncated_by_encoder_budget"] = 1.0
-    data["graph_integrity_before_encoder_budget"] = raw_integrity
-    refresh_observable_signals(data)
-
-    # Encoder truncation is a visibility constraint, not a parse/extraction
-    # failure. Preserve the pre-budget graph integrity as q_graph and
-    # let graph_encoder_coverage account for the lost visibility exactly once.
-    graph_integrity = max(0.0, min(1.0, raw_integrity))
-    data["graph_integrity"] = graph_integrity
-    data["q_graph"] = graph_integrity
-    data["code_integrity"] = math.sqrt(
-        max(0.0, float(data["api_integrity"]) * graph_integrity)
-    )
-    graph_coverage = max(0.0, min(1.0, float(data["graph_encoder_coverage"])))
-
-    data["effective_graph_integrity"] = graph_integrity * graph_coverage
-    data["effective_code_integrity"] = math.sqrt(
-        max(0.0, float(data["api_integrity"]) * data["effective_graph_integrity"])
-    )
+    refresh_hard_availability(data)
     return data
 
 class FatalDatasetConfigError(RuntimeError):
@@ -282,13 +199,6 @@ def _as_category_map(value, rows: int, columns: int = SEMANTIC_CATEGORY_DIM) -> 
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def _first_present(sources: list[dict[str, Any]], key: str):
-    for src in sources:
-        if isinstance(src, dict) and key in src and src[key] is not None:
-            return src[key]
-    return None
-
-
 def _validate_current_pt_payload(
     raw: Any,
     pt_path: str | Path,
@@ -360,28 +270,6 @@ def _validate_current_pt_payload(
     return dex_list, [raw, *dex_list]
 
 
-def apply_dex_success_ratio(data: dict[str, Any], sources: list[dict[str, Any]]) -> None:
-    """Penalize code-side quality when only part of a multi-DEX APK parsed."""
-    direct_meta = _first_present(sources, "direct_build_meta")
-    if not isinstance(direct_meta, dict):
-        return
-    success_ratio = float(direct_meta.get("dex_success_ratio", 1.0))
-    if not math.isfinite(success_ratio):
-        success_ratio = 0.0
-    success_ratio = max(0.0, min(1.0, success_ratio))
-    if success_ratio >= 1.0:
-        return
-    data["q_api"] *= success_ratio
-    data["q_graph"] *= success_ratio
-    data["q_align"] = compute_align_quality(
-        data["q_api"],
-        data["q_graph"],
-        data["method_api_edge_index"],
-        int(data["real_num_nodes"]),
-        int(data["api_ids"].numel()),
-    )
-
-
 class RobustTriModalDataset(Dataset):
     """Standalone API + Graph + Manifest dataset for robust fusion."""
 
@@ -390,13 +278,10 @@ class RobustTriModalDataset(Dataset):
         pt_dir: str,
         csv_path: str,
         is_train: bool = True,
-        robust_aug: bool = False,
-        perturb_prob: float = 0.5,
-        perturb_strengths: list[float] | tuple[float, ...] | None = None,
         eval_perturb_type: str | None = None,
         eval_perturb_strength: float = 0.0,
         max_api_events_per_sample: int | None = None,
-        max_graph_nodes_per_sample: int | None = None,
+        max_graph_nodes_per_sample: int = 12288,
         manifest_dim: int = 256,
         manifest_category_dim: int = 12,
         manifest_stats_dim: int = 11,
@@ -404,7 +289,6 @@ class RobustTriModalDataset(Dataset):
         manifest_intent_dim: int = 64,
         manifest_feature_dim: int = 32,
         drop_graph_behavior_hints: bool = False,
-        graph_semantic_source: str = "alignment",
         num_classes: int = 2,
         label_map: dict | None = None,
         strict_split_integrity: bool = True,
@@ -412,23 +296,14 @@ class RobustTriModalDataset(Dataset):
         expected_manifest_vocab_sha256: str | None = None,
         expected_manifest_train_csv_sha256: str | None = None,
         expected_manifest_train_sample_ids_sha256: str | None = None,
+        expected_pt_build_fingerprint: str | None = None,
     ):
         if eval_perturb_type not in EVAL_PERTURB_TYPES:
             raise ValueError(f"Unsupported eval_perturb_type: {eval_perturb_type}")
         self.pt_dir = Path(pt_dir)
         self.is_train = bool(is_train)
-        self.robust_aug = bool(robust_aug)
-        self.perturb_prob = float(perturb_prob)
-        self.perturb_strengths = list(perturb_strengths or [0.1, 0.3, 0.5])
         self.eval_perturb_type = eval_perturb_type
         self.eval_perturb_strength = float(eval_perturb_strength)
-        if not math.isfinite(self.perturb_prob) or not 0.0 <= self.perturb_prob <= 1.0:
-            raise ValueError(f"perturb_prob must be within [0, 1], got {self.perturb_prob}")
-        if not self.perturb_strengths or any(
-            not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
-            for value in self.perturb_strengths
-        ):
-            raise ValueError(f"perturb_strengths must be a non-empty list within [0, 1], got {self.perturb_strengths}")
         if not math.isfinite(self.eval_perturb_strength) or not 0.0 <= self.eval_perturb_strength <= 1.0:
             raise ValueError(
                 f"eval_perturb_strength must be within [0, 1], got {self.eval_perturb_strength}"
@@ -441,14 +316,13 @@ class RobustTriModalDataset(Dataset):
             if max_api_events_per_sample is not None
             else None
         )
-        self.max_graph_nodes_per_sample = (
-            int(max_graph_nodes_per_sample)
-            if max_graph_nodes_per_sample is not None
-            else None
+        self.max_graph_nodes_per_sample = strict_finite_integer(
+            max_graph_nodes_per_sample,
+            field_name="max_graph_nodes_per_sample",
         )
         if self.max_api_events_per_sample is not None and self.max_api_events_per_sample <= 0:
             raise ValueError("max_api_events_per_sample must be positive; use None for no limit")
-        if self.max_graph_nodes_per_sample is not None and self.max_graph_nodes_per_sample <= 0:
+        if self.max_graph_nodes_per_sample <= 0:
             raise ValueError("max_graph_nodes_per_sample must be positive")
         self.manifest_dim = int(manifest_dim)
         if int(manifest_category_dim) != SEMANTIC_CATEGORY_DIM:
@@ -462,15 +336,21 @@ class RobustTriModalDataset(Dataset):
         self.manifest_intent_dim = int(manifest_intent_dim)
         self.manifest_feature_dim = int(manifest_feature_dim)
         self.drop_graph_behavior_hints = bool(drop_graph_behavior_hints)
-        src = str(graph_semantic_source or "alignment").lower()
-        if src not in VALID_GRAPH_SEMANTIC_SOURCES:
-            raise ValueError(
-                f"Unsupported graph_semantic_source={graph_semantic_source!r}; "
-                f"must be one of {VALID_GRAPH_SEMANTIC_SOURCES}"
-            )
-        self.graph_semantic_source = src
         self.strict_split_integrity = bool(strict_split_integrity)
         self.allow_pt_superset = bool(allow_pt_superset)
+        self.expected_pt_build_fingerprint = str(
+            expected_pt_build_fingerprint or ""
+        ).strip().lower()
+        if self.expected_pt_build_fingerprint and (
+            len(self.expected_pt_build_fingerprint) != 64
+            or any(
+                char not in "0123456789abcdef"
+                for char in self.expected_pt_build_fingerprint
+            )
+        ):
+            raise ValueError(
+                "expected_pt_build_fingerprint must be a lowercase SHA-256 digest"
+            )
         manifest_provenance = {
             "manifest_vocab_sha256": expected_manifest_vocab_sha256,
             "manifest_train_csv_sha256": expected_manifest_train_csv_sha256,
@@ -694,6 +574,25 @@ class RobustTriModalDataset(Dataset):
                 f"mismatches={mismatches}"
             )
 
+    def _validate_pt_build_fingerprint(
+        self,
+        raw: dict[str, Any],
+        pt_path: str | Path,
+    ) -> None:
+        """Bind every consumed PT to the pre-registered extraction build."""
+
+        if not self.expected_pt_build_fingerprint:
+            return
+        direct_meta = raw.get("direct_build_meta") or {}
+        actual = str(direct_meta.get("build_fingerprint") or "").strip().lower()
+        if actual != self.expected_pt_build_fingerprint:
+            raise FatalDatasetConfigError(
+                "PT build fingerprint does not match "
+                "data.expected_pt_build_fingerprint: "
+                f"path={pt_path} expected={self.expected_pt_build_fingerprint!r} "
+                f"actual={actual!r}"
+            )
+
     def _infer_feature_dim(self, default_dim: int) -> int:
         for pt_file, _, _, _ in self.samples:
             try:
@@ -708,6 +607,7 @@ class RobustTriModalDataset(Dataset):
                     mmap=True,
                 )
                 dex_list, _ = _validate_current_pt_payload(raw, pt_file)
+                self._validate_pt_build_fingerprint(raw, pt_file)
                 self._validate_manifest_pt_provenance(raw, pt_file)
                 for dex in dex_list:
                     x = dex.get("call_x") if isinstance(dex, dict) else None
@@ -729,46 +629,17 @@ class RobustTriModalDataset(Dataset):
             y=torch.tensor(label, dtype=torch.long),
         )
         data.sensitive_mask = torch.zeros((1,), dtype=torch.uint8)
-        data.real_num_nodes = torch.tensor([0], dtype=torch.long)
-        data.real_node_mask = torch.zeros((1,), dtype=torch.bool)
         data.api_ids = torch.empty((0,), dtype=torch.long)
         data.api_type_ids = torch.empty((0,), dtype=torch.long)
         data.api_sensitive_mask = torch.empty((0,), dtype=torch.float32)
-        data.api_method_index = torch.empty((0,), dtype=torch.long)
-        data.api_in_graph_mask = torch.empty((0,), dtype=torch.float32)
-        data.method_api_edge_index = torch.empty((2, 0), dtype=torch.long)
-        data.api_semantic_category_counts = torch.zeros((self.manifest_category_dim,), dtype=torch.float32)
-        data.graph_semantic_category_counts = torch.zeros((self.manifest_category_dim,), dtype=torch.float32)
-        data.api_category_counts = data.api_semantic_category_counts.clone()
-        data.graph_category_counts = data.graph_semantic_category_counts.clone()
         data.graph_encoder_budget_max_nodes = torch.tensor(
-            [
-                int(self.max_graph_nodes_per_sample)
-                if self.max_graph_nodes_per_sample is not None
-                and self.max_graph_nodes_per_sample > 0
-                else 0
-            ],
+            [int(self.max_graph_nodes_per_sample)],
             dtype=torch.long,
         )
         data.manifest_x = torch.zeros((1, self.manifest_dim), dtype=torch.float32)
-        data.manifest_permission_ids = torch.empty((0,), dtype=torch.long)
-        data.manifest_intent_ids = torch.empty((0,), dtype=torch.long)
-        data.manifest_category_counts = torch.zeros((self.manifest_category_dim,), dtype=torch.float32)
-        data.manifest_stats = torch.zeros((self.manifest_stats_dim,), dtype=torch.float32)
-        data.q_api = torch.tensor([0.0], dtype=torch.float32)
-        data.q_graph = torch.tensor([0.0], dtype=torch.float32)
-        data.q_manifest = torch.tensor([0.0], dtype=torch.float32)
-        data.q_align = torch.tensor([0.0], dtype=torch.float32)
-        data.pert_api = torch.tensor([1.0], dtype=torch.float32)
-        data.pert_graph = torch.tensor([1.0], dtype=torch.float32)
-        data.pert_manifest = torch.tensor([1.0], dtype=torch.float32)
-        for key in OBSERVABLE_NUMERIC_FIELDS:
-            setattr(data, key, torch.tensor([0.0], dtype=torch.float32))
-        for key in OBSERVABLE_SIGNAL_FIELDS:
-            setattr(data, key, torch.tensor([0.0], dtype=torch.float32))
-        for key in OBSERVABLE_ERROR_FIELDS:
-            setattr(data, key, reason)
-        data.schema_version = "dummy"
+        data.api_alive = torch.tensor([0.0], dtype=torch.float32)
+        data.graph_alive = torch.tensor([0.0], dtype=torch.float32)
+        data.manifest_alive = torch.tensor([0.0], dtype=torch.float32)
         data.sid = sid
         data.year = torch.tensor(int(year), dtype=torch.long)
         data.is_dummy = True
@@ -816,29 +687,18 @@ class RobustTriModalDataset(Dataset):
 
     def _limit_api_events(self, parts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         n = int(parts["api_ids"].numel())
-        parts["api_event_count_before_encoder_budget"] = n
-        parts["api_event_count_after_encoder_budget"] = n
-        parts["api_runtime_encoder_coverage"] = 1.0
-        parts["api_encoder_coverage"] = 1.0
-        parts["api_truncated_by_encoder_budget"] = 0.0
         if self.max_api_events_per_sample is None:
             return parts
         if n <= self.max_api_events_per_sample:
             return parts
         limit = max(0, int(self.max_api_events_per_sample))
-        parts["api_event_count_after_encoder_budget"] = limit
-        parts["api_runtime_encoder_coverage"] = float(limit / max(n, 1))
-        parts["api_encoder_coverage"] = parts["api_runtime_encoder_coverage"]
-        parts["api_truncated_by_encoder_budget"] = 1.0
         device = parts["api_ids"].device
         # Intrinsic, modality-independent priority: keep all sensitive API events
         # (a property of the API call itself), then fill the remaining budget
         # with a CONTIGUOUS prefix of the non-sensitive events. Contiguity is
         # essential -- the API branch is a sequence model that learns local
         # behavioural n-grams, so an even/strided subsample would shatter those
-        # patterns. We deliberately do NOT use api_in_graph_mask /
-        # method_api_edge_index here: making the kept API set depend on the graph
-        # would duplicate graph-derived selection evidence in the API branch.
+        # patterns. Selection is based only on API-local tensors.
         sensitive = parts.get("api_sensitive_mask")
         if isinstance(sensitive, torch.Tensor) and sensitive.numel() == n:
             sens_flag = sensitive.to(device).view(-1) > 0.5
@@ -852,28 +712,12 @@ class RobustTriModalDataset(Dataset):
             keep = keep.sort().values
         else:
             keep = torch.arange(limit, device=device)
-        for key in ("api_ids", "api_type_ids", "api_sensitive_mask", "api_method_index", "api_in_graph_mask"):
+        for key in ("api_ids", "api_type_ids", "api_sensitive_mask"):
             value = parts[key]
             parts[key] = value[keep.to(value.device)] if value.numel() > 0 else value[:0]
-        edge = parts["method_api_edge_index"]
-        if edge.numel() > 0:
-            mapping = torch.full((n,), -1, dtype=torch.long, device=edge.device)
-            keep_edge = keep.to(edge.device)
-            mapping[keep_edge] = torch.arange(keep_edge.numel(), dtype=torch.long, device=edge.device)
-            dst = edge[1].long()
-            valid = (dst >= 0) & (dst < n) & (mapping[dst.clamp(0, max(n - 1, 0))] >= 0)
-            edge = edge[:, valid].clone()
-            if edge.numel() > 0:
-                edge[1] = mapping[edge[1].long()]
-            parts["method_api_edge_index"] = edge
         return parts
 
-    @staticmethod
-    def _api_semantic_category_counts(api_type_ids: torch.Tensor) -> torch.Tensor:
-        return api_semantic_counts_from_type_ids(api_type_ids)
-
-
-    def _process_dex(self, dex: dict[str, Any], node_offset: int, api_offset: int):
+    def _process_dex(self, dex: dict[str, Any], node_offset: int):
         x = self._sanitize_call_x(dex.get("call_x"))
         orig_size = int(x.size(0))
         if orig_size == 0:
@@ -896,36 +740,11 @@ class RobustTriModalDataset(Dataset):
         num_api = int(api_ids.numel())
         api_type_ids = _as_long_tensor(dex.get("api_type_ids"), num_api, fill_value=0).clamp_min(0)
         api_sensitive = self._sanitize_mask(dex.get("api_sensitive_mask"), num_api, dtype=torch.float32).clamp(0.0, 1.0)
-        api_method_index = _as_long_tensor(dex.get("api_method_index"), num_api, fill_value=-1)
-        valid_method = (api_method_index >= 0) & (api_method_index < orig_size)
-        api_method_index = torch.where(api_method_index >= 0, api_method_index + node_offset, api_method_index)
-        api_method_index = torch.where(valid_method, api_method_index, torch.full_like(api_method_index, -1))
-        api_in_graph = self._sanitize_mask(dex.get("api_in_graph_mask"), num_api, dtype=torch.float32).clamp(0.0, 1.0)
-
-        method_api_edge_index = dex.get("method_api_edge_index")
-        if isinstance(method_api_edge_index, torch.Tensor) and method_api_edge_index.ndim == 2 and method_api_edge_index.size(0) == 2:
-            local_edge = method_api_edge_index.long()
-            valid = (
-                (local_edge[0] >= 0)
-                & (local_edge[0] < orig_size)
-                & (local_edge[1] >= 0)
-                & (local_edge[1] < num_api)
-            )
-            method_api_edge_index = local_edge[:, valid]
-            if method_api_edge_index.numel() > 0:
-                method_api_edge_index = method_api_edge_index.clone()
-                method_api_edge_index[0] += node_offset
-                method_api_edge_index[1] += api_offset
-        else:
-            method_api_edge_index = torch.empty((2, 0), dtype=torch.long)
 
         parts = {
             "api_ids": api_ids,
             "api_type_ids": api_type_ids,
             "api_sensitive_mask": api_sensitive,
-            "api_method_index": api_method_index,
-            "api_in_graph_mask": api_in_graph,
-            "method_api_edge_index": method_api_edge_index,
         }
         return {
             "x": x,
@@ -933,21 +752,17 @@ class RobustTriModalDataset(Dataset):
             "sensitive_mask": sensitive,
             "real_node_mask": real_node_mask,
             "num_nodes": n,
-            "real_nodes": orig_size,
-            "num_api": int(parts["api_ids"].numel()),
             **parts,
         }
 
     def _aggregate_api_graph(self, dex_list: list[dict[str, Any]]) -> dict[str, Any] | None:
         xs, edges, sens, real_masks = [], [], [], []
-        api_ids, api_types, api_sensitive, api_methods, api_in_graph, method_edges = [], [], [], [], [], []
+        api_ids, api_types, api_sensitive = [], [], []
         node_offset = 0
-        api_offset = 0
-        total_real_nodes = 0
         for dex in dex_list:
             if not isinstance(dex, dict):
                 continue
-            part = self._process_dex(dex, node_offset, api_offset)
+            part = self._process_dex(dex, node_offset)
             xs.append(part["x"])
             edges.append(part["edge_index"])
             sens.append(part["sensitive_mask"])
@@ -955,12 +770,7 @@ class RobustTriModalDataset(Dataset):
             api_ids.append(part["api_ids"])
             api_types.append(part["api_type_ids"])
             api_sensitive.append(part["api_sensitive_mask"])
-            api_methods.append(part["api_method_index"])
-            api_in_graph.append(part["api_in_graph_mask"])
-            method_edges.append(part["method_api_edge_index"])
             node_offset += int(part["num_nodes"])
-            api_offset += int(part["num_api"])
-            total_real_nodes += int(part.get("real_nodes", int(part["num_nodes"])))
         if not xs:
             return None
 
@@ -971,78 +781,25 @@ class RobustTriModalDataset(Dataset):
         final_api_ids = torch.cat([v for v in api_ids if v.numel() > 0], dim=0) if any(v.numel() > 0 for v in api_ids) else torch.empty((0,), dtype=torch.long)
         final_api_types = torch.cat([v for v in api_types if v.numel() > 0], dim=0) if any(v.numel() > 0 for v in api_types) else torch.empty((0,), dtype=torch.long)
         final_api_sensitive = torch.cat([v for v in api_sensitive if v.numel() > 0], dim=0) if any(v.numel() > 0 for v in api_sensitive) else torch.empty((0,), dtype=torch.float32)
-        final_api_methods = torch.cat([v for v in api_methods if v.numel() > 0], dim=0) if any(v.numel() > 0 for v in api_methods) else torch.empty((0,), dtype=torch.long)
-        final_api_in_graph = torch.cat([v for v in api_in_graph if v.numel() > 0], dim=0) if any(v.numel() > 0 for v in api_in_graph) else torch.empty((0,), dtype=torch.float32)
-        final_method_edges = torch.cat([e for e in method_edges if e.numel() > 0], dim=1) if any(e.numel() > 0 for e in method_edges) else torch.empty((2, 0), dtype=torch.long)
 
         api_parts = self._limit_api_events({
             "api_ids": final_api_ids,
             "api_type_ids": final_api_types,
             "api_sensitive_mask": final_api_sensitive,
-            "api_method_index": final_api_methods,
-            "api_in_graph_mask": final_api_in_graph,
-            "method_api_edge_index": final_method_edges,
         })
         final_api_ids = api_parts["api_ids"]
         final_api_types = api_parts["api_type_ids"]
         final_api_sensitive = api_parts["api_sensitive_mask"]
-        final_api_methods = api_parts["api_method_index"]
-        final_api_in_graph = api_parts["api_in_graph_mask"]
-        final_method_edges = api_parts["method_api_edge_index"]
-
-        q_api = compute_api_quality(final_api_ids, final_api_types, final_api_in_graph)
-        q_graph = compute_graph_quality(edge_index, total_real_nodes, x, real_node_mask)
-        if total_real_nodes <= 0:
-            q_graph = 0.0  # all nodes are zero-feature ghosts — no real graph signal
-        q_align = compute_align_quality(
-            q_api,
-            q_graph,
-            final_method_edges,
-            total_real_nodes,
-            int(final_api_ids.numel()),
-            int(x.size(0)),
-        )
-        api_semantic_counts = self._api_semantic_category_counts(final_api_types)
-        if self.graph_semantic_source == "alignment":
-            graph_semantic_counts = graph_semantic_counts_from_method_api_edges(
-                final_api_types,
-                final_method_edges,
-            )
-        elif self.graph_semantic_source == "full_api":
-            graph_semantic_counts = api_semantic_counts.clone()
-        else:  # "zero"
-            graph_semantic_counts = torch.zeros(
-                (SEMANTIC_CATEGORY_DIM,), dtype=torch.float32
-            )
         return {
             "x": x,
             "edge_index": edge_index,
             "sensitive_mask": sensitive_mask,
-            "real_num_nodes": total_real_nodes,
             "real_node_mask": real_node_mask,
             "api_ids": final_api_ids,
             "api_type_ids": final_api_types,
             "api_sensitive_mask": final_api_sensitive,
-            "api_method_index": final_api_methods,
-            "api_in_graph_mask": final_api_in_graph,
-            "method_api_edge_index": final_method_edges,
-            "api_semantic_category_counts": api_semantic_counts,
-            "api_category_counts": api_semantic_counts,
-            "graph_semantic_category_counts": graph_semantic_counts,
-            "graph_category_counts": graph_semantic_counts,
-            "q_api": q_api,
-            "q_graph": q_graph,
-            "q_align": q_align,
-            "api_event_count_before_encoder_budget": api_parts.get("api_event_count_before_encoder_budget", int(final_api_ids.numel())),
-            "api_event_count_after_encoder_budget": api_parts.get("api_event_count_after_encoder_budget", int(final_api_ids.numel())),
-            "api_runtime_encoder_coverage": api_parts.get("api_runtime_encoder_coverage", 1.0),
-            "api_encoder_coverage": api_parts.get("api_encoder_coverage", 1.0),
-            "api_truncated_by_encoder_budget": api_parts.get("api_truncated_by_encoder_budget", 0.0),
-            "pert_api": 0.0,
-            "pert_graph": 0.0,
             "api_aug_type": "none",
             "graph_aug_type": "none",
-            "mask": torch.empty((x.size(0), 0), dtype=torch.float32),
         }
 
     def _manifest_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1056,8 +813,6 @@ class RobustTriModalDataset(Dataset):
             "manifest_permission_category_map",
             "manifest_intent_category_map",
             "manifest_stats",
-            "q_manifest",
-            "pert_manifest",
         )
         invalid_tensors = [
             key for key in required_tensors if not isinstance(payload.get(key), torch.Tensor)
@@ -1085,7 +840,7 @@ class RobustTriModalDataset(Dataset):
         manifest_counts = sanitize_semantic_counts(
             payload["manifest_category_counts"], require_exact=True
         )
-        manifest_component_counts = sanitize_semantic_counts(
+        sanitize_semantic_counts(
             payload["manifest_component_category_counts"], require_exact=True
         )
         manifest_stats = _as_float_tensor(payload["manifest_stats"], self.manifest_stats_dim)
@@ -1110,31 +865,22 @@ class RobustTriModalDataset(Dataset):
         meta = payload["manifest_meta"]
         if not isinstance(meta, dict):
             raise FatalDatasetConfigError("Current PT manifest_meta must be a mapping")
-        q_manifest = float(torch.as_tensor(payload["q_manifest"]).float().view(-1)[0].item())
-        if not math.isfinite(q_manifest):
-            raise FatalDatasetConfigError("Current PT q_manifest must be finite")
-        pert_manifest = float(torch.as_tensor(payload["pert_manifest"]).float().view(-1)[0].item())
-        if not math.isfinite(pert_manifest):
-            raise FatalDatasetConfigError("Current PT pert_manifest must be finite")
-
+        permission_ids = _as_long_tensor(payload["manifest_permission_ids"])
+        _as_long_tensor(payload["manifest_intent_ids"])
+        permission_map = _as_category_map(
+            permission_map_raw,
+            permission_dim,
+        )
+        _as_category_map(intent_map_raw, intent_dim)
         return {
             "manifest_x": manifest_x,
-            "manifest_permission_ids": _as_long_tensor(payload["manifest_permission_ids"]),
-            "manifest_intent_ids": _as_long_tensor(payload["manifest_intent_ids"]),
-            "manifest_permission_category_map": _as_category_map(
-                permission_map_raw,
-                permission_dim,
-            ),
-            "manifest_intent_category_map": _as_category_map(
-                intent_map_raw,
-                intent_dim,
-            ),
+            # CPU-only state required to keep manifest_x internally consistent
+            # under manifest_permission_mask. None of these tensors reaches the
+            # model batch.
+            "manifest_permission_ids": permission_ids,
+            "manifest_permission_category_map": permission_map,
             "manifest_category_counts": manifest_counts,
-            "manifest_component_category_counts": manifest_component_counts,
             "manifest_stats": manifest_stats,
-            "manifest_meta": meta,
-            "q_manifest": max(0.0, min(1.0, q_manifest)),
-            "pert_manifest": max(0.0, min(1.0, pert_manifest)),
             "manifest_aug_type": "none",
             "manifest_permission_dim": permission_dim,
             "manifest_intent_dim": intent_dim,
@@ -1144,57 +890,21 @@ class RobustTriModalDataset(Dataset):
     def _to_data_object(self, data: dict[str, Any], label: int, sid: str, year: int) -> Data:
         obj = Data(x=data["x"], edge_index=data["edge_index"], y=torch.tensor(label, dtype=torch.long))
         obj.sensitive_mask = data["sensitive_mask"]
-        obj.real_num_nodes = torch.tensor([int(data.get("real_num_nodes", 0))], dtype=torch.long)
-        obj.real_node_mask = data["real_node_mask"].bool()
         obj.api_ids = data["api_ids"]
         obj.api_type_ids = data["api_type_ids"]
         obj.api_sensitive_mask = data["api_sensitive_mask"]
-        obj.api_method_index = data["api_method_index"]
-        obj.api_in_graph_mask = data["api_in_graph_mask"]
-        obj.method_api_edge_index = data["method_api_edge_index"]
-        obj.api_semantic_category_counts = data["api_semantic_category_counts"].float()
-        obj.graph_semantic_category_counts = data["graph_semantic_category_counts"].float()
-        obj.api_category_counts = obj.api_semantic_category_counts
-        obj.graph_category_counts = obj.graph_semantic_category_counts
-        obj.graph_encoder_coverage = torch.tensor(
-            [scalar_float(data.get("graph_encoder_coverage"), 1.0)], dtype=torch.float32
-        )
-        obj.graph_truncated_by_encoder_budget = torch.tensor(
-            [scalar_float(data.get("graph_truncated_by_encoder_budget"), 0.0)],
-            dtype=torch.float32,
-        )
-        obj.graph_integrity_before_encoder_budget = torch.tensor(
-            [
-                scalar_float(
-                    data.get("graph_integrity_before_encoder_budget"),
-                    data.get("graph_integrity", 0.0),
-                )
-            ],
-            dtype=torch.float32,
-        )
         obj.graph_encoder_budget_max_nodes = torch.tensor(
-            [int(data.get("graph_encoder_budget_max_nodes", 0))],
+            [int(data["graph_encoder_budget_max_nodes"])],
             dtype=torch.long,
         )
         obj.manifest_x = data["manifest_x"].float().view(1, -1)
-        obj.manifest_permission_ids = data["manifest_permission_ids"].long().view(-1)
-        obj.manifest_intent_ids = data["manifest_intent_ids"].long().view(-1)
-        obj.manifest_category_counts = data["manifest_category_counts"].float().view(-1)
-        obj.manifest_stats = data["manifest_stats"].float().view(-1)
-        obj.q_api = torch.tensor([data["q_api"]], dtype=torch.float32)
-        obj.q_graph = torch.tensor([data["q_graph"]], dtype=torch.float32)
-        obj.q_manifest = torch.tensor([data["q_manifest"]], dtype=torch.float32)
-        obj.q_align = torch.tensor([data["q_align"]], dtype=torch.float32)
-        obj.pert_api = torch.tensor([data["pert_api"]], dtype=torch.float32)
-        obj.pert_graph = torch.tensor([data["pert_graph"]], dtype=torch.float32)
-        obj.pert_manifest = torch.tensor([data["pert_manifest"]], dtype=torch.float32)
-        for key in OBSERVABLE_NUMERIC_FIELDS:
-            setattr(obj, key, torch.tensor([scalar_float(data.get(key), 0.0)], dtype=torch.float32))
-        for key in OBSERVABLE_SIGNAL_FIELDS:
-            setattr(obj, key, torch.tensor([scalar_float(data.get(key), 0.0)], dtype=torch.float32))
-        for key in OBSERVABLE_ERROR_FIELDS:
-            setattr(obj, key, str(data.get(key, "") or ""))
-        obj.schema_version = str(data.get("schema_version", "") or "")
+        obj.api_alive = torch.tensor([float(data["api_alive"])], dtype=torch.float32)
+        obj.graph_alive = torch.tensor(
+            [float(data["graph_alive"])], dtype=torch.float32
+        )
+        obj.manifest_alive = torch.tensor(
+            [float(data["manifest_alive"])], dtype=torch.float32
+        )
         obj.sid = sid
         obj.year = torch.tensor(int(year), dtype=torch.long)
         obj.is_dummy = False
@@ -1215,36 +925,31 @@ class RobustTriModalDataset(Dataset):
                 weights_only=True,
                 mmap=True,
             )
-            dex_list, sources = _validate_current_pt_payload(raw, pt_path)
+            dex_list, _sources = _validate_current_pt_payload(raw, pt_path)
+            self._validate_pt_build_fingerprint(raw, pt_path)
             self._validate_manifest_pt_provenance(raw, pt_path)
             data = self._aggregate_api_graph(dex_list)
             if data is None:
                 return self._dummy(label, sid, year, "empty valid sample", pt_path)
-            # _aggregate_api_graph applies the current encoder budget. Preserve
-            # those runtime values across the persisted observable-metadata
-            # merge below; PT metadata describes extraction time and may have
-            # been produced with a different (or unlimited) runtime budget.
-            runtime_api_budget = {
-                key: data[key]
-                for key in (
-                    "api_event_count_before_encoder_budget",
-                    "api_event_count_after_encoder_budget",
-                    "api_runtime_encoder_coverage",
-                    "api_truncated_by_encoder_budget",
-                )
-            }
-            apply_dex_success_ratio(data, sources)
             data.update(self._manifest_payload(raw))
-            data.update(raw["observable_metadata"])
-            data.update(runtime_api_budget)
-            # Runtime-only selector used to keep API perturbations and their
-            # graph-alignment-derived semantic histogram consistent.
-            data["graph_semantic_source"] = self.graph_semantic_source
-            refresh_observable_signals(data)
-            if self.robust_aug and self.is_train:
-                perturb_type, strength = sample_training_perturbation(self.perturb_prob, self.perturb_strengths)
-                data = apply_perturbation(data, perturb_type, strength)
-            elif not self.is_train and self.eval_perturb_type:
+            # Persisted quality/coverage fields remain schema-validated for PT
+            # provenance. Runtime fusion reads only parse state plus counts
+            # recomputed from the tensors that actually enter the encoders.
+            observable = raw["observable_metadata"]
+            for key in (
+                "api_parse_ok",
+                "dex_parse_ok",
+                "graph_parse_ok",
+                "graph_timeout",
+                "manifest_parse_ok",
+                "manifest_has_content",
+                "manifest_permission_count",
+                "manifest_component_count",
+                "manifest_intent_count",
+            ):
+                data[key] = observable[key]
+            refresh_hard_availability(data)
+            if not self.is_train and self.eval_perturb_type:
                 # Keep aggregate perturbation subtypes stable across strength sweeps.
                 seed = _stable_seed(sid, self.eval_perturb_type)
                 with _temporary_random_seed(seed):
@@ -1252,7 +957,6 @@ class RobustTriModalDataset(Dataset):
             data = apply_graph_encoder_budget(
                 data,
                 self.max_graph_nodes_per_sample,
-                self.graph_semantic_source,
             )
             obj = self._to_data_object(data, label, sid, year)
             # Runtime-only isolation metadata from the split CSV. It is not
@@ -1289,7 +993,6 @@ def robust_collate_fn(data_list):
             "sids": None,
             "sample_groups": None,
             "years": None,
-            "quality": None,
             "failed_items": failed_items,
             "num_failed": len(failed_items),
             "num_valid": 0,
@@ -1306,20 +1009,16 @@ def robust_collate_fn(data_list):
     labels = torch.stack([d.y for d in valid_items])
     graph_list = []
     api_ids_all, api_type_all, api_sensitive_all, api_batch_all = [], [], [], []
-    api_method_all, api_in_graph_all, method_edges_all = [], [], []
-    api_counts, graph_counts, manifest_counts, manifest_xs, manifest_stats = [], [], [], [], []
-    perm_ids_all, perm_batch_all, intent_ids_all, intent_batch_all = [], [], [], []
-    observable_numeric = {key: [] for key in OBSERVABLE_NUMERIC_FIELDS}
-    observable_signals = {key: [] for key in OBSERVABLE_SIGNAL_FIELDS}
-    observable_errors = {key: [] for key in OBSERVABLE_ERROR_FIELDS}
-    observable_versions: list[str] = []
+    manifest_xs = []
+    availability_values = {
+        "api_alive": [],
+        "graph_alive": [],
+        "manifest_alive": [],
+    }
     graph_budget_values: list[int] = []
     graph_node_counts: list[int] = []
-    node_offset = 0
-    api_offset = 0
-
     for sample_idx, d in enumerate(valid_items):
-        gd = Data(x=d.x, edge_index=d.edge_index, y=d.y)
+        gd = Data(x=d.x, edge_index=d.edge_index)
         gd.sensitive_mask = d.sensitive_mask
         graph_budget = torch.as_tensor(
             getattr(d, "graph_encoder_budget_max_nodes", 0),
@@ -1341,40 +1040,10 @@ def robust_collate_fn(data_list):
             api_type_all.append(d.api_type_ids.long())
             api_sensitive_all.append(d.api_sensitive_mask.float())
             api_batch_all.append(torch.full((n_api,), sample_idx, dtype=torch.long, device=d.api_ids.device))
-            method_idx = d.api_method_index.long().clone()
-            valid_method = method_idx >= 0
-            method_idx[valid_method] += node_offset
-            api_method_all.append(method_idx)
-            api_in_graph_all.append(d.api_in_graph_mask.float())
-            edge = d.method_api_edge_index
-            if isinstance(edge, torch.Tensor) and edge.numel() > 0:
-                edge = edge.long().clone()
-                edge[0] += node_offset
-                edge[1] += api_offset
-                method_edges_all.append(edge)
 
-        api_counts.append(getattr(d, "api_semantic_category_counts", d.api_category_counts).float())
-        graph_counts.append(getattr(d, "graph_semantic_category_counts", d.graph_category_counts).float())
-        manifest_counts.append(d.manifest_category_counts.float())
         manifest_xs.append(d.manifest_x.float().view(1, -1))
-        manifest_stats.append(d.manifest_stats.float().view(-1))
-        for key in OBSERVABLE_NUMERIC_FIELDS:
-            observable_numeric[key].append(getattr(d, key).float().view(-1)[:1])
-        for key in OBSERVABLE_SIGNAL_FIELDS:
-            observable_signals[key].append(getattr(d, key).float().view(-1)[:1])
-        for key in OBSERVABLE_ERROR_FIELDS:
-            observable_errors[key].append(str(getattr(d, key, "") or ""))
-        observable_versions.append(str(getattr(d, "schema_version", "") or ""))
-
-        if d.manifest_permission_ids.numel() > 0:
-            perm_ids_all.append(d.manifest_permission_ids.long())
-            perm_batch_all.append(torch.full((d.manifest_permission_ids.numel(),), sample_idx, dtype=torch.long, device=d.x.device))
-        if d.manifest_intent_ids.numel() > 0:
-            intent_ids_all.append(d.manifest_intent_ids.long())
-            intent_batch_all.append(torch.full((d.manifest_intent_ids.numel(),), sample_idx, dtype=torch.long, device=d.x.device))
-
-        node_offset += int(d.x.size(0))
-        api_offset += n_api
+        for key in availability_values:
+            availability_values[key].append(getattr(d, key).float().view(-1)[:1])
 
     graph_batch = Batch.from_data_list(graph_list)
     if (
@@ -1399,42 +1068,10 @@ def robust_collate_fn(data_list):
     graph_batch.api_type_ids = torch.cat(api_type_all).long() if api_type_all else torch.empty((0,), dtype=torch.long, device=device)
     graph_batch.api_sensitive_mask = torch.cat(api_sensitive_all).float() if api_sensitive_all else torch.empty((0,), dtype=torch.float32, device=device)
     graph_batch.api_batch = torch.cat(api_batch_all).long() if api_batch_all else torch.empty((0,), dtype=torch.long, device=device)
-    graph_batch.api_method_index = torch.cat(api_method_all).long() if api_method_all else torch.empty((0,), dtype=torch.long, device=device)
-    graph_batch.api_in_graph_mask = torch.cat(api_in_graph_all).float() if api_in_graph_all else torch.empty((0,), dtype=torch.float32, device=device)
-    graph_batch.method_api_edge_index = torch.cat(method_edges_all, dim=1).long() if method_edges_all else torch.empty((2, 0), dtype=torch.long, device=device)
-    graph_batch.api_semantic_category_counts = torch.stack(api_counts).float()
-    graph_batch.graph_semantic_category_counts = torch.stack(graph_counts).float()
-    graph_batch.api_category_counts = graph_batch.api_semantic_category_counts
-    graph_batch.graph_category_counts = graph_batch.graph_semantic_category_counts
     graph_batch.manifest_x = torch.cat(manifest_xs, dim=0).float()
-    graph_batch.manifest_category_counts = torch.stack(manifest_counts).float()
-    graph_batch.manifest_stats = torch.stack(manifest_stats).float()
-    graph_batch.manifest_permission_ids = torch.cat(perm_ids_all).long() if perm_ids_all else torch.empty((0,), dtype=torch.long, device=device)
-    graph_batch.manifest_permission_batch = torch.cat(perm_batch_all).long() if perm_batch_all else torch.empty((0,), dtype=torch.long, device=device)
-    graph_batch.manifest_intent_ids = torch.cat(intent_ids_all).long() if intent_ids_all else torch.empty((0,), dtype=torch.long, device=device)
-    graph_batch.manifest_intent_batch = torch.cat(intent_batch_all).long() if intent_batch_all else torch.empty((0,), dtype=torch.long, device=device)
 
-    q_api = torch.stack([d.q_api for d in valid_items])
-    q_graph = torch.stack([d.q_graph for d in valid_items])
-    q_manifest = torch.stack([d.q_manifest for d in valid_items])
-    q_align = torch.stack([d.q_align for d in valid_items])
-    pert_api = torch.stack([d.pert_api for d in valid_items])
-    pert_graph = torch.stack([d.pert_graph for d in valid_items])
-    pert_manifest = torch.stack([d.pert_manifest for d in valid_items])
-    graph_batch.q_api = q_api
-    graph_batch.q_graph = q_graph
-    graph_batch.q_manifest = q_manifest
-    graph_batch.q_align = q_align
-    graph_batch.pert_api = pert_api
-    graph_batch.pert_graph = pert_graph
-    graph_batch.pert_manifest = pert_manifest
-    for key, values in observable_numeric.items():
+    for key, values in availability_values.items():
         setattr(graph_batch, key, torch.stack(values).float())
-    for key, values in observable_signals.items():
-        setattr(graph_batch, key, torch.stack(values).float())
-    graph_batch.observable_errors = observable_errors
-    graph_batch.observable_schema_versions = observable_versions
-    graph_batch.years = years
 
     return {
         "graph_batch": graph_batch,
@@ -1445,27 +1082,6 @@ def robust_collate_fn(data_list):
         "graph_aug_types": graph_aug_types,
         "manifest_aug_types": manifest_aug_types,
         "years": years,
-        "quality": {
-            "q_api": q_api,
-            "q_graph": q_graph,
-            "q_manifest": q_manifest,
-            "q_align": q_align,
-            "pert_api": pert_api,
-            "pert_graph": pert_graph,
-            "pert_manifest": pert_manifest,
-            **{
-                key: getattr(graph_batch, key)
-                for key in OBSERVABLE_SIGNAL_FIELDS
-            },
-        },
-        "observable_metadata": {
-            **{
-                key: getattr(graph_batch, key)
-                for key in OBSERVABLE_NUMERIC_FIELDS
-            },
-            **observable_errors,
-            "schema_version": observable_versions,
-        },
         "failed_items": failed_items,
         "num_failed": len(failed_items),
         "num_valid": len(valid_items),
@@ -1476,9 +1092,7 @@ def prepare_robust_batch(batch: dict[str, Any], device: torch.device):
     graph = batch.get("graph_batch")
     labels = batch.get("labels")
     if graph is None or labels is None:
-        return None, None, None, None, int(batch.get("num_failed", 0))
+        return None, None, None, int(batch.get("num_failed", 0))
     graph = graph.to(device, non_blocking=True)
     labels = labels.to(device, non_blocking=True)
-    quality = batch.get("quality") or {}
-    quality = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in quality.items()}
-    return graph, labels, batch.get("sids"), quality, int(batch.get("num_failed", 0))
+    return graph, labels, batch.get("sids"), int(batch.get("num_failed", 0))

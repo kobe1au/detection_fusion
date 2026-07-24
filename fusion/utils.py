@@ -13,18 +13,6 @@ logger = logging.getLogger(__name__)
 
 # ── shared numeric helpers ────────────────────────────────────────────
 
-def scalar_float(value, default: float = 0.0) -> float:
-    """Extract a Python float from a tensor / scalar / number, with a safe fallback."""
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 0:
-            return float(default)
-        return float(value.detach().float().view(-1)[0].item())
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
-
-
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 

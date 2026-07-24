@@ -12,5 +12,5 @@ fusion:
     # Atomic u ablation: retain learned pi but replace its learned risk head with
     # the deterministic I1 reliability deficit.
     risk_mode: reliability_prior
-    risk_target: reliability_deficit_score
+    risk_target: threshold_malware_false_negative
     risk_loss_weight: 0.0

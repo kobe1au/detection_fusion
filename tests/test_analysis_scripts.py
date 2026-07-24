@@ -9,7 +9,6 @@ import yaml
 
 from scripts.analyze_reliability_evidence import (
     evidence_bin_effects_table,
-    natural_degradation_subset_table,
     reliability_signal_diagnostics_table,
     reliability_table,
 )
@@ -29,7 +28,7 @@ def test_evidence_bin_effects_report_branch_accuracy_by_tercile():
             "seed": ["42"] * 3,
             "diagnostic_file": ["gate_diagnostics.csv"] * 3,
             "split": ["test_clean"] * 3,
-            "api_integrity": [0.1, 0.5, 0.9],
+            "evidential_certainty_api": [0.1, 0.5, 0.9],
             "api_correct": [0, 1, 1],
             "predicted_reliability_api": [0.2, 0.6, 0.8],
         }
@@ -37,7 +36,7 @@ def test_evidence_bin_effects_report_branch_accuracy_by_tercile():
 
     table = evidence_bin_effects_table(frame, bin_scope="group")
     api_rows = table[
-        (table["evidence"] == "api_integrity")
+        (table["evidence"] == "evidential_certainty_api")
         & (table["branch"] == "api")
     ].set_index("evidence_bin")
 
@@ -47,13 +46,16 @@ def test_evidence_bin_effects_report_branch_accuracy_by_tercile():
     assert api_rows.loc["high", "predicted_reliability_mean"] == pytest.approx(0.8)
 
 
-def test_evidence_bin_effects_include_effective_integrity_and_discount_bins():
+def test_evidence_bin_effects_include_prediction_margin_without_quality_proxies():
     frame = pd.DataFrame(
         {
             "experiment": ["final_seed_42"] * 3,
             "seed": ["42"] * 3,
             "diagnostic_file": ["gate_diagnostics.csv"] * 3,
             "split": ["test_clean"] * 3,
+            "prediction_margin_api": [0.1, 0.4, 0.9],
+            # Old extraction-quality values may remain in diagnostics, but
+            # they are not components of the final intrinsic I1.
             "effective_api_integrity": [0.2, 0.6, 0.95],
             "discount_api": [0.1, 0.4, 0.9],
             "api_correct": [0, 1, 1],
@@ -63,13 +65,14 @@ def test_evidence_bin_effects_include_effective_integrity_and_discount_bins():
 
     table = evidence_bin_effects_table(frame, bin_scope="group")
 
-    assert "effective_api_integrity" in set(table["evidence"])
-    discount_rows = table[
-        (table["evidence"] == "discount_api")
+    assert "effective_api_integrity" not in set(table["evidence"])
+    assert "discount_api" not in set(table["evidence"])
+    margin_rows = table[
+        (table["evidence"] == "prediction_margin_api")
         & (table["branch"] == "api")
     ].set_index("evidence_bin")
-    assert set(discount_rows.index) == {"low", "mid", "high"}
-    assert discount_rows.loc["low", "branch_accuracy"] == pytest.approx(0.0)
+    assert set(margin_rows.index) == {"low", "mid", "high"}
+    assert margin_rows.loc["low", "branch_accuracy"] == pytest.approx(0.0)
 
 
 def test_reliability_table_marks_auc_and_ap_undefined_for_single_class_correctness():
@@ -93,7 +96,7 @@ def test_reliability_table_marks_auc_and_ap_undefined_for_single_class_correctne
     assert np.isnan(row["ap"])
 
 
-def test_reliability_signal_diagnostics_reports_certainty_and_permutation_gap():
+def test_reliability_signal_diagnostics_reports_intrinsic_i1_signals():
     frame = pd.DataFrame(
         {
             "experiment": ["final"] * 6,
@@ -101,8 +104,8 @@ def test_reliability_signal_diagnostics_reports_certainty_and_permutation_gap():
             "diagnostic_file": ["gate_diagnostics.csv"] * 6,
             "split": ["test_clean"] * 6,
             "predicted_reliability_api": [0.1, 0.2, 0.3, 0.7, 0.8, 0.9],
-            "api_integrity": [0.2, 0.3, 0.4, 0.6, 0.7, 0.8],
-            "uncertainty_proxy_api": [0.9, 0.8, 0.7, 0.3, 0.2, 0.1],
+            "evidential_certainty_api": [0.1, 0.2, 0.3, 0.7, 0.8, 0.9],
+            "prediction_margin_api": [0.2, 0.3, 0.4, 0.6, 0.7, 0.8],
             "api_correct": [0, 0, 0, 1, 1, 1],
         }
     )
@@ -110,104 +113,70 @@ def test_reliability_signal_diagnostics_reports_certainty_and_permutation_gap():
         frame, permutations=20, random_seed=7
     ).iloc[0]
     assert row["reliability_auc"] == pytest.approx(1.0)
-    assert row["intrinsic_integrity_auc"] == pytest.approx(1.0)
     assert row["evidential_certainty_auc"] == pytest.approx(1.0)
+    assert row["prediction_margin_auc"] == pytest.approx(1.0)
+    assert "intrinsic_integrity_auc" not in row.index
     assert row["reliability_permutation_gap"] > 0.0
 
 
-def test_natural_degradation_subset_table_reports_low_integrity_final_metrics():
-    frame = pd.DataFrame(
-        {
-            "experiment": ["final_seed_42"] * 6,
-            "seed": ["42"] * 6,
-            "diagnostic_file": ["gate_diagnostics.csv"] * 6,
-            "split": ["test_clean"] * 6,
-            "api_integrity": [0.05, 0.10, 0.20, 0.70, 0.80, 0.90],
-            "label": [0, 1, 1, 0, 1, 0],
-            "prob_malware": [0.20, 0.80, 0.40, 0.10, 0.90, 0.30],
-            "pred": [0, 1, 0, 0, 1, 0],
-        }
-    )
-
-    table = natural_degradation_subset_table(frame, quantile=1.0 / 3.0, min_count=1)
-    row = table[table["subset"] == "api_low_integrity"].iloc[0]
-
-    assert row["count"] == 2
-    assert 0.10 < row["threshold"] < 0.20
-    assert row["acc"] == pytest.approx(1.0)
-    assert row["macro_f1"] == pytest.approx(1.0)
-
-
-def test_natural_degradation_analysis_rejects_fractional_labels():
-    frame = pd.DataFrame(
-        {
-            "experiment": ["final_seed_42", "final_seed_42"],
-            "seed": ["42", "42"],
-            "diagnostic_file": ["gate_diagnostics.csv"] * 2,
-            "split": ["test_clean", "test_clean"],
-            "api_integrity": [0.1, 0.9],
-            "label": [0.5, 1.0],
-            "prob_malware": [0.2, 0.8],
-            "pred": [0, 1],
-        }
-    )
-
-    with pytest.raises(ValueError, match="analysis label"):
-        natural_degradation_subset_table(frame, quantile=0.25, min_count=1)
-
-
-def test_natural_degradation_subset_table_reports_conflict_and_acceptance_risk():
-    frame = pd.DataFrame(
-        {
-            "experiment": ["final_seed_42"] * 6,
-            "seed": ["42"] * 6,
-            "diagnostic_file": ["gate_diagnostics.csv"] * 6,
-            "split": ["test_clean"] * 6,
-            "raw_conflict": [0.01, 0.02, 0.30, 0.40, 0.80, 0.90],
-            "acceptance_score": [0.95, 0.85, 0.70, 0.40, 0.20, 0.10],
-            "label": [0, 1, 1, 0, 1, 0],
-            "prob_malware": [0.20, 0.80, 0.40, 0.60, 0.30, 0.70],
-            "pred": [0, 1, 0, 1, 0, 1],
-            "rejected": [0, 0, 0, 1, 1, 1],
-        }
-    )
-
-    table = natural_degradation_subset_table(frame, quantile=1.0 / 3.0, min_count=1)
-    conflict_row = table[table["subset"] == "raw_high_conflict"].iloc[0]
-    acceptance_row = table[table["subset"] == "low_acceptance"].iloc[0]
-
-    assert conflict_row["count"] == 2
-    assert conflict_row["error_rate"] == pytest.approx(1.0)
-    assert acceptance_row["count"] == 2
-    assert acceptance_row["rejection_rate"] == pytest.approx(1.0)
-    assert np.isnan(acceptance_row["selective_risk"])
-
-
 def _natural_subset_inputs(tmp_path):
-    ids = [f"sample-{index}" for index in range(6)]
+    calibration_ids = [f"calibration-{index}" for index in range(6)]
+    test_ids = [f"sample-{index}" for index in range(6)]
     diagnostics_path = tmp_path / "gate_diagnostics.csv"
     test_csv_path = tmp_path / "test.csv"
-    pd.DataFrame(
+    calibration = pd.DataFrame(
         {
-            "sid": ids,
-            "split": ["test_clean"] * len(ids),
-            "effective_api_integrity": [0.1, 0.2, 0.3, 0.7, 0.8, 0.9],
-            "api_graph_anchor_support": [0.2, 0.1, 0.3, 0.8, 0.9, 0.7],
-            "predictive_conflict": [0.1, 0.2, 0.8, 0.3, 0.9, 0.4],
-            "acceptance_score": [0.9, 0.8, 0.2, 0.7, 0.1, 0.6],
-        }
-    ).to_csv(diagnostics_path, index=False)
-    pd.DataFrame(
-        {
-            "sha256": ids,
+            "sid": calibration_ids,
+            "split": ["val_selection"] * len(calibration_ids),
             "label": [0, 1, 0, 1, 0, 1],
-            "year": [2023] * len(ids),
+            "api_alive": [1] * 6,
+            "graph_alive": [1] * 6,
+            "manifest_alive": [1] * 6,
+            "api_pred": [0, 1, 0, 1, 0, 1],
+            "graph_pred": [0, 1, 0, 1, 0, 1],
+            "manifest_pred": [0, 1, 0, 1, 0, 1],
+            "api_prob": [0.10, 0.90, 0.10, 0.10, 0.05, 0.05],
+            "graph_prob": [0.10, 0.90, 0.20, 0.40, 0.50, 0.50],
+            "manifest_prob": [0.10, 0.90, 0.30, 0.70, 0.90, 0.95],
+            "predicted_reliability_api": [0.70, 0.65, 0.60, 0.55, 0.50, 0.45],
+            "predicted_reliability_graph": [0.75, 0.75, 0.75, 0.75, 0.75, 0.75],
+            "predicted_reliability_manifest": [0.80, 0.85, 0.90, 0.95, 1.00, 1.00],
+        }
+    )
+    target = pd.DataFrame(
+        {
+            "sid": test_ids,
+            "split": ["test_clean"] * len(test_ids),
+            "label": [0, 1, 0, 1, 0, 1],
+            "api_alive": [1] * 6,
+            "graph_alive": [1] * 6,
+            "manifest_alive": [1] * 6,
+            # First three rows are the three exactly-one-wrong diagnostics.
+            "api_pred": [1, 1, 0, 1, 0, 1],
+            "graph_pred": [0, 0, 0, 1, 1, 1],
+            "manifest_pred": [0, 1, 1, 1, 0, 1],
+            "api_prob": [0.95, 0.90, 0.10, 0.90, 0.10, 0.90],
+            "graph_prob": [0.05, 0.10, 0.10, 0.90, 0.90, 0.90],
+            "manifest_prob": [0.05, 0.90, 0.90, 0.90, 0.10, 0.90],
+            "predicted_reliability_api": [0.05, 0.90, 0.90, 0.10, 0.80, 0.90],
+            "predicted_reliability_graph": [0.90, 0.10, 0.90, 0.90, 0.20, 0.90],
+            "predicted_reliability_manifest": [0.85, 0.85, 0.10, 0.80, 0.75, 0.90],
+        }
+    )
+    pd.concat([calibration, target], ignore_index=True).to_csv(
+        diagnostics_path, index=False
+    )
+    pd.DataFrame(
+        {
+            "sha256": test_ids,
+            "label": [0, 1, 0, 1, 0, 1],
+            "year": [2023] * len(test_ids),
         }
     ).to_csv(test_csv_path, index=False)
     return diagnostics_path, test_csv_path
 
 
-def test_natural_subset_builder_writes_predictive_conflict_with_provenance(tmp_path):
+def test_natural_subset_builder_uses_validation_frozen_protocol(tmp_path):
     diagnostics_path, test_csv_path = _natural_subset_inputs(tmp_path)
     output_dir = tmp_path / "subsets"
     output_dir.mkdir()
@@ -216,32 +185,143 @@ def test_natural_subset_builder_writes_predictive_conflict_with_provenance(tmp_p
         diagnostics_path=diagnostics_path,
         test_csv_path=test_csv_path,
         output_dir=output_dir,
-        split="test_clean",
-        quantile=1.0 / 3.0,
+        calibration_split="val_selection",
+        target_split="test_clean",
+        tail_fraction=1.0 / 3.0,
         min_count=1,
+        min_calibration_count=1,
     )
 
     assert {row["subset"] for row in summary} == {
-        "api_low_effective_integrity",
-        "api_graph_low_support",
-        "predictive_high_conflict",
-        "low_acceptance",
+        "branch_disagreement",
+        "api_only_wrong",
+        "graph_only_wrong",
+        "manifest_only_wrong",
+        "reliability_imbalance",
+        "high_cross_modal_conflict",
     }
-    assert (output_dir / "test_predictive_high_conflict.csv").is_file()
+    assert (output_dir / "test_branch_disagreement.csv").is_file()
+    assert (output_dir / "test_high_cross_modal_conflict.csv").is_file()
     manifest = json.loads(
         (output_dir / "subset_manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["schema_version"] == 3
-    assert manifest["sample_count"] == 6
+    assert manifest["schema_version"] == 6
+    assert manifest["protocol_id"] == "i1_i2_unseen_validation_natural_difficulty_v2"
+    assert manifest["calibration_split"] == "val_selection"
+    assert manifest["target_split"] == "test_clean"
+    assert manifest["calibration_sample_count"] == 6
+    assert manifest["target_sample_count"] == 6
+    assert manifest["protocol_guarantees"] == {
+        "thresholds_fit_on_validation_only": True,
+        "target_split_used_for_threshold_selection": False,
+        "calibration_split_unseen_by_i1_i2": True,
+        "i1_success_is_not_defined_by_i1_reliability": True,
+        "label_dependent_subsets_are_diagnostic_only": True,
+    }
+    assert (
+        manifest["protocol_dependencies"]["reliability_imbalance_dependency"]
+        == "depends_on_i1_outputs_and_is_not_independent_evidence_for_i1"
+    )
+    assert (
+        manifest["protocol_dependencies"]["cross_modal_conflict_dependency"]
+        == "computed_from_branch_probabilities_without_i1_reliability"
+    )
+    assert set(manifest["thresholds"]) == {
+        "reliability_imbalance",
+        "high_cross_modal_conflict",
+    }
+    assert all(
+        threshold["source_split"] == "val_selection"
+        for threshold in manifest["thresholds"].values()
+    )
     assert len(manifest["diagnostics_sha256"]) == 64
     assert len(manifest["test_csv_sha256"]) == 64
-    assert len(manifest["subsets"]) == 4
+    assert len(manifest["subsets"]) == 6
     assert all(len(record["csv_sha256"]) == 64 for record in manifest["subsets"])
+    label_dependencies = {
+        record["subset"]: record["label_dependency"]
+        for record in manifest["subsets"]
+    }
+    assert label_dependencies["branch_disagreement"] == "label_free"
+    assert label_dependencies["api_only_wrong"] == "uses_ground_truth_label"
+    api_only_wrong = pd.read_csv(output_dir / "test_api_only_wrong.csv")
+    graph_only_wrong = pd.read_csv(output_dir / "test_graph_only_wrong.csv")
+    manifest_only_wrong = pd.read_csv(output_dir / "test_manifest_only_wrong.csv")
+    assert api_only_wrong["sha256"].tolist() == ["sample-0"]
+    assert graph_only_wrong["sha256"].tolist() == ["sample-1", "sample-4"]
+    assert manifest_only_wrong["sha256"].tolist() == ["sample-2"]
+
+
+def test_natural_subset_thresholds_do_not_depend_on_test_scores(tmp_path):
+    diagnostics_path, test_csv_path = _natural_subset_inputs(tmp_path)
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    build_subsets(
+        diagnostics_path=diagnostics_path,
+        test_csv_path=test_csv_path,
+        output_dir=first_dir,
+        tail_fraction=1.0 / 3.0,
+        min_count=1,
+        min_calibration_count=1,
+    )
+    first_manifest = json.loads(
+        (first_dir / "subset_manifest.json").read_text(encoding="utf-8")
+    )
+
+    diagnostics = pd.read_csv(diagnostics_path)
+    target = diagnostics["split"] == "test_clean"
+    diagnostics.loc[target, "predicted_reliability_api"] = [
+        0.0, 1.0, 0.0, 1.0, 0.0, 1.0
+    ]
+    diagnostics.loc[target, "api_prob"] = [0.99, 0.99, 0.01, 0.99, 0.01, 0.99]
+    diagnostics.to_csv(diagnostics_path, index=False)
+    build_subsets(
+        diagnostics_path=diagnostics_path,
+        test_csv_path=test_csv_path,
+        output_dir=second_dir,
+        tail_fraction=1.0 / 3.0,
+        min_count=1,
+        min_calibration_count=1,
+    )
+    second_manifest = json.loads(
+        (second_dir / "subset_manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert (
+        first_manifest["thresholds"]["reliability_imbalance"]["threshold"]
+        == second_manifest["thresholds"]["reliability_imbalance"]["threshold"]
+    )
+    assert (
+        first_manifest["thresholds"]["reliability_imbalance"][
+            "source_split_sha256"
+        ]
+        == second_manifest["thresholds"]["reliability_imbalance"][
+            "source_split_sha256"
+        ]
+    )
+    assert (
+        first_manifest["thresholds"]["high_cross_modal_conflict"]["threshold"]
+        == second_manifest["thresholds"]["high_cross_modal_conflict"]["threshold"]
+    )
+    assert (
+        first_manifest["thresholds"]["high_cross_modal_conflict"][
+            "source_split_sha256"
+        ]
+        == second_manifest["thresholds"]["high_cross_modal_conflict"][
+            "source_split_sha256"
+        ]
+    )
 
 
 def test_natural_subset_builder_rejects_incomplete_diagnostics(tmp_path):
     diagnostics_path, test_csv_path = _natural_subset_inputs(tmp_path)
-    diagnostics = pd.read_csv(diagnostics_path).iloc[:-1]
+    diagnostics = pd.read_csv(diagnostics_path)
+    diagnostics = diagnostics[
+        ~(
+            (diagnostics["split"] == "test_clean")
+            & (diagnostics["sid"] == "sample-5")
+        )
+    ]
     diagnostics.to_csv(diagnostics_path, index=False)
 
     with pytest.raises(ValueError, match="one clean diagnostic row for every test sample"):
@@ -249,9 +329,23 @@ def test_natural_subset_builder_rejects_incomplete_diagnostics(tmp_path):
             diagnostics_path=diagnostics_path,
             test_csv_path=test_csv_path,
             output_dir=tmp_path / "subsets",
-            split="test_clean",
-            quantile=1.0 / 3.0,
+            tail_fraction=1.0 / 3.0,
             min_count=1,
+            min_calibration_count=1,
+        )
+
+
+def test_natural_subset_builder_rejects_target_as_threshold_source(tmp_path):
+    diagnostics_path, test_csv_path = _natural_subset_inputs(tmp_path)
+    with pytest.raises(ValueError, match="requires calibration_split"):
+        build_subsets(
+            diagnostics_path=diagnostics_path,
+            test_csv_path=test_csv_path,
+            output_dir=tmp_path / "subsets",
+            calibration_split="test_clean",
+            target_split="test_clean",
+            min_count=1,
+            min_calibration_count=1,
         )
 
 
@@ -261,7 +355,7 @@ def test_aggregate_metrics_groups_seed_runs_by_method(tmp_path):
         run_dir.mkdir(parents=True)
         (run_dir / "summary.yaml").write_text(
             f"""
-metric_schema_version: 5
+metric_schema_version: 10
 run_identity:
   experiment_name: final_seed_{seed}
   method_name: final_seed_{seed}
@@ -328,7 +422,7 @@ def test_aggregate_metrics_marks_single_run_std_undefined_and_serializable(tmp_p
 
 def test_result_collector_reads_flat_summaries_and_deduplicates_copies(tmp_path):
     payload = """
-metric_schema_version: 5
+metric_schema_version: 10
 run_identity:
   experiment_name: evidential_seed_42
   method_name: evidential_trusted_fusion
@@ -374,7 +468,7 @@ test:
 def test_result_collector_normalizes_embedded_seed_method_names(tmp_path):
     for seed, macro_f1 in ((42, 0.90), (2024, 0.92), (3407, 0.91)):
         payload = {
-            "metric_schema_version": 5,
+            "metric_schema_version": 10,
             "run_identity": {
                 "experiment_name": f"evidential_seed_{seed}",
                 "method_name": f"evidential_seed_{seed}",
@@ -422,7 +516,7 @@ def test_result_collector_rejects_legacy_metric_semantics(tmp_path):
 def test_result_collector_requires_embedded_identity_in_current_schema(tmp_path):
     path = tmp_path / "summary_final_seed_42.yaml"
     path.write_text(
-        "metric_schema_version: 5\ntest:\n  macro_f1: 0.99\n",
+        "metric_schema_version: 10\ntest:\n  macro_f1: 0.99\n",
         encoding="utf-8",
     )
 
@@ -431,11 +525,11 @@ def test_result_collector_requires_embedded_identity_in_current_schema(tmp_path)
 
 
 def test_metric_summary_schema_versions_match():
-    assert PRODUCER_METRIC_SCHEMA_VERSION == 5
+    assert PRODUCER_METRIC_SCHEMA_VERSION == 10
     assert COLLECTOR_METRIC_SCHEMA_VERSION == PRODUCER_METRIC_SCHEMA_VERSION
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, "5"])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 8, 9, "10"])
 def test_result_collector_rejects_wrong_metric_schema_version(tmp_path, version):
     payload = {
         "metric_schema_version": version,
@@ -452,13 +546,13 @@ def test_result_collector_rejects_wrong_metric_schema_version(tmp_path, version)
     path = tmp_path / "summary.yaml"
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="expected=5"):
+    with pytest.raises(ValueError, match="expected=10"):
         collect_metric_rows(tmp_path)
 
 
 def test_result_collector_uses_only_canonical_sections_and_embedded_extra_eval(tmp_path):
     payload = {
-        "metric_schema_version": 5,
+        "metric_schema_version": 10,
         "run_identity": {
             "experiment_name": "canonical",
             "method_name": "canonical",

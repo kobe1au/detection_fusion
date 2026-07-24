@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Dirichlet, kl_divergence
 
-from fusion.constants import EvidenceIndex
+from fusion.constants import AvailabilityIndex
 from fusion.discount_fusion import DiscountProbabilityFusion
 from fusion.evidential import (
     combine_ecml_opinions,
@@ -19,18 +19,13 @@ VIEW_NAMES = ("api", "graph", "manifest")
 
 
 def _observable_evidence(batch_size: int) -> torch.Tensor:
-    evidence = torch.ones(batch_size, EvidenceIndex.BASE_DIM)
-    evidence[:, EvidenceIndex.MANIFEST_TO_CODE_CONFLICT] = 0.0
-    evidence[:, EvidenceIndex.CODE_TO_MANIFEST_CONFLICT] = 0.0
-    return evidence
+    return torch.ones(batch_size, AvailabilityIndex.BASE_DIM)
 
 
 def _paper_loss_config(objective: str, *, mask_unavailable: bool) -> dict:
     return {
         "objective": objective,
         "branch_aux_weight": 0.0,
-        "reliability_calibration_weight": 0.0,
-        "probability_calibration_weight": 0.0,
         "evidential_loss_weight": 0.0,
         "label_smoothing": 0.0,
         objective: {
@@ -47,13 +42,9 @@ def _fusion(combination: str) -> DiscountProbabilityFusion:
             "combination": combination,
             "opinion_source": "evidential",
             "evidence_activation": "softplus",
-            "use_reliability_discount": False,
+            "use_i1_reliability": False,
             "use_hard_alive_mask": True,
-            "use_confidence_proxy": False,
-            "use_support_discount": False,
-            "use_conflict_discount": False,
             "reliability_calibration": {"enabled": False},
-            "probability_calibration": {"enabled": False},
             "routing": {"enabled": False},
         }
     )
@@ -191,7 +182,7 @@ def test_tmc_objective_is_exact_sum_of_three_views_and_fused_loss() -> None:
         labels,
         extra,
         _paper_loss_config("tmc", mask_unavailable=False),
-        evidence=_observable_evidence(2),
+        availability=_observable_evidence(2),
         epoch=5,
         materialize_diagnostics=False,
     )
@@ -278,7 +269,7 @@ def test_ecml_objective_matches_accuracy_average_plus_consistency() -> None:
         labels,
         extra,
         _paper_loss_config("ecml", mask_unavailable=False),
-        evidence=_observable_evidence(2),
+        availability=_observable_evidence(2),
         epoch=5,
         materialize_diagnostics=False,
     )
@@ -341,7 +332,7 @@ def test_missing_view_has_no_direct_or_fused_gradient(
     ]
     labels = torch.tensor([0, 1])
     evidence = _observable_evidence(2)
-    evidence[1, EvidenceIndex.GRAPH_ALIVE] = 0.0
+    evidence[1, AvailabilityIndex.GRAPH_ALIVE] = 0.0
 
     outputs = fusion(*logits, evidence)
     loss, _parts = compute_robust_loss(
@@ -349,7 +340,7 @@ def test_missing_view_has_no_direct_or_fused_gradient(
         labels,
         outputs,
         _paper_loss_config(objective, mask_unavailable=True),
-        evidence=evidence,
+        availability=evidence,
         epoch=5,
         materialize_diagnostics=False,
     )
@@ -386,7 +377,7 @@ def test_conflicting_opinions_have_finite_nonzero_gradients(
         labels,
         outputs,
         _paper_loss_config(objective, mask_unavailable=True),
-        evidence=evidence,
+        availability=evidence,
         epoch=10,
         materialize_diagnostics=False,
     )

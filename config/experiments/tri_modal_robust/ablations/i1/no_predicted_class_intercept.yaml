@@ -9,7 +9,5 @@ train:
 
 fusion:
   reliability_calibration:
-    # Fixed topology: remove only the explicit benign/malware conditional
-    # intercept. The density score still selects the reference corresponding
-    # to this branch's raw-logit prediction class.
-    use_predicted_class_feature: false
+    # Remove only the optional benign/malware conditional intercept.
+    use_predicted_class_intercept: false

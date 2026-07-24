@@ -20,7 +20,7 @@ class _StaticCheckpointModel(torch.nn.Module):
         super().__init__()
         self.forward_calls = 0
 
-    def forward(self, graph, return_features=False):
+    def forward(self, graph):
         self.forward_calls += 1
         batch_size = graph.logits.size(0)
         extra = {
@@ -32,6 +32,9 @@ class _StaticCheckpointModel(torch.nn.Module):
             ),
             "fusion_weight_manifest": graph.logits.new_full(
                 (batch_size,), 1.0 / 3.0
+            ),
+            "selective_eligible": torch.ones(
+                batch_size, dtype=torch.bool, device=graph.logits.device
             ),
         }
         return graph.logits, extra
@@ -95,4 +98,3 @@ def test_checkpoint_selection_profile_matches_full_clean_metrics():
     assert "aurc" in full_metrics
     assert "aurc" not in checkpoint_metrics
     assert full_model.forward_calls == lean_model.forward_calls == 2
-

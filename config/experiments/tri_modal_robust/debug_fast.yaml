@@ -14,11 +14,14 @@ train:
   eval_num_workers: 0
 
 calibration:
-  epochs: 1
+  enabled: false
 
 # Explicit three-branch smoke path: API, Graph, and Manifest only.
+model:
+  fusion_mode: tri_modal_fixed_gate
+
 fusion:
-  combination: linear
+  mode: model_dispatch
 
 eval:
   run_test: false

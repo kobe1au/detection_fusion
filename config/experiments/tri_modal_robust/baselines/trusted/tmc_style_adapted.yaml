@@ -23,8 +23,6 @@ loss:
   objective: tmc
   label_smoothing: 0.0
   branch_aux_weight: 0.0
-  reliability_calibration_weight: 0.0
-  probability_calibration_weight: 0.0
   evidential_loss_weight: 0.0
   auxiliary_weight_mode: unmasked_uniform
   tmc:

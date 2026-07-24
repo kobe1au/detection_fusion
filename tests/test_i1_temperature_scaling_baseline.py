@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from fusion.constants import EvidenceIndex
+from fusion.constants import AvailabilityIndex
 from fusion.discount_fusion import DiscountProbabilityFusion
 from fusion.reliability_calibration import (
     BRANCH_NAMES,
@@ -35,18 +35,14 @@ class _TemperatureScalingPosthocModel(torch.nn.Module):
         self.discount_fusion = DiscountProbabilityFusion(
             {
                 "combination": "cumulative",
-                "use_reliability_discount": True,
+                "use_i1_reliability": True,
                 "use_hard_alive_mask": True,
                 "reliability_calibration": {
                     "enabled": True,
                     "method": TEMPERATURE_SCALING_CONFIDENCE_METHOD,
                     "branches": ["api", "graph", "manifest"],
-                    "use_model_visibility": False,
-                    "use_prediction_margin": False,
-                    "use_predicted_class_feature": False,
                 },
                 "routing": {"enabled": False},
-                "probability_calibration": {"enabled": False},
             }
         )
 
@@ -56,7 +52,7 @@ class _TemperatureScalingPosthocModel(torch.nn.Module):
     def set_calibration_active(self, enabled: bool):
         self.discount_fusion.set_calibration_active(enabled)
 
-    def forward(self, graph, return_features=False):
+    def forward(self, graph):
         batch_size = graph.evidence.size(0)
         api = graph.evidence.new_tensor(
             [[5.0, -5.0], [-5.0, 5.0]]
@@ -70,22 +66,15 @@ class _TemperatureScalingPosthocModel(torch.nn.Module):
         )
         for name, logits in branches.items():
             outputs[f"{name}_logits_aux"] = logits
-        outputs["gate_evidence"] = graph.evidence
+        outputs["fusion_availability"] = graph.evidence
+        outputs["selective_eligible"] = graph.evidence[:, :3].gt(0).any(dim=-1)
         return outputs["final_logits"], outputs
 
 
 def _evidence(batch_size: int, *, manifest_alive: bool = True) -> torch.Tensor:
-    evidence = torch.zeros(batch_size, EvidenceIndex.BASE_DIM)
-    evidence[:, EvidenceIndex.API_INTEGRITY] = 1.0
-    evidence[:, EvidenceIndex.GRAPH_INTEGRITY] = 1.0
-    evidence[:, EvidenceIndex.MANIFEST_INTEGRITY] = float(manifest_alive)
-    evidence[:, EvidenceIndex.CODE_INTEGRITY] = 1.0
-    evidence[:, EvidenceIndex.API_ALIVE] = 1.0
-    evidence[:, EvidenceIndex.GRAPH_ALIVE] = 1.0
-    evidence[:, EvidenceIndex.MANIFEST_ALIVE] = float(manifest_alive)
-    evidence[:, EvidenceIndex.API_ENCODER_COVERAGE] = 1.0
-    evidence[:, EvidenceIndex.GRAPH_ENCODER_COVERAGE] = 1.0
-    return evidence
+    availability = torch.ones(batch_size, AvailabilityIndex.BASE_DIM)
+    availability[:, AvailabilityIndex.MANIFEST_ALIVE] = float(manifest_alive)
+    return availability
 
 
 def _branch_logits(api_logits: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -104,8 +93,12 @@ def test_temperature_confidence_is_exact_max_scaled_softmax_and_masks_dead_branc
             calibrator.log_temperatures[branch].fill_(math.log(2.0))
 
     outputs = calibrator(
-        _evidence(2, manifest_alive=False),
-        branch_logits=_branch_logits(logits),
+        _branch_logits(logits),
+        alive={
+            "api": torch.ones(2),
+            "graph": torch.ones(2),
+            "manifest": torch.zeros(2),
+        },
     )
 
     expected = torch.softmax(logits / 2.0, dim=-1).amax(dim=-1)
@@ -155,11 +148,11 @@ def test_branch_temperature_nll_fits_one_positive_scalar_and_improves_nll():
         ]
     )
     labels = torch.tensor([0, 0, 0, 1, 1, 1, 1, 0])
-    evidence = _evidence(labels.numel())
+    alive = torch.ones(labels.numel())
     calibrator = BranchTemperatureScalingConfidenceCalibrator()
 
     before = float(
-        calibrator.branch_nll("api", logits, labels, evidence).detach().item()
+        calibrator.branch_nll("api", logits, labels, alive).detach().item()
     )
     optimizer = torch.optim.LBFGS(
         calibrator.branch_parameters("api"),
@@ -170,13 +163,13 @@ def test_branch_temperature_nll_fits_one_positive_scalar_and_improves_nll():
 
     def closure() -> torch.Tensor:
         optimizer.zero_grad(set_to_none=True)
-        loss = calibrator.branch_nll("api", logits, labels, evidence)
+        loss = calibrator.branch_nll("api", logits, labels, alive)
         loss.backward()
         return loss
 
     optimizer.step(closure)
     after = float(
-        calibrator.branch_nll("api", logits, labels, evidence).detach().item()
+        calibrator.branch_nll("api", logits, labels, alive).detach().item()
     )
     assert after < before
     assert float(calibrator.temperature("api").detach().item()) > 1.0
@@ -187,18 +180,14 @@ def test_discount_fusion_routes_raw_logit_temperature_confidence_into_i1():
     fusion = DiscountProbabilityFusion(
         {
             "combination": "cumulative",
-            "use_reliability_discount": True,
+            "use_i1_reliability": True,
             "use_hard_alive_mask": True,
             "reliability_calibration": {
                 "enabled": True,
                 "method": TEMPERATURE_SCALING_CONFIDENCE_METHOD,
                 "branches": ["api", "graph", "manifest"],
-                "use_model_visibility": False,
-                "use_prediction_margin": False,
-                "use_predicted_class_feature": False,
             },
             "routing": {"enabled": False},
-            "probability_calibration": {"enabled": False},
         }
     )
     fusion.set_calibration_active(True)
@@ -232,9 +221,8 @@ def test_temperature_baseline_configs_separate_matched_and_clean_fit_sources():
         reliability = cfg["fusion"]["reliability_calibration"]
         assert reliability["method"] == TEMPERATURE_SCALING_CONFIDENCE_METHOD
         assert reliability["branches"] == ["api", "graph", "manifest"]
-        assert reliability["use_model_visibility"] is False
-        assert reliability["use_prediction_margin"] is False
-        assert reliability["use_predicted_class_feature"] is False
+        assert "use_model_visibility" not in reliability
+        assert "use_predicted_class_feature" not in reliability
         assert cfg["calibration"]["cross_fitting"]["enabled"] is True
         assert cfg["fusion"]["routing"]["risk_target"] == (
             "threshold_malware_false_negative"
@@ -248,7 +236,7 @@ def test_temperature_baseline_configs_separate_matched_and_clean_fit_sources():
 
     assert (
         matched["fusion"]["reliability_calibration"]["temperature_fit_source"]
-        == "matched_observable"
+        == "clean_plus_branch_local_partial"
     )
     assert (
         clean["fusion"]["reliability_calibration"]["temperature_fit_source"]
@@ -315,10 +303,8 @@ def test_temperature_baseline_uses_grouped_oof_i1_lifecycle_and_full_refit():
                 "reliability_calibration": {
                     "enabled": True,
                     "method": TEMPERATURE_SCALING_CONFIDENCE_METHOD,
-                    "temperature_fit_source": "matched_observable",
-                    "weight": 1.0,
+                    "temperature_fit_source": "clean_plus_branch_local_partial",
                 },
-                "probability_calibration": {"enabled": False, "weight": 0.0},
                 "routing": {"enabled": False},
             },
         },
@@ -328,7 +314,9 @@ def test_temperature_baseline_uses_grouped_oof_i1_lifecycle_and_full_refit():
     assert summary["reliability_calibration_method"] == (
         TEMPERATURE_SCALING_CONFIDENCE_METHOD
     )
-    assert summary["reliability_calibration_fit_source"] == "matched_observable"
+    assert summary["reliability_calibration_fit_source"] == (
+        "clean_plus_branch_local_partial"
+    )
     assert summary["cross_fitting"]["oof_reliability_coverage"] == 1.0
     assert len(summary["_oof_clean_rows"]) == 6
     assert set(summary["reliability_temperatures"]) == {
@@ -337,28 +325,10 @@ def test_temperature_baseline_uses_grouped_oof_i1_lifecycle_and_full_refit():
         "manifest",
     }
     assert summary["stages"]["reliability"]["objective_groups"] == [
-        "api:clean_plus_matched_observable",
+        "api:clean_plus_branch_local_partial",
         "graph:clean_only",
         "manifest:clean_only",
     ]
-
-
-def test_temperature_baseline_rejects_feature_conditioned_i1_inputs():
-    try:
-        DiscountProbabilityFusion(
-            {
-                "combination": "cumulative",
-                "reliability_calibration": {
-                    "enabled": True,
-                    "method": TEMPERATURE_SCALING_CONFIDENCE_METHOD,
-                    "use_prediction_margin": True,
-                },
-            }
-        )
-    except ValueError as exc:
-        assert "raw-logit-only I1 baseline" in str(exc)
-    else:
-        raise AssertionError("temperature baseline accepted a feature-conditioned input")
 
 
 def test_temperature_baseline_fits_only_configured_evidence_branches():
@@ -385,7 +355,6 @@ def test_explicit_main_i1_method_does_not_change_state_or_rng_consumption():
             "branches": ["api", "graph", "manifest"],
         },
         "routing": {"enabled": False},
-        "probability_calibration": {"enabled": False},
     }
     torch.manual_seed(917)
     implicit = DiscountProbabilityFusion(base)

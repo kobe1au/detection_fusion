@@ -18,15 +18,8 @@ fusion:
     enabled: true
     mode: prior_only
     fixed_prior_beta: 1.0
-    train_end_to_end: false
     posthoc_refine: true
     prediction_loss_weight: 0.0
-    route_oracle_loss_weight: 0.0
-    subset_oracle_loss_weight: 0.0
-    subset_oracle_temperature: 1.0
-    group_robust_objective:
-      enabled: false
-      soft_worst_weight: 0.0
     risk_mode: learned
     risk_loss_weight: 1.0
     final_temperature_scaling: true

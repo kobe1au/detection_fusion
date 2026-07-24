@@ -1,24 +1,24 @@
 defaults:
   - ../../base_tri_modal_robust.yaml
 
+# Each trusted comparison trains its own declared evidential objective/rule.
+encoder_stage:
+  protocol_id: trusted_comparison_specific_stage1_v1
+
 model:
   fusion_mode: discount_probability
 
 fusion:
   mode: discount_probability
-  use_reliability_discount: false
-  use_support_discount: false
-  use_conflict_discount: false
-  use_confidence_proxy: false
+  use_i1_reliability: false
   use_hard_alive_mask: true
   reliability_calibration:
     enabled: false
-  probability_calibration:
-    enabled: false
-
 calibration:
   enabled: false
   holdout_enabled: true
+  role_assignment_path: labels/validation_roles_protocol_v1.json
+  require_role_assignment: true
 
 selective_prediction:
   enabled: false

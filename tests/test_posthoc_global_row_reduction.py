@@ -6,18 +6,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fusion.constants import EvidenceIndex
+from fusion.constants import AvailabilityIndex
 from fusion.losses import (
-    compute_posthoc_calibration_loss,
-    compute_reliability_calibration_loss,
     reliability_alive_mask,
     reliability_correctness_target,
     reliability_per_sample_loss,
     routing_mixture_log_prob,
     routing_risk_per_sample_loss,
     routing_risk_target,
-    routing_soft_oracle_per_sample_loss,
-    routing_soft_oracle_target,
 )
 from fusion.train import (
     _compile_posthoc_row_weights,
@@ -48,15 +44,15 @@ def _sources_and_groups():
     offset = 0
     for name, family, alive_rows, source_labels in specs:
         rows = len(source_labels)
-        source_evidence = torch.zeros(rows, EvidenceIndex.BASE_DIM)
+        source_evidence = torch.zeros(rows, AvailabilityIndex.BASE_DIM)
         source_evidence[:, :3] = 1.0
-        source_evidence[:, EvidenceIndex.API_ALIVE] = torch.tensor(
+        source_evidence[:, AvailabilityIndex.API_ALIVE] = torch.tensor(
             [row[0] for row in alive_rows], dtype=torch.float32
         )
-        source_evidence[:, EvidenceIndex.GRAPH_ALIVE] = torch.tensor(
+        source_evidence[:, AvailabilityIndex.GRAPH_ALIVE] = torch.tensor(
             [row[1] for row in alive_rows], dtype=torch.float32
         )
-        source_evidence[:, EvidenceIndex.MANIFEST_ALIVE] = torch.tensor(
+        source_evidence[:, AvailabilityIndex.MANIFEST_ALIVE] = torch.tensor(
             [row[2] for row in alive_rows], dtype=torch.float32
         )
         source_labels_tensor = torch.tensor(source_labels, dtype=torch.long)
@@ -113,14 +109,47 @@ def _old_group_reduction(
 
     def source_loss(item: dict) -> torch.Tensor:
         start, end = segment_by_id[id(item)]
-        loss, _ = compute_posthoc_calibration_loss(
-            _slice_outputs(outputs, start, end, total),
-            item["labels"],
-            item["evidence"],
-            config,
-            reliability_branches=item["reliability_branches"],
-            materialize_diagnostics=False,
+        source_outputs = _slice_outputs(outputs, start, end, total)
+        labels = item["labels"]
+        routing_cfg = config["routing"]
+        prediction_weight = float(
+            routing_cfg.get("prediction_loss_weight", 1.0)
         )
+        risk_weight = float(routing_cfg.get("risk_loss_weight", 0.0))
+        has_available = source_outputs[
+            "routing_has_available"
+        ].view(-1).bool()
+        mixture_log_prob = routing_mixture_log_prob(source_outputs)
+        loss = mixture_log_prob.sum() * 0.0
+        if prediction_weight > 0.0:
+            per_row = F.nll_loss(
+                mixture_log_prob, labels, reduction="none"
+            )
+            loss = loss + prediction_weight * (
+                per_row[has_available].mean()
+                if bool(has_available.any())
+                else per_row.sum() * 0.0
+            )
+        if risk_weight > 0.0:
+            target, valid, loss_type, _ = routing_risk_target(
+                source_outputs,
+                labels,
+                routing_cfg,
+                mixture_log_prob=mixture_log_prob,
+                valid_routing=has_available,
+            )
+            per_row = routing_risk_per_sample_loss(
+                source_outputs["routing_risk_probability"],
+                source_outputs["routing_risk_training_logit"],
+                target,
+                valid,
+                loss_type=loss_type,
+            )
+            loss = loss + risk_weight * (
+                per_row[valid].mean()
+                if bool(valid.any())
+                else per_row.sum() * 0.0
+            )
         return loss
 
     group_losses = []
@@ -154,9 +183,9 @@ def _route_outputs(
 ) -> dict:
     alive = torch.stack(
         (
-            evidence[:, EvidenceIndex.API_ALIVE],
-            evidence[:, EvidenceIndex.GRAPH_ALIVE],
-            evidence[:, EvidenceIndex.MANIFEST_ALIVE],
+            evidence[:, AvailabilityIndex.API_ALIVE],
+            evidence[:, AvailabilityIndex.GRAPH_ALIVE],
+            evidence[:, AvailabilityIndex.MANIFEST_ALIVE],
         ),
         dim=-1,
     ).bool()
@@ -176,10 +205,6 @@ def _route_outputs(
         "routing_mixture_prob": mixture,
         "routing_branch_distribution": branch_distribution,
         "routing_scores": route_scores,
-        **{
-            f"calibrated_log_prob_{name}": branch_probabilities[:, index].log()
-            for index, name in enumerate(("api", "graph", "manifest"))
-        },
     }
 
 
@@ -196,7 +221,10 @@ def test_compiled_source_and_row_weights_preserve_hierarchy_and_all_dead():
     for name in ("p4", "p5", "p6"):
         assert by_name[name] == pytest.approx(0.3 / 9.0)
 
-    valid = evidence[:, EvidenceIndex.API_ALIVE : EvidenceIndex.MANIFEST_ALIVE + 1].bool().any(dim=-1)
+    valid = evidence[
+        :,
+        AvailabilityIndex.API_ALIVE : AvailabilityIndex.MANIFEST_ALIVE + 1,
+    ].bool().any(dim=-1)
     row_weights = _compile_posthoc_row_weights(items, segments, masses, valid)
     for item, (start, end) in zip(items, segments):
         expected = 0.0 if item["name"] == "p3" else masses[id(item)]
@@ -212,7 +240,10 @@ def test_compiled_clean_only_group_ignores_perturb_prior():
     groups = [{"name": "clean", "clean": clean, "scenario": []}]
     masses = _compile_posthoc_source_masses(groups, clean, SCENARIO_PRIOR)
     assert [masses[id(item)] for item in clean] == pytest.approx([0.5, 0.5])
-    valid = evidence[: clean_segments[-1][1], EvidenceIndex.API_ALIVE : EvidenceIndex.MANIFEST_ALIVE + 1].bool().any(dim=-1)
+    valid = evidence[
+        : clean_segments[-1][1],
+        AvailabilityIndex.API_ALIVE : AvailabilityIndex.MANIFEST_ALIVE + 1,
+    ].bool().any(dim=-1)
     weights = _compile_posthoc_row_weights(clean, clean_segments, masses, valid)
     assert float(weights.sum()) == pytest.approx(1.0)
 
@@ -223,15 +254,10 @@ def test_global_route_loss_matches_source_family_reference_value_and_gradient():
     branch_probabilities = _fixed_branch_probabilities(rows)
     initial_scores = torch.linspace(-0.9, 1.1, rows * 3).view(rows, 3)
     config = {
-        "reliability_calibration": {"weight": 0.0},
-        "probability_calibration": {"weight": 0.0},
         "routing": {
             "enabled": True,
             "posthoc_refine": True,
-            "calibration_weight": 0.8,
             "prediction_loss_weight": 1.2,
-            "route_oracle_loss_weight": 0.35,
-            "route_oracle_temperature": 0.7,
             "risk_loss_weight": 0.0,
         },
     }
@@ -256,22 +282,11 @@ def test_global_route_loss_matches_source_family_reference_value_and_gradient():
     )
     mixture_log_prob = routing_mixture_log_prob(global_outputs)
     prediction_per_row = F.nll_loss(mixture_log_prob, labels, reduction="none")
-    oracle_target, oracle_valid = routing_soft_oracle_target(
-        global_outputs,
-        labels,
-        evidence,
-        temperature=0.7,
+    # Final I2 learns the conditional mixture solely through its proper-scoring
+    # NLL. Per-row/source-subset oracle supervision has been removed.
+    global_loss = 1.2 * torch.dot(
+        prediction_per_row, prediction_weights
     )
-    oracle_weights = _compile_posthoc_row_weights(
-        items, segments, masses, oracle_valid
-    )
-    oracle_per_row = routing_soft_oracle_per_sample_loss(
-        global_outputs, oracle_target
-    )
-    global_loss = 0.8 * (
-        1.2 * torch.dot(prediction_per_row, prediction_weights)
-        + 0.35 * torch.dot(oracle_per_row, oracle_weights)
-    ) / (1.2 + 0.35)
     global_loss.backward()
 
     torch.testing.assert_close(global_loss, reference, rtol=1.0e-6, atol=1.0e-7)
@@ -337,14 +352,22 @@ def test_global_i1_loss_matches_branch_source_reference_value_and_gradient(
                     f"predicted_reliability_logit_{name}": logit,
                     f"{name}_logits_aux": branch_logits[start:end, index],
                 }
-                loss, _ = compute_reliability_calibration_loss(
-                    outputs,
+                correctness = reliability_correctness_target(
+                    outputs[f"{name}_logits_aux"],
                     item["labels"],
-                    item["evidence"],
-                    {"branches": [name], "loss": loss_type},
-                    materialize_diagnostics=False,
                 )
-                return loss
+                per_row = reliability_per_sample_loss(
+                    outputs[f"predicted_reliability_{name}"],
+                    outputs[f"predicted_reliability_logit_{name}"],
+                    correctness,
+                    loss_type=loss_type,
+                )
+                alive_mask = alive.bool()
+                return (
+                    per_row[alive_mask].mean()
+                    if bool(alive_mask.any())
+                    else per_row.sum() * 0.0
+                )
 
             clean_loss = torch.stack(
                 [_source_loss(item) for item in group["clean"]]
@@ -428,7 +451,8 @@ def test_global_i1_loss_matches_branch_source_reference_value_and_gradient(
 def _risk_static_outputs(labels: torch.Tensor, evidence: torch.Tensor) -> dict:
     rows = labels.numel()
     has_available = evidence[
-        :, EvidenceIndex.API_ALIVE : EvidenceIndex.MANIFEST_ALIVE + 1
+        :,
+        AvailabilityIndex.API_ALIVE : AvailabilityIndex.MANIFEST_ALIVE + 1,
     ].bool().any(dim=-1)
     malware = (0.15 + 0.7 * torch.sigmoid(torch.linspace(-2.0, 2.0, rows))).clamp(
         1.0e-4, 1.0 - 1.0e-4
@@ -447,38 +471,26 @@ def _risk_static_outputs(labels: torch.Tensor, evidence: torch.Tensor) -> dict:
 
 
 @pytest.mark.parametrize("loss_type", ("bce", "brier"))
-@pytest.mark.parametrize(
-    "target_type",
-    (
-        "mixture_argmax_error",
-        "threshold_classification_error",
-        "threshold_malware_false_negative",
-    ),
-)
 def test_global_risk_loss_matches_source_family_reference_value_and_gradient(
     loss_type: str,
-    target_type: str,
 ):
+    target_type = "threshold_malware_false_negative"
     items, segments, groups, labels, evidence = _sources_and_groups()
     rows = labels.numel()
     static_outputs = _risk_static_outputs(labels, evidence)
-    features = torch.linspace(-0.7, 1.2, rows * 5).view(rows, 5)
-    initial_weights = torch.tensor((-0.4, 0.2, -0.1, 0.5, -0.25))
+    features = torch.linspace(-0.7, 1.2, rows * 3).view(rows, 3)
+    initial_weights = torch.tensor((-0.4, 0.2, -0.1))
     initial_bias = torch.tensor(-0.3)
     routing_options = {
         "enabled": True,
         "posthoc_refine": True,
-        "calibration_weight": 0.9,
         "prediction_loss_weight": 0.0,
-        "route_oracle_loss_weight": 0.0,
         "risk_loss_weight": 1.1,
         "risk_loss": loss_type,
         "risk_target": target_type,
         "classification_log_odds_threshold": 0.25,
     }
     config = {
-        "reliability_calibration": {"weight": 0.0},
-        "probability_calibration": {"weight": 0.0},
         "routing": routing_options,
     }
 
@@ -527,7 +539,7 @@ def test_global_risk_loss_matches_source_family_reference_value_and_gradient(
         valid,
         loss_type=loss_type,
     )
-    global_loss = 0.9 * 1.1 * torch.dot(per_row, row_weights)
+    global_loss = 1.1 * torch.dot(per_row, row_weights)
     global_loss.backward()
 
     torch.testing.assert_close(global_loss, reference, rtol=1.0e-6, atol=1.0e-7)
@@ -537,8 +549,7 @@ def test_global_risk_loss_matches_source_family_reference_value_and_gradient(
     torch.testing.assert_close(
         global_bias.grad, reference_bias.grad, rtol=2.0e-6, atol=2.0e-7
     )
-    if target_type == "threshold_malware_false_negative":
-        # The exact-threshold row predicts malware because comparison is >=,
-        # and is therefore excluded from the conditional-FN fitting mask.
-        assert static_outputs["uncalibrated_final_log_prob"][1, 1].item() == pytest.approx(0.25)
-        assert not bool(valid[1])
+    # The exact-threshold row predicts malware because comparison is >=, and
+    # is therefore excluded from the conditional-FN fitting mask.
+    assert static_outputs["uncalibrated_final_log_prob"][1, 1].item() == pytest.approx(0.25)
+    assert not bool(valid[1])
