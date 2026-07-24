@@ -186,6 +186,37 @@ GATE_DIAGNOSTIC_KEYS = (
     "calibration_active",
 )
 
+def _resolve_restored_stage_convergence(
+    *,
+    provisional_stop_reason: str,
+    final_grad_inf_norm: float,
+    gradient_tolerance: float,
+) -> tuple[bool, str]:
+    """Determine convergence at the exact restored deployment state.
+
+    Objective plateau is a stopping heuristic, not sufficient evidence of
+    stationarity. The final convergence flag is decided from the gradient at
+    the restored minimum-objective parameters.
+    """
+
+    if (
+        not math.isfinite(final_grad_inf_norm)
+        or not math.isfinite(gradient_tolerance)
+        or gradient_tolerance <= 0.0
+    ):
+        return False, "restored_best_invalid_gradient"
+
+    if final_grad_inf_norm <= gradient_tolerance:
+        return True, "restored_best_gradient_tolerance"
+
+    if provisional_stop_reason == "objective_plateau":
+        return False, "objective_plateau_nonstationary"
+
+    if provisional_stop_reason == "gradient_tolerance":
+        return False, "provisional_gradient_not_valid_at_restored_best"
+
+    return False, provisional_stop_reason
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -6908,6 +6939,18 @@ def fit_posthoc_calibration(
         restored_grad_norm, final_grad_inf_norm = _raw_gradient_norms()
         max_grad_norm = max(max_grad_norm, restored_grad_norm)
         optimizer.zero_grad(set_to_none=True)
+
+        provisional_stop_reason = stop_reason
+        plateau_detected = provisional_stop_reason == "objective_plateau"
+
+        converged, stop_reason = _resolve_restored_stage_convergence(
+            provisional_stop_reason=provisional_stop_reason,
+            final_grad_inf_norm=final_grad_inf_norm,
+            gradient_tolerance=optimization["gradient_tolerance"],
+        )
+
+        stopped_early = total_steps < optimization["max_steps"]
+
         if not math.isclose(
             restored_best_loss,
             best_loss,
@@ -6948,7 +6991,11 @@ def fit_posthoc_calibration(
             "name": stage_name,
             "epochs_ran": total_steps,
             "best_epoch": best_step,
-            "stopped_early": bool(converged),
+            # "stopped_early": bool(converged),
+            "stopped_early": bool(stopped_early),
+            "plateau_detected": bool(plateau_detected),
+            "restored_gradient_converged": bool(converged),
+            "provisional_stop_reason": provisional_stop_reason,
             "converged": bool(converged),
             "stop_reason": stop_reason,
             "parameter_selection": "minimum_training_objective",
