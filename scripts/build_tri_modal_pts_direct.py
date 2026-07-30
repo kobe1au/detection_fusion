@@ -31,7 +31,7 @@ from fusion.quality import (
     OBSERVABLE_REQUIRED_FIELDS,
     OBSERVABLE_SCHEMA_VERSION,
 )
-from fusion.pt_schema import CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS, PT_SCHEMA_VERSION
+from fusion.pt_schema import PT_SCHEMA_VERSION, validate_current_pt_payload
 
 
 logger = logging.getLogger("build_tri_modal_pts_direct")
@@ -47,9 +47,18 @@ def _canonical(value: Any) -> Any:
     return value
 
 
-def _build_fingerprint(cfg: dict, vocab: dict) -> str:
+def _build_fingerprint(
+    cfg: dict,
+    vocab: dict,
+    *,
+    pt_schema_version: int | None = None,
+) -> str:
     payload = {
-        "pt_schema_version": PT_SCHEMA_VERSION,
+        "pt_schema_version": (
+            PT_SCHEMA_VERSION
+            if pt_schema_version is None
+            else int(pt_schema_version)
+        ),
         "observable_schema_version": OBSERVABLE_SCHEMA_VERSION,
         "config": _canonical(cfg),
         "manifest_vocab": _canonical(vocab),
@@ -96,33 +105,19 @@ def _resume_existing(job: dict[str, Any], cfg: dict, build_fingerprint: str) -> 
         return False, {**row, "status": "pending"}
     try:
         raw = torch.load(path, map_location="cpu", weights_only=True)
-        meta = raw.get("direct_build_meta", {}) if isinstance(raw, dict) else {}
-        version = int(meta.get("pt_schema_version", 0)) if isinstance(meta, dict) else 0
-        fingerprint = str(meta.get("build_fingerprint") or "") if isinstance(meta, dict) else ""
-        observable = raw.get("observable_metadata", {}) if isinstance(raw, dict) else {}
-        observable_complete = (
-            isinstance(observable, dict)
-            and observable.get("schema_version") == OBSERVABLE_SCHEMA_VERSION
-            and all(key in observable for key in OBSERVABLE_REQUIRED_FIELDS)
-        )
-        payload_complete = isinstance(raw, dict) and all(
-            key in raw for key in CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS
-        )
-        manifest_meta = raw.get("manifest_meta", {}) if isinstance(raw, dict) else {}
-        identity_complete = (
-            str(meta.get("sha256") or "").strip().lower() == sha
-            and isinstance(manifest_meta, dict)
-            and str(manifest_meta.get("sha256") or "").strip().lower() == sha
-        )
-        if (
-            version == PT_SCHEMA_VERSION
-            and fingerprint == build_fingerprint
-            and observable_complete
-            and payload_complete
-            and identity_complete
-        ):
+        validate_current_pt_payload(raw, path, expected_sid=sha)
+        meta = raw["direct_build_meta"]
+        fingerprint = str(meta.get("build_fingerprint") or "")
+        if fingerprint == build_fingerprint:
             return True, {**row, "status": "ok", "reason": ""}
-        return False, {**row, "status": "failed", "reason": "schema or build fingerprint mismatch"}
+        return False, {
+            **row,
+            "status": "failed",
+            "reason": (
+                "build fingerprint mismatch: "
+                f"expected={build_fingerprint!r} actual={fingerprint!r}"
+            ),
+        }
     except Exception as exc:
         return False, {**row, "status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
 
@@ -435,6 +430,7 @@ def _build_one(
                 ),
             }
         )
+        validate_current_pt_payload(payload, path, expected_sid=sha)
         atomic_torch_save(payload, path)
         return {**row, "status": "ok", "reason": ""}
     except Exception as exc:

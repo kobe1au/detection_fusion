@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -22,44 +25,150 @@ from paper.run_trusted_fusion_baselines import (
 )
 
 
-def test_paper_validation_selection_matches_disjoint_group_holdout():
+def _write_validation_protocol(
+    tmp_path,
+    frame: pd.DataFrame,
+    *,
+    model_selection: list[str],
+    decision_calibration: list[str],
+):
+    csv_path = tmp_path / "val.csv"
+    frame.to_csv(csv_path, index=False)
+    role_path = tmp_path / "roles.json"
+    payload = {
+        "schema_version": 2,
+        "protocol": "year_label_stratified_package_group_75_25_v2",
+        "validation_csv_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+        "counts": {
+            "model_selection": len(model_selection),
+            "decision_calibration": len(decision_calibration),
+        },
+        "roles": {
+            "model_selection": model_selection,
+            "decision_calibration": decision_calibration,
+        },
+    }
+    role_path.write_text(json.dumps(payload), encoding="utf-8")
+    return csv_path, role_path
+
+
+def test_paper_validation_selection_uses_fixed_v2_roles(tmp_path):
     frame = pd.DataFrame(
         {
-            "sha256": [f"sha-{index}" for index in range(20)],
-            "label": [index % 2 for index in range(20)],
-            "year": [2020 + index % 2 for index in range(20)],
-            "pkg_name": [f"pkg-{index // 2}" for index in range(20)],
+            "sha256": [f"sha-{index}" for index in range(8)],
+            "label": [index % 2 for index in range(8)],
+            "year": [2020 + index % 2 for index in range(8)],
+            "pkg_name": [f"pkg-{index // 2}" for index in range(8)],
         }
+    )
+    csv_path, role_path = _write_validation_protocol(
+        tmp_path,
+        frame,
+        model_selection=["sha-4", "sha-5", "sha-0", "sha-1", "sha-2", "sha-3"],
+        decision_calibration=["sha-6", "sha-7"],
     )
 
     selection, summary = validation_selection_indices(
-        frame, calibration_fraction=0.5, seed=42
+        frame,
+        validation_csv_path=csv_path,
+        role_assignment_path=role_path,
     )
 
-    calibration = summary["calibration_indices"]
-    assert selection == summary["selection_indices"]
+    calibration = summary["decision_calibration_indices"]
+    assert selection == [0, 1, 2, 3, 4, 5]
+    assert selection == summary["model_selection_indices"]
     assert set(selection).isdisjoint(calibration)
     assert sorted(selection + calibration) == list(range(len(frame)))
     selection_groups = set(frame.iloc[selection]["pkg_name"])
     calibration_groups = set(frame.iloc[calibration]["pkg_name"])
     assert selection_groups.isdisjoint(calibration_groups)
+    assert summary["protocol"] == "year_label_stratified_package_group_75_25_v2"
+    assert summary["model_selection_fraction_of_validation"] == pytest.approx(0.75)
 
 
-def test_paper_validation_selection_defaults_to_formal_40_percent_budget():
-    frame = pd.DataFrame(
-        {
-            "sha256": [f"sha-{index}" for index in range(20)],
-            "label": [index % 2 for index in range(20)],
-            "year": [2020 + index % 2 for index in range(20)],
-            "pkg_name": [f"pkg-{index // 2}" for index in range(20)],
-        }
+def test_checked_in_paper_validation_selection_matches_main_v2_protocol():
+    frame = read_label_csv("labels/val.csv")
+    selection, summary = validation_selection_indices(
+        frame,
+        validation_csv_path="labels/val.csv",
     )
 
-    selection, summary = validation_selection_indices(frame, seed=42)
+    assert len(selection) == 2188
+    assert summary["num_decision_calibration"] == 733
+    assert summary["validation_csv_sha256"] == (
+        "ac6ceb079246a7c59a443861ea0430bc6f4510bf0b464de35c776e9aade1ad89"
+    )
 
-    assert summary["validation_fraction"] == pytest.approx(0.60)
-    assert summary["selection_fraction_of_validation"] == pytest.approx(0.40)
-    assert len(selection) == 8
+
+def test_paper_validation_selection_rejects_csv_digest_mismatch(tmp_path):
+    original = pd.DataFrame(
+        {
+            "sha256": ["a", "b"],
+            "label": [0, 1],
+            "pkg_name": ["pkg.a", "pkg.b"],
+        }
+    )
+    csv_path, role_path = _write_validation_protocol(
+        tmp_path,
+        original,
+        model_selection=["a"],
+        decision_calibration=["b"],
+    )
+    changed = original.iloc[::-1].reset_index(drop=True)
+    changed.to_csv(csv_path, index=False)
+
+    with pytest.raises(ValueError, match="different validation CSV"):
+        validation_selection_indices(
+            changed,
+            validation_csv_path=csv_path,
+            role_assignment_path=role_path,
+        )
+
+
+def test_paper_validation_selection_rejects_incomplete_identity_cover(tmp_path):
+    frame = pd.DataFrame(
+        {
+            "sha256": ["a", "b", "c"],
+            "label": [0, 1, 0],
+            "pkg_name": ["pkg.a", "pkg.b", "pkg.c"],
+        }
+    )
+    csv_path, role_path = _write_validation_protocol(
+        tmp_path,
+        frame,
+        model_selection=["a"],
+        decision_calibration=["b"],
+    )
+
+    with pytest.raises(ValueError, match="does not cover the full"):
+        validation_selection_indices(
+            frame,
+            validation_csv_path=csv_path,
+            role_assignment_path=role_path,
+        )
+
+
+def test_paper_validation_selection_rejects_crossed_package_group(tmp_path):
+    frame = pd.DataFrame(
+        {
+            "sha256": ["a", "b"],
+            "label": [0, 1],
+            "pkg_name": ["same.package", "same.package"],
+        }
+    )
+    csv_path, role_path = _write_validation_protocol(
+        tmp_path,
+        frame,
+        model_selection=["a"],
+        decision_calibration=["b"],
+    )
+
+    with pytest.raises(ValueError, match="splits package groups"):
+        validation_selection_indices(
+            frame,
+            validation_csv_path=csv_path,
+            role_assignment_path=role_path,
+        )
 
 
 def test_maldozer_empty_api_sequence_is_padding_only(tmp_path):
@@ -137,7 +246,7 @@ def test_paper_label_reader_rejects_lossy_or_nonfinite_labels(tmp_path, label):
         read_label_csv(path)
 
 
-def test_validation_selection_defensively_rejects_fractional_labels():
+def test_validation_selection_defensively_rejects_fractional_labels(tmp_path):
     frame = pd.DataFrame(
         {
             "sha256": ["a", "b"],
@@ -145,9 +254,19 @@ def test_validation_selection_defensively_rejects_fractional_labels():
             "pkg_name": ["pkg.a", "pkg.b"],
         }
     )
+    csv_path, role_path = _write_validation_protocol(
+        tmp_path,
+        frame,
+        model_selection=["a"],
+        decision_calibration=["b"],
+    )
 
     with pytest.raises(ValueError, match="finite binary integers"):
-        validation_selection_indices(frame)
+        validation_selection_indices(
+            frame,
+            validation_csv_path=csv_path,
+            role_assignment_path=role_path,
+        )
 
 
 @pytest.mark.parametrize(

@@ -1,9 +1,9 @@
 defaults:
-  - ../evidential_trusted_fusion.yaml
+  - ../competence_anchored_fusion.yaml
 
 method:
-  name: evidential_seed_3407
+  name: competence_anchored_seed_3407
 
 train:
-  exp_name: evidential_seed_3407
+  exp_name: competence_anchored_seed_3407
   seed: 3407

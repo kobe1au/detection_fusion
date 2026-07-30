@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from fusion.constants import AvailabilityIndex
 from fusion.evidential import dirichlet_expected_ce_loss, evidential_loss
+from fusion.opinion_router import threshold_aligned_fn_risk_state
 
 
 BRANCH_AUX_KEYS = (
@@ -26,6 +27,7 @@ AUXILIARY_WEIGHT_MODES = (
     "unmasked_uniform",
 )
 PAPER_EVIDENTIAL_OBJECTIVES = ("tmc", "ecml")
+ANCHORED_STAGE_A_OBJECTIVE = "anchored_stage_a"
 REMOVED_LOSS_CONFIG_KEYS = frozenset(
     {
         "reliability_weighted_aux",
@@ -308,6 +310,7 @@ def routing_risk_target(
     *,
     mixture_log_prob: torch.Tensor | None = None,
     valid_routing: torch.Tensor | None = None,
+    classification_log_odds_threshold_by_row: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, str, str]:
     """Build the detached I2 risk target and its exact training mask.
 
@@ -316,7 +319,9 @@ def routing_risk_target(
     predicted-malware side is excluded from the fitting denominator rather
     than added as abundant zero targets.  Both the public source-level loss and
     the packed post-hoc optimizer call this helper so that this contract cannot
-    drift between paths.
+    drift between paths. Strict cross-fitting supplies one fold-excluded
+    classifier cutoff per row; deployed inference uses the scalar cutoff in
+    ``routing_config``.
     """
     routing_config = routing_config or {}
     risk_loss_type = str(routing_config.get("risk_loss", "bce")).strip().lower()
@@ -347,17 +352,6 @@ def routing_risk_target(
     if valid_routing.numel() != labels.numel():
         raise ValueError("routing_has_available batch shape disagrees with labels")
 
-    raw_threshold = routing_config.get("classification_log_odds_threshold")
-    if raw_threshold is None:
-        raise ValueError(
-            "threshold-aligned malware-FN risk requires a fitted "
-            "classification_log_odds_threshold"
-        )
-    raw_threshold = float(raw_threshold)
-    if not math.isfinite(raw_threshold):
-        raise ValueError(
-            "fusion.routing.classification_log_odds_threshold must be finite"
-        )
     raw_log_prob = outputs.get("uncalibrated_final_log_prob")
     if not isinstance(raw_log_prob, torch.Tensor) or (
         raw_log_prob.ndim != 2
@@ -368,9 +362,37 @@ def routing_risk_target(
             "threshold-aligned routing risk requires "
             "uncalibrated_final_log_prob with shape [B, 2]"
         )
-    threshold_prediction = (
-        raw_log_prob.detach()[:, 1] - raw_log_prob.detach()[:, 0]
-        >= raw_threshold
+    if classification_log_odds_threshold_by_row is None:
+        raw_threshold = routing_config.get("classification_log_odds_threshold")
+        if raw_threshold is None:
+            raise ValueError(
+                "threshold-aligned malware-FN risk requires a fitted "
+                "classification_log_odds_threshold"
+            )
+        raw_threshold = float(raw_threshold)
+        if not math.isfinite(raw_threshold):
+            raise ValueError(
+                "fusion.routing.classification_log_odds_threshold must be finite"
+            )
+        threshold: float | torch.Tensor = raw_threshold
+    else:
+        threshold = (
+            classification_log_odds_threshold_by_row.detach()
+            .to(
+                device=raw_log_prob.device,
+                dtype=raw_log_prob.dtype,
+            )
+            .view(-1)
+        )
+        if threshold.numel() != labels.numel():
+            raise ValueError(
+                "per-row classification cutoffs must match the label batch"
+            )
+        if not bool(torch.isfinite(threshold).all().item()):
+            raise ValueError("per-row classification cutoffs must be finite")
+    threshold_prediction, _ = threshold_aligned_fn_risk_state(
+        raw_log_prob.detach()[:, 1] - raw_log_prob.detach()[:, 0],
+        threshold,
     )
     error_target = (labels.eq(1) & ~threshold_prediction).float()
     # Conditional FN risk is learned only where the classifier predicts
@@ -586,6 +608,106 @@ def compute_branch_auxiliary_loss(
     return total, diagnostics
 
 
+def _anchored_stage_a_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    outputs: dict,
+    availability: torch.Tensor | None,
+    loss_cfg: dict,
+) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
+    """Train a clean Joint expert plus independently useful atomic experts.
+
+    The primary logits are the real Joint expert.  Atomic losses are first
+    averaged across the alive experts *within each sample* and then across
+    samples.  This prevents a batch with one frequently alive modality from
+    changing the relative objective merely through missingness frequency.
+    All-dead rows train neither Joint nor atomic head bias.
+    """
+
+    if not isinstance(availability, torch.Tensor):
+        raise ValueError(
+            "loss.objective='anchored_stage_a' requires fusion availability"
+        )
+    _validate_availability(
+        availability,
+        context="anchored Stage-A availability",
+    )
+    if float(loss_cfg.get("evidential_loss_weight", 0.0)) != 0.0:
+        raise ValueError(
+            "anchored Stage A has no EDL objective; remove "
+            "loss.evidential_loss_weight or set it to zero"
+        )
+    if "branch_aux_weight" in loss_cfg:
+        raise ValueError(
+            "anchored Stage A uses loss.atomic_aux_weight; remove the legacy "
+            "loss.branch_aux_weight key"
+        )
+    atomic_weight = float(loss_cfg.get("atomic_aux_weight", 0.25))
+    if not math.isfinite(atomic_weight) or atomic_weight < 0.0:
+        raise ValueError(
+            "loss.atomic_aux_weight must be finite and non-negative"
+        )
+    label_smoothing = float(loss_cfg.get("label_smoothing", 0.0))
+    if not math.isfinite(label_smoothing) or not 0.0 <= label_smoothing < 1.0:
+        raise ValueError("loss.label_smoothing must lie within [0, 1)")
+
+    alive = _branch_alive_masks(availability)
+    joint_alive = torch.stack(
+        [alive[name].bool() for name in BRANCH_NAMES],
+        dim=-1,
+    ).all(dim=-1).to(dtype=logits.dtype)
+    joint_loss = _weighted_cross_entropy(
+        logits,
+        labels,
+        joint_alive,
+        label_smoothing,
+    )
+
+    per_atomic: list[torch.Tensor] = []
+    atomic_masks: list[torch.Tensor] = []
+    for key in BRANCH_AUX_KEYS:
+        branch = BRANCH_AUX_NAMES[key]
+        branch_logits = outputs.get(key)
+        if (
+            not isinstance(branch_logits, torch.Tensor)
+            or branch_logits.shape != logits.shape
+        ):
+            raise ValueError(
+                "anchored Stage A requires exact API/Graph/Manifest "
+                f"auxiliary logits; missing or invalid {key!r}"
+            )
+        per_atomic.append(
+            F.cross_entropy(
+                branch_logits,
+                labels.long(),
+                reduction="none",
+                label_smoothing=label_smoothing,
+            )
+        )
+        atomic_masks.append(alive[branch].to(dtype=logits.dtype))
+    atomic_loss_matrix = torch.stack(per_atomic, dim=-1)
+    atomic_alive_matrix = torch.stack(atomic_masks, dim=-1)
+    atomic_count = atomic_alive_matrix.sum(dim=-1)
+    per_sample_atomic = (
+        atomic_loss_matrix * atomic_alive_matrix
+    ).sum(dim=-1) / atomic_count.clamp_min(1.0)
+    valid_atomic = atomic_count.gt(0).to(dtype=logits.dtype)
+    atomic_loss = (
+        per_sample_atomic * valid_atomic
+    ).sum() / valid_atomic.sum().clamp_min(1.0)
+    atomic_loss = atomic_loss * valid_atomic.sum().gt(0).to(atomic_loss)
+
+    total = joint_loss + atomic_weight * atomic_loss
+    return total, {
+        "loss": total.detach(),
+        "joint_ce": joint_loss.detach(),
+        "atomic_ce": atomic_loss.detach(),
+        "atomic_aux_weight": atomic_weight,
+        "joint_active_fraction": joint_alive.mean().detach(),
+        "atomic_active_fraction": valid_atomic.mean().detach(),
+    }
+
+
 def compute_robust_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -621,6 +743,22 @@ def compute_robust_loss(
         )
 
     objective = str(loss_cfg.get("objective", "standard")).strip().lower()
+    if objective == ANCHORED_STAGE_A_OBJECTIVE:
+        total, parts = _anchored_stage_a_loss(
+            logits,
+            labels,
+            extra,
+            availability,
+            loss_cfg,
+        )
+        if materialize_diagnostics:
+            parts = {
+                key: float(value.item())
+                if isinstance(value, torch.Tensor)
+                else float(value)
+                for key, value in parts.items()
+            }
+        return total, parts
     if objective in PAPER_EVIDENTIAL_OBJECTIVES:
         total, parts = _compute_paper_evidential_objective(
             extra,
@@ -640,7 +778,7 @@ def compute_robust_loss(
         return total, parts
     if objective not in {"standard", "default", "generic"}:
         raise ValueError(
-            "loss.objective must be standard, tmc, or ecml; "
+            "loss.objective must be anchored_stage_a, standard, tmc, or ecml; "
             f"got {objective!r}"
         )
 

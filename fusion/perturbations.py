@@ -4,6 +4,10 @@ import math
 
 import torch
 
+from fusion.manifest_features import (
+    category_counts_from_strings,
+    normalize_manifest_permissions,
+)
 from fusion.quality import refresh_hard_availability
 from fusion.semantic_categories import SEMANTIC_CATEGORY_DIM
 from fusion.utils import clamp_strength
@@ -152,42 +156,6 @@ def apply_graph_missing(data: dict) -> dict:
     return data
 
 
-def _choose_active_permission_positions(
-    vec: torch.Tensor,
-    permission_dim: int,
-    strength: float,
-) -> torch.Tensor:
-    if vec.ndim not in {1, 2}:
-        raise ValueError(
-            f"manifest_x must be one- or two-dimensional, got shape={tuple(vec.shape)}"
-        )
-    width = int(vec.size(-1))
-    permission_dim = max(0, min(int(permission_dim), width))
-    if permission_dim <= 0:
-        return torch.empty((0,), dtype=torch.long, device=vec.device)
-    segment = vec[..., :permission_dim].reshape(-1, permission_dim)
-    active = torch.where((segment.abs() > 1e-8).any(dim=0))[0]
-    count = _num_to_perturb(active.numel(), strength)
-    if count <= 0:
-        return active[:0]
-    chosen = active[
-        torch.randperm(active.numel(), device=vec.device)[:count]
-    ]
-    return chosen
-
-
-def _mask_vector_positions(
-    vec: torch.Tensor,
-    positions: torch.Tensor,
-) -> torch.Tensor:
-    out = vec.clone()
-    if out.ndim == 1:
-        out[positions] = 0.0
-    else:
-        out[:, positions] = 0.0
-    return out
-
-
 def _set_manifest_semantic_counts(data: dict, updated: torch.Tensor) -> None:
     updated = updated.float().clamp_min(0.0)
     data["manifest_category_counts"] = updated
@@ -214,42 +182,124 @@ def _set_manifest_semantic_counts(data: dict, updated: torch.Tensor) -> None:
     data["manifest_x"] = out
 
 
-def _remove_manifest_permission_semantics(
+def _validated_manifest_permission_state(
     data: dict,
-    positions: torch.Tensor,
-) -> None:
-    counts = data.get("manifest_category_counts")
-    mapping = data.get("manifest_permission_category_map")
-    if (
-        not isinstance(counts, torch.Tensor)
-        or not isinstance(mapping, torch.Tensor)
-        or mapping.ndim != 2
-        or mapping.size(1) != counts.numel()
-        or mapping.size(0) < int(data.get("manifest_permission_dim", 0))
-    ):
+) -> tuple[
+    list[str],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+]:
+    """Validate the CPU-only token alignment used by permission masking."""
+
+    tokens = data.get("manifest_permission_tokens")
+    if not isinstance(tokens, list):
         raise ValueError(
-            "Current PT is missing a valid manifest_permission_category_map; "
-            "regenerate it with build_tri_modal_pts_direct.py"
+            "Current PT is missing canonical manifest permission tokens; run "
+            "scripts/migrate_manifest_vocab_pts.py"
         )
-    selected = positions.to(mapping.device).long()
-    delta = mapping[selected].sum(dim=0).to(
-        device=counts.device,
-        dtype=counts.dtype,
-    )
-    _set_manifest_semantic_counts(data, (counts - delta).clamp_min(0.0))
-
-
-def _sync_manifest_permission_count(data: dict) -> None:
-    """Make IDs, manifest_stats and the embedded stats segment agree."""
-
+    canonical_tokens = normalize_manifest_permissions(tokens)
+    if tokens != canonical_tokens:
+        raise ValueError(
+            "manifest permission tokens must be lower-case, de-duplicated, and sorted"
+        )
+    token_ids = data.get("manifest_permission_token_ids")
     ids = data.get("manifest_permission_ids")
+    counts = data.get("manifest_category_counts")
     stats = data.get("manifest_stats")
     vec = data.get("manifest_x")
-    if not isinstance(ids, torch.Tensor):
+    permission_dim = int(data.get("manifest_permission_dim", -1))
+    if (
+        not isinstance(token_ids, torch.Tensor)
+        or not isinstance(ids, torch.Tensor)
+        or not isinstance(counts, torch.Tensor)
+        or not isinstance(stats, torch.Tensor)
+        or not isinstance(vec, torch.Tensor)
+    ):
         raise ValueError(
-            "Current PT is missing manifest_permission_ids; regenerate it with "
-            "build_tri_modal_pts_direct.py"
+            "Current PT is missing Manifest permission-alignment tensors; run "
+            "scripts/migrate_manifest_vocab_pts.py"
         )
+    token_ids = token_ids.long().reshape(-1)
+    ids = ids.long().reshape(-1)
+    counts = counts.float().reshape(-1)
+    stats = stats.float().reshape(-1)
+    if token_ids.numel() != len(tokens):
+        raise ValueError(
+            "manifest_permission_token_ids must align one-to-one with permission tokens"
+        )
+    if vec.ndim not in {1, 2}:
+        raise ValueError(
+            f"manifest_x must be one- or two-dimensional, got {tuple(vec.shape)}"
+        )
+    if permission_dim < 0 or permission_dim > vec.size(-1):
+        raise ValueError(
+            "manifest_permission_dim is outside manifest_x: "
+            f"permission_dim={permission_dim} width={vec.size(-1)}"
+        )
+    if (
+        counts.numel() != SEMANTIC_CATEGORY_DIM
+        or not bool(torch.isfinite(counts).all().item())
+        or bool((counts < 0.0).any().item())
+    ):
+        raise ValueError(
+            "manifest_category_counts must contain exactly "
+            f"{SEMANTIC_CATEGORY_DIM} finite non-negative values"
+        )
+    if stats.numel() < 1 or not bool(torch.isfinite(stats).all().item()):
+        raise ValueError("manifest_stats must be a non-empty finite tensor")
+    if bool(
+        ((token_ids < 0) | (token_ids > permission_dim)).any().item()
+    ):
+        raise ValueError(
+            f"manifest_permission_token_ids must be within [0, {permission_dim}]"
+        )
+    expected_ids = token_ids[token_ids > 0].unique(sorted=True)
+    if int((token_ids > 0).sum().item()) != int(expected_ids.numel()):
+        raise ValueError(
+            "non-zero manifest_permission_token_ids must be unique"
+        )
+    if not torch.equal(ids.cpu(), expected_ids.cpu()):
+        raise ValueError(
+            "manifest_permission_ids disagrees with manifest_permission_token_ids"
+        )
+    if permission_dim == 0:
+        active_ids = torch.empty((0,), dtype=torch.long, device=vec.device)
+    else:
+        permission_segment = vec[..., :permission_dim].reshape(
+            -1, permission_dim
+        )
+        active_ids = (
+            torch.where((permission_segment.abs() > 1.0e-8).any(dim=0))[0].long()
+            + 1
+        )
+    if not torch.equal(active_ids.cpu(), expected_ids.cpu()):
+        raise ValueError(
+            "Manifest permission bits disagree with manifest_permission_token_ids"
+        )
+    expected_count_stat = math.log1p(len(tokens)) / _MANIFEST_PERMISSION_COUNT_LOG_NORM
+    actual_count_stat = float(stats[0].item())
+    if not math.isclose(
+        actual_count_stat,
+        expected_count_stat,
+        rel_tol=1.0e-5,
+        abs_tol=1.0e-6,
+    ):
+        raise ValueError(
+            "manifest_stats permission count disagrees with "
+            "manifest_meta.permissions; run scripts/migrate_manifest_vocab_pts.py"
+        )
+    return tokens, token_ids, ids, counts, stats, vec, permission_dim
+
+
+def _set_manifest_permission_count(data: dict, count: int) -> None:
+    """Synchronize the raw count statistic and its embedded feature."""
+
+    stats = data["manifest_stats"]
+    vec = data["manifest_x"]
     if not isinstance(stats, torch.Tensor) or stats.numel() < 1:
         raise ValueError(
             "Current PT is missing manifest_stats; regenerate it with "
@@ -261,7 +311,7 @@ def _sync_manifest_permission_count(data: dict) -> None:
             "build_tri_modal_pts_direct.py"
         )
 
-    count = int(torch.unique(ids.long().reshape(-1)).numel())
+    count = max(0, int(count))
     if not math.isfinite(float(stats.detach().float().reshape(-1)[0].item())):
         raise ValueError("manifest_stats permission count must be finite")
     normalized = math.log1p(count) / _MANIFEST_PERMISSION_COUNT_LOG_NORM
@@ -293,59 +343,70 @@ def apply_manifest_permission_mask(data: dict, strength: float) -> dict:
     strength = clamp_strength(strength)
     if strength <= 0.0:
         return data
-    vec = data.get("manifest_x")
-    if not isinstance(vec, torch.Tensor) or vec.numel() == 0:
-        return data
-
-    permission_dim = int(data.get("manifest_permission_dim", 0))
-    if permission_dim < 0 or permission_dim > vec.size(-1):
-        raise ValueError(
-            "manifest_permission_dim is outside manifest_x: "
-            f"permission_dim={permission_dim} width={vec.size(-1)}"
-        )
-    positions = _choose_active_permission_positions(
+    (
+        tokens,
+        token_ids,
+        ids,
+        original_counts,
+        _stats,
         vec,
         permission_dim,
-        strength,
+    ) = _validated_manifest_permission_state(data)
+
+    num_to_remove = _num_to_perturb(len(tokens), strength)
+    remove_positions = (
+        torch.randperm(len(tokens), device=token_ids.device)[:num_to_remove]
+        if num_to_remove > 0
+        else torch.empty((0,), dtype=torch.long, device=token_ids.device)
     )
-    ids = data.get("manifest_permission_ids")
-    if not isinstance(ids, torch.Tensor):
+    keep = torch.ones(
+        (len(tokens),), dtype=torch.bool, device=token_ids.device
+    )
+    keep[remove_positions] = False
+    remaining_tokens = [
+        token for index, token in enumerate(tokens) if bool(keep[index].item())
+    ]
+    remaining_token_ids = token_ids[keep].clone()
+    remaining_known_ids = remaining_token_ids[
+        remaining_token_ids > 0
+    ].unique(sorted=True)
+
+    original_permission_counts = category_counts_from_strings(tokens).to(
+        device=original_counts.device,
+        dtype=original_counts.dtype,
+    )
+    non_permission_counts = original_counts - original_permission_counts
+    if bool((non_permission_counts < -1.0e-5).any().item()):
         raise ValueError(
-            "Current PT is missing manifest_permission_ids; regenerate it with "
-            "build_tri_modal_pts_direct.py"
+            "manifest_category_counts is inconsistent with manifest_meta.permissions; "
+            "run scripts/migrate_manifest_vocab_pts.py"
         )
+    remaining_permission_counts = category_counts_from_strings(
+        remaining_tokens
+    ).to(
+        device=original_counts.device,
+        dtype=original_counts.dtype,
+    )
+    updated_counts = (
+        non_permission_counts.clamp_min(0.0) + remaining_permission_counts
+    )
 
-    active_ids = torch.unique(ids.long().reshape(-1)).sort().values
-    if permission_dim == 0:
-        active_positions = torch.empty(
-            (0,), dtype=torch.long, device=vec.device
-        )
-    else:
-        active_positions = (
-            torch.where(
-                (
-                    vec[..., :permission_dim]
-                    .reshape(-1, permission_dim)
-                    .abs()
-                    > 1e-8
-                ).any(dim=0)
-            )[0]
-            + 1
-        )
-    if not torch.equal(active_ids.cpu(), active_positions.long().cpu()):
-        raise ValueError(
-            "manifest_permission_ids and active permission bits disagree; "
-            "regenerate the PT"
-        )
-
-    if positions.numel() > 0:
-        data["manifest_x"] = _mask_vector_positions(vec, positions)
-        _remove_manifest_permission_semantics(data, positions)
-        removed_ids = positions.to(ids.device).long() + 1
-        keep = ~torch.isin(ids.long().reshape(-1), removed_ids)
-        data["manifest_permission_ids"] = ids.reshape(-1)[keep].clone()
-
-    _sync_manifest_permission_count(data)
+    updated_vec = vec.clone()
+    updated_vec[..., :permission_dim] = 0.0
+    if remaining_known_ids.numel() > 0:
+        positions = (remaining_known_ids - 1).to(updated_vec.device)
+        if updated_vec.ndim == 1:
+            updated_vec[positions] = 1.0
+        else:
+            updated_vec[:, positions] = 1.0
+    data["manifest_x"] = updated_vec
+    data["manifest_permission_tokens"] = remaining_tokens
+    data["manifest_permission_token_ids"] = remaining_token_ids
+    data["manifest_permission_ids"] = remaining_known_ids.to(
+        device=ids.device
+    )
+    _set_manifest_semantic_counts(data, updated_counts)
+    _set_manifest_permission_count(data, len(remaining_tokens))
     data["manifest_aug_type"] = "manifest_permission_mask"
     refresh_hard_availability(data)
     return data
@@ -355,15 +416,20 @@ def apply_manifest_missing(data: dict) -> dict:
     for key in (
         "manifest_x",
         "manifest_permission_ids",
+        "manifest_permission_token_ids",
         "manifest_category_counts",
         "manifest_stats",
     ):
         value = data.get(key)
         if isinstance(value, torch.Tensor):
-            if key == "manifest_permission_ids":
+            if key in {
+                "manifest_permission_ids",
+                "manifest_permission_token_ids",
+            }:
                 data[key] = value.reshape(-1)[:0].clone()
             else:
                 data[key] = torch.zeros_like(value)
+    data["manifest_permission_tokens"] = []
     data["manifest_has_content"] = False
     data["manifest_permission_count"] = 0
     data["manifest_component_count"] = 0

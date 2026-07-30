@@ -1,0 +1,28 @@
+defaults:
+  - _evidential_base.yaml
+
+method:
+  name: ecml_style_adapted
+  protocol_id: ecml_style_adapted_v1
+
+train:
+  exp_name: baseline_ecml_style_adapted
+
+fusion:
+  # ECML-style adapted aggregation under the common APK encoders: fixed-order
+  # binary averaging of API -> Graph -> Manifest evidence.
+  combination: ecml
+  opinion_source: evidential
+
+loss:
+  # Retains ECML-style fused/per-view evidential objectives and its
+  # conflict-consistency regularizer, without claiming exact reproduction.
+  objective: ecml
+  label_smoothing: 0.0
+  branch_aux_weight: 0.0
+  evidential_loss_weight: 0.0
+  auxiliary_weight_mode: unmasked_uniform
+  ecml:
+    anneal_epochs: 10
+    consistency_weight: 1.0
+    mask_unavailable_views: true

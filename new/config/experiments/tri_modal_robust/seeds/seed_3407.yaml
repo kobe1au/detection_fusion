@@ -1,0 +1,6 @@
+defaults:
+  - ../care_droid.yaml
+
+train:
+  exp_name: care_droid_seed_3407
+  seed: 3407

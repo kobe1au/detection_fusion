@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
+import json
 import logging
 import math
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,7 @@ from torch_geometric.data import Batch, Data
 
 from fusion.perturbations import (
     EVAL_PERTURB_TYPES,
+    GRADED_PERTURBATIONS,
     apply_perturbation,
 )
 from fusion.semantic_categories import (
@@ -22,14 +25,42 @@ from fusion.semantic_categories import (
     sanitize_semantic_counts,
 )
 from fusion.quality import (
-    OBSERVABLE_REQUIRED_FIELDS,
-    OBSERVABLE_SCHEMA_VERSION,
     refresh_hard_availability,
 )
-from fusion.pt_schema import CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS, PT_SCHEMA_VERSION
+from fusion.pt_schema import (
+    PT_AUDIT_CERTIFICATE_VERSION,
+    PT_SCHEMA_VERSION,
+    PTSchemaValidationError,
+    pt_audit_entries_sha256,
+    validate_current_pt_payload,
+)
 from fusion.utils import strict_binary_integer, strict_finite_integer
 
 logger = logging.getLogger(__name__)
+
+# Successful validation summaries are safe to reuse across train/validation
+# views of the same immutable PT pool.  Keeping tensors out of this cache avoids
+# retaining a multi-gigabyte extraction corpus in process memory.
+_PT_PREFLIGHT_CACHE: dict[tuple[Any, ...], tuple[int, ...]] = {}
+_PT_AUDIT_CERTIFICATE_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
+_PT_PREFLIGHT_MAX_REPORTED_FAILURES = 10
+
+
+def _load_pt_weights_only(path: str | Path) -> Any:
+    """Load a PT safely while keeping Linux's lazy mmap fast path.
+
+    On Windows, PyTorch mmap keeps the backing file locked for the lifetime of
+    returned storages, which prevents temporary datasets from being cleaned up.
+    Formal AutoDL runs are Linux, so they retain mmap without making the local
+    Windows development path unreliable.
+    """
+
+    return torch.load(
+        str(path),
+        map_location="cpu",
+        weights_only=True,
+        mmap=os.name != "nt",
+    )
 
 
 def apply_graph_encoder_budget(
@@ -187,87 +218,16 @@ def _as_long_tensor(value, length: int | None = None, fill_value: int = 0) -> to
     return out
 
 
-def _as_category_map(value, rows: int, columns: int = SEMANTIC_CATEGORY_DIM) -> torch.Tensor:
-    if isinstance(value, torch.Tensor) and value.ndim == 2 and value.size(1) == columns:
-        out = value.detach().float()
-    else:
-        out = torch.zeros((0, columns), dtype=torch.float32)
-    if out.size(0) < rows:
-        out = torch.cat([out, torch.zeros((rows - out.size(0), columns), dtype=torch.float32)], dim=0)
-    elif out.size(0) > rows:
-        out = out[:rows]
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-
-
 def _validate_current_pt_payload(
     raw: Any,
     pt_path: str | Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Validate and expose only the current direct-builder PT structure."""
-    if not isinstance(raw, dict):
-        raise FatalDatasetConfigError(
-            f"PT must be a current schema-{PT_SCHEMA_VERSION} top-level mapping: {pt_path}"
-        )
-    missing_top_level = [
-        key for key in CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS if key not in raw
-    ]
-    if missing_top_level:
-        raise FatalDatasetConfigError(
-            f"PT schema-{PT_SCHEMA_VERSION} payload is missing top-level fields "
-            f"{missing_top_level}: {pt_path}"
-        )
+    """Translate the shared persisted-data contract to a dataset-fatal error."""
 
-    direct_meta = raw["direct_build_meta"]
-    if not isinstance(direct_meta, dict):
-        raise FatalDatasetConfigError(f"PT direct_build_meta must be a mapping: {pt_path}")
     try:
-        version = int(direct_meta.get("pt_schema_version", 0))
-    except (TypeError, ValueError):
-        version = 0
-    if version != PT_SCHEMA_VERSION:
-        raise FatalDatasetConfigError(
-            f"PT schema version {version} does not match required current version "
-            f"{PT_SCHEMA_VERSION}: {pt_path}"
-        )
-    if direct_meta.get("schema_version") != OBSERVABLE_SCHEMA_VERSION:
-        raise FatalDatasetConfigError(
-            f"PT direct_build_meta.schema_version must be {OBSERVABLE_SCHEMA_VERSION!r}: "
-            f"{pt_path}"
-        )
-    if not str(direct_meta.get("build_fingerprint") or "").strip():
-        raise FatalDatasetConfigError(f"PT is missing direct build fingerprint: {pt_path}")
-    expected_sid = Path(pt_path).stem.strip().lower()
-    direct_sid = str(direct_meta.get("sha256") or "").strip().lower()
-    if not direct_sid or direct_sid != expected_sid:
-        raise FatalDatasetConfigError(
-            "PT filename/direct_build_meta.sha256 identity mismatch: "
-            f"path={pt_path} expected={expected_sid!r} actual={direct_sid!r}"
-        )
-    manifest_meta = raw.get("manifest_meta")
-    if not isinstance(manifest_meta, dict):
-        raise FatalDatasetConfigError(f"PT manifest_meta must be a mapping: {pt_path}")
-    manifest_sid = str(manifest_meta.get("sha256") or "").strip().lower()
-    if not manifest_sid or manifest_sid != expected_sid:
-        raise FatalDatasetConfigError(
-            "PT filename/manifest_meta.sha256 identity mismatch: "
-            f"path={pt_path} expected={expected_sid!r} actual={manifest_sid!r}"
-        )
-
-    observable = raw["observable_metadata"]
-    if not isinstance(observable, dict):
-        raise FatalDatasetConfigError(f"PT observable_metadata must be a mapping: {pt_path}")
-    missing_observable = [key for key in OBSERVABLE_REQUIRED_FIELDS if key not in observable]
-    if observable.get("schema_version") != OBSERVABLE_SCHEMA_VERSION or missing_observable:
-        raise FatalDatasetConfigError(
-            f"PT observable schema is incomplete for {pt_path}: "
-            f"schema_version={observable.get('schema_version')!r}, "
-            f"missing={missing_observable}"
-        )
-
-    dex_list = raw["dex_list"]
-    if not isinstance(dex_list, list) or any(not isinstance(dex, dict) for dex in dex_list):
-        raise FatalDatasetConfigError(f"PT dex_list must be a list of mappings: {pt_path}")
-    return dex_list, [raw, *dex_list]
+        return validate_current_pt_payload(raw, pt_path)
+    except PTSchemaValidationError as exc:
+        raise FatalDatasetConfigError(str(exc)) from exc
 
 
 class RobustTriModalDataset(Dataset):
@@ -280,6 +240,10 @@ class RobustTriModalDataset(Dataset):
         is_train: bool = True,
         eval_perturb_type: str | None = None,
         eval_perturb_strength: float = 0.0,
+        train_perturbations: tuple[str, ...] | list[str] | None = None,
+        train_perturb_strength_min: float = 0.1,
+        train_perturb_strength_max: float = 0.9,
+        train_perturb_seed: int = 42,
         max_api_events_per_sample: int | None = None,
         max_graph_nodes_per_sample: int = 12288,
         manifest_dim: int = 256,
@@ -297,6 +261,8 @@ class RobustTriModalDataset(Dataset):
         expected_manifest_train_csv_sha256: str | None = None,
         expected_manifest_train_sample_ids_sha256: str | None = None,
         expected_pt_build_fingerprint: str | None = None,
+        pt_audit_certificate: str | None = None,
+        require_pt_audit_certificate: bool = False,
     ):
         if eval_perturb_type not in EVAL_PERTURB_TYPES:
             raise ValueError(f"Unsupported eval_perturb_type: {eval_perturb_type}")
@@ -308,6 +274,39 @@ class RobustTriModalDataset(Dataset):
             raise ValueError(
                 f"eval_perturb_strength must be within [0, 1], got {self.eval_perturb_strength}"
             )
+        raw_train_perturbations = tuple(train_perturbations or ())
+        unsupported_train_perturbations = sorted(
+            set(raw_train_perturbations) - set(GRADED_PERTURBATIONS)
+        )
+        if unsupported_train_perturbations:
+            raise ValueError(
+                "train_perturbations supports exactly the registered graded "
+                f"single-modality mechanisms; unsupported={unsupported_train_perturbations}"
+            )
+        if len(raw_train_perturbations) != len(set(raw_train_perturbations)):
+            raise ValueError("train_perturbations must not contain duplicates")
+        if raw_train_perturbations and not self.is_train:
+            raise ValueError(
+                "train_perturbations can only be enabled on a training dataset"
+            )
+        self.train_perturbations = raw_train_perturbations
+        self.train_perturb_strength_min = float(train_perturb_strength_min)
+        self.train_perturb_strength_max = float(train_perturb_strength_max)
+        if (
+            not math.isfinite(self.train_perturb_strength_min)
+            or not math.isfinite(self.train_perturb_strength_max)
+            or not 0.0 < self.train_perturb_strength_min
+            <= self.train_perturb_strength_max
+            <= 1.0
+        ):
+            raise ValueError(
+                "train perturbation strengths must satisfy "
+                "0 < min <= max <= 1"
+            )
+        self.train_perturb_seed = strict_finite_integer(
+            train_perturb_seed,
+            field_name="train_perturb_seed",
+        )
         self.max_api_events_per_sample = (
             strict_finite_integer(
                 max_api_events_per_sample,
@@ -341,6 +340,24 @@ class RobustTriModalDataset(Dataset):
         self.expected_pt_build_fingerprint = str(
             expected_pt_build_fingerprint or ""
         ).strip().lower()
+        self.pt_audit_certificate = (
+            Path(pt_audit_certificate).expanduser().resolve()
+            if str(pt_audit_certificate or "").strip()
+            else None
+        )
+        self.require_pt_audit_certificate = bool(require_pt_audit_certificate)
+        if self.require_pt_audit_certificate and self.pt_audit_certificate is None:
+            raise ValueError(
+                "data.pt_audit_certificate is required for this formal run"
+            )
+        if (
+            self.pt_audit_certificate is not None
+            and not self.expected_pt_build_fingerprint
+        ):
+            raise ValueError(
+                "expected_pt_build_fingerprint is required with "
+                "pt_audit_certificate"
+            )
         if self.expected_pt_build_fingerprint and (
             len(self.expected_pt_build_fingerprint) != 64
             or any(
@@ -543,7 +560,12 @@ class RobustTriModalDataset(Dataset):
         self.sample_labels = [label for _, label, _, _ in self.samples]
         self.sample_years = [year for _, _, _, year in self.samples]
         self.sample_groups = build_package_isolation_groups(self.sample_sids, groups)
-        self.feature_dim = self._infer_feature_dim(default_dim=515)
+        if self.pt_audit_certificate is not None:
+            self.feature_dim = (
+                self._validate_certificate_and_infer_feature_dim()
+            )
+        else:
+            self.feature_dim = self._preflight_validate_and_infer_feature_dim()
         logger.info("Loaded %d robust tri-modal samples from %s", len(self.samples), self.pt_dir)
 
     def __len__(self) -> int:
@@ -593,97 +615,298 @@ class RobustTriModalDataset(Dataset):
                 f"actual={actual!r}"
             )
 
-    def _infer_feature_dim(self, default_dim: int) -> int:
-        for pt_file, _, _, _ in self.samples:
-            try:
-                # Current APK payloads use PyTorch's zip format.  Memory mapping
-                # keeps unused tensor storages lazy instead of copying the whole
-                # multi-DEX payload on every epoch; tensors touched below retain
-                # exactly the same dtype and values.
-                raw = torch.load(
-                    str(pt_file),
-                    map_location="cpu",
-                    weights_only=True,
-                    mmap=True,
+    def _load_pt_audit_certificate(self) -> dict[str, Any]:
+        path = self.pt_audit_certificate
+        if path is None or not path.is_file():
+            raise FatalDatasetConfigError(
+                f"PT audit certificate does not exist: {path}"
+            )
+        stat = path.stat()
+        cache_key = (
+            str(path),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+        )
+        cached = _PT_AUDIT_CERTIFICATE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        with path.open("r", encoding="utf-8") as handle:
+            report = json.load(handle)
+        if not isinstance(report, dict):
+            raise FatalDatasetConfigError(
+                f"PT audit report must be a mapping: {path}"
+            )
+        certificate = (report.get("after") or {}).get("pt_audit_certificate")
+        if report.get("mode") != "apply" or not isinstance(certificate, dict):
+            raise FatalDatasetConfigError(
+                "PT audit certificate must come from a successful migration "
+                f"--apply report: {path}"
+            )
+        if (
+            certificate.get("certificate_version")
+            != PT_AUDIT_CERTIFICATE_VERSION
+            or certificate.get("pt_schema_version") != PT_SCHEMA_VERSION
+        ):
+            raise FatalDatasetConfigError(
+                f"Unsupported PT audit certificate/schema version: {path}"
+            )
+        entries = certificate.get("entries")
+        if not isinstance(entries, list) or not entries:
+            raise FatalDatasetConfigError(
+                f"PT audit certificate has no entries: {path}"
+            )
+        expected_digest = pt_audit_entries_sha256(entries)
+        if certificate.get("certificate_sha256") != expected_digest:
+            raise FatalDatasetConfigError(
+                f"PT audit certificate digest mismatch: {path}"
+            )
+        if (
+            str(certificate.get("build_fingerprint") or "").strip().lower()
+            != self.expected_pt_build_fingerprint
+        ):
+            raise FatalDatasetConfigError(
+                "PT audit certificate build fingerprint does not match "
+                "data.expected_pt_build_fingerprint"
+            )
+        pool_root = Path(str(certificate.get("pool_root") or "")).resolve()
+        if pool_root != self.pt_dir.resolve():
+            raise FatalDatasetConfigError(
+                "PT audit certificate pool_root does not match the configured "
+                f"PT directory: certificate={pool_root} configured={self.pt_dir.resolve()}"
+            )
+        by_sid: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise FatalDatasetConfigError(
+                    f"PT audit certificate entry must be a mapping: {path}"
                 )
-                dex_list, _ = _validate_current_pt_payload(raw, pt_file)
-                self._validate_pt_build_fingerprint(raw, pt_file)
-                self._validate_manifest_pt_provenance(raw, pt_file)
-                for dex in dex_list:
-                    x = dex.get("call_x") if isinstance(dex, dict) else None
-                    if isinstance(x, torch.Tensor) and x.ndim == 2 and x.size(1) > 0:
-                        dim = int(x.size(1))
-                        if self.drop_graph_behavior_hints and dim == 519:
-                            return 515
-                        return dim
-            except FatalDatasetConfigError:
+            sid = str(entry.get("sid") or "").strip().lower()
+            if not sid or sid in by_sid:
+                raise FatalDatasetConfigError(
+                    f"PT audit certificate contains an empty/duplicate SID: {sid!r}"
+                )
+            by_sid[sid] = entry
+        result = {
+            "pool_root": pool_root,
+            "by_sid": by_sid,
+        }
+        _PT_AUDIT_CERTIFICATE_CACHE[cache_key] = result
+        return result
+
+    def _validate_certificate_and_infer_feature_dim(self) -> int:
+        certificate = self._load_pt_audit_certificate()
+        pool_root: Path = certificate["pool_root"]
+        by_sid: dict[str, dict[str, Any]] = certificate["by_sid"]
+        feature_dims: set[int] = set()
+        failures: list[str] = []
+        self._validated_pt_cache_keys = {}
+        for pt_file, _, sid, _ in self.samples:
+            try:
+                entry = by_sid[sid]
+                relative_path = entry.get("relative_path")
+                if not isinstance(relative_path, str) or not relative_path:
+                    raise ValueError("missing relative_path")
+                certified_path = (pool_root / relative_path).resolve()
+                if certified_path != pt_file.resolve():
+                    raise ValueError(
+                        f"path mismatch certified={certified_path} actual={pt_file.resolve()}"
+                    )
+                stat = pt_file.stat()
+                actual_stat = (
+                    int(stat.st_size),
+                    int(stat.st_mtime_ns),
+                    int(stat.st_ctime_ns),
+                )
+                certified_stat = (
+                    int(entry["size"]),
+                    int(entry["mtime_ns"]),
+                    int(entry["ctime_ns"]),
+                )
+                if actual_stat != certified_stat:
+                    raise ValueError(
+                        f"stat mismatch certified={certified_stat} actual={actual_stat}"
+                    )
+                dims = entry.get("call_x_dims")
+                if (
+                    not isinstance(dims, list)
+                    or not dims
+                    or any(
+                        isinstance(dim, bool)
+                        or not isinstance(dim, int)
+                        or dim <= 0
+                        for dim in dims
+                    )
+                ):
+                    raise ValueError(f"invalid call_x_dims={dims!r}")
+                feature_dims.update(
+                    515
+                    if self.drop_graph_behavior_hints and dim == 519
+                    else int(dim)
+                    for dim in dims
+                )
+                self._validated_pt_cache_keys[str(pt_file)] = (
+                    self._preflight_cache_key(pt_file)
+                )
+            except Exception as exc:
+                failures.append(
+                    f"sid={sid} path={pt_file} reason={type(exc).__name__}: {exc}"
+                )
+        if failures:
+            raise FatalDatasetConfigError(
+                "PT audit certificate validation failed before model "
+                f"construction: failed={len(failures)}/{len(self.samples)}; "
+                f"first_failures={failures[:10]}"
+            )
+        if len(feature_dims) != 1:
+            raise FatalDatasetConfigError(
+                "PT audit certificate contains inconsistent normalized call_x "
+                f"dimensions: {sorted(feature_dims)}"
+            )
+        logger.info(
+            "PT audit certificate verified %d split sample(s) without loading PT tensors",
+            len(self.samples),
+        )
+        return int(next(iter(feature_dims)))
+
+    def _preflight_cache_key(self, pt_file: Path) -> tuple[Any, ...]:
+        stat = pt_file.stat()
+        return (
+            str(pt_file.resolve()),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(stat.st_ctime_ns),
+            self.manifest_dim,
+            self.manifest_stats_dim,
+            tuple(sorted(self.expected_manifest_provenance.items())),
+            self.expected_pt_build_fingerprint,
+        )
+
+    def _preflight_one_pt(
+        self,
+        pt_file: Path,
+    ) -> tuple[tuple[Any, ...], tuple[int, ...]]:
+        cache_key = self._preflight_cache_key(pt_file)
+        cached = _PT_PREFLIGHT_CACHE.get(cache_key)
+        if cached is not None:
+            return cache_key, cached
+
+        # Current APK payloads use PyTorch's zip format. Memory mapping keeps
+        # unused storage lazy while the validator touches every required field.
+        raw = _load_pt_weights_only(pt_file)
+        dex_list, _ = _validate_current_pt_payload(raw, pt_file)
+        self._validate_pt_build_fingerprint(raw, pt_file)
+        self._validate_manifest_pt_provenance(raw, pt_file)
+        # Validate configured Manifest dimensions now, rather than discovering
+        # a malformed test/checkpoint sample in a later epoch.
+        self._manifest_payload(raw)
+        feature_dims = tuple(int(dex["call_x"].shape[1]) for dex in dex_list)
+        if self._preflight_cache_key(pt_file) != cache_key:
+            raise FatalDatasetConfigError(
+                f"PT file changed while it was being preflighted: {pt_file}"
+            )
+        _PT_PREFLIGHT_CACHE[cache_key] = feature_dims
+        return cache_key, feature_dims
+
+    def _preflight_validate_and_infer_feature_dim(self) -> int:
+        """Audit the complete split and infer its one normalized graph width."""
+
+        feature_dims: set[int] = set()
+        failures: list[dict[str, str]] = []
+        cached_count = 0
+        self._validated_pt_cache_keys: dict[str, tuple[Any, ...]] = {}
+        for index, (pt_file, _, sid, _) in enumerate(self.samples, start=1):
+            try:
+                cache_key = self._preflight_cache_key(pt_file)
+                if cache_key in _PT_PREFLIGHT_CACHE:
+                    cached_count += 1
+                validated_cache_key, raw_dims = self._preflight_one_pt(pt_file)
+                self._validated_pt_cache_keys[str(pt_file)] = validated_cache_key
+                feature_dims.update(
+                    515
+                    if self.drop_graph_behavior_hints and dim == 519
+                    else int(dim)
+                    for dim in raw_dims
+                )
+            except torch.cuda.OutOfMemoryError:
                 raise
             except Exception as exc:
-                logger.warning("feature_dim inference failed for %s: %s", pt_file, exc)
-        return int(default_dim)
+                failures.append(
+                    {
+                        "sid": sid,
+                        "path": str(pt_file),
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            if index % 500 == 0:
+                logger.info(
+                    "PT preflight audited %d/%d sample(s); failures=%d cache_hits=%d",
+                    index,
+                    len(self.samples),
+                    len(failures),
+                    cached_count,
+                )
 
-    def _dummy(self, label: int, sid: str, year: int, reason: str, pt_path: Path | None = None) -> Data:
-        data = Data(
-            x=torch.zeros((1, self.feature_dim), dtype=torch.float32),
-            edge_index=torch.empty((2, 0), dtype=torch.long),
-            y=torch.tensor(label, dtype=torch.long),
+        if failures:
+            shown = failures[:_PT_PREFLIGHT_MAX_REPORTED_FAILURES]
+            details = "\n".join(
+                f"  - sid={row['sid']} path={row['path']} reason={row['reason']}"
+                for row in shown
+            )
+            remaining = len(failures) - len(shown)
+            suffix = (
+                f"\n  ... and {remaining} additional failure(s)"
+                if remaining > 0
+                else ""
+            )
+            raise FatalDatasetConfigError(
+                "PT preflight failed before model construction: "
+                f"failed={len(failures)}/{len(self.samples)}; first "
+                f"{len(shown)} failure(s):\n{details}{suffix}"
+            )
+        if not feature_dims:
+            raise FatalDatasetConfigError(
+                "PT preflight found no graph feature width despite a non-empty "
+                "validated dex_list"
+            )
+        if len(feature_dims) != 1:
+            raise FatalDatasetConfigError(
+                "PT preflight found inconsistent normalized call_x feature "
+                f"dimensions across the split: {sorted(feature_dims)}"
+            )
+        logger.info(
+            "PT preflight validated %d sample(s) (%d cache hit(s))",
+            len(self.samples),
+            cached_count,
         )
-        data.sensitive_mask = torch.zeros((1,), dtype=torch.uint8)
-        data.api_ids = torch.empty((0,), dtype=torch.long)
-        data.api_type_ids = torch.empty((0,), dtype=torch.long)
-        data.api_sensitive_mask = torch.empty((0,), dtype=torch.float32)
-        data.graph_encoder_budget_max_nodes = torch.tensor(
-            [int(self.max_graph_nodes_per_sample)],
-            dtype=torch.long,
-        )
-        data.manifest_x = torch.zeros((1, self.manifest_dim), dtype=torch.float32)
-        data.api_alive = torch.tensor([0.0], dtype=torch.float32)
-        data.graph_alive = torch.tensor([0.0], dtype=torch.float32)
-        data.manifest_alive = torch.tensor([0.0], dtype=torch.float32)
-        data.sid = sid
-        data.year = torch.tensor(int(year), dtype=torch.long)
-        data.is_dummy = True
-        data.fail_reason = reason
-        data.fail_path = str(pt_path) if pt_path else ""
-        return data
+        return int(next(iter(feature_dims)))
 
     def _sanitize_call_x(self, x) -> torch.Tensor:
-        if not isinstance(x, torch.Tensor) or x.ndim != 2:
-            return torch.zeros((0, self.feature_dim), dtype=torch.float32)
-        x = x.float()
+        # Persisted shape/dtype/finiteness has already passed the strict shared
+        # validator.  The only transformation here is the declared removal of
+        # the optional four graph-behaviour hint columns.
+        x = x.detach().float()
         if self.drop_graph_behavior_hints and x.size(1) == 519:
             x = x[:, :515]
-        if x.size(1) > self.feature_dim:
-            x = x[:, : self.feature_dim]
-        elif x.size(1) < self.feature_dim:
-            x = torch.cat([x, torch.zeros((x.size(0), self.feature_dim - x.size(1)), dtype=x.dtype)], dim=1)
-        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        if int(x.size(1)) != self.feature_dim:
+            raise FatalDatasetConfigError(
+                "call_x width changed after PT preflight: "
+                f"actual={x.size(1)} expected={self.feature_dim}"
+            )
+        return x
 
     @staticmethod
     def _sanitize_edge_index(edge_index, num_nodes: int) -> torch.Tensor:
-        if not isinstance(edge_index, torch.Tensor) or edge_index.ndim != 2 or edge_index.size(0) != 2:
-            return torch.empty((2, 0), dtype=torch.long)
-        edge_index = edge_index.long()
-        if edge_index.numel() == 0 or num_nodes <= 0:
-            return torch.empty((2, 0), dtype=torch.long)
-        valid = (
-            (edge_index[0] >= 0)
-            & (edge_index[0] < num_nodes)
-            & (edge_index[1] >= 0)
-            & (edge_index[1] < num_nodes)
-        )
-        return edge_index[:, valid]
+        del num_nodes  # bounds were checked against persisted call_x by schema validation
+        return edge_index.detach().long()
 
     @staticmethod
     def _sanitize_mask(mask, length: int, dtype=torch.float32) -> torch.Tensor:
-        if not isinstance(mask, torch.Tensor):
-            return torch.zeros((length,), dtype=dtype)
-        out = mask.to(dtype=dtype).view(-1)
-        if out.numel() < length:
-            out = torch.cat([out, torch.zeros((length - out.numel(),), dtype=dtype)])
-        elif out.numel() > length:
-            out = out[:length]
-        return out
+        if int(mask.numel()) != int(length):
+            raise FatalDatasetConfigError(
+                f"mask length changed after PT preflight: actual={mask.numel()} "
+                f"expected={length}"
+            )
+        return mask.detach().to(dtype=dtype).view(-1)
 
     def _limit_api_events(self, parts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         n = int(parts["api_ids"].numel())
@@ -718,7 +941,7 @@ class RobustTriModalDataset(Dataset):
         return parts
 
     def _process_dex(self, dex: dict[str, Any], node_offset: int):
-        x = self._sanitize_call_x(dex.get("call_x"))
+        x = self._sanitize_call_x(dex["call_x"])
         orig_size = int(x.size(0))
         if orig_size == 0:
             # Ghost node: keeps GNN message-passing alive for dex files with
@@ -728,18 +951,30 @@ class RobustTriModalDataset(Dataset):
             # uniform average of ghosts.
             x = torch.zeros((1, self.feature_dim), dtype=torch.float32)
         n = int(x.size(0))
-        edge_index = self._sanitize_edge_index(dex.get("call_edge_index"), orig_size)
+        edge_index = self._sanitize_edge_index(dex["call_edge_index"], orig_size)
         if edge_index.numel() > 0:
             edge_index = edge_index + node_offset
-        sensitive = self._sanitize_mask(dex.get("call_sensitive_mask"), n, dtype=torch.uint8)
+        sensitive = self._sanitize_mask(
+            dex["call_sensitive_mask"],
+            orig_size,
+            dtype=torch.uint8,
+        )
+        if orig_size == 0:
+            # The ghost node is a runtime batching device, not fabricated
+            # persisted evidence.
+            sensitive = torch.zeros((1,), dtype=torch.uint8)
         real_node_mask = torch.ones((n,), dtype=torch.bool)
         if orig_size == 0:
             real_node_mask.zero_()
 
-        api_ids = _as_long_tensor(dex.get("api_ids")).clamp_min(0)
+        api_ids = dex["api_ids"].detach().long()
         num_api = int(api_ids.numel())
-        api_type_ids = _as_long_tensor(dex.get("api_type_ids"), num_api, fill_value=0).clamp_min(0)
-        api_sensitive = self._sanitize_mask(dex.get("api_sensitive_mask"), num_api, dtype=torch.float32).clamp(0.0, 1.0)
+        api_type_ids = dex["api_type_ids"].detach().long()
+        api_sensitive = self._sanitize_mask(
+            dex["api_sensitive_mask"],
+            num_api,
+            dtype=torch.float32,
+        )
 
         parts = {
             "api_ids": api_ids,
@@ -755,13 +990,11 @@ class RobustTriModalDataset(Dataset):
             **parts,
         }
 
-    def _aggregate_api_graph(self, dex_list: list[dict[str, Any]]) -> dict[str, Any] | None:
+    def _aggregate_api_graph(self, dex_list: list[dict[str, Any]]) -> dict[str, Any]:
         xs, edges, sens, real_masks = [], [], [], []
         api_ids, api_types, api_sensitive = [], [], []
         node_offset = 0
         for dex in dex_list:
-            if not isinstance(dex, dict):
-                continue
             part = self._process_dex(dex, node_offset)
             xs.append(part["x"])
             edges.append(part["edge_index"])
@@ -771,8 +1004,6 @@ class RobustTriModalDataset(Dataset):
             api_types.append(part["api_type_ids"])
             api_sensitive.append(part["api_sensitive_mask"])
             node_offset += int(part["num_nodes"])
-        if not xs:
-            return None
 
         x = torch.cat(xs, dim=0)
         edge_index = torch.cat([e for e in edges if e.numel() > 0], dim=1) if any(e.numel() > 0 for e in edges) else torch.empty((2, 0), dtype=torch.long)
@@ -807,11 +1038,10 @@ class RobustTriModalDataset(Dataset):
         required_tensors = (
             "manifest_x",
             "manifest_permission_ids",
+            "manifest_permission_token_ids",
             "manifest_intent_ids",
             "manifest_category_counts",
             "manifest_component_category_counts",
-            "manifest_permission_category_map",
-            "manifest_intent_category_map",
             "manifest_stats",
         )
         invalid_tensors = [
@@ -847,38 +1077,26 @@ class RobustTriModalDataset(Dataset):
         permission_dim = int(payload["manifest_permission_dim"])
         intent_dim = int(payload["manifest_intent_dim"])
         feature_dim = int(payload["manifest_feature_dim"])
-        permission_map_raw = payload["manifest_permission_category_map"]
-        intent_map_raw = payload["manifest_intent_category_map"]
-        maps_available = (
-            isinstance(permission_map_raw, torch.Tensor)
-            and permission_map_raw.ndim == 2
-            and permission_map_raw.shape == (permission_dim, SEMANTIC_CATEGORY_DIM)
-            and isinstance(intent_map_raw, torch.Tensor)
-            and intent_map_raw.ndim == 2
-            and intent_map_raw.shape == (intent_dim, SEMANTIC_CATEGORY_DIM)
-        )
-        if not maps_available:
-            raise FatalDatasetConfigError(
-                "Current PT is missing valid Manifest term-to-category maps. "
-                "Regenerate it with build_tri_modal_pts_direct.py."
-            )
         meta = payload["manifest_meta"]
         if not isinstance(meta, dict):
             raise FatalDatasetConfigError("Current PT manifest_meta must be a mapping")
         permission_ids = _as_long_tensor(payload["manifest_permission_ids"])
+        # The shared schema-v5 validator has already proved canonical ordering,
+        # token/ID alignment, ID bounds, and exact agreement with permission
+        # bits. Keep the raw token state CPU-only for controlled degradation.
+        permission_tokens = list(meta["permissions"])
+        permission_token_ids = payload[
+            "manifest_permission_token_ids"
+        ].detach().long().view(-1)
         _as_long_tensor(payload["manifest_intent_ids"])
-        permission_map = _as_category_map(
-            permission_map_raw,
-            permission_dim,
-        )
-        _as_category_map(intent_map_raw, intent_dim)
         return {
             "manifest_x": manifest_x,
             # CPU-only state required to keep manifest_x internally consistent
             # under manifest_permission_mask. None of these tensors reaches the
             # model batch.
             "manifest_permission_ids": permission_ids,
-            "manifest_permission_category_map": permission_map,
+            "manifest_permission_tokens": permission_tokens,
+            "manifest_permission_token_ids": permission_token_ids,
             "manifest_category_counts": manifest_counts,
             "manifest_stats": manifest_stats,
             "manifest_aug_type": "none",
@@ -907,7 +1125,6 @@ class RobustTriModalDataset(Dataset):
         )
         obj.sid = sid
         obj.year = torch.tensor(int(year), dtype=torch.long)
-        obj.is_dummy = False
         obj.api_aug_type = data.get("api_aug_type", "none")
         obj.graph_aug_type = data.get("graph_aug_type", "none")
         obj.manifest_aug_type = data.get("manifest_aug_type", "none")
@@ -916,21 +1133,24 @@ class RobustTriModalDataset(Dataset):
     def __getitem__(self, idx: int):
         pt_path, label, sid, year = self.samples[idx]
         try:
+            expected_cache_key = self._validated_pt_cache_keys[str(pt_path)]
+            current_cache_key = self._preflight_cache_key(pt_path)
+            if current_cache_key != expected_cache_key:
+                raise FatalDatasetConfigError(
+                    "PT file changed after split preflight; recreate the dataset "
+                    "only after the PT pool is stable"
+                )
             # PT files are intentionally left unchanged.  mmap only changes how
             # their storages are paged into CPU memory and avoids eagerly reading
             # large extraction fields that this runtime does not consume.
-            raw = torch.load(
-                str(pt_path),
-                map_location="cpu",
-                weights_only=True,
-                mmap=True,
-            )
-            dex_list, _sources = _validate_current_pt_payload(raw, pt_path)
+            raw = _load_pt_weights_only(pt_path)
+            # The certificate removes the redundant all-pool startup load, but
+            # the sample being consumed still passes the complete schema
+            # contract. This also covers certificate-free small/test datasets.
+            dex_list, _ = _validate_current_pt_payload(raw, pt_path)
             self._validate_pt_build_fingerprint(raw, pt_path)
             self._validate_manifest_pt_provenance(raw, pt_path)
             data = self._aggregate_api_graph(dex_list)
-            if data is None:
-                return self._dummy(label, sid, year, "empty valid sample", pt_path)
             data.update(self._manifest_payload(raw))
             # Persisted quality/coverage fields remain schema-validated for PT
             # provenance. Runtime fusion reads only parse state plus counts
@@ -949,7 +1169,30 @@ class RobustTriModalDataset(Dataset):
             ):
                 data[key] = observable[key]
             refresh_hard_availability(data)
-            if not self.is_train and self.eval_perturb_type:
+            if self.is_train and self.train_perturbations:
+                # Stage B assigns each train identity exactly one deterministic
+                # single-modality degradation. The strength is continuous
+                # across identities, but repeated cache construction remains
+                # bitwise reproducible. These values create the current input;
+                # neither the mechanism nor its strength is consumed by the
+                # model.
+                seed = _stable_seed(
+                    sid,
+                    "anchored_stage_b",
+                    self.train_perturb_seed,
+                )
+                with _temporary_random_seed(seed):
+                    perturb_type = random.choice(self.train_perturbations)
+                    perturb_strength = random.uniform(
+                        self.train_perturb_strength_min,
+                        self.train_perturb_strength_max,
+                    )
+                    data = apply_perturbation(
+                        data,
+                        perturb_type,
+                        perturb_strength,
+                    )
+            elif not self.is_train and self.eval_perturb_type:
                 # Keep aggregate perturbation subtypes stable across strength sweeps.
                 seed = _stable_seed(sid, self.eval_perturb_type)
                 with _temporary_random_seed(seed):
@@ -963,40 +1206,32 @@ class RobustTriModalDataset(Dataset):
             # persisted into, or required from, the APK-derived PT payload.
             obj.sample_group = str(self.sample_groups[idx])
             return obj
-        except FatalDatasetConfigError:
-            raise
+        except FatalDatasetConfigError as exc:
+            raise FatalDatasetConfigError(
+                f"PT sample processing failed: sid={sid} path={pt_path} "
+                f"reason={exc}"
+            ) from exc
         except torch.cuda.OutOfMemoryError:
             raise
         except Exception as exc:
-            return self._dummy(label, sid, year, f"{type(exc).__name__}: {exc}", pt_path)
+            raise FatalDatasetConfigError(
+                f"PT sample processing failed: sid={sid} path={pt_path} "
+                f"reason={type(exc).__name__}: {exc}"
+            ) from exc
 
 
 def robust_collate_fn(data_list):
-    failed_items = []
-    valid_items = []
-    for d in data_list:
-        if d is None:
-            failed_items.append({"sid": None, "path": None, "reason": "data is None"})
-        elif getattr(d, "is_dummy", False):
-            failed_items.append({
-                "sid": getattr(d, "sid", None),
-                "path": getattr(d, "fail_path", None),
-                "reason": getattr(d, "fail_reason", "dummy sample"),
-            })
-        else:
-            valid_items.append(d)
-
-    if not valid_items:
-        return {
-            "graph_batch": None,
-            "labels": None,
-            "sids": None,
-            "sample_groups": None,
-            "years": None,
-            "failed_items": failed_items,
-            "num_failed": len(failed_items),
-            "num_valid": 0,
-        }
+    if not data_list:
+        raise FatalDatasetConfigError("robust_collate_fn received an empty batch")
+    none_indices = [
+        index for index, item in enumerate(data_list) if item is None
+    ]
+    if none_indices:
+        raise FatalDatasetConfigError(
+            "Dataset produced None items; samples are never dropped from "
+            f"metrics: indices={none_indices[:10]}"
+        )
+    valid_items = data_list
 
     sids = [d.sid for d in valid_items]
     sample_groups = [
@@ -1082,8 +1317,7 @@ def robust_collate_fn(data_list):
         "graph_aug_types": graph_aug_types,
         "manifest_aug_types": manifest_aug_types,
         "years": years,
-        "failed_items": failed_items,
-        "num_failed": len(failed_items),
+        "num_failed": 0,
         "num_valid": len(valid_items),
     }
 

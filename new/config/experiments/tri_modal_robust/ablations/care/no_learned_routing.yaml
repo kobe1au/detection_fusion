@@ -1,0 +1,15 @@
+defaults:
+  - ../../seeds/seed_42.yaml
+
+care:
+  routing:
+    enabled: false
+    inference_path: agm
+
+eval:
+  eval_only: true
+  output_name: care_ablation_no_learned_routing
+  checkpoint_path: results/tri_modal_robust/care_droid_seed_42/42/best_care_pipeline.pt
+  refit_decision_calibration: true
+  run_test: true
+  run_robust_test: true

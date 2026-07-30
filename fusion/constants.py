@@ -19,20 +19,22 @@ class AvailabilityIndex:
     BASE_DIM = 3
 
 
-# Formal validation-budget protocol. ``VALIDATION_HOLDOUT_FRACTION`` is the
-# fraction reserved jointly for post-hoc fitting and I3; the second value is
-# conditional on that holdout. Together they produce a 40/35/25 split of the
-# original validation set (checkpoint / post-hoc / I3).
+# Legacy three-role split defaults retained only for comparison methods that
+# still exercise the generic post-hoc implementation.  The proposed
+# competence-anchored method does not consume these values: it requires the
+# fixed schema-v2 75/25 model-selection/decision-calibration assignment.
 VALIDATION_HOLDOUT_FRACTION = 0.60
 CONFORMAL_WITHIN_HOLDOUT_FRACTION = 5.0 / 12.0
 
 class TriModalConfigDefaults:
-    """Stable defaults for the lean intrinsic-reliability pipeline.
+    """Shared implementation defaults, not the identity of the paper method.
 
-    YAML experiment files should contain paths, experiment names, and the few
-    mechanism switches being studied. Architecture defaults and invariant
-    safety settings live here so the paper configuration does not look like a
-    pile of unrelated knobs.
+    Runnable experiments must select an explicit method YAML.  In particular,
+    ``competence_anchored_fusion.yaml`` replaces the legacy fusion,
+    calibration, loss, and validation sections below with its closed schema.
+    Keeping shared architecture and comparison-method defaults here avoids
+    duplicating them across the experiment catalogue without making this
+    mapping an implicit "main method".
     """
 
     CONFIG = {
@@ -120,6 +122,7 @@ class TriModalConfigDefaults:
                 "method": "monotonic_correctness",
                 "use_evidential_certainty": True,
                 "use_prediction_margin": True,
+                "use_api_observed_support": True,
                 "use_predicted_class_intercept": True,
                 "scenario_objective_weights": {
                     "clean": 0.50,
@@ -132,7 +135,6 @@ class TriModalConfigDefaults:
                 "mode": "learned",
                 "posthoc_refine": True,
                 "prediction_loss_weight": 1.0,
-                "route_conflict_enabled": True,
                 "risk_conflict_enabled": True,
                 "risk_mode": "learned",
                 "risk_loss_weight": 1.0,

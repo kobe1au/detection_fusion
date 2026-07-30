@@ -30,10 +30,21 @@ if str(ROOT) not in sys.path:
 from extract.extract_graph_api import atomic_torch_save
 from fusion.manifest_features import (
     build_manifest_vocab,
+    normalize_manifest_permissions,
     validate_manifest_vocab,
     vectorize_manifest_record,
 )
-from fusion.pt_schema import CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS, PT_SCHEMA_VERSION
+from fusion.pt_schema import (
+    CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS,
+    PT_AUDIT_CERTIFICATE_VERSION,
+    PT_SCHEMA_VERSION,
+    PTSchemaValidationError,
+    RETIRED_PT_TOP_LEVEL_FIELDS,
+    pt_audit_entries_sha256,
+    validate_observable_metadata,
+    validate_current_dex_list,
+    validate_current_pt_payload,
+)
 from fusion.quality import OBSERVABLE_REQUIRED_FIELDS, OBSERVABLE_SCHEMA_VERSION
 from scripts.build_tri_modal_pts_direct import (
     _build_fingerprint,
@@ -48,18 +59,23 @@ logger = logging.getLogger("migrate_manifest_vocab_pts")
 MANIFEST_TOP_LEVEL_FIELDS = (
     "manifest_x",
     "manifest_permission_ids",
+    "manifest_permission_token_ids",
     "manifest_intent_ids",
     "manifest_category_counts",
     "manifest_component_category_counts",
-    "manifest_permission_category_map",
-    "manifest_intent_category_map",
     "manifest_stats",
     "manifest_meta",
     "manifest_permission_dim",
     "manifest_intent_dim",
     "manifest_feature_dim",
-    "q_manifest",
-    "pert_manifest",
+)
+
+# Schema v4 persisted vocabulary-wide term/category maps solely to support the
+# retired known-token masking implementation. Schema v5 rebuilds permission
+# semantics from canonical raw tokens, so carrying these tensors forward would
+# waste space and preserve a misleading second source of truth.
+REMOVED_MANIFEST_TOP_LEVEL_FIELDS = (
+    *RETIRED_PT_TOP_LEVEL_FIELDS,
 )
 
 MANIFEST_OBSERVABLE_FIELDS = (
@@ -95,10 +111,10 @@ _NON_MANIFEST_REQUIRED_FIELDS = {
     "observable_metadata",
     "direct_build_meta",
 }
-if (
+_CURRENT_MANIFEST_SCHEMA_FIELDS = (
     set(CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS) - _NON_MANIFEST_REQUIRED_FIELDS
-    != set(MANIFEST_TOP_LEVEL_FIELDS)
-):
+)
+if _CURRENT_MANIFEST_SCHEMA_FIELDS != set(MANIFEST_TOP_LEVEL_FIELDS):
     raise RuntimeError(
         "PT schema changed; review the Manifest migration field ownership before running"
     )
@@ -256,23 +272,70 @@ def _load_pt(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _validate_current_pt(payload: dict[str, Any], path: Path, sid: str) -> None:
-    missing = [key for key in CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS if key not in payload]
-    if missing:
-        raise ValueError(
-            f"PT is not current schema-{PT_SCHEMA_VERSION}; missing={missing}: {path}"
-        )
-    if not isinstance(payload.get("dex_list"), list):
-        raise ValueError(f"PT dex_list must be a list: {path}")
+def _validate_current_pt(
+    payload: dict[str, Any],
+    path: Path,
+    sid: str,
+    *,
+    allow_legacy_permission_mapping: bool = False,
+) -> None:
+    if not allow_legacy_permission_mapping:
+        try:
+            validate_current_pt_payload(payload, path, expected_sid=sid)
+        except PTSchemaValidationError as exc:
+            raise ValueError(str(exc)) from exc
+        return
 
     direct_meta = payload.get("direct_build_meta")
     if not isinstance(direct_meta, dict):
         raise ValueError(f"PT direct_build_meta must be a mapping: {path}")
-    if int(direct_meta.get("pt_schema_version", 0)) != PT_SCHEMA_VERSION:
+    raw_pt_version = direct_meta.get("pt_schema_version")
+    if (
+        isinstance(raw_pt_version, bool)
+        or not isinstance(raw_pt_version, int)
+    ):
+        raise ValueError(
+            f"PT schema version must be an integer at {path}: "
+            f"actual={raw_pt_version!r}"
+        )
+    actual_pt_version = int(raw_pt_version)
+    if actual_pt_version == PT_SCHEMA_VERSION:
+        # A current payload must always satisfy the complete current contract.
+        # The migration may remove explicitly retired top-level fields from a
+        # briefly generated schema-v5 payload, but it cannot waive any other
+        # part of the current contract.
+        validation_payload = dict(payload)
+        for field in RETIRED_PT_TOP_LEVEL_FIELDS:
+            validation_payload.pop(field, None)
+        try:
+            validate_current_pt_payload(
+                validation_payload,
+                path,
+                expected_sid=sid,
+            )
+        except PTSchemaValidationError as exc:
+            raise ValueError(str(exc)) from exc
+        return
+    if actual_pt_version != PT_SCHEMA_VERSION - 1:
         raise ValueError(
             f"PT schema version mismatch at {path}: "
-            f"expected={PT_SCHEMA_VERSION} actual={direct_meta.get('pt_schema_version')!r}"
+            f"expected one of {[PT_SCHEMA_VERSION - 1, PT_SCHEMA_VERSION]} "
+            f"actual={actual_pt_version!r}"
         )
+
+    missing = [key for key in CURRENT_PT_REQUIRED_TOP_LEVEL_FIELDS if key not in payload]
+    allowed_missing = {"manifest_permission_token_ids"}
+    unsupported_missing = sorted(set(missing) - allowed_missing)
+    if unsupported_missing:
+        raise ValueError(
+            f"PT is not current schema-{PT_SCHEMA_VERSION}; "
+            f"missing={unsupported_missing}: {path}"
+        )
+    try:
+        validate_current_dex_list(payload.get("dex_list"), path=path)
+    except PTSchemaValidationError as exc:
+        raise ValueError(str(exc)) from exc
+
     if direct_meta.get("schema_version") != OBSERVABLE_SCHEMA_VERSION:
         raise ValueError(
             f"PT observable schema mismatch at {path}: "
@@ -311,6 +374,59 @@ def _validate_current_pt(payload: dict[str, Any], path: Path, sid: str) -> None:
         raise ValueError(
             f"PT observable_metadata is incomplete; missing={missing_observable}: {path}"
         )
+    try:
+        validate_observable_metadata(observable, path=path)
+    except PTSchemaValidationError as exc:
+        raise ValueError(str(exc)) from exc
+
+    token_ids = payload.get("manifest_permission_token_ids")
+    if token_ids is None and allow_legacy_permission_mapping:
+        if actual_pt_version != PT_SCHEMA_VERSION - 1:
+            raise ValueError(
+                "Only schema-v4 payloads may omit "
+                f"manifest_permission_token_ids; schema-v{actual_pt_version} "
+                f"is corrupt and must not use the legacy migration path: {path}"
+            )
+        return
+    if not isinstance(token_ids, torch.Tensor):
+        raise ValueError(
+            f"PT manifest_permission_token_ids must be a tensor: {path}"
+        )
+    raw_permissions = manifest_meta.get("permissions")
+    if not isinstance(raw_permissions, list):
+        raise ValueError(
+            f"PT manifest_meta.permissions must be a canonical list: {path}"
+        )
+    permission_tokens = normalize_manifest_permissions(raw_permissions)
+    if raw_permissions != permission_tokens:
+        raise ValueError(
+            "PT manifest_meta.permissions must be lower-case, de-duplicated, "
+            f"and sorted: {path}"
+        )
+    token_ids = token_ids.detach().long().reshape(-1)
+    if token_ids.numel() != len(permission_tokens):
+        raise ValueError(
+            "PT manifest_permission_token_ids does not align one-to-one with "
+            f"manifest_meta.permissions: {path}"
+        )
+    permission_dim = int(payload.get("manifest_permission_dim", -1))
+    if permission_dim < 0 or bool(
+        ((token_ids < 0) | (token_ids > permission_dim)).any().item()
+    ):
+        raise ValueError(
+            "PT manifest_permission_token_ids contains an ID outside "
+            f"[0, {permission_dim}]: {path}"
+        )
+    permission_ids = payload.get("manifest_permission_ids")
+    if not isinstance(permission_ids, torch.Tensor):
+        raise ValueError(f"PT manifest_permission_ids must be a tensor: {path}")
+    expected_known_ids = token_ids[token_ids > 0].unique(sorted=True)
+    actual_known_ids = permission_ids.detach().long().reshape(-1)
+    if not torch.equal(actual_known_ids.cpu(), expected_known_ids.cpu()):
+        raise ValueError(
+            "PT manifest_permission_ids disagrees with "
+            f"manifest_permission_token_ids: {path}"
+        )
 
 
 def _values_equal(left: Any, right: Any) -> bool:
@@ -339,6 +455,9 @@ def _manifest_matches(
         _values_equal(payload.get(key), expected.get(key))
         for key in MANIFEST_TOP_LEVEL_FIELDS
     )
+    manifest_match = manifest_match and not any(
+        key in payload for key in REMOVED_MANIFEST_TOP_LEVEL_FIELDS
+    )
     observable = payload.get("observable_metadata") or {}
     expected_observable = expected.get("observable_metadata") or {}
     manifest_match = manifest_match and all(
@@ -365,6 +484,8 @@ def _updated_payload(
 ) -> dict[str, Any]:
     """Return a shallow copy with only explicitly owned fields replaced."""
     updated = dict(payload)
+    for key in REMOVED_MANIFEST_TOP_LEVEL_FIELDS:
+        updated.pop(key, None)
     for key in MANIFEST_TOP_LEVEL_FIELDS:
         updated[key] = manifest_payload[key]
 
@@ -375,6 +496,7 @@ def _updated_payload(
     updated["observable_metadata"] = observable
 
     direct_meta = dict(payload["direct_build_meta"])
+    direct_meta["pt_schema_version"] = PT_SCHEMA_VERSION
     direct_meta["build_fingerprint"] = str(build_fingerprint)
     direct_meta.update(provenance)
     updated["direct_build_meta"] = direct_meta
@@ -485,21 +607,26 @@ def _audit_pool(
     provenance: dict[str, str],
     *,
     verify_expected: bool,
+    certificate_root: Path | None = None,
     allowed_existing_fingerprints: set[str] | None = None,
-) -> tuple[dict[str, Any], list[str], dict[str, tuple[int, int]]]:
+) -> tuple[dict[str, Any], list[str], dict[str, tuple[int, int, int]]]:
     fingerprint_counts: Counter[str] = Counter()
     layout_counts: Counter[str] = Counter()
-    q_total = 0.0
     coverage_total = 0.0
-    q_count = 0
     coverage_count = 0
     manifest_mismatch: list[str] = []
     fingerprint_mismatch: list[str] = []
-    file_stats: dict[str, tuple[int, int]] = {}
+    file_stats: dict[str, tuple[int, int, int]] = {}
+    certificate_entries: list[dict[str, Any]] = []
 
     for index, (sid, path) in enumerate(sorted(pt_files.items()), start=1):
         payload = _load_pt(path)
-        _validate_current_pt(payload, path, sid)
+        _validate_current_pt(
+            payload,
+            path,
+            sid,
+            allow_legacy_permission_mapping=not verify_expected,
+        )
         expected = vectorize_manifest_record(records[sid], vocab, manifest_dim=manifest_dim)
         manifest_match, fingerprint_match = _manifest_matches(
             payload,
@@ -535,12 +662,36 @@ def _audit_pool(
         observable = payload["observable_metadata"]
         fingerprint_counts[existing_fingerprint or "<missing>"] += 1
         layout_counts[_layout_key(payload)] += 1
-        q_total += _scalar_float(payload["q_manifest"])
-        q_count += 1
         coverage_total += float(observable["manifest_vocab_coverage"])
         coverage_count += 1
         stat = path.stat()
-        file_stats[sid] = (int(stat.st_size), int(stat.st_mtime_ns))
+        current_stat = (
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(stat.st_ctime_ns),
+        )
+        file_stats[sid] = current_stat
+        if verify_expected:
+            if certificate_root is None:
+                raise RuntimeError(
+                    "certificate_root is required for the post-migration audit"
+                )
+            relative_path = path.resolve().relative_to(
+                certificate_root.resolve()
+            ).as_posix()
+            certificate_entries.append(
+                {
+                    "sid": sid,
+                    "relative_path": relative_path,
+                    "size": current_stat[0],
+                    "mtime_ns": current_stat[1],
+                    "ctime_ns": current_stat[2],
+                    "call_x_dims": [
+                        int(dex["call_x"].shape[1])
+                        for dex in payload["dex_list"]
+                    ],
+                }
+            )
         if index % 500 == 0:
             logger.info("Audited %d/%d PT files", index, len(pt_files))
 
@@ -549,7 +700,6 @@ def _audit_pool(
         "pt_count": len(pt_files),
         "build_fingerprint_counts": dict(sorted(fingerprint_counts.items())),
         "manifest_layout_counts": dict(sorted(layout_counts.items())),
-        "mean_q_manifest": _mean_or_none(q_total, q_count),
         "mean_manifest_vocab_coverage": _mean_or_none(coverage_total, coverage_count),
         "manifest_mismatch_count": len(manifest_mismatch),
         "manifest_mismatch_examples": manifest_mismatch[:10],
@@ -558,17 +708,32 @@ def _audit_pool(
         "needs_update_count": len(needs_update),
         "needs_update_examples": needs_update[:10],
     }
+    if verify_expected:
+        audit["pt_audit_certificate"] = {
+            "certificate_version": PT_AUDIT_CERTIFICATE_VERSION,
+            "pt_schema_version": PT_SCHEMA_VERSION,
+            "pool_root": str(certificate_root.resolve()),
+            "build_fingerprint": build_fingerprint,
+            "entries": certificate_entries,
+            "certificate_sha256": pt_audit_entries_sha256(
+                certificate_entries
+            ),
+        }
     return audit, needs_update, file_stats
 
 
 def _assert_files_unchanged(
     pt_files: dict[str, Path],
-    expected_stats: dict[str, tuple[int, int]],
+    expected_stats: dict[str, tuple[int, int, int]],
 ) -> None:
     changed: list[str] = []
     for sid, path in sorted(pt_files.items()):
         stat = path.stat()
-        current = (int(stat.st_size), int(stat.st_mtime_ns))
+        current = (
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(stat.st_ctime_ns),
+        )
         if current != expected_stats[sid]:
             changed.append(sid)
     if changed:
@@ -580,10 +745,14 @@ def _assert_files_unchanged(
 
 def _assert_file_unchanged(
     path: Path,
-    expected_stat: tuple[int, int],
+    expected_stat: tuple[int, int, int],
 ) -> None:
     stat = path.stat()
-    current = (int(stat.st_size), int(stat.st_mtime_ns))
+    current = (
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
     if current != expected_stat:
         raise RuntimeError(
             "PT changed after migration preflight; refusing to overwrite a "
@@ -664,6 +833,11 @@ def run_migration(
         allow_empty=bool(cfg["allow_empty_vocab"]),
     )
     build_fingerprint = _build_fingerprint(_fingerprint_config(cfg), vocab)
+    legacy_build_fingerprint = _build_fingerprint(
+        _fingerprint_config(cfg),
+        vocab,
+        pt_schema_version=PT_SCHEMA_VERSION - 1,
+    )
     manifest_provenance = {
         "manifest_vocab_sha256": _vocab_digest(vocab),
         "manifest_train_csv_sha256": str(
@@ -679,9 +853,23 @@ def run_migration(
         if old_vocab is not None
         else None
     )
-    allowed_existing_fingerprints = {build_fingerprint}
+    legacy_previous_build_fingerprint = (
+        _build_fingerprint(
+            _fingerprint_config(cfg),
+            old_vocab,
+            pt_schema_version=PT_SCHEMA_VERSION - 1,
+        )
+        if old_vocab is not None
+        else None
+    )
+    allowed_existing_fingerprints = {
+        build_fingerprint,
+        legacy_build_fingerprint,
+    }
     if previous_build_fingerprint is not None:
         allowed_existing_fingerprints.add(previous_build_fingerprint)
+    if legacy_previous_build_fingerprint is not None:
+        allowed_existing_fingerprints.add(legacy_previous_build_fingerprint)
 
     before, needs_update, file_stats = _audit_pool(
         pt_files,
@@ -691,17 +879,8 @@ def run_migration(
         build_fingerprint,
         manifest_provenance,
         verify_expected=False,
-        allowed_existing_fingerprints=(
-            allowed_existing_fingerprints if old_vocab is not None else None
-        ),
+        allowed_existing_fingerprints=allowed_existing_fingerprints,
     )
-    if needs_update and old_vocab is None:
-        raise RuntimeError(
-            "Existing PTs require migration, but no previous Manifest vocabulary "
-            f"exists at {vocab_out_path}. The old vocabulary is required to "
-            "prove that the supplied build config matches the unchanged API/Graph "
-            "payloads. Restore the vocabulary used to build these PTs and retry."
-        )
     report: dict[str, Any] = {
         "mode": "apply" if apply else "dry-run",
         "inputs": {
@@ -727,7 +906,11 @@ def run_migration(
             "diff": _vocab_diff(old_vocab, vocab),
         },
         "proposed_build_fingerprint": build_fingerprint,
+        "legacy_proposed_build_fingerprint": legacy_build_fingerprint,
         "previous_build_fingerprint": previous_build_fingerprint,
+        "legacy_previous_build_fingerprint": (
+            legacy_previous_build_fingerprint
+        ),
         "manifest_provenance": manifest_provenance,
         "before": before,
         "apply": None,
@@ -745,7 +928,12 @@ def run_migration(
             path = pt_files[sid]
             _assert_file_unchanged(path, file_stats[sid])
             payload = _load_pt(path)
-            _validate_current_pt(payload, path, sid)
+            _validate_current_pt(
+                payload,
+                path,
+                sid,
+                allow_legacy_permission_mapping=True,
+            )
             current_fingerprint = str(
                 payload["direct_build_meta"].get("build_fingerprint") or ""
             )
@@ -766,6 +954,7 @@ def run_migration(
                 build_fingerprint,
                 manifest_provenance,
             )
+            _validate_current_pt(updated, path, sid)
             _assert_file_unchanged(path, file_stats[sid])
             atomic_torch_save(updated, path)
             updated_count += 1
@@ -784,6 +973,7 @@ def run_migration(
             build_fingerprint,
             manifest_provenance,
             verify_expected=True,
+            certificate_root=pt_dir_path,
             allowed_existing_fingerprints={build_fingerprint},
         )
         if remaining:

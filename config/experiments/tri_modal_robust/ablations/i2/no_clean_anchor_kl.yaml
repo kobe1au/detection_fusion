@@ -1,0 +1,17 @@
+defaults:
+  - ../../seeds/seed_42.yaml
+
+method:
+  name: ablation_i2_no_clean_anchor_kl
+
+train:
+  exp_name: ablation_i2_no_clean_anchor_kl
+
+encoder_stage:
+  mode: reuse
+  checkpoint_path: results/tri_modal_robust/competence_anchored_seed_42/42/best_encoder_selected.pt
+  strict_identity: true
+
+stage_b:
+  router:
+    clean_anchor_kl_weight: 0.0

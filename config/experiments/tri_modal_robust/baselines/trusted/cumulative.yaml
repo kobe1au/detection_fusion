@@ -1,0 +1,22 @@
+defaults:
+  - _evidential_base.yaml
+
+encoder_stage:
+  protocol_id: fixed_evidential_cumulative_stage1_v1
+
+method:
+  name: fusion_rule_cumulative
+  protocol_id: fixed_evidential_cumulative_v1
+
+train:
+  exp_name: fusion_rule_cumulative
+
+fusion:
+  combination: cumulative
+  opinion_source: evidential
+  routing:
+    enabled: false
+    final_temperature_scaling: false
+
+selective_prediction:
+  enabled: false

@@ -22,10 +22,45 @@ RELIABILITY_FEATURE_NAMES = (
     "prediction_margin",
     "predicted_malware_indicator",
 )
+API_OBSERVED_SUPPORT_FEATURE_NAME = "observed_support"
+API_SUPPORT_RELIABILITY_FEATURE_NAMES = (
+    "evidential_certainty",
+    "prediction_margin",
+    API_OBSERVED_SUPPORT_FEATURE_NAME,
+    "predicted_malware_indicator",
+)
 RELIABILITY_FEATURE_LAYOUT = {
     branch: RELIABILITY_FEATURE_NAMES for branch in BRANCH_NAMES
 }
+API_SUPPORT_RELIABILITY_FEATURE_LAYOUT = {
+    "api": API_SUPPORT_RELIABILITY_FEATURE_NAMES,
+    "graph": RELIABILITY_FEATURE_NAMES,
+    "manifest": RELIABILITY_FEATURE_NAMES,
+}
 CONTINUOUS_RELIABILITY_FEATURES = RELIABILITY_FEATURE_NAMES[:2]
+API_SUPPORT_CONTINUOUS_RELIABILITY_FEATURES = (
+    *CONTINUOUS_RELIABILITY_FEATURES,
+    API_OBSERVED_SUPPORT_FEATURE_NAME,
+)
+
+
+def reliability_feature_layout(
+    *,
+    use_api_observed_support: bool = False,
+) -> dict[str, tuple[str, ...]]:
+    """Return the exact branch-specific I1 feature contract.
+
+    The default remains the three-dimensional intrinsic layout. Enabling
+    current-view support changes only the API branch to four dimensions;
+    Graph and Manifest retain the intrinsic layout.
+    """
+
+    source = (
+        API_SUPPORT_RELIABILITY_FEATURE_LAYOUT
+        if bool(use_api_observed_support)
+        else RELIABILITY_FEATURE_LAYOUT
+    )
+    return {branch: tuple(source[branch]) for branch in BRANCH_NAMES}
 
 
 def normalize_reliability_calibration_method(value: str) -> str:
@@ -80,18 +115,47 @@ def _validate_binary_alpha(
     return alpha
 
 
+def _validate_api_observed_support(
+    value: torch.Tensor,
+    *,
+    batch_size: int,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    """Validate an explicitly supplied current-view API support score."""
+
+    if not isinstance(value, torch.Tensor):
+        raise ValueError("api_observed_support must be an explicit tensor")
+    if not value.is_floating_point():
+        raise ValueError("api_observed_support must be floating point")
+    if value.ndim != 1 or value.numel() != batch_size:
+        raise ValueError(
+            "api_observed_support must have shape "
+            f"[B]=[{batch_size}], got {tuple(value.shape)}"
+        )
+    support = value.to(device=reference.device, dtype=reference.dtype)
+    if not bool(torch.isfinite(support).all().item()):
+        raise ValueError("api_observed_support contains non-finite values")
+    if bool(((support < 0.0) | (support > 1.0)).any().item()):
+        raise ValueError("api_observed_support must lie within [0, 1]")
+    return support
+
+
 def build_reliability_features(
     branch_alpha: Mapping[str, torch.Tensor],
+    *,
+    api_observed_support: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Build the complete intrinsic model-state input to the proposed I1.
+    """Build the branch-local model-state input to the proposed I1.
 
     For binary Dirichlet concentration ``alpha`` with strength ``S`` and
-    ``K=2`` classes, the feature vector is exactly:
+    ``K=2`` classes, the default feature vector is exactly:
 
     ``[1 - K/S, top1(alpha/S) - top2(alpha/S), argmax(alpha/S) == 1]``.
 
-    No quality proxy, model-visibility value, perturbation metadata, peer
-    modality, or hidden two-stage feature is accepted by this API.
+    If and only if ``api_observed_support`` is supplied explicitly, the API
+    layout becomes ``[certainty, margin, observed_support, predicted_class]``.
+    Graph and Manifest remain three-dimensional. This function never derives
+    support from perturbation metadata, a pre-damage count, or peer modalities.
     """
 
     _require_exact_branch_mapping(branch_alpha, name="branch_alpha")
@@ -110,10 +174,17 @@ def build_reliability_features(
         top_two = expected_probability.topk(k=2, dim=-1).values
         margin = (top_two[:, 0] - top_two[:, 1]).clamp(0.0, 1.0)
         predicted_malware = expected_probability.argmax(dim=-1).eq(1).to(alpha)
-        features[branch] = torch.stack(
-            [certainty, margin, predicted_malware],
-            dim=-1,
-        )
+        branch_features = [certainty, margin]
+        if branch == "api" and api_observed_support is not None:
+            branch_features.append(
+                _validate_api_observed_support(
+                    api_observed_support,
+                    batch_size=int(alpha.size(0)),
+                    reference=alpha,
+                )
+            )
+        branch_features.append(predicted_malware)
+        features[branch] = torch.stack(branch_features, dim=-1)
     return features
 
 
@@ -121,12 +192,21 @@ def _validate_feature_tensor(
     features: torch.Tensor,
     *,
     branch: str,
+    feature_names: tuple[str, ...] = RELIABILITY_FEATURE_NAMES,
 ) -> torch.Tensor:
     if not isinstance(features, torch.Tensor):
         raise ValueError(f"features[{branch!r}] must be a tensor")
     if not features.is_floating_point():
         raise ValueError(f"features[{branch!r}] must be floating point")
-    expected_width = len(RELIABILITY_FEATURE_NAMES)
+    if feature_names not in (
+        RELIABILITY_FEATURE_NAMES,
+        API_SUPPORT_RELIABILITY_FEATURE_NAMES,
+    ):
+        raise ValueError(
+            f"unsupported reliability feature layout for {branch!r}: "
+            f"{feature_names!r}"
+        )
+    expected_width = len(feature_names)
     if (
         features.ndim != 2
         or features.size(0) <= 0
@@ -138,12 +218,21 @@ def _validate_feature_tensor(
         )
     if not bool(torch.isfinite(features).all().item()):
         raise ValueError(f"features[{branch!r}] contains non-finite values")
-    continuous = features[:, :2]
+    predicted_class_index = feature_names.index(
+        "predicted_malware_indicator"
+    )
+    continuous_indices = [
+        index
+        for index, name in enumerate(feature_names)
+        if name != "predicted_malware_indicator"
+    ]
+    continuous = features[:, continuous_indices]
     if bool(((continuous < 0.0) | (continuous > 1.0)).any().item()):
         raise ValueError(
-            f"features[{branch!r}] certainty and margin must lie within [0, 1]"
+            f"features[{branch!r}] continuous reliability features "
+            "must lie within [0, 1]"
         )
-    predicted_malware = features[:, 2]
+    predicted_malware = features[:, predicted_class_index]
     if bool(
         ((predicted_malware != 0.0) & (predicted_malware != 1.0)).any().item()
     ):
@@ -187,13 +276,14 @@ def _inverse_softplus(value: float) -> float:
 class MonotonicBranchCorrectnessCalibrator(nn.Module):
     """One branch's structurally monotone correctness-probability model.
 
-    The logit is
+    The intrinsic logit is
 
     ``b + w_c * certainty + w_m * margin + gamma * predicted_malware``
 
-    where ``w_c`` and ``w_m`` are strictly non-negative through softplus.
-    ``gamma`` is an optional signed intercept because predicted class is
-    categorical rather than an ordered quality coordinate.
+    An API branch can additionally use ``w_s * observed_support``. All
+    continuous weights are strictly non-negative through softplus. ``gamma``
+    is an optional signed intercept because predicted class is categorical
+    rather than an ordered quality coordinate.
     """
 
     def __init__(
@@ -201,22 +291,34 @@ class MonotonicBranchCorrectnessCalibrator(nn.Module):
         *,
         use_evidential_certainty: bool = True,
         use_prediction_margin: bool = True,
+        use_observed_support: bool = False,
         use_predicted_class_intercept: bool = True,
         initial_continuous_weight: float = 0.25,
         initial_bias: float = 0.0,
     ) -> None:
         super().__init__()
+        self.use_observed_support = bool(use_observed_support)
+        self.feature_names = (
+            API_SUPPORT_RELIABILITY_FEATURE_NAMES
+            if self.use_observed_support
+            else RELIABILITY_FEATURE_NAMES
+        )
+        self.continuous_feature_names = (
+            API_SUPPORT_CONTINUOUS_RELIABILITY_FEATURES
+            if self.use_observed_support
+            else CONTINUOUS_RELIABILITY_FEATURES
+        )
         active_mask = torch.tensor(
             [
                 bool(use_evidential_certainty),
                 bool(use_prediction_margin),
+                *([True] if self.use_observed_support else []),
             ],
             dtype=torch.float32,
         )
         if not bool(active_mask.bool().any().item()):
             raise ValueError(
-                "at least one of evidential certainty or prediction margin "
-                "must be active"
+                "at least one continuous reliability feature must be active"
             )
         self.register_buffer(
             "active_continuous_mask",
@@ -228,7 +330,7 @@ class MonotonicBranchCorrectnessCalibrator(nn.Module):
             raise ValueError("initial_bias must be finite")
         raw_initial = _inverse_softplus(initial_continuous_weight)
         self.raw_continuous_weights = nn.Parameter(
-            torch.full((len(CONTINUOUS_RELIABILITY_FEATURES),), raw_initial)
+            torch.full((len(self.continuous_feature_names),), raw_initial)
         )
         self.bias = nn.Parameter(torch.tensor(initial_bias))
         self.use_predicted_class_intercept = bool(
@@ -246,11 +348,15 @@ class MonotonicBranchCorrectnessCalibrator(nn.Module):
         )
         return {
             name: weights[index]
-            for index, name in enumerate(CONTINUOUS_RELIABILITY_FEATURES)
+            for index, name in enumerate(self.continuous_feature_names)
         }
 
     def forward_logit(self, features: torch.Tensor) -> torch.Tensor:
-        features = _validate_feature_tensor(features, branch="single_branch")
+        features = _validate_feature_tensor(
+            features,
+            branch="single_branch",
+            feature_names=self.feature_names,
+        )
         weights = (
             F.softplus(self.raw_continuous_weights)
             * self.active_continuous_mask
@@ -262,8 +368,9 @@ class MonotonicBranchCorrectnessCalibrator(nn.Module):
             raise RuntimeError(
                 "monotonic correctness parameters must remain finite"
             )
+        continuous_width = len(self.continuous_feature_names)
         logit = bias + (
-            features[:, :2] * weights.view(1, -1)
+            features[:, :continuous_width] * weights.view(1, -1)
         ).sum(dim=-1)
         if self.predicted_class_intercept is not None:
             class_intercept = self.predicted_class_intercept.to(features)
@@ -271,7 +378,13 @@ class MonotonicBranchCorrectnessCalibrator(nn.Module):
                 raise RuntimeError(
                     "predicted-class intercept must remain finite"
                 )
-            logit = logit + features[:, 2] * class_intercept
+            predicted_class_index = self.feature_names.index(
+                "predicted_malware_indicator"
+            )
+            logit = (
+                logit
+                + features[:, predicted_class_index] * class_intercept
+            )
         return logit
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
@@ -286,6 +399,7 @@ class MonotonicReliabilityCalibrator(nn.Module):
         *,
         use_evidential_certainty: bool = True,
         use_prediction_margin: bool = True,
+        use_api_observed_support: bool = False,
         use_predicted_class_intercept: bool = True,
         initial_continuous_weight: float = 0.25,
         initial_bias: float = 0.0,
@@ -293,14 +407,21 @@ class MonotonicReliabilityCalibrator(nn.Module):
         super().__init__()
         self.use_evidential_certainty = bool(use_evidential_certainty)
         self.use_prediction_margin = bool(use_prediction_margin)
+        self.use_api_observed_support = bool(use_api_observed_support)
         self.use_predicted_class_intercept = bool(
             use_predicted_class_intercept
+        )
+        self.feature_layout = reliability_feature_layout(
+            use_api_observed_support=self.use_api_observed_support
         )
         self.branches = nn.ModuleDict(
             {
                 branch: MonotonicBranchCorrectnessCalibrator(
                     use_evidential_certainty=self.use_evidential_certainty,
                     use_prediction_margin=self.use_prediction_margin,
+                    use_observed_support=(
+                        self.use_api_observed_support and branch == "api"
+                    ),
                     use_predicted_class_intercept=(
                         self.use_predicted_class_intercept
                     ),
@@ -317,6 +438,41 @@ class MonotonicReliabilityCalibrator(nn.Module):
             raise ValueError(f"unsupported reliability branch {branch!r}")
         return list(self.branches[branch].parameters())
 
+    def effective_parameter_details(self) -> dict[str, object]:
+        """Return the exact deployed I1 coefficients for result auditing."""
+
+        details: dict[str, object] = {
+            "feature_layout": {
+                branch: list(self.feature_layout[branch])
+                for branch in BRANCH_NAMES
+            },
+            "api_observed_support_enabled": bool(
+                self.use_api_observed_support
+            ),
+            "branches": {},
+        }
+        branch_details: dict[str, object] = {}
+        with torch.no_grad():
+            for branch in BRANCH_NAMES:
+                calibrator = self.branches[branch]
+                weights = calibrator.effective_continuous_weights()
+                branch_details[branch] = {
+                    "bias": float(calibrator.bias.detach().cpu()),
+                    "continuous_weights": {
+                        name: float(value.detach().cpu())
+                        for name, value in weights.items()
+                    },
+                    "predicted_class_intercept": (
+                        None
+                        if calibrator.predicted_class_intercept is None
+                        else float(
+                            calibrator.predicted_class_intercept.detach().cpu()
+                        )
+                    ),
+                }
+        details["branches"] = branch_details
+        return details
+
     def forward(
         self,
         features: Mapping[str, torch.Tensor],
@@ -329,7 +485,11 @@ class MonotonicReliabilityCalibrator(nn.Module):
         validated: dict[str, torch.Tensor] = {}
         batch_size: int | None = None
         for branch in BRANCH_NAMES:
-            value = _validate_feature_tensor(features[branch], branch=branch)
+            value = _validate_feature_tensor(
+                features[branch],
+                branch=branch,
+                feature_names=self.feature_layout[branch],
+            )
             if batch_size is None:
                 batch_size = int(value.size(0))
             elif int(value.size(0)) != batch_size:
@@ -351,11 +511,29 @@ class MonotonicReliabilityCalibrator(nn.Module):
             outputs[f"predicted_reliability_{branch}"] = probability
             outputs[f"predicted_reliability_logit_{branch}"] = raw_logit
             outputs[f"reliability_features_{branch}"] = branch_features
-            outputs[f"evidential_certainty_{branch}"] = branch_features[:, 0]
-            outputs[f"prediction_margin_{branch}"] = branch_features[:, 1]
+            branch_layout = self.feature_layout[branch]
+            outputs[f"evidential_certainty_{branch}"] = branch_features[
+                :, branch_layout.index("evidential_certainty")
+            ]
+            outputs[f"prediction_margin_{branch}"] = branch_features[
+                :, branch_layout.index("prediction_margin")
+            ]
             outputs[f"predicted_malware_indicator_{branch}"] = (
-                branch_features[:, 2]
+                branch_features[
+                    :, branch_layout.index(
+                        "predicted_malware_indicator"
+                    )
+                ]
             )
+            if (
+                branch == "api"
+                and self.use_api_observed_support
+            ):
+                outputs["observed_support_api"] = branch_features[
+                    :, branch_layout.index(
+                        API_OBSERVED_SUPPORT_FEATURE_NAME
+                    )
+                ]
             outputs[f"alive_{branch}"] = branch_alive
 
         reference = validated[BRANCH_NAMES[0]][:, 0]
@@ -373,6 +551,10 @@ class MonotonicReliabilityCalibrator(nn.Module):
         outputs["prediction_margin_feature_active"] = torch.full_like(
             reference,
             float(self.use_prediction_margin),
+        )
+        outputs["api_observed_support_feature_active"] = torch.full_like(
+            reference,
+            float(self.use_api_observed_support),
         )
         return outputs
 
@@ -527,6 +709,10 @@ class BranchTemperatureScalingConfidenceCalibrator(nn.Module):
 
 
 __all__ = [
+    "API_OBSERVED_SUPPORT_FEATURE_NAME",
+    "API_SUPPORT_CONTINUOUS_RELIABILITY_FEATURES",
+    "API_SUPPORT_RELIABILITY_FEATURE_LAYOUT",
+    "API_SUPPORT_RELIABILITY_FEATURE_NAMES",
     "BRANCH_NAMES",
     "CONTINUOUS_RELIABILITY_FEATURES",
     "MONOTONIC_CORRECTNESS_METHOD",
@@ -539,4 +725,5 @@ __all__ = [
     "MonotonicReliabilityCalibrator",
     "build_reliability_features",
     "normalize_reliability_calibration_method",
+    "reliability_feature_layout",
 ]

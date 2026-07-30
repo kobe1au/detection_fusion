@@ -23,9 +23,15 @@ fusion:
     enabled: false
 calibration:
   enabled: false
+  validation_fraction: 0.25
   holdout_enabled: true
-  role_assignment_path: labels/validation_roles_protocol_v1.json
+  role_assignment_path: labels/validation_roles_protocol_v2.json
   require_role_assignment: true
+
+classification_threshold:
+  enabled: true
+  objective: macro_f1
+  selection_rule: macro_f1_unconstrained_v1
 
 selective_prediction:
   enabled: false

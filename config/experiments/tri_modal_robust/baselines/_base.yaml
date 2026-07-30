@@ -17,11 +17,19 @@ fusion:
     enabled: false
 calibration:
   enabled: false
-  # Keep checkpoint selection on the same validation subset as the proposed
-  # method even though these baselines do not fit post-hoc calibration.
+  validation_fraction: 0.25
+  # Keep checkpoint selection on the exact same fixed model-selection
+  # identities as the proposed method.
   holdout_enabled: true
-  role_assignment_path: labels/validation_roles_protocol_v1.json
+  role_assignment_path: labels/validation_roles_protocol_v2.json
   require_role_assignment: true
+
+# Main-table fairness: every comparison receives the same model-selection
+# identities and the same unconstrained macro-F1 operating-point budget.
+classification_threshold:
+  enabled: true
+  objective: macro_f1
+  selection_rule: macro_f1_unconstrained_v1
 
 selective_prediction:
   enabled: false

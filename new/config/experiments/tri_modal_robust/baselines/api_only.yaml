@@ -1,0 +1,12 @@
+defaults:
+  - _base.yaml
+
+method:
+  name: baseline_api_only
+  protocol_id: baseline_api_only_v1
+
+train:
+  exp_name: baseline_api_only
+
+model:
+  fusion_mode: api_only

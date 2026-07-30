@@ -182,13 +182,12 @@ def test_fixed_validation_roles_are_identity_complete_and_disjoint(tmp_path):
     role_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "validation_csv_sha256": csv_sha,
                 "split_seed": 42,
                 "roles": {
-                    "checkpoint_selection": ["a", "b"],
-                    "posthoc_calibration": ["c"],
-                    "decision_calibration": ["d"],
+                    "model_selection": ["a", "b"],
+                    "decision_calibration": ["c", "d"],
                 },
             }
         ),
@@ -207,8 +206,11 @@ def test_fixed_validation_roles_are_identity_complete_and_disjoint(tmp_path):
     )
 
     assert list(selection.indices) == [0, 1]
-    assert list(posthoc.indices) == [2]
-    assert list(decision.indices) == [3]
+    # The compatibility return slot intentionally aliases model selection:
+    # the redesigned protocol has no validation-fitted I1/I2 role.
+    assert list(posthoc.indices) == [0, 1]
+    assert list(decision.indices) == [2, 3]
     assert summary["num_selection"] == 2
-    assert summary["num_posthoc_calibration"] == 1
-    assert summary["num_conformal_calibration"] == 1
+    assert summary["num_posthoc_calibration"] == 0
+    assert summary["num_conformal_calibration"] == 2
+    assert summary["role_assignment_schema_version"] == 2

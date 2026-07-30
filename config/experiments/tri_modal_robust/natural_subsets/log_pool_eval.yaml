@@ -1,5 +1,5 @@
 defaults:
-  - ../ablations/i2/combination_log_pool.yaml
+  - ../baselines/trusted/log_pool.yaml
   - _subset_protocol.yaml
 
 method:

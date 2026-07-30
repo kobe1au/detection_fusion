@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,9 @@ import pandas as pd
 import yaml
 
 
-BRANCHES = ("api", "graph", "manifest")
-METRIC_SUMMARY_SCHEMA_VERSION = 10
+BRANCHES = ("api", "graph", "manifest", "joint")
+METRIC_SUMMARY_SCHEMA_VERSION = 14
+FORCED_CLASSIFICATION_SECTIONS = frozenset({"test", "robust", "extra_eval"})
 
 SCALAR_TYPES = (str, int, float, bool, type(None))
 
@@ -171,16 +173,25 @@ DEFAULT_AGGREGATE_METRICS = {
     "risk_control_num_rejected",
     "risk_control_num_ineligible_forced_reject",
     "risk_control_target_met_empirically",
+    "tcp_mse",
+    "tcp_mae",
+    "tcp_pearson",
+    "tcp_spearman",
+    "error_auroc",
+    "robust_mean_macro_f1",
+    "robust_joint_mean_macro_f1",
+    "robust_mean_gain",
+    "robust_worst_macro_f1",
+    "clean_macro_f1",
 }
 
 BRANCH_AGGREGATE_SUFFIXES = (
-    "_reliability_brier",
-    "_reliability_ece_10",
-    "_reliability_auc",
-    "_reliability_ap",
-    "_reliability_mean",
+    "_competence_tcp_mse",
+    "_competence_tcp_mae",
+    "_competence_tcp_pearson",
+    "_competence_tcp_spearman",
+    "_competence_error_auroc",
     "_branch_accuracy",
-    "_reliability_accuracy_gap",
 )
 
 NON_METRIC_COLUMNS = {
@@ -238,6 +249,68 @@ def _validate_result_summary_schema(
         raise ValueError(
             f"{summary_path} run_identity is missing required fields: {missing}"
         )
+    validation_sections = (
+        "val_model_selection",
+        "val_model_selection_threshold_fit",
+        "val_decision_calibration",
+    )
+    invalid_validation = [
+        key
+        for key in validation_sections
+        if not isinstance(summary.get(key), dict)
+    ]
+    if invalid_validation:
+        raise ValueError(
+            f"{summary_path} is missing schema-v14 two-role validation "
+            f"sections: {invalid_validation}"
+        )
+    retired_validation = sorted(
+        {
+            "val_selection",
+            "val_posthoc_calibration",
+            "val_conformal_calibration",
+        }
+        & set(summary)
+    )
+    if retired_validation:
+        raise ValueError(
+            f"{summary_path} contains retired validation sections "
+            f"{retired_validation}; rerun with the two-role producer"
+        )
+    stage_b = summary.get("stage_b_training")
+    if isinstance(stage_b, dict) and bool(stage_b.get("enabled", False)):
+        stage_b_threshold = stage_b.get("classification_threshold")
+        deployment_threshold = summary.get("classification_threshold")
+        if not isinstance(stage_b_threshold, dict) or not bool(
+            stage_b_threshold.get("locked_by_stage_b", False)
+        ):
+            raise ValueError(
+                f"{summary_path} has no locked Stage-B classification threshold"
+            )
+        if not isinstance(deployment_threshold, dict):
+            raise ValueError(
+                f"{summary_path} has no deployment classification threshold"
+            )
+        try:
+            stage_b_value = float(stage_b_threshold["threshold"])
+            deployment_value = float(deployment_threshold["threshold"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{summary_path} has an invalid Stage-B threshold payload"
+            ) from exc
+        if (
+            not math.isfinite(stage_b_value)
+            or not math.isfinite(deployment_value)
+            or not math.isclose(
+                stage_b_value,
+                deployment_value,
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            )
+        ):
+            raise ValueError(
+                f"{summary_path} Stage-B and deployment thresholds disagree"
+            )
 
 
 def _run_identity(
@@ -313,22 +386,92 @@ def _summary_metric_rows(
     identity["metric_schema_version"] = int(summary["metric_schema_version"])
     rows: list[dict[str, Any]] = []
     _add_metric_row(
-        rows, identity, "val_selection", "val_selection", summary.get("val_selection")
+        rows,
+        identity,
+        "val_model_selection",
+        "val_model_selection",
+        summary.get("val_model_selection"),
     )
     _add_metric_row(
         rows,
         identity,
-        "val_posthoc_calibration",
-        "val_posthoc_calibration",
-        summary.get("val_posthoc_calibration"),
+        "val_model_selection_threshold_fit",
+        "val_model_selection_threshold_fit",
+        summary.get("val_model_selection_threshold_fit"),
     )
     _add_metric_row(
         rows,
         identity,
-        "val_conformal_calibration",
-        "val_conformal_calibration",
-        summary.get("val_conformal_calibration"),
+        "val_decision_calibration",
+        "val_decision_calibration",
+        summary.get("val_decision_calibration"),
     )
+    stage_b = summary.get("stage_b_training")
+    if isinstance(stage_b, dict):
+        _add_metric_row(
+            rows,
+            identity,
+            "stage_b_lifecycle",
+            "stage_b_lifecycle",
+            stage_b,
+        )
+        cache = stage_b.get("cache")
+        if isinstance(cache, dict):
+            for source, metrics in cache.items():
+                _add_metric_row(
+                    rows,
+                    identity,
+                    "stage_b_cache",
+                    str(source),
+                    metrics,
+                )
+        competence = stage_b.get("competence")
+        if isinstance(competence, dict):
+            _add_metric_row(
+                rows,
+                identity,
+                "stage_b_competence_fit",
+                "fit",
+                competence,
+            )
+            diagnostics = competence.get("diagnostics")
+            if isinstance(diagnostics, dict):
+                for source, source_metrics in diagnostics.items():
+                    if not isinstance(source_metrics, dict):
+                        continue
+                    for expert, metrics in source_metrics.items():
+                        _add_metric_row(
+                            rows,
+                            identity,
+                            "stage_b_competence_diagnostics",
+                            f"{source}/{expert}",
+                            metrics,
+                        )
+        router = stage_b.get("router")
+        if isinstance(router, dict):
+            _add_metric_row(
+                rows,
+                identity,
+                "stage_b_router",
+                "selected",
+                router.get("selected"),
+            )
+            candidates = router.get("candidates")
+            if isinstance(candidates, list):
+                for index, metrics in enumerate(candidates):
+                    scenario = (
+                        f"degradation_weight_"
+                        f"{metrics.get('degradation_loss_weight')}"
+                        if isinstance(metrics, dict)
+                        else f"candidate_{index}"
+                    )
+                    _add_metric_row(
+                        rows,
+                        identity,
+                        "stage_b_router_candidate",
+                        scenario,
+                        metrics,
+                    )
     _add_metric_row(rows, identity, "test", "test", summary.get("test"))
     robust = summary.get("robust") or {}
     if isinstance(robust, dict):
@@ -361,31 +504,54 @@ def collect_metric_rows(results_root: Path) -> pd.DataFrame:
     return pd.DataFrame.from_records(rows)
 
 
-def _branch_reliability_rows(metrics: pd.DataFrame) -> pd.DataFrame:
+def _branch_competence_rows(metrics: pd.DataFrame) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     if metrics.empty:
         return pd.DataFrame.from_records(records)
-    base_columns = ["experiment", "seed", "run_dir", "section", "scenario"]
-    for row in metrics.to_dict("records"):
-        for branch in BRANCHES:
-            prefix = f"{branch}_reliability_"
-            branch_record = {
-                key: row.get(key)
-                for key in base_columns
-                if key in row
+    stage_rows = metrics[
+        metrics.get("section", pd.Series(dtype=object)).astype(str)
+        == "stage_b_competence_diagnostics"
+    ]
+    base_columns = [
+        "experiment",
+        "method",
+        "seed",
+        "run_dir",
+        "section",
+        "scenario",
+    ]
+    metric_columns = (
+        "defined",
+        "num_rows",
+        "tcp_mse",
+        "tcp_mae",
+        "tcp_pearson",
+        "tcp_spearman",
+        "error_auroc",
+    )
+    for row in stage_rows.to_dict("records"):
+        scenario = str(row.get("scenario") or "")
+        if "/" not in scenario:
+            continue
+        source, expert = scenario.rsplit("/", 1)
+        if expert not in BRANCHES:
+            continue
+        records.append(
+            {
+                **{
+                    key: row.get(key)
+                    for key in base_columns
+                    if key in row
+                },
+                "source": source,
+                "expert": expert,
+                **{
+                    key: row.get(key)
+                    for key in metric_columns
+                    if key in row
+                },
             }
-            branch_record["branch"] = branch
-            copied = False
-            for key, value in row.items():
-                if key.startswith(prefix):
-                    branch_record[key[len(prefix):]] = value
-                    copied = True
-            accuracy_key = f"{branch}_branch_accuracy"
-            if accuracy_key in row:
-                branch_record["branch_accuracy"] = row.get(accuracy_key)
-                copied = True
-            if copied:
-                records.append(branch_record)
+        )
     return pd.DataFrame.from_records(records)
 
 
@@ -467,6 +633,96 @@ def aggregate_metrics(
     return aggregate
 
 
+def build_paper_forced_classification_table(
+    metrics: pd.DataFrame,
+) -> pd.DataFrame:
+    """Expose only fixed-0.5 decisions for cross-method classification tables.
+
+    The primary main table gives every method the same model-selection
+    macro-F1 threshold budget. This secondary table intentionally discards
+    those fitted operating points and renames the stored fixed-0.5 metrics to
+    canonical paper columns for a no-threshold-tuning sensitivity comparison.
+    """
+
+    if metrics.empty:
+        return pd.DataFrame()
+    if "section" not in metrics:
+        raise ValueError("Collected metrics are missing the section column")
+    frame = metrics[
+        metrics["section"].astype(str).isin(FORCED_CLASSIFICATION_SECTIONS)
+    ].copy()
+    if frame.empty:
+        return frame
+
+    required = (
+        "fixed_0_5_acc",
+        "fixed_0_5_macro_f1",
+        "fixed_0_5_f1_pos",
+        "fixed_0_5_recall_pos",
+    )
+    missing = [key for key in required if key not in frame.columns]
+    if missing:
+        raise ValueError(
+            "Formal forced-classification rows require explicit fixed-0.5 "
+            f"metrics; missing columns={missing}"
+        )
+    incomplete = frame[list(required)].isna().any(axis=1)
+    if bool(incomplete.any()):
+        identity_keys = [
+            key
+            for key in ("experiment", "seed", "section", "scenario")
+            if key in frame
+        ]
+        examples = frame.loc[incomplete, identity_keys].head(5)
+        raise ValueError(
+            "Formal forced-classification rows contain missing fixed-0.5 "
+            f"metrics; examples={examples.to_dict('records')}"
+        )
+
+    identity_columns = [
+        key
+        for key in (
+            "metric_schema_version",
+            "experiment",
+            "method",
+            "seed",
+            "run_dir",
+            "summary_path",
+            "resolved_config_sha256",
+            "method_protocol_sha256",
+            "method_implementation_sha256",
+            "section",
+            "scenario",
+            "pt_dir",
+            "csv",
+            "perturb_type",
+            "perturb_strength",
+        )
+        if key in frame
+    ]
+    threshold_independent = [
+        key for key in ("auc", "ap", "brier", "ece_10") if key in frame
+    ]
+    out = frame[
+        [
+            *identity_columns,
+            *required,
+            *threshold_independent,
+        ]
+    ].copy()
+    out = out.rename(
+        columns={
+            "fixed_0_5_acc": "acc",
+            "fixed_0_5_macro_f1": "macro_f1",
+            "fixed_0_5_f1_pos": "f1_pos",
+            "fixed_0_5_recall_pos": "recall_pos",
+        }
+    )
+    out["classification_threshold"] = 0.5
+    out["classification_protocol"] = "forced_fixed_0_5_v1"
+    return out
+
+
 def _filter_methods(aggregate: pd.DataFrame, prefixes: tuple[str, ...], extras: tuple[str, ...] = ()) -> pd.DataFrame:
     if aggregate.empty or "method" not in aggregate.columns:
         return pd.DataFrame()
@@ -501,19 +757,51 @@ def main() -> None:
         metrics,
         metric_allowlist=set(args.aggregate_metrics) if args.aggregate_metrics else None,
     )
+    paper_forced = build_paper_forced_classification_table(metrics)
+    paper_forced_aggregate = aggregate_metrics(
+        paper_forced,
+        metric_allowlist={
+            "classification_threshold",
+            "acc",
+            "macro_f1",
+            "f1_pos",
+            "recall_pos",
+            "auc",
+            "ap",
+            "brier",
+            "ece_10",
+        },
+    )
     _write_csv(metrics, out_dir / "main_results.csv")
     _write_csv(aggregate, out_dir / "aggregate_main_results.csv")
-    _write_csv(_filter_methods(aggregate, ("i1_",)), out_dir / "aggregate_i1_ablation.csv")
-    _write_csv(_filter_methods(aggregate, ("i2_",)), out_dir / "aggregate_i2_ablation.csv")
+    _write_csv(
+        paper_forced,
+        out_dir / "paper_forced_classification_results.csv",
+    )
+    _write_csv(
+        paper_forced_aggregate,
+        out_dir / "aggregate_paper_forced_classification_results.csv",
+    )
+    _write_csv(
+        _filter_methods(aggregate, ("ablation_i1_",)),
+        out_dir / "aggregate_i1_ablation.csv",
+    )
+    _write_csv(
+        _filter_methods(aggregate, ("ablation_i2_",)),
+        out_dir / "aggregate_i2_ablation.csv",
+    )
     _write_csv(
         _filter_methods(
             aggregate,
-            ("i3_",),
+            ("i3_", "ablation_i3_"),
             extras=("module_no_i3_decision_layer",),
         ),
         out_dir / "aggregate_i3_ablation.csv",
     )
-    _write_csv(_branch_reliability_rows(metrics), out_dir / "i1_reliability_calibration_summary.csv")
+    _write_csv(
+        _branch_competence_rows(metrics),
+        out_dir / "i1_tcp_competence_summary.csv",
+    )
     _write_csv(_selected_columns(metrics, SELECTIVE_KEYS), out_dir / "i3_selective_results.csv")
     run_index_columns = [
         key
@@ -527,8 +815,23 @@ def main() -> None:
             "method_implementation_sha256",
             "resolved_config_sha256",
             "model_fusion_mode",
-            "combination_rule",
-            "evidential_certainty_enabled",
+            "training_objective",
+            "stage_a_primary_expert",
+            "stage_a_atomic_aux_weight",
+            "stage_b_enabled",
+            "stage_b_fit_population",
+            "i1_target",
+            "i1_inputs",
+            "i1_regression",
+            "i1_degraded_loss_weight",
+            "i1_ranking_weight",
+            "i1_clean_noninferiority_relative_tolerance",
+            "i1_clean_noninferiority_absolute_tolerance",
+            "i2_formula",
+            "i2_clean_anchor_kl_weight",
+            "i2_clean_noninferiority_tolerance",
+            "i2_degraded_source_noninferiority_tolerance",
+            "i2_minimum_robust_gain",
             "classification_threshold_enabled",
             "classification_threshold_objective",
             "classification_threshold_selection_rule",

@@ -9,13 +9,17 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+import yaml
 
 
 BRANCHES = ("api", "graph", "manifest")
-SUBSET_SCHEMA_VERSION = 6
-SUBSET_PROTOCOL_ID = "i1_i2_unseen_validation_natural_difficulty_v2"
-SUBSET_CALIBRATION_SPLIT = "val_selection"
+SUBSET_SCHEMA_VERSION = 9
+SUBSET_PROTOCOL_ID = "competence_validation_natural_difficulty_v1"
+SUBSET_CALIBRATION_SPLIT = "val_model_selection"
 SUBSET_TARGET_SPLIT = "test_clean"
+SUBSET_TAIL_FRACTION = 1.0 / 3.0
+SOURCE_METHOD_PROTOCOL_ID = "tcp_joint_anchor_crc_v1"
+SOURCE_SEED = 42
 
 # These definitions are deliberately small and auditable:
 # - disagreement is label-free;
@@ -50,12 +54,14 @@ SUBSET_DEFINITIONS: dict[str, dict[str, Any]] = {
         "purpose": "diagnostic_exactly_one_branch_wrong",
         "valid_claim_scope": "posthoc_branch_failure_diagnosis_only",
     },
-    "reliability_imbalance": {
+    "competence_imbalance": {
         "label_dependency": "label_free",
         "threshold_source": "validation_only",
         "eligibility": "at_least_two_alive_branches",
-        "purpose": "natural_sample_level_branch_reliability_imbalance",
-        "valid_claim_scope": "downstream_i2_routing_stress_diagnostic_not_i1_validation",
+        "purpose": "natural_sample_level_branch_competence_imbalance",
+        "valid_claim_scope": (
+            "downstream_i2_routing_stress_diagnostic_not_independent_i1_evidence"
+        ),
     },
     "high_cross_modal_conflict": {
         "label_dependency": "label_free",
@@ -79,6 +85,129 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _require_sha256(value: Any, field: str) -> str:
+    text = str(value or "").strip().lower()
+    if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return text
+
+
+def _load_registered_source_summary(
+    summary_path: Path,
+    diagnostics_path: Path,
+) -> dict[str, Any]:
+    if not summary_path.is_file():
+        raise FileNotFoundError(
+            "Natural-subset construction requires the source main-method "
+            f"summary: {summary_path}"
+        )
+    try:
+        summary = yaml.safe_load(summary_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"Unable to read source summary {summary_path}: {exc}") from exc
+    if not isinstance(summary, dict):
+        raise ValueError("Natural-subset source summary must be a mapping")
+
+    identity = summary.get("run_identity")
+    if not isinstance(identity, dict):
+        raise ValueError("Natural-subset source summary is missing run_identity")
+    if str(identity.get("method_protocol_id") or "") != SOURCE_METHOD_PROTOCOL_ID:
+        raise ValueError(
+            "Natural subsets must come from the registered primary method; "
+            f"expected protocol={SOURCE_METHOD_PROTOCOL_ID!r}, "
+            f"actual={identity.get('method_protocol_id')!r}"
+        )
+    try:
+        source_seed = int(identity.get("seed"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Natural-subset source summary has an invalid seed") from exc
+    if source_seed != SOURCE_SEED:
+        raise ValueError(
+            f"Natural subsets are frozen from seed {SOURCE_SEED}, got {source_seed}"
+        )
+
+    artifacts = summary.get("diagnostic_artifacts")
+    artifact = (
+        artifacts.get("gate_diagnostics")
+        if isinstance(artifacts, dict)
+        else None
+    )
+    if not isinstance(artifact, dict):
+        raise ValueError(
+            "Natural-subset source summary does not bind gate_diagnostics.csv"
+        )
+    artifact_path = Path(str(artifact.get("path") or ""))
+    if not artifact_path.is_absolute():
+        raise ValueError("Bound gate_diagnostics path must be absolute")
+    if artifact_path.resolve() != diagnostics_path.resolve():
+        raise ValueError(
+            "Requested diagnostics are not the artifact bound by the source "
+            f"summary: requested={diagnostics_path.resolve()} "
+            f"bound={artifact_path.resolve()}"
+        )
+    diagnostics_sha256 = _sha256(diagnostics_path)
+    if _require_sha256(
+        artifact.get("sha256"), "diagnostic_artifacts.gate_diagnostics.sha256"
+    ) != diagnostics_sha256:
+        raise ValueError(
+            "gate_diagnostics.csv changed after the source summary was written"
+        )
+
+    for key in (
+        "method_protocol_sha256",
+        "method_implementation_sha256",
+        "pipeline_model_state_sha256",
+        "pipeline_decision_metadata_sha256",
+        "validation_role_assignment_semantic_sha256",
+    ):
+        _require_sha256(artifact.get(key), f"gate_diagnostics.{key}")
+    if artifact["method_protocol_sha256"] != identity.get(
+        "method_protocol_sha256"
+    ):
+        raise ValueError(
+            "Diagnostic artifact protocol hash disagrees with source run identity"
+        )
+    if artifact["method_implementation_sha256"] != identity.get(
+        "method_implementation_sha256"
+    ):
+        raise ValueError(
+            "Diagnostic artifact implementation hash disagrees with source run identity"
+        )
+
+    validation_split = summary.get("validation_split")
+    if not isinstance(validation_split, dict) or (
+        validation_split.get("role_assignment_semantic_sha256")
+        != artifact["validation_role_assignment_semantic_sha256"]
+    ):
+        raise ValueError(
+            "Diagnostic artifact is not bound to the summary's validation-role "
+            "assignment"
+        )
+
+    return {
+        "summary": str(summary_path.resolve()),
+        "summary_sha256": _sha256(summary_path),
+        "experiment_name": str(identity.get("experiment_name") or ""),
+        "method_name": str(identity.get("method_name") or ""),
+        "seed": source_seed,
+        "method_protocol_id": SOURCE_METHOD_PROTOCOL_ID,
+        "method_protocol_sha256": artifact["method_protocol_sha256"],
+        "method_implementation_sha256": artifact[
+            "method_implementation_sha256"
+        ],
+        "pipeline_model_state_sha256": artifact[
+            "pipeline_model_state_sha256"
+        ],
+        "pipeline_decision_metadata_sha256": artifact[
+            "pipeline_decision_metadata_sha256"
+        ],
+        "validation_role_assignment_semantic_sha256": artifact[
+            "validation_role_assignment_semantic_sha256"
+        ],
+        "diagnostics_sha256": diagnostics_sha256,
+    }
 
 
 def _frame_sha256(frame: pd.DataFrame, columns: Iterable[str]) -> str:
@@ -179,7 +308,7 @@ def _prepare_split(
         *(f"{branch}_alive" for branch in BRANCHES),
         *(f"{branch}_pred" for branch in BRANCHES),
         *(f"{branch}_prob" for branch in BRANCHES),
-        *(f"predicted_reliability_{branch}" for branch in BRANCHES),
+        *(f"predicted_competence_{branch}" for branch in BRANCHES),
     ]
     if require_label:
         required.append("label")
@@ -209,9 +338,9 @@ def _prepare_split(
             lower=0.0,
             upper=1.0,
         )
-        frame[f"predicted_reliability_{branch}"] = _finite_numeric_column(
+        frame[f"predicted_competence_{branch}"] = _finite_numeric_column(
             frame,
-            f"predicted_reliability_{branch}",
+            f"predicted_competence_{branch}",
             source=f"diagnostics split={split!r}",
             lower=0.0,
             upper=1.0,
@@ -253,7 +382,7 @@ def _derived_scores(frame: pd.DataFrame) -> pd.DataFrame:
     scored = frame.copy()
     alive_count: list[int] = []
     disagreement: list[bool] = []
-    reliability_imbalance: list[float] = []
+    competence_imbalance: list[float] = []
     probability_conflict: list[float] = []
 
     for row in scored.to_dict(orient="records"):
@@ -266,15 +395,15 @@ def _derived_scores(frame: pd.DataFrame) -> pd.DataFrame:
             len(predictions) >= 2 and len(set(predictions)) > 1
         )
         if len(alive_branches) < 2:
-            reliability_imbalance.append(float("nan"))
+            competence_imbalance.append(float("nan"))
             probability_conflict.append(float("nan"))
             continue
 
-        reliability = [
-            float(row[f"predicted_reliability_{branch}"])
+        competence = [
+            float(row[f"predicted_competence_{branch}"])
             for branch in alive_branches
         ]
-        reliability_imbalance.append(max(reliability) - min(reliability))
+        competence_imbalance.append(max(competence) - min(competence))
         pairwise_conflict = [
             _bernoulli_js(
                 float(row[f"{left}_prob"]),
@@ -287,7 +416,7 @@ def _derived_scores(frame: pd.DataFrame) -> pd.DataFrame:
 
     scored["_alive_count"] = alive_count
     scored["_branch_disagreement"] = disagreement
-    scored["_reliability_imbalance"] = reliability_imbalance
+    scored["_competence_imbalance"] = competence_imbalance
     scored["_cross_modal_conflict"] = probability_conflict
     return scored
 
@@ -366,15 +495,15 @@ def _join_target_labels(
 def _target_subset_masks(
     target: pd.DataFrame,
     *,
-    reliability_threshold: float,
+    competence_threshold: float,
     conflict_threshold: float,
 ) -> dict[str, pd.Series]:
     all_alive = target["_alive_count"] == len(BRANCHES)
     masks: dict[str, pd.Series] = {
         "branch_disagreement": target["_branch_disagreement"].astype(bool),
-        "reliability_imbalance": (
+        "competence_imbalance": (
             (target["_alive_count"] >= 2)
-            & (target["_reliability_imbalance"] >= reliability_threshold)
+            & (target["_competence_imbalance"] >= competence_threshold)
         ),
         "high_cross_modal_conflict": (
             (target["_alive_count"] >= 2)
@@ -403,9 +532,10 @@ def build_subsets(
     test_csv_path: Path,
     output_dir: Path,
     *,
+    source_summary_path: Path | None = None,
     calibration_split: str = SUBSET_CALIBRATION_SPLIT,
     target_split: str = SUBSET_TARGET_SPLIT,
-    tail_fraction: float = 1.0 / 3.0,
+    tail_fraction: float = SUBSET_TAIL_FRACTION,
     min_count: int = 10,
     min_calibration_count: int = 10,
     id_column: str | None = None,
@@ -418,8 +548,16 @@ def build_subsets(
     therefore diagnostic slices, not label-free deployment detectors.
     """
 
-    if not (0.0 < tail_fraction < 0.5):
-        raise ValueError("tail_fraction must be in (0, 0.5)")
+    if not math.isclose(
+        float(tail_fraction),
+        SUBSET_TAIL_FRACTION,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        raise ValueError(
+            "The registered natural-subset protocol fixes tail_fraction at "
+            f"{SUBSET_TAIL_FRACTION}; changing it defines a different protocol"
+        )
     if min_count < 1:
         raise ValueError("min_count must be at least 1")
     if min_calibration_count < 1:
@@ -427,8 +565,9 @@ def build_subsets(
     if calibration_split != SUBSET_CALIBRATION_SPLIT:
         raise ValueError(
             "The registered natural-subset protocol requires "
-            f"calibration_split={SUBSET_CALIBRATION_SPLIT!r}; I1/I2 fitting "
-            "identities cannot define their own reliability-imbalance tail."
+            f"calibration_split={SUBSET_CALIBRATION_SPLIT!r}; changing the "
+            "registered model-selection source would define a different "
+            "diagnostic protocol."
         )
     if target_split != SUBSET_TARGET_SPLIT:
         raise ValueError(
@@ -441,6 +580,17 @@ def build_subsets(
             "cannot define natural-subset thresholds"
         )
 
+    diagnostics_path = diagnostics_path.resolve()
+    test_csv_path = test_csv_path.resolve()
+    source_summary_path = (
+        source_summary_path.resolve()
+        if source_summary_path is not None
+        else (diagnostics_path.parent / "summary.yaml").resolve()
+    )
+    source_run = _load_registered_source_summary(
+        source_summary_path,
+        diagnostics_path,
+    )
     diagnostics = _read_csv(diagnostics_path)
     _require_columns(diagnostics, ["split"], str(diagnostics_path))
     sample_id_column = _resolve_id_column(diagnostics, id_column)
@@ -459,11 +609,11 @@ def build_subsets(
     calibration = _derived_scores(calibration)
     target = _derived_scores(target)
 
-    reliability_threshold, reliability_calibration_count = (
+    competence_threshold, competence_calibration_count = (
         _fit_validation_threshold(
-            calibration["_reliability_imbalance"],
+            calibration["_competence_imbalance"],
             tail_fraction=tail_fraction,
-            subset_name="reliability_imbalance",
+            subset_name="competence_imbalance",
             min_calibration_count=min_calibration_count,
         )
     )
@@ -474,19 +624,19 @@ def build_subsets(
         min_calibration_count=min_calibration_count,
     )
     thresholds = {
-        "reliability_imbalance": {
-            "evidence": "max_minus_min_predicted_reliability_over_alive_branches",
-            "threshold": reliability_threshold,
+        "competence_imbalance": {
+            "evidence": "max_minus_min_predicted_competence_over_alive_branches",
+            "threshold": competence_threshold,
             "comparison": ">=",
             "source_split": calibration_split,
             "source_split_sha256": _frame_sha256(
                 calibration,
                 [
                     *(f"{branch}_alive" for branch in BRANCHES),
-                    *(f"predicted_reliability_{branch}" for branch in BRANCHES),
+                    *(f"predicted_competence_{branch}" for branch in BRANCHES),
                 ],
             ),
-            "eligible_validation_count": reliability_calibration_count,
+            "eligible_validation_count": competence_calibration_count,
             "tail_fraction": tail_fraction,
         },
         "high_cross_modal_conflict": {
@@ -510,7 +660,7 @@ def build_subsets(
     labels = _join_target_labels(target, test_csv, test_csv_path=test_csv_path)
     masks = _target_subset_masks(
         target,
-        reliability_threshold=reliability_threshold,
+        competence_threshold=competence_threshold,
         conflict_threshold=conflict_threshold,
     )
 
@@ -574,11 +724,11 @@ def build_subsets(
                 "availability": [f"{branch}_alive" for branch in BRANCHES],
                 "prediction": [f"{branch}_pred" for branch in BRANCHES],
                 "probability": [f"{branch}_prob" for branch in BRANCHES],
-                "i1_reliability": [
-                    f"predicted_reliability_{branch}" for branch in BRANCHES
+                "i1_competence": [
+                    f"predicted_competence_{branch}" for branch in BRANCHES
                 ],
             },
-            "reliability_imbalance_dependency": (
+            "competence_imbalance_dependency": (
                 "depends_on_i1_outputs_and_is_not_independent_evidence_for_i1"
             ),
             "cross_modal_conflict_dependency": (
@@ -591,12 +741,13 @@ def build_subsets(
         "protocol_guarantees": {
             "thresholds_fit_on_validation_only": True,
             "target_split_used_for_threshold_selection": False,
-            "calibration_split_unseen_by_i1_i2": True,
-            "i1_success_is_not_defined_by_i1_reliability": True,
+            "model_selection_disjoint_from_decision_calibration": True,
+            "competence_success_is_not_defined_by_predicted_competence": True,
             "label_dependent_subsets_are_diagnostic_only": True,
         },
         "diagnostics": str(diagnostics_path.as_posix()),
         "diagnostics_sha256": diagnostics_sha256,
+        "source_run": source_run,
         "test_csv": str(test_csv_path.as_posix()),
         "test_csv_sha256": test_csv_sha256,
         "calibration_split": calibration_split,
@@ -619,6 +770,14 @@ def main() -> None:
         )
     )
     parser.add_argument("--diagnostics", default="results/gate_diagnostics.csv")
+    parser.add_argument(
+        "--source-summary",
+        default=None,
+        help=(
+            "Main-method summary.yaml that cryptographically binds the requested "
+            "diagnostics. Defaults to summary.yaml beside --diagnostics."
+        ),
+    )
     parser.add_argument("--test-csv", default="labels/test.csv")
     parser.add_argument("--out-dir", default="labels/natural_subsets")
     parser.add_argument(
@@ -626,7 +785,8 @@ def main() -> None:
         default=SUBSET_CALIBRATION_SPLIT,
         help=(
             "Validation-only diagnostic split used to freeze tail thresholds. "
-            "The default was not used to fit I1/I2."
+            "The default is the registered model-selection diagnostic split; "
+            "it is disjoint from I3 decision calibration and all test rows."
         ),
     )
     parser.add_argument(
@@ -637,8 +797,11 @@ def main() -> None:
     parser.add_argument(
         "--tail-fraction",
         type=float,
-        default=1.0 / 3.0,
-        help="Upper-tail fraction selected using validation diagnostics only.",
+        default=SUBSET_TAIL_FRACTION,
+        help=(
+            "Registered upper-tail fraction. Values other than 1/3 are rejected "
+            "because they define a different protocol."
+        ),
     )
     parser.add_argument("--min-count", type=int, default=10)
     parser.add_argument("--min-calibration-count", type=int, default=10)
@@ -649,6 +812,9 @@ def main() -> None:
         diagnostics_path=Path(args.diagnostics),
         test_csv_path=Path(args.test_csv),
         output_dir=Path(args.out_dir),
+        source_summary_path=(
+            Path(args.source_summary) if args.source_summary else None
+        ),
         calibration_split=str(args.calibration_split),
         target_split=str(args.target_split),
         tail_fraction=float(args.tail_fraction),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -18,12 +19,28 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from fusion.constants import VALIDATION_HOLDOUT_FRACTION
 from fusion.utils import strict_binary_integer, strict_finite_integer
+
+
+VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION = 2
+VALIDATION_ROLE_ASSIGNMENT_PROTOCOL = (
+    "year_label_stratified_package_group_75_25_v2"
+)
+DEFAULT_VALIDATION_ROLE_ASSIGNMENT = Path(
+    "labels/validation_roles_protocol_v2.json"
+)
 
 
 def resolve_path(path: str | Path) -> Path:
     return Path(path).expanduser().resolve()
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def set_reproducible_seed(seed: int) -> None:
@@ -85,11 +102,130 @@ def enforce_formal_split_completeness(
 def validation_selection_indices(
     frame: pd.DataFrame,
     *,
-    calibration_fraction: float = VALIDATION_HOLDOUT_FRACTION,
-    seed: int = 42,
+    validation_csv_path: str | Path,
+    role_assignment_path: str | Path = DEFAULT_VALIDATION_ROLE_ASSIGNMENT,
 ) -> tuple[list[int], dict[str, Any]]:
-    """Return the same group-stratified checkpoint-selection split as Full."""
-    from fusion.train import split_validation_dataset
+    """Load the immutable v2 ``model_selection`` identities.
+
+    Paper baselines must not independently redraw validation subsets. The
+    assignment file is accepted only when it exactly matches the bytes and
+    identities of the supplied validation CSV.
+    """
+
+    validation_csv = resolve_path(validation_csv_path)
+    role_assignment = resolve_path(role_assignment_path)
+    if not validation_csv.is_file():
+        raise FileNotFoundError(
+            f"Validation CSV not found: {validation_csv}"
+        )
+    if not role_assignment.is_file():
+        raise FileNotFoundError(
+            f"Validation role assignment not found: {role_assignment}"
+        )
+    try:
+        payload = json.loads(role_assignment.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Unable to read validation role assignment {role_assignment}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Validation role assignment must be a JSON mapping")
+    if (
+        int(payload.get("schema_version", -1))
+        != VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "Validation role assignment schema mismatch: "
+            f"expected={VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION} "
+            f"actual={payload.get('schema_version')!r}"
+        )
+    if payload.get("protocol") != VALIDATION_ROLE_ASSIGNMENT_PROTOCOL:
+        raise ValueError(
+            "Validation role assignment protocol mismatch: "
+            f"expected={VALIDATION_ROLE_ASSIGNMENT_PROTOCOL!r} "
+            f"actual={payload.get('protocol')!r}"
+        )
+
+    expected_csv_sha = str(payload.get("validation_csv_sha256") or "").lower()
+    actual_csv_sha = _file_sha256(validation_csv)
+    if expected_csv_sha != actual_csv_sha:
+        raise ValueError(
+            "Validation role assignment was built for a different validation "
+            f"CSV: expected={expected_csv_sha!r} actual={actual_csv_sha!r}"
+        )
+
+    required_columns = {"sha256", "label"}
+    missing_columns = sorted(required_columns - set(frame.columns))
+    if missing_columns:
+        raise ValueError(
+            "Validation frame is missing required columns: "
+            f"{missing_columns}"
+        )
+    sids = frame["sha256"].astype(str).str.strip().str.lower().tolist()
+    if any(not sid for sid in sids):
+        raise ValueError("Validation frame contains an empty sha256")
+    if len(set(sids)) != len(sids):
+        raise ValueError("Validation frame contains duplicate sample identities")
+    _strict_binary_label_series(
+        frame["label"], context="validation selection frame"
+    )
+    index_by_sid = {sid: index for index, sid in enumerate(sids)}
+
+    role_names = ("model_selection", "decision_calibration")
+    roles = payload.get("roles")
+    if not isinstance(roles, dict) or set(roles) != set(role_names):
+        raise ValueError(
+            "Validation role assignment must contain exactly roles "
+            f"{list(role_names)}"
+        )
+    role_ids: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for role_name in role_names:
+        raw_ids = roles[role_name]
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ValueError(
+                f"Validation role {role_name!r} must be a non-empty list"
+            )
+        normalized = [str(value).strip().lower() for value in raw_ids]
+        if any(not sid for sid in normalized):
+            raise ValueError(
+                f"Validation role {role_name!r} contains an empty identity"
+            )
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(
+                f"Validation role {role_name!r} contains duplicate identities"
+            )
+        overlap = seen.intersection(normalized)
+        if overlap:
+            raise ValueError(
+                "Validation roles overlap; examples="
+                f"{sorted(overlap)[:10]}"
+            )
+        unknown = sorted(set(normalized) - set(index_by_sid))
+        if unknown:
+            raise ValueError(
+                f"Validation role {role_name!r} contains unknown identities: "
+                f"{unknown[:10]}"
+            )
+        seen.update(normalized)
+        role_ids[role_name] = normalized
+
+    missing = sorted(set(sids) - seen)
+    if missing:
+        raise ValueError(
+            "Validation role assignment does not cover the full validation "
+            f"set; missing={len(missing)} examples={missing[:10]}"
+        )
+
+    declared_counts = payload.get("counts")
+    actual_counts = {
+        role_name: len(role_ids[role_name]) for role_name in role_names
+    }
+    if declared_counts != actual_counts:
+        raise ValueError(
+            "Validation role assignment count mismatch: "
+            f"declared={declared_counts!r} actual={actual_counts!r}"
+        )
 
     package_col = next(
         (
@@ -99,60 +235,59 @@ def validation_selection_indices(
         ),
         None,
     )
-    sids = frame["sha256"].astype(str).tolist()
     if package_col is None:
-        groups = list(sids)
-    else:
-        groups = []
-        for sid, value in zip(sids, frame[package_col].tolist()):
-            group = str(value or "").strip().lower()
-            groups.append(group if group not in {"", "nan", "none", "null"} else sid)
-
-    validated_labels = _strict_binary_label_series(
-        frame["label"], context="validation selection frame"
-    ).tolist()
-    year_col = next(
-        (name for name in ("year", "Year", "vt_year", "dex_year") if name in frame.columns),
-        None,
-    )
-    if year_col is None:
         raise ValueError(
-            "Formal baseline validation selection requires a year column so "
-            "it matches the main year-label/package-group protocol"
+            "Formal baseline validation roles require a package-group column"
         )
-    validated_years = [
-        strict_finite_integer(
-            value,
-            field_name=f"validation selection year at row {index}",
+    group_by_sid: dict[str, str] = {}
+    for sid, value in zip(sids, frame[package_col].tolist()):
+        group = str(value or "").strip().lower()
+        group_by_sid[sid] = (
+            sid if group in {"", "nan", "none", "null"} else group
         )
-        for index, value in frame[year_col].items()
-    ]
-
-    class FrameView:
-        def __init__(self) -> None:
-            self.sample_sids = sids
-            self.sample_groups = groups
-            self.sample_labels = validated_labels
-            self.sample_years = validated_years
-
-        def __len__(self) -> int:
-            return len(self.sample_sids)
-
-        def __getitem__(self, index: int) -> int:
-            return index
-
-    selection, _calibration, summary = split_validation_dataset(
-        {
-            "train": {"seed": int(seed)},
-            "calibration": {
-                "validation_fraction": float(calibration_fraction),
-                "split_seed": int(seed),
-                "stratified_group_split": True,
-            },
-        },
-        FrameView(),
+    group_roles: dict[str, set[str]] = {}
+    for role_name, identities in role_ids.items():
+        for sid in identities:
+            group_roles.setdefault(group_by_sid[sid], set()).add(role_name)
+    crossed_groups = sorted(
+        group for group, assigned_roles in group_roles.items()
+        if len(assigned_roles) > 1
     )
-    return [int(index) for index in selection.indices], summary
+    if crossed_groups:
+        raise ValueError(
+            "Validation role assignment splits package groups across roles; "
+            f"examples={crossed_groups[:10]}"
+        )
+
+    model_selection_set = set(role_ids["model_selection"])
+    model_selection_indices = [
+        index for index, sid in enumerate(sids) if sid in model_selection_set
+    ]
+    decision_set = set(role_ids["decision_calibration"])
+    decision_indices = [
+        index for index, sid in enumerate(sids) if sid in decision_set
+    ]
+    size = len(frame)
+    summary = {
+        "schema_version": VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION,
+        "protocol": VALIDATION_ROLE_ASSIGNMENT_PROTOCOL,
+        "role_assignment_path": str(role_assignment),
+        "role_assignment_sha256": _file_sha256(role_assignment),
+        "validation_csv_path": str(validation_csv),
+        "validation_csv_sha256": actual_csv_sha,
+        "num_validation": size,
+        "num_model_selection": len(model_selection_indices),
+        "num_decision_calibration": len(decision_indices),
+        "model_selection_fraction_of_validation": (
+            len(model_selection_indices) / float(size)
+        ),
+        "decision_calibration_fraction_of_validation": (
+            len(decision_indices) / float(size)
+        ),
+        "model_selection_indices": model_selection_indices,
+        "decision_calibration_indices": decision_indices,
+    }
+    return model_selection_indices, summary
 
 
 def read_label_csv(path: str | Path) -> pd.DataFrame:

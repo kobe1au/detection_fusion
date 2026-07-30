@@ -209,39 +209,13 @@ def test_discount_fusion_routes_raw_logit_temperature_confidence_into_i1():
     )
 
 
-def test_temperature_baseline_configs_separate_matched_and_clean_fit_sources():
-    matched = load_config_path(
+def test_retired_temperature_i1_configs_are_not_formal_ablations():
+    assert not (
         ROOT / "ablations/i1/temperature_scaling_confidence.yaml"
-    )
-    clean = load_config_path(
+    ).exists()
+    assert not (
         ROOT / "ablations/i1/temperature_scaling_confidence_clean_only.yaml"
-    )
-
-    for cfg in (matched, clean):
-        reliability = cfg["fusion"]["reliability_calibration"]
-        assert reliability["method"] == TEMPERATURE_SCALING_CONFIDENCE_METHOD
-        assert reliability["branches"] == ["api", "graph", "manifest"]
-        assert "use_model_visibility" not in reliability
-        assert "use_predicted_class_feature" not in reliability
-        assert cfg["calibration"]["cross_fitting"]["enabled"] is True
-        assert cfg["fusion"]["routing"]["risk_target"] == (
-            "threshold_malware_false_negative"
-        )
-        assert cfg["selective_prediction"]["mode"] == "risk_control"
-        resolved_fusion = DiscountProbabilityFusion(cfg["fusion"])
-        assert isinstance(
-            resolved_fusion.reliability_calibrator,
-            BranchTemperatureScalingConfidenceCalibrator,
-        )
-
-    assert (
-        matched["fusion"]["reliability_calibration"]["temperature_fit_source"]
-        == "clean_plus_branch_local_partial"
-    )
-    assert (
-        clean["fusion"]["reliability_calibration"]["temperature_fit_source"]
-        == "clean_only"
-    )
+    ).exists()
 
 
 def test_temperature_baseline_uses_grouped_oof_i1_lifecycle_and_full_refit():
@@ -332,10 +306,20 @@ def test_temperature_baseline_uses_grouped_oof_i1_lifecycle_and_full_refit():
 
 
 def test_temperature_baseline_fits_only_configured_evidence_branches():
-    cfg = load_config_path(
-        ROOT / "ablations/i1/temperature_scaling_confidence.yaml"
+    fusion = DiscountProbabilityFusion(
+        {
+            "combination": "cumulative",
+            "reliability_calibration": {
+                "enabled": True,
+                "method": TEMPERATURE_SCALING_CONFIDENCE_METHOD,
+                "branches": ["api", "graph", "manifest"],
+                "temperature_fit_source": (
+                    "clean_plus_branch_local_partial"
+                ),
+            },
+            "routing": {"enabled": False},
+        }
     )
-    fusion = DiscountProbabilityFusion(cfg["fusion"])
     calibrator = fusion.reliability_calibrator
     assert isinstance(calibrator, BranchTemperatureScalingConfidenceCalibrator)
     fitted = fusion.reliability_calibration_parameters()

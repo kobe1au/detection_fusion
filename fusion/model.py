@@ -7,6 +7,12 @@ from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
+from fusion.competence_fusion import (
+    ATOMIC_EXPERT_NAMES,
+    EXPERT_NAMES,
+    AnchoredCompetenceFusion,
+    ContentConditionedCompetence,
+)
 from fusion.evidence import build_fusion_availability_and_diagnostics
 
 from fusion.constants import ArchitectureConstants, AvailabilityIndex
@@ -30,11 +36,13 @@ TRI_MODAL_FUSION_MODES = {
     "tri_modal_fixed_gate",
     "tri_modal_quality_fusion",
     "tri_modal_dense_embedding_gate",
+    "anchored_joint_late",
     "discount_probability",
 }
 
 API_GRAPH_CONCAT_FUSION_MODES = {"api_graph_concat"}
 TRI_MODAL_CONCAT_FUSION_MODES = {"tri_modal_concat"}
+ANCHORED_JOINT_LATE_FUSION_MODES = {"anchored_joint_late"}
 
 
 # ── fusion-mode dispatch helpers ──────────────────────────────────────
@@ -268,6 +276,7 @@ def _fusion_discount_probability(model, batch_size, device, dtype, tensors, extr
         tensors["graph_logits"],
         tensors["manifest_logits"],
         availability,
+        api_observed_support=tensors["api_observed_support"],
     )
     extra.update(fusion_outputs)
     return fusion_outputs["final_logits"], fusion_outputs["fusion_weights"], extra
@@ -487,6 +496,91 @@ class ManifestEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x.float())
 
+
+class JointExpert(nn.Module):
+    """A real joint representation expert over the three current-view embeddings.
+
+    The hard alive bits are part of the joint input so a zero-filled missing
+    branch cannot be confused with a valid embedding that happens to be near
+    zero.  This module belongs to Stage A and is deliberately separate from the
+    Stage-B competence/router parameters.
+    """
+
+    def __init__(
+        self,
+        embedding_dims: Mapping[str, int],
+        *,
+        joint_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if set(embedding_dims) != set(ATOMIC_EXPERT_NAMES):
+            raise ValueError(
+                "JointExpert embedding_dims must contain exactly "
+                f"{list(ATOMIC_EXPERT_NAMES)}"
+            )
+        if int(joint_dim) <= 0 or int(hidden_dim) <= 0:
+            raise ValueError("JointExpert dimensions must be positive")
+        if not 0.0 <= float(dropout) < 1.0:
+            raise ValueError("JointExpert dropout must lie within [0, 1)")
+        self.embedding_dims = {
+            name: int(embedding_dims[name]) for name in ATOMIC_EXPERT_NAMES
+        }
+        if any(width <= 0 for width in self.embedding_dims.values()):
+            raise ValueError("JointExpert embedding dimensions must be positive")
+        self.joint_dim = int(joint_dim)
+        input_dim = sum(self.embedding_dims.values()) + len(ATOMIC_EXPERT_NAMES)
+        self.representation = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, int(hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), self.joint_dim),
+            nn.LayerNorm(self.joint_dim),
+        )
+        self.classifier = build_main_head(self.joint_dim, int(num_classes))
+
+    def forward(
+        self,
+        embeddings: Mapping[str, torch.Tensor],
+        alive: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if set(embeddings) != set(ATOMIC_EXPERT_NAMES) or set(alive) != set(
+            ATOMIC_EXPERT_NAMES
+        ):
+            raise ValueError(
+                "JointExpert requires exact API/Graph/Manifest embeddings and alive masks"
+            )
+        reference = embeddings[ATOMIC_EXPERT_NAMES[0]]
+        if reference.ndim != 2:
+            raise ValueError("JointExpert embeddings must have shape [B, D]")
+        batch_size = int(reference.size(0))
+        pieces: list[torch.Tensor] = []
+        alive_pieces: list[torch.Tensor] = []
+        for name in ATOMIC_EXPERT_NAMES:
+            embedding = embeddings[name]
+            if (
+                embedding.ndim != 2
+                or int(embedding.size(0)) != batch_size
+                or int(embedding.size(1)) != self.embedding_dims[name]
+            ):
+                raise ValueError(
+                    f"JointExpert embedding {name!r} has invalid shape "
+                    f"{tuple(embedding.shape)}"
+                )
+            mask = alive[name]
+            if not isinstance(mask, torch.Tensor) or mask.numel() != batch_size:
+                raise ValueError(f"JointExpert alive[{name!r}] must have shape [B]")
+            mask = mask.to(device=embedding.device).view(-1).bool()
+            pieces.append(embedding * mask.to(embedding).unsqueeze(-1))
+            alive_pieces.append(mask.to(embedding).unsqueeze(-1))
+        joint_input = torch.cat([*pieces, *alive_pieces], dim=-1)
+        joint_embedding = self.representation(joint_input)
+        return joint_embedding, self.classifier(joint_embedding)
+
+
 class TriModalRobustModel(nn.Module):
     def __init__(
         self,
@@ -513,6 +607,15 @@ class TriModalRobustModel(nn.Module):
         manifest_emb_dim: int = 128,
         manifest_hidden_dim: int = 256,
         manifest_dropout: float = 0.1,
+        joint_emb_dim: int = 128,
+        joint_hidden_dim: int = 256,
+        joint_dropout: float = 0.15,
+        competence_projection_dim: int = 32,
+        competence_hidden_dim: int = 16,
+        competence_dropout: float = 0.10,
+        initial_atomic_competence_scale: float = 1.0,
+        initial_joint_late_scale: float = 1.0,
+        initial_late_gate: float = 0.10,
         quality_fusion_temperature: float = 10.0,
         gate_hidden_dim: int = 128,
         gate_detach: bool = True,
@@ -532,6 +635,7 @@ class TriModalRobustModel(nn.Module):
         self.graph_emb_dim = int(graph_emb_dim)
         self.manifest_in_dim = int(manifest_in_dim)
         self.manifest_emb_dim = int(manifest_emb_dim)
+        self.joint_emb_dim = int(joint_emb_dim)
         if not math.isfinite(float(quality_fusion_temperature)) or float(quality_fusion_temperature) <= 0.0:
             raise ValueError("quality_fusion_temperature must be finite and positive")
         self.quality_fusion_temperature = float(quality_fusion_temperature)
@@ -580,6 +684,55 @@ class TriModalRobustModel(nn.Module):
         self.api_head = build_main_head(api_emb_dim, num_classes)
         self.graph_head = build_main_head(graph_emb_dim, num_classes)
         self.manifest_head = build_main_head(manifest_emb_dim, num_classes)
+        self.joint_expert = (
+            JointExpert(
+                {
+                    "api": self.api_emb_dim,
+                    "graph": self.graph_emb_dim,
+                    "manifest": self.manifest_emb_dim,
+                },
+                joint_dim=self.joint_emb_dim,
+                hidden_dim=int(joint_hidden_dim),
+                num_classes=self.num_classes,
+                dropout=float(joint_dropout),
+            )
+            if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES
+            else None
+        )
+        self.competence_estimator = (
+            ContentConditionedCompetence(
+                {
+                    "api": self.api_emb_dim,
+                    "graph": self.graph_emb_dim,
+                    "manifest": self.manifest_emb_dim,
+                    "joint": self.joint_emb_dim,
+                },
+                class_count=self.num_classes,
+                projection_dim=int(competence_projection_dim),
+                hidden_dim=int(competence_hidden_dim),
+                dropout=float(competence_dropout),
+            )
+            if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES
+            else None
+        )
+        self.anchored_fusion = (
+            AnchoredCompetenceFusion(
+                initial_atomic_competence_scale=float(
+                    initial_atomic_competence_scale
+                ),
+                initial_joint_late_scale=float(initial_joint_late_scale),
+                initial_late_gate=float(initial_late_gate),
+            )
+            if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES
+            else None
+        )
+        # A Python lifecycle flag avoids a scalar accelerator synchronisation in
+        # every forward pass. Full-pipeline loading explicitly re-enables it.
+        self._anchored_fusion_active = False
+        # Separate diagnostic lifecycle: a selection-guard fallback disables
+        # I2 deployment but must still expose the already fitted I1 competence
+        # estimates for audit rows.
+        self._competence_diagnostics_active = False
         self.api_graph_concat_head = (
             build_main_head(api_emb_dim + graph_emb_dim, num_classes)
             if self.fusion_mode in API_GRAPH_CONCAT_FUSION_MODES
@@ -617,9 +770,43 @@ class TriModalRobustModel(nn.Module):
 
     def calibration_parameters(self) -> list[nn.Parameter]:
         """Parameters fitted after model selection without changing encoders."""
+        if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES:
+            if self.competence_estimator is None or self.anchored_fusion is None:
+                raise RuntimeError("Anchored fusion modules were not initialized")
+            return [
+                *self.competence_estimator.parameters(),
+                *self.anchored_fusion.parameters(),
+            ]
         if self.discount_fusion is None:
             return []
         return self.discount_fusion.calibration_parameters()
+
+    def set_anchored_fusion_active(self, enabled: bool) -> None:
+        if self.fusion_mode not in ANCHORED_JOINT_LATE_FUSION_MODES:
+            if enabled:
+                raise RuntimeError(
+                    "Anchored fusion can only be activated for anchored_joint_late"
+                )
+            return
+        self._anchored_fusion_active = bool(enabled)
+
+    @property
+    def anchored_fusion_active(self) -> bool:
+        return bool(self._anchored_fusion_active)
+
+    def set_competence_diagnostics_active(self, enabled: bool) -> None:
+        if self.competence_estimator is None:
+            if enabled:
+                raise ValueError(
+                    "competence diagnostics require a competence estimator"
+                )
+            self._competence_diagnostics_active = False
+            return
+        self._competence_diagnostics_active = bool(enabled)
+
+    @property
+    def competence_diagnostics_active(self) -> bool:
+        return bool(self._competence_diagnostics_active)
 
     def _encoder_stage_modules(self) -> tuple[tuple[str, nn.Module], ...]:
         """Return the modules whose learned state belongs to Stage-1.
@@ -648,6 +835,8 @@ class TriModalRobustModel(nn.Module):
             modules.append(("api_graph_concat_head", self.api_graph_concat_head))
         if self.tri_concat_head is not None:
             modules.append(("tri_concat_head", self.tri_concat_head))
+        if self.joint_expert is not None:
+            modules.append(("joint_expert", self.joint_expert))
         if self.dense_embedding_gate is not None:
             modules.append(("dense_embedding_gate", self.dense_embedding_gate))
 
@@ -788,6 +977,13 @@ class TriModalRobustModel(nn.Module):
 
     def encoder_training_frozen_parameters(self) -> list[nn.Parameter]:
         """Parameters that must remain untouched during encoder training."""
+        if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES:
+            if self.competence_estimator is None or self.anchored_fusion is None:
+                raise RuntimeError("Anchored fusion modules were not initialized")
+            return [
+                *self.competence_estimator.parameters(),
+                *self.anchored_fusion.parameters(),
+            ]
         if self.discount_fusion is None:
             return []
         return self.discount_fusion.encoder_training_frozen_parameters()
@@ -820,8 +1016,57 @@ class TriModalRobustModel(nn.Module):
         return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _encode_api(self, graph_data, batch_size: int, device, dtype):
-        _, pooled, _ = self.api_encoder(graph_data, batch_size, device, dtype)
-        return pooled
+        """Encode the API stream and expose support from the stream actually used.
+
+        ``api_observed_support`` is deliberately computed from ``api_batch``
+        returned by the encoder, not from extraction-time or pre-perturbation
+        counts stored in a PT payload.  It therefore measures only how much of
+        the fixed encoder capacity is occupied by the input visible at
+        inference time:
+
+            log(1 + n_visible) / log(1 + encoder_capacity)
+
+        This is a bounded amount-of-current-evidence signal, not an estimate
+        of an APK's unknown original completeness.
+        """
+
+        _, pooled, encoded_api_batch = self.api_encoder(
+            graph_data, batch_size, device, dtype
+        )
+        if batch_size <= 0:
+            raise ValueError("API observed support requires a positive batch size")
+        if (
+            encoded_api_batch.ndim != 1
+            or encoded_api_batch.dtype != torch.long
+        ):
+            raise RuntimeError(
+                "ApiSequenceEncoder must return a one-dimensional long "
+                "api_batch index tensor"
+            )
+        counts = torch.bincount(
+            encoded_api_batch,
+            minlength=batch_size,
+        ).to(device=device, dtype=torch.float32)
+        if counts.numel() != batch_size:
+            raise RuntimeError(
+                "API observed-support counts disagree with the model batch size"
+            )
+        capacity = int(self.api_encoder.max_seq_len)
+        if capacity <= 0:
+            raise RuntimeError("API encoder capacity must be positive")
+        count_contract_valid = (counts <= float(capacity)).all()
+        count_contract_message = (
+            "API observed-support count exceeds the encoder capacity; "
+            "the dataset/encoder budget contract was violated"
+        )
+        if counts.device.type == "cpu":
+            if not bool(count_contract_valid.item()):
+                raise RuntimeError(count_contract_message)
+        else:
+            torch._assert_async(count_contract_valid, count_contract_message)
+        denominator = math.log1p(float(capacity))
+        support = torch.log1p(counts).div(denominator).clamp(0.0, 1.0)
+        return pooled, support
 
     @staticmethod
     def _availability_mask(
@@ -849,7 +1094,9 @@ class TriModalRobustModel(nn.Module):
         dtype = next(self.parameters()).dtype
         batch_size = int(getattr(graph_data, "num_graphs", 1))
 
-        api_emb = self._encode_api(graph_data, batch_size, device, dtype)
+        api_emb, api_observed_support = self._encode_api(
+            graph_data, batch_size, device, dtype
+        )
         _, graph_emb, _, _ = self.graph_encoder(graph_data)
         manifest_x = self._manifest_input(graph_data, batch_size, device, dtype)
         manifest_emb = self.manifest_encoder(manifest_x)
@@ -871,6 +1118,9 @@ class TriModalRobustModel(nn.Module):
             "api_logits_aux": api_logits,
             "graph_logits_aux": graph_logits,
             "manifest_logits_aux": manifest_logits,
+            # Current-view input amount, computed only from the API events
+            # that actually reached the encoder in this forward pass.
+            "api_observed_support": api_observed_support.detach(),
         }
 
         fusion_tensors = {
@@ -881,6 +1131,7 @@ class TriModalRobustModel(nn.Module):
             "graph_emb": graph_emb,
             "manifest_emb": manifest_emb,
             "graph_data": graph_data,
+            "api_observed_support": api_observed_support,
         }
         concat_features: dict[str, torch.Tensor] = {}
         if self.fusion_mode in API_GRAPH_CONCAT_FUSION_MODES:
@@ -912,15 +1163,193 @@ class TriModalRobustModel(nn.Module):
             }
         fusion_tensors.update(concat_features)
 
-        handler = FUSION_DISPATCH[self.fusion_mode]
-        logits, gate_weights, extra = handler(
-            self,
-            batch_size,
-            device,
-            dtype,
-            fusion_tensors,
-            extra,
-        )
+        if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES:
+            if (
+                self.joint_expert is None
+                or self.competence_estimator is None
+                or self.anchored_fusion is None
+            ):
+                raise RuntimeError("Anchored joint/competence modules are incomplete")
+            availability, diagnostics = build_fusion_availability_and_diagnostics(
+                graph_data,
+                api_logits,
+                graph_logits,
+                manifest_logits,
+                api_emb,
+                graph_emb,
+                manifest_emb,
+                materialize_diagnostics=not self.training,
+            )
+            extra.update(diagnostics)
+            extra["fusion_availability"] = availability.detach()
+            atomic_alive = {
+                "api": availability[:, AvailabilityIndex.API_ALIVE].bool(),
+                "graph": availability[:, AvailabilityIndex.GRAPH_ALIVE].bool(),
+                "manifest": availability[
+                    :, AvailabilityIndex.MANIFEST_ALIVE
+                ].bool(),
+            }
+            joint_emb, joint_logits = self.joint_expert(
+                {
+                    "api": api_emb,
+                    "graph": graph_emb,
+                    "manifest": manifest_emb,
+                },
+                atomic_alive,
+            )
+            joint_alive = torch.stack(
+                [atomic_alive[name] for name in ATOMIC_EXPERT_NAMES], dim=-1
+            ).all(dim=-1)
+            # Joint is a first-class Stage-A expert and receives its own TCP
+            # competence head in Stage B.  Export its eligibility explicitly
+            # so row-level diagnostics can audit that head on exactly the
+            # population on which Joint is defined.
+            extra["joint_alive"] = joint_alive
+            expert_embeddings = {
+                "api": api_emb,
+                "graph": graph_emb,
+                "manifest": manifest_emb,
+                "joint": joint_emb,
+            }
+            expert_logits = {
+                "api": api_logits,
+                "graph": graph_logits,
+                "manifest": manifest_logits,
+                "joint": joint_logits,
+            }
+            expert_alive = {**atomic_alive, "joint": joint_alive}
+            expert_probabilities = {
+                name: torch.softmax(expert_logits[name].float(), dim=-1).to(
+                    dtype=dtype
+                )
+                for name in EXPERT_NAMES
+            }
+            extra.update(
+                {
+                    "joint_logits_aux": joint_logits,
+                    "expert_embeddings": expert_embeddings,
+                    "expert_logits": expert_logits,
+                    "expert_probabilities": expert_probabilities,
+                    "expert_alive": expert_alive,
+                }
+            )
+            competence_output = None
+            if (
+                self.anchored_fusion_active
+                or self.competence_diagnostics_active
+            ):
+                competence_output = self.competence_estimator(
+                    expert_embeddings,
+                    expert_logits,
+                    expert_alive,
+                )
+                for name in EXPERT_NAMES:
+                    extra[f"predicted_competence_{name}"] = (
+                        competence_output.competence[name]
+                    )
+            if self.anchored_fusion_active:
+                if competence_output is None:
+                    raise RuntimeError(
+                        "Active anchored fusion has no competence output"
+                    )
+                anchored_output = self.anchored_fusion(
+                    expert_probabilities,
+                    competence_output.competence,
+                    expert_alive,
+                )
+                probability = anchored_output.probability.clamp_min(1.0e-8)
+                probability = probability / probability.sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(1.0e-8)
+                logits = probability.log()
+                gate_weights = anchored_output.atomic_weights
+                extra["final_is_log_probability"] = True
+                extra["uncalibrated_final_log_prob"] = logits
+                extra["joint_probability"] = anchored_output.joint_probability
+                extra["late_probability"] = anchored_output.late_probability
+                extra["late_gate"] = anchored_output.late_gate
+                joint_weight = (
+                    (1.0 - anchored_output.late_gate)
+                    * anchored_output.has_joint.to(
+                        anchored_output.late_gate
+                    )
+                )
+                extra["joint_weight"] = joint_weight
+                extra["late_competence"] = anchored_output.late_competence
+                for index, name in enumerate(ATOMIC_EXPERT_NAMES):
+                    extra[f"late_weight_{name}"] = anchored_output.atomic_weights[
+                        :, index
+                    ]
+                    extra[f"fusion_weight_{name}"] = (
+                        anchored_output.late_gate
+                        * anchored_output.atomic_weights[:, index]
+                    )
+                extra["fusion_weight_joint"] = joint_weight
+            else:
+                # Stage A selects the real joint expert. The Stage-B heads are
+                # frozen and are not consulted before their TCP supervision.
+                # Joint was trained only where all three inputs are alive.
+                # Therefore both Stage-A validation and a selection-guard
+                # deployment use an explicit uniform atomic fallback whenever
+                # Joint is ineligible; they never extrapolate Joint to a
+                # missing-modality state it did not see.
+                atomic_alive_matrix = torch.stack(
+                    [atomic_alive[name] for name in ATOMIC_EXPERT_NAMES],
+                    dim=-1,
+                )
+                gate_weights = atomic_alive_matrix.to(dtype=dtype)
+                gate_weights = gate_weights / gate_weights.sum(
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_min(1.0)
+                uniform_probability = torch.full_like(
+                    expert_probabilities["joint"],
+                    1.0 / float(self.num_classes),
+                )
+                late_probability = sum(
+                    gate_weights[:, index].unsqueeze(-1)
+                    * expert_probabilities[name]
+                    for index, name in enumerate(ATOMIC_EXPERT_NAMES)
+                )
+                has_atomic = atomic_alive_matrix.any(dim=-1)
+                late_probability = torch.where(
+                    has_atomic.unsqueeze(-1),
+                    late_probability,
+                    uniform_probability,
+                )
+                probability = torch.where(
+                    joint_alive.unsqueeze(-1),
+                    expert_probabilities["joint"],
+                    late_probability,
+                )
+                probability = probability / probability.sum(
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_min(1.0e-8)
+                logits = probability.clamp_min(1.0e-8).log()
+                extra["final_is_log_probability"] = True
+                extra["uncalibrated_final_log_prob"] = logits
+                fallback_gate = (
+                    (~joint_alive) & has_atomic
+                ).to(dtype=dtype)
+                extra["joint_weight"] = joint_alive.to(dtype=dtype)
+                extra["late_gate"] = fallback_gate
+                extra["fusion_weight_joint"] = joint_alive.to(dtype=dtype)
+                for index, name in enumerate(ATOMIC_EXPERT_NAMES):
+                    extra[f"late_weight_{name}"] = gate_weights[:, index]
+                    extra[f"fusion_weight_{name}"] = (
+                        fallback_gate * gate_weights[:, index]
+                    )
+        else:
+            handler = FUSION_DISPATCH[self.fusion_mode]
+            logits, gate_weights, extra = handler(
+                self,
+                batch_size,
+                device,
+                dtype,
+                fusion_tensors,
+                extra,
+            )
 
         primary_available = torch.cat(
             [api_available, graph_available, manifest_available], dim=-1
@@ -935,7 +1364,10 @@ class TriModalRobustModel(nn.Module):
             selective_eligible = primary_available[:, :2].any(dim=-1)
         else:
             selective_eligible = primary_available.any(dim=-1)
-        if self.fusion_mode != "discount_probability":
+        if (
+            self.fusion_mode != "discount_probability"
+            and not bool(extra.get("final_is_log_probability", False))
+        ):
             # Canonical logit baselines use cross entropy, so zero logits are
             # the explicit uniform-predictive fallback when every branch that
             # the method consumes is unavailable. The routed evidential path

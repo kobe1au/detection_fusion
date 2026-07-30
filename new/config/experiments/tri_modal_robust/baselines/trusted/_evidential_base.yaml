@@ -1,0 +1,26 @@
+defaults:
+  - ../../base_tri_modal_robust.yaml
+
+# Each trusted comparison trains its own declared evidential objective/rule.
+encoder_stage:
+  protocol_id: trusted_comparison_specific_stage1_v1
+
+model:
+  fusion_mode: discount_probability
+
+fusion:
+  mode: discount_probability
+  use_hard_alive_mask: true
+calibration:
+  expert_val_fraction: 0.10
+  expert_split_seed: 4242
+  role_assignment_path: labels/validation_roles_protocol_v3.json
+  require_role_assignment: true
+
+classification_threshold:
+  enabled: false
+
+loss:
+  branch_aux_weight: 0.25
+  auxiliary_weight_mode: unmasked_uniform
+  evidential_loss_weight: 0.05

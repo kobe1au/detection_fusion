@@ -1,0 +1,28 @@
+defaults:
+  - base_tri_modal_robust.yaml
+
+method:
+  name: debug_fast
+
+train:
+  exp_name: debug_fast
+  epochs: 2
+  patience: 1
+  batch_size: 8
+  eval_batch_size: 16
+  num_workers: 0
+  eval_num_workers: 0
+
+calibration:
+  enabled: false
+
+# Explicit three-branch smoke path: API, Graph, and Manifest only.
+model:
+  fusion_mode: tri_modal_fixed_gate
+
+fusion:
+  mode: model_dispatch
+
+eval:
+  run_test: false
+  run_robust_test: false

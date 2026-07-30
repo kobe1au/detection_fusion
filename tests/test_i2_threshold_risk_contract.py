@@ -9,9 +9,13 @@ import torch
 import torch.nn.functional as F
 
 from fusion.losses import routing_risk_per_sample_loss, routing_risk_target
-from fusion.opinion_router import GlobalOpinionRouter
+from fusion.opinion_router import (
+    GlobalOpinionRouter,
+    threshold_aligned_fn_risk_state,
+)
 from fusion.train import (
     compute_branch_reliability_metrics,
+    fit_fold_excluded_oof_classification_thresholds,
     fit_oof_malware_classification_threshold,
     validate_threshold_aligned_risk_cutoff,
 )
@@ -94,6 +98,45 @@ def test_threshold_fn_loss_masks_malware_predictions_and_has_finite_gradients():
         risk_training_logit.grad[[1, 3]],
         torch.zeros(2),
     )
+
+
+def test_threshold_fn_target_and_feature_accept_fold_excluded_row_cutoffs():
+    raw_scores = torch.tensor([-0.25, -0.25])
+    raw_log_prob = F.log_softmax(
+        torch.stack([torch.zeros_like(raw_scores), raw_scores], dim=-1),
+        dim=-1,
+    )
+    row_cutoffs = torch.tensor([-0.5, 0.0])
+    labels = torch.tensor([1, 1])
+    outputs = {
+        "routing_has_available": torch.ones(2),
+        "routing_mixture_prob": raw_log_prob.exp(),
+        "uncalibrated_final_log_prob": raw_log_prob,
+    }
+
+    predicted_malware, proximity = threshold_aligned_fn_risk_state(
+        raw_scores,
+        row_cutoffs,
+    )
+    target, valid, _, _ = routing_risk_target(
+        outputs,
+        labels,
+        _risk_only_config(
+            "threshold_malware_false_negative",
+            # This scalar deployment cutoff must not override the supplied
+            # fold-excluded training cutoffs.
+            raw_cutoff=10.0,
+        )["routing"],
+        classification_log_odds_threshold_by_row=row_cutoffs,
+    )
+
+    assert torch.equal(predicted_malware, torch.tensor([True, False]))
+    assert proximity[0].item() == pytest.approx(0.0)
+    assert proximity[1].item() == pytest.approx(
+        2.0 / (1.0 + math.exp(0.25))
+    )
+    assert torch.equal(target, torch.tensor([0.0, 1.0]))
+    assert torch.equal(valid, torch.tensor([False, True]))
 
 
 def _router_inputs(
@@ -187,6 +230,39 @@ def test_threshold_risk_metrics_use_the_declared_event_semantics(target, rows):
     assert metrics["routing_risk_target_event_rate"] == pytest.approx(0.5)
     assert metrics["routing_risk_brier"] == pytest.approx(0.04)
     assert metrics["routing_risk_auc"] == pytest.approx(1.0)
+    assert metrics["routing_risk_predicted_benign_count"] == 1
+    assert metrics["routing_risk_predicted_benign_event_rate"] == pytest.approx(
+        1.0
+    )
+    assert metrics["routing_risk_predicted_benign_brier"] == pytest.approx(
+        0.04
+    )
+    assert metrics["routing_risk_predicted_benign_ece_10"] == pytest.approx(
+        0.2
+    )
+    assert metrics["routing_risk_predicted_benign_auc_defined"] == 0
+    assert metrics["routing_risk_predicted_benign_ap_defined"] == 0
+
+
+def test_predicted_benign_risk_metrics_keep_an_explicit_empty_population():
+    metrics = compute_branch_reliability_metrics(
+        [
+            _risk_metric_row(
+                label=1,
+                pred=1,
+                mixture_pred=1,
+                risk=0.0,
+                target="threshold_malware_false_negative",
+            )
+        ]
+    )
+
+    assert metrics["routing_risk_predicted_benign_count"] == 0
+    assert math.isnan(metrics["routing_risk_predicted_benign_event_rate"])
+    assert math.isnan(metrics["routing_risk_predicted_benign_brier"])
+    assert math.isnan(metrics["routing_risk_predicted_benign_ece_10"])
+    assert metrics["routing_risk_predicted_benign_auc_defined"] == 0
+    assert metrics["routing_risk_predicted_benign_ap_defined"] == 0
 
 
 def _threshold_aligned_cfg(*, classification_enabled: bool) -> dict:
@@ -282,3 +358,55 @@ def test_oof_cutoff_preserves_partition_for_adjacent_fp32_scores():
     ) >= float(cutoff)
     assert torch.equal(deploy_predictions, torch.tensor([False, True]))
     assert summary["macro_f1"] == pytest.approx(1.0)
+
+
+def test_fold_excluded_oof_cutoffs_never_fit_on_the_held_out_fold():
+    def _row(fold: int, suffix: str, label: int, score: float) -> dict:
+        return {
+            "sid": f"fold-{fold}-{suffix}",
+            "group": f"group-{fold}-{suffix}",
+            "label": label,
+            "raw_log_prob": _normalized_binary_log_prob(score),
+        }
+
+    rows_by_fold = {
+        0: [_row(0, "b", 0, -3.0), _row(0, "m", 1, -2.0)],
+        1: [_row(1, "b", 0, -1.0), _row(1, "m", 1, 1.0)],
+        2: [_row(2, "b", 0, 0.5), _row(2, "m", 1, 2.0)],
+    }
+    config = {
+        "enabled": True,
+        "objective": "macro_f1",
+        "selection_rule": "macro_f1_unconstrained_v1",
+    }
+
+    summary = fit_fold_excluded_oof_classification_thresholds(
+        rows_by_fold,
+        config,
+        deployment_temperature=1.0,
+    )
+
+    assert summary["mode"] == "fold_excluded_upstream_oof_clean"
+    assert summary["num_folds"] == 3
+    for held_out_fold in range(3):
+        expected = fit_oof_malware_classification_threshold(
+            [
+                row
+                for fold, rows in rows_by_fold.items()
+                if fold != held_out_fold
+                for row in rows
+            ],
+            config,
+            deployment_temperature=1.0,
+        )
+        assert expected is not None
+        assert summary["threshold_by_fold"][held_out_fold] == pytest.approx(
+            expected["raw_log_odds_threshold"]
+        )
+        provenance = summary["folds"][held_out_fold]
+        assert provenance["held_out_fold"] == held_out_fold
+        assert held_out_fold not in provenance["fit_folds"]
+        assert provenance["num_fit_rows"] == 4
+        assert provenance["num_held_out_rows"] == 2
+        assert len(provenance["fit_row_identity_sha256"]) == 64
+        assert len(provenance["held_out_row_identity_sha256"]) == 64

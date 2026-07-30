@@ -67,6 +67,7 @@ temp/
 *.tmp
 *.bak
 *.backup
+/.tmp_*/
 
 # OS and local worktrees
 Thumbs.db
@@ -81,4 +82,5 @@ labels/
 !labels/
 labels/*
 !labels/validation_roles_protocol_v1.json
+!labels/validation_roles_protocol_v2.json
 figures/

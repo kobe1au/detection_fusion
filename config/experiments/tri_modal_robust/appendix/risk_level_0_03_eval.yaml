@@ -6,16 +6,15 @@ method:
 
 selective_prediction:
   mode: risk_control
-  threshold_score: model_acceptance
+  threshold_score: malware_fn_probability_anchor
   risk_target: accepted_fn_risk_among_malware
   risk_level: 0.03
 
 eval:
   eval_only: true
   output_name: appendix_risk_level_0_03_eval
-  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
-  # Reuse saved clean OOF post-hoc probabilities to refit the classification
-  # boundary, then refit risk control on the disjoint decision subset.
+  checkpoint_path: results/tri_modal_robust/competence_anchored_seed_42/42/best_tri_modal_robust.pt
+  # Refit only the decision layer on the disjoint decision-calibration role.
   refit_decision_calibration: true
   run_test: true
   run_robust_test: true

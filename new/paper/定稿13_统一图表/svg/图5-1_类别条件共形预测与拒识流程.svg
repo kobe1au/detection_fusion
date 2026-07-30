@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="700" viewBox="0 0 1600 700">
+<defs>
+<marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+<path d="M0,0 L9,3.5 L0,7 Z" fill="#333333"/>
+</marker>
+</defs>
+<rect width="100%" height="100%" fill="#FFFFFF"/>
+<text x="35" y="58" text-anchor="start" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="27" font-weight="600" fill="#111111">校准阶段</text>
+<rect x="90" y="80" width="260" height="110" rx="8" fill="#F4F4F4" stroke="#333333" stroke-width="2"/>
+<text x="220.0" y="143.5" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">独立校准集</text>
+<line x1="350" y1="135" x2="420" y2="135" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="430" y="80" width="270" height="110" rx="8" fill="#F4F4F4" stroke="#333333" stroke-width="2"/>
+<text x="565.0" y="126.625" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">类别非一致性分数</text>
+<text x="565.0" y="160.375" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="400" fill="#111111">r_c(x)</text>
+<line x1="700" y1="135" x2="780" y2="135" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="790" y="80" width="260" height="110" rx="8" fill="#F4F4F4" stroke="#333333" stroke-width="2"/>
+<text x="920.0" y="126.625" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">类别条件阈值</text>
+<text x="920.0" y="160.375" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="400" fill="#111111">τ₀，τ₁</text>
+<text x="35" y="302" text-anchor="start" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="27" font-weight="600" fill="#111111">测试阶段</text>
+<rect x="90" y="325" width="260" height="120" rx="8" fill="#FFFFFF" stroke="#333333" stroke-width="2"/>
+<text x="220.0" y="376.625" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">融合输出</text>
+<text x="220.0" y="410.375" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="400" fill="#111111">pᶠ(x)，κ(x)</text>
+<line x1="350" y1="385" x2="420" y2="385" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="430" y="325" width="270" height="120" rx="8" fill="#FFFFFF" stroke="#333333" stroke-width="2"/>
+<text x="565.0" y="376.625" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">测试样本类别分数</text>
+<text x="565.0" y="410.375" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="400" fill="#111111">r₀(x)，r₁(x)</text>
+<line x1="700" y1="385" x2="780" y2="385" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="790" y="325" width="260" height="120" rx="8" fill="#FFFFFF" stroke="#333333" stroke-width="2"/>
+<text x="920.0" y="376.625" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">类别阈值检验</text>
+<text x="920.0" y="410.375" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="400" fill="#111111">τ₀，τ₁</text>
+<line x1="1050" y1="385" x2="1120" y2="385" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="1130" y="325" width="270" height="120" rx="8" fill="#F4F4F4" stroke="#333333" stroke-width="2"/>
+<text x="1265.0" y="376.625" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="600" fill="#111111">共形预测集合</text>
+<text x="1265.0" y="410.375" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="25" font-weight="400" fill="#111111">Γ(x)</text>
+<line x1="920" y1="190" x2="920" y2="315" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="735" y="545" width="240" height="110" rx="8" fill="#EAF4E5" stroke="#333333" stroke-width="2"/>
+<text x="855.0" y="592.2950000000001" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="23" font-weight="600" fill="#111111">|Γ(x)|=1</text>
+<text x="855.0" y="623.345" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="23" font-weight="400" fill="#111111">接受预测</text>
+<rect x="1030" y="545" width="240" height="110" rx="8" fill="#F8ECEC" stroke="#333333" stroke-width="2"/>
+<text x="1150.0" y="592.2950000000001" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="23" font-weight="600" fill="#111111">|Γ(x)|=0</text>
+<text x="1150.0" y="623.345" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="23" font-weight="400" fill="#111111">拒识：证据不足</text>
+<rect x="1325" y="545" width="240" height="110" rx="8" fill="#F8ECEC" stroke="#333333" stroke-width="2"/>
+<text x="1445.0" y="592.2950000000001" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="23" font-weight="600" fill="#111111">|Γ(x)|=2</text>
+<text x="1445.0" y="623.345" text-anchor="middle" font-family="SimSun, 'Microsoft YaHei', sans-serif" font-size="23" font-weight="400" fill="#111111">拒识：类别歧义</text>
+<line x1="1265" y1="445" x2="1265" y2="500" stroke="#777777" stroke-width="1.6"/>
+<polyline points="1265,500 855,500 855,535" fill="none" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="1265,500 1150,500 1150,535" fill="none" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="1265,500 1445,500 1445,535" fill="none" stroke="#333333" stroke-width="2.2" marker-end="url(#arrow)"/>
+</svg>

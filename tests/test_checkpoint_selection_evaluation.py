@@ -40,6 +40,30 @@ class _StaticCheckpointModel(torch.nn.Module):
         return graph.logits, extra
 
 
+class _AnchoredCheckpointModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(self, graph):
+        self.forward_calls += 1
+        if self.forward_calls == 1:
+            joint_logits = graph.logits.new_tensor(
+                [[2.0, 0.0], [10.0, -10.0]]
+            )
+        else:
+            joint_logits = graph.logits.new_tensor(
+                [[0.0, 2.0], [-10.0, 10.0]]
+            )
+        joint_alive = torch.tensor(
+            [True, False], device=graph.logits.device
+        )
+        return graph.logits, {
+            "joint_logits_aux": joint_logits,
+            "expert_alive": {"joint": joint_alive},
+        }
+
+
 def _loader():
     return [
         {
@@ -98,3 +122,24 @@ def test_checkpoint_selection_profile_matches_full_clean_metrics():
     assert "aurc" in full_metrics
     assert "aurc" not in checkpoint_metrics
     assert full_model.forward_calls == lean_model.forward_calls == 2
+
+
+def test_checkpoint_selection_reports_joint_only_on_eligible_rows():
+    model = _AnchoredCheckpointModel()
+
+    metrics = evaluate_checkpoint_selection(
+        model,
+        _loader(),
+        torch.device("cpu"),
+        False,
+    )
+
+    # The two ineligible Joint logits are intentionally wrong and must not
+    # contaminate the pure-Joint subset diagnostic.
+    assert metrics["joint_num_eval"] == 2
+    assert metrics["joint_eligible_fraction"] == pytest.approx(0.5)
+    assert metrics["joint_macro_f1"] == pytest.approx(1.0)
+    assert metrics["branch_metrics"]["joint"]["num_total"] == 4
+    # Full-population checkpoint selection is still the deployed anchor path.
+    assert metrics["joint_anchor_macro_f1"] == metrics["macro_f1"]
+    assert metrics["joint_anchor_num_eval"] == 4

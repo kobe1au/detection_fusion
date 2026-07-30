@@ -1,0 +1,56 @@
+log_level: INFO
+
+# Stable architecture and method defaults live in fusion/constants.py.
+# This file keeps only dataset paths and training budget knobs that usually
+# change across machines or experiment phases.
+data:
+  root: ""
+  train_pt_dir: D:/pts_robust/train
+  val_pt_dir: D:/pts_robust/val
+  test_pt_dir: D:/pts_robust/test
+  train_csv: labels/train.csv
+  val_csv: labels/val.csv
+  test_csv: labels/test.csv
+  out_dir: results/tri_modal_robust
+  # Formal runs refuse to start unless this vocabulary records hashes for the
+  # current train CSV and train identity set. Populate it with the Manifest-only
+  # PT migration command after any split change.
+  manifest_vocab_path: config/manifest_vocab.yaml
+  require_manifest_vocab_provenance: true
+  # Produced by config/build_pts.yaml + the current train-only Manifest vocab.
+  # The migration dry-run reports this as proposed_build_fingerprint.
+  expected_pt_build_fingerprint: ababf723f4f60bbff701c326d5b31cd741c7ff449d2c59dba7553cad445906c8
+  # The --apply migration report contains a stat-bound certificate for every
+  # schema-v5 PT. Formal runs verify this certificate instead of reloading the
+  # complete 14k-file pool before training.
+  pt_audit_certificate: manifest_migration_apply.json
+  require_pt_audit_certificate: true
+
+train:
+  seed: 42
+  epochs: 60
+  patience: 8
+  batch_size: 48
+  eval_batch_size: 64
+  num_workers: 8
+  eval_num_workers: 4
+  lr: 0.0003
+  weight_decay: 0.01
+
+# Registered paper evaluation: one representative quality degradation per
+# modality over five strengths, plus clean and three missing-modality endpoints
+# (1 + 3*5 + 3 = 19 result cells). These six transforms are the complete
+# controlled-degradation registry; unrelated legacy transforms are unsupported.
+eval:
+  # Shared by CARE and every baseline: each controlled test view uses
+  # H(SID, mechanism, 424242), independent of model seed and worker order.
+  controlled_view_protocol_seed: 424242
+  perturb_strengths: [0.1, 0.3, 0.5, 0.7, 0.9]
+  perturb_tests:
+    - clean
+    - api_event_dropout
+    - graph_sparsify
+    - manifest_permission_mask
+    - api_missing
+    - graph_missing
+    - manifest_missing

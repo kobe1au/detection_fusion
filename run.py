@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parent
@@ -23,20 +26,24 @@ FORMAL_CONFIG_DIRS = {
     "seeds",
 }
 NATURAL_SUBSET_DIR = Path("labels/natural_subsets")
-NATURAL_SUBSET_SCHEMA_VERSION = 6
-NATURAL_SUBSET_PROTOCOL_ID = "i1_i2_unseen_validation_natural_difficulty_v2"
+NATURAL_SUBSET_SCHEMA_VERSION = 9
+NATURAL_SUBSET_PROTOCOL_ID = "competence_validation_natural_difficulty_v1"
+NATURAL_SUBSET_TAIL_FRACTION = 1.0 / 3.0
+NATURAL_SUBSET_SOURCE_METHOD_PROTOCOL_ID = "tcp_joint_anchor_crc_v1"
+NATURAL_SUBSET_SOURCE_SEED = 42
 NATURAL_SUBSET_FILES = (
     "test_branch_disagreement.csv",
     "test_api_only_wrong.csv",
     "test_graph_only_wrong.csv",
     "test_manifest_only_wrong.csv",
-    "test_reliability_imbalance.csv",
+    "test_competence_imbalance.csv",
     "test_high_cross_modal_conflict.csv",
 )
 
-# Paper method: I1 calibrated branch-correctness reliability, I2 conditional
-# modality routing plus threshold-aligned malware-FN risk, and I3 malware-FN
-# risk control.
+# Paper method: I1 predicts each expert's continuous true-class probability
+# (TCP); I2 anchors clean decisions to a real Joint expert and uses the
+# competence-weighted atomic late expert only when it helps; I3 independently
+# controls accepted malware false-negative risk.
 PRIMARY_SEED = "seeds/seed_42.yaml"
 
 BASELINES = [
@@ -50,6 +57,10 @@ BASELINES = [
 ]
 
 TRUSTED_FUSION_BASELINES = [
+    "baselines/trusted/dempster.yaml",
+    "baselines/trusted/cumulative.yaml",
+    "baselines/trusted/log_pool.yaml",
+    "baselines/trusted/conflict_weighted_opinion.yaml",
     "baselines/trusted/tmc_style_adapted.yaml",
     "baselines/trusted/qmf_energy.yaml",
     "baselines/trusted/ecml_style_adapted.yaml",
@@ -89,53 +100,21 @@ NATURAL_SUBSET_EVAL = [
     *NATURAL_SUBSET_TRUSTED_EVAL,
 ]
 
-MODULE_ABLATIONS = [
-    "ablations/modules/no_i1_reliability.yaml",
-    "ablations/modules/no_i2_learned_components.yaml",
-    "ablations/modules/no_i3_decision_layer.yaml",
-]
-
-I1_ATOMIC_ABLATIONS = [
-    "ablations/i1/no_evidential_certainty.yaml",
-    "ablations/i1/no_prediction_margin.yaml",
-    "ablations/i1/no_predicted_class_intercept.yaml",
-]
-
-I1_COMPARATORS = [
-    # Matched-budget simple comparator: same nested OOF identities/views as I1,
-    # but only one NLL-fitted scalar temperature per modality branch.
-    "ablations/i1/temperature_scaling_confidence.yaml",
-]
-
-I2_ROUTER_ATOMIC_ABLATIONS = [
-    "ablations/i2/router_prior_only.yaml",
-    "ablations/i2/router_risk_prior.yaml",
-    "ablations/i2/router_no_route_conflict.yaml",
-    "ablations/i2/router_no_risk_conflict.yaml",
-]
-
-I2_SCENARIO_WEIGHT_ABLATIONS = [
-    "ablations/i2/scenario_weight_clean_0_70.yaml",
-    "ablations/i2/scenario_weight_clean_0_30.yaml",
-]
-
-I2_PRIOR_BETA_SENSITIVITY = [
-    "appendix/prior_beta_0_5.yaml",
-    # beta=1 is the already registered prior-only atomic cell.
-    "ablations/i2/router_prior_only.yaml",
-    "appendix/prior_beta_2_0.yaml",
-]
-
 FUSION_RULE_COMPARISONS = [
-    "ablations/i2/combination_dempster.yaml",
-    "ablations/i2/combination_cumulative.yaml",
-    "ablations/i2/combination_log_pool.yaml",
-    "ablations/i2/combination_conflict_weighted_opinion.yaml",
+    "baselines/trusted/dempster.yaml",
+    "baselines/trusted/cumulative.yaml",
+    "baselines/trusted/log_pool.yaml",
+    "baselines/trusted/conflict_weighted_opinion.yaml",
 ]
 
-I2_MECHANISM_ABLATIONS = [
-    *I2_ROUTER_ATOMIC_ABLATIONS,
-    *I2_SCENARIO_WEIGHT_ABLATIONS,
+I1_ABLATIONS = [
+    "ablations/i1/no_degraded_competence.yaml",
+    "ablations/i1/no_tcp_ranking.yaml",
+]
+
+I2_ABLATIONS = [
+    "ablations/i2/clean_only_router.yaml",
+    "ablations/i2/no_clean_anchor_kl.yaml",
 ]
 
 I3_ACCEPTANCE_SCORE_COMPARISONS = [
@@ -146,56 +125,29 @@ I3_ACCEPTANCE_SCORE_COMPARISONS = [
 I3_MECHANISM_ABLATIONS = [
     "ablations/i3/class_conditional_conformal.yaml",
     "ablations/i3/marginal_conformal.yaml",
-    "ablations/i3/conflict_augmented_conformal.yaml",
     "ablations/i3/deployed_class_probability_threshold.yaml",
     "ablations/i3/msp_threshold.yaml",
-    "ablations/i3/uncertainty_threshold.yaml",
-    "ablations/i3/model_acceptance_threshold.yaml",
-    # fused_risk is already the primary experiment; run only the two
-    # decision-only score substitutions here.
     *I3_ACCEPTANCE_SCORE_COMPARISONS,
 ]
 
-MECHANISM_ABLATIONS = [
-    *I1_ATOMIC_ABLATIONS,
-    *I1_COMPARATORS,
-    *I2_MECHANISM_ABLATIONS,
+METHOD_ABLATIONS = [
+    *I1_ABLATIONS,
+    *I2_ABLATIONS,
     *I3_MECHANISM_ABLATIONS,
 ]
 
-I1_I2_FACTORIAL = [
-    PRIMARY_SEED,
-    "ablations/modules/no_i1_reliability.yaml",
-    "ablations/modules/no_i2_learned_components.yaml",
-    "ablations/factorial/i1_i2/i1_off_i2_off.yaml",
-]
-
-FACTORIAL_ABLATIONS = [
-    *I1_I2_FACTORIAL,
-]
-
-FACTORIAL_REMAINING = [
-    *I1_I2_FACTORIAL[1:],
+MODULE_ABLATIONS = [
+    "ablations/modules/no_i1_i2_joint_anchor.yaml",
+    "ablations/modules/no_i3_decision_layer.yaml",
 ]
 
 TRAINING_ABLATIONS = [
-    "ablations/training/no_branch_auxiliary.yaml",
-    "ablations/training/no_edl_supervision.yaml",
-    "ablations/training/no_edl_class_weight.yaml",
+    "ablations/training/no_atomic_auxiliary.yaml",
 ]
 
 APPENDIX_SENSITIVITY = [
-    "appendix/edl_weight_0_10.yaml",
-    # Canonical clean-only temperature scaling is separated from the
-    # matched-budget I1 comparator in the formal mechanism comparisons.
-    "ablations/i1/temperature_scaling_confidence_clean_only.yaml",
-    "appendix/prior_beta_0_5.yaml",
-    "appendix/prior_beta_2_0.yaml",
     "appendix/risk_level_0_03_eval.yaml",
     "appendix/risk_level_0_10_eval.yaml",
-    # Binary entropy certainty is rank-equivalent to MSP; retain only as a
-    # numerical sanity check rather than a formal independent mechanism cell.
-    "ablations/i3/predictive_entropy_threshold.yaml",
 ]
 
 SEEDS = [
@@ -206,58 +158,37 @@ SEEDS = [
 
 ALIASES = {
     "final": PRIMARY_SEED,
-    "evidential": PRIMARY_SEED,
+    "ours": PRIMARY_SEED,
     "api": "baselines/api_only.yaml",
     "graph": "baselines/graph_only.yaml",
     "manifest": "baselines/manifest_only.yaml",
     "concat": "baselines/tri_modal_concat.yaml",
     "late": "baselines/fixed_logit_fusion.yaml",
     "embedding_gate": "baselines/dense_embedding_gate_adapted.yaml",
-    "no_i1": "ablations/modules/no_i1_reliability.yaml",
-    "no_i2": "ablations/modules/no_i2_learned_components.yaml",
     "no_i3": "ablations/modules/no_i3_decision_layer.yaml",
-    "no_evidential_certainty": "ablations/i1/no_evidential_certainty.yaml",
-    "no_prediction_margin": "ablations/i1/no_prediction_margin.yaml",
-    "no_predicted_class_intercept": "ablations/i1/no_predicted_class_intercept.yaml",
-    "i1_temperature": "ablations/i1/temperature_scaling_confidence.yaml",
-    "i1_temperature_clean": "ablations/i1/temperature_scaling_confidence_clean_only.yaml",
-    "dempster": "ablations/i2/combination_dempster.yaml",
-    "cumulative": "ablations/i2/combination_cumulative.yaml",
-    "log_pool": "ablations/i2/combination_log_pool.yaml",
-    "conflict_weighted_opinion": "ablations/i2/combination_conflict_weighted_opinion.yaml",
-    "router_prior_only": "ablations/i2/router_prior_only.yaml",
-    "router_risk_prior": "ablations/i2/router_risk_prior.yaml",
-    "router_no_route_conflict": "ablations/i2/router_no_route_conflict.yaml",
-    "router_no_risk_conflict": "ablations/i2/router_no_risk_conflict.yaml",
-    "i2_weight_clean_070": "ablations/i2/scenario_weight_clean_0_70.yaml",
-    "i2_weight_clean_030": "ablations/i2/scenario_weight_clean_0_30.yaml",
-    "prior_beta_050": "appendix/prior_beta_0_5.yaml",
-    "prior_beta_100": "ablations/i2/router_prior_only.yaml",
-    "prior_beta_200": "appendix/prior_beta_2_0.yaml",
+    "no_i1_i2": "ablations/modules/no_i1_i2_joint_anchor.yaml",
+    "no_degraded_competence": "ablations/i1/no_degraded_competence.yaml",
+    "no_tcp_ranking": "ablations/i1/no_tcp_ranking.yaml",
+    "router_clean_only": "ablations/i2/clean_only_router.yaml",
+    "no_clean_anchor": "ablations/i2/no_clean_anchor_kl.yaml",
+    "no_atomic_aux": "ablations/training/no_atomic_auxiliary.yaml",
+    "dempster": "baselines/trusted/dempster.yaml",
+    "cumulative": "baselines/trusted/cumulative.yaml",
+    "log_pool": "baselines/trusted/log_pool.yaml",
+    "conflict_weighted_opinion": "baselines/trusted/conflict_weighted_opinion.yaml",
     "class_conditional_conformal": "ablations/i3/class_conditional_conformal.yaml",
     "marginal_conformal": "ablations/i3/marginal_conformal.yaml",
-    "conflict_conformal": "ablations/i3/conflict_augmented_conformal.yaml",
     "deployed_probability_threshold": "ablations/i3/deployed_class_probability_threshold.yaml",
     "msp_threshold": "ablations/i3/msp_threshold.yaml",
-    "predictive_entropy_threshold": "ablations/i3/predictive_entropy_threshold.yaml",
-    "uncertainty_threshold": "ablations/i3/uncertainty_threshold.yaml",
-    "acceptance_threshold": "ablations/i3/model_acceptance_threshold.yaml",
-    "accept_risk": PRIMARY_SEED,
     "accept_msp_crc": "ablations/i3/acceptance_msp_risk_control.yaml",
     "accept_deployed_probability_crc": "ablations/i3/acceptance_deployed_class_probability_risk_control.yaml",
-    "i1_on_i2_on": PRIMARY_SEED,
-    "i1_off_i2_on": "ablations/modules/no_i1_reliability.yaml",
-    "i1_on_i2_off": "ablations/modules/no_i2_learned_components.yaml",
-    "i1_off_i2_off": "ablations/factorial/i1_i2/i1_off_i2_off.yaml",
-    "i3_on": PRIMARY_SEED,
-    "i3_off": "ablations/modules/no_i3_decision_layer.yaml",
     "risk_03": "appendix/risk_level_0_03_eval.yaml",
+    "risk_10": "appendix/risk_level_0_10_eval.yaml",
     "tmc": "baselines/trusted/tmc_style_adapted.yaml",
     "tmc_style_adapted": "baselines/trusted/tmc_style_adapted.yaml",
     "qmf_energy": "baselines/trusted/qmf_energy.yaml",
     "ecml": "baselines/trusted/ecml_style_adapted.yaml",
     "ecml_style_adapted": "baselines/trusted/ecml_style_adapted.yaml",
-    "no_edl_supervision": "ablations/training/no_edl_supervision.yaml",
     "natural_ours": "natural_subsets/ours_eval.yaml",
     "natural_dempster": "natural_subsets/dempster_eval.yaml",
     "natural_cumulative": "natural_subsets/cumulative_eval.yaml",
@@ -269,32 +200,9 @@ ALIASES = {
     "natural_ecml": "natural_subsets/ecml_style_adapted_eval.yaml",
 }
 
-# Old aliases named partial mechanisms as if they were complete literature
-# methods. Failing explicitly prevents old commands and checkpoints from being
-# silently reinterpreted under the current style-adapted baseline protocol.
-REMOVED_ALIASES = {
-    "no_i2_cumulative": (
-        "use 'cumulative'; cumulative is a full fusion-rule comparison, "
-        "not an atomic no-I2 cell"
-    ),
-    "i2_rules": "use 'fusion_rules'; these are full fusion-rule comparisons",
-    "natural_subset_i2": "use 'natural_subset_fusion_rules'",
-    "natural_i2": "use 'natural_subset_fusion_rules'",
-    "tmc_faithful": "use 'tmc' (TMC-style adapted)",
-    "tmc_style": "use 'tmc' (TMC-style adapted)",
-    "qmf_style": "use 'qmf_energy' (energy-fusion component only)",
-    "ecml_faithful": "use 'ecml' (ECML-style adapted)",
-    "ecml_adapted": "use 'ecml' (ECML-style adapted) or 'conflict_weighted_opinion'",
-    "ecml_style": "use 'ecml' (ECML-style adapted) or 'conflict_weighted_opinion'",
-    "ecml_inspired": "use 'conflict_weighted_opinion'; this custom rule is not ECML",
-    "natural_tmc_style": "use 'natural_tmc'",
-    "natural_qmf_style": "use 'natural_qmf_energy'",
-    "natural_ecml_adapted": "use 'natural_ecml'",
-    "natural_ecml_style": "use 'natural_conflict_weighted_opinion'",
-}
-
 GROUPS = {
-    "main": [PRIMARY_SEED, *BASELINES],
+    "main": [PRIMARY_SEED],
+    "main_comparison": [PRIMARY_SEED, *BASELINES, *TRUSTED_FUSION_BASELINES],
     "baselines": BASELINES,
     "trusted_baselines": TRUSTED_FUSION_BASELINES,
     "natural_subsets": NATURAL_SUBSET_EVAL,
@@ -302,51 +210,35 @@ GROUPS = {
     "natural_subset_baselines": NATURAL_SUBSET_BASELINE_EVAL,
     "natural_subset_fusion_rules": NATURAL_SUBSET_FUSION_RULE_EVAL,
     "natural_subset_trusted": NATURAL_SUBSET_TRUSTED_EVAL,
-    "module": MODULE_ABLATIONS,
-    "mechanism": MECHANISM_ABLATIONS,
-    "i1_atomic": I1_ATOMIC_ABLATIONS,
-    "i1_comparator": I1_COMPARATORS,
-    "i2_atomic": I2_ROUTER_ATOMIC_ABLATIONS,
-    "fusion_rules": FUSION_RULE_COMPARISONS,
-    "i2_scenario_weights": I2_SCENARIO_WEIGHT_ABLATIONS,
-    "i2_prior_beta_sensitivity": I2_PRIOR_BETA_SENSITIVITY,
-    "i2_mechanism": I2_MECHANISM_ABLATIONS,
-    "i3_mechanism": I3_MECHANISM_ABLATIONS,
-    "i3_acceptance_score": I3_ACCEPTANCE_SCORE_COMPARISONS,
-    "i1_i2_2x2": I1_I2_FACTORIAL,
-    "i1_i2_factorial": I1_I2_FACTORIAL,
-    "factorial": FACTORIAL_ABLATIONS,
-    "factorial_remaining": FACTORIAL_REMAINING,
+    "i1_ablation": I1_ABLATIONS,
+    "i2_ablation": I2_ABLATIONS,
+    "i3_ablation": I3_MECHANISM_ABLATIONS,
+    "module_ablation": MODULE_ABLATIONS,
     "training_ablation": TRAINING_ABLATIONS,
+    "method_ablation": METHOD_ABLATIONS,
+    "fusion_rules": FUSION_RULE_COMPARISONS,
+    "i3_acceptance_score": I3_ACCEPTANCE_SCORE_COMPARISONS,
     "seed": SEEDS,
     "appendix": APPENDIX_SENSITIVITY,
     "paper_main": [*SEEDS, *BASELINES, *TRUSTED_FUSION_BASELINES],
     "paper_ablation": [
-        PRIMARY_SEED,
+        *I1_ABLATIONS,
+        *I2_ABLATIONS,
         *MODULE_ABLATIONS,
-        *MECHANISM_ABLATIONS,
-        *FUSION_RULE_COMPARISONS,
-        *FACTORIAL_ABLATIONS,
-    ],
-    "paper_evidential": [
-        *SEEDS,
-        *BASELINES,
-        *TRUSTED_FUSION_BASELINES,
-        *MODULE_ABLATIONS,
-        *MECHANISM_ABLATIONS,
-        *FUSION_RULE_COMPARISONS,
-        *FACTORIAL_ABLATIONS,
+        *I3_MECHANISM_ABLATIONS,
+        *TRAINING_ABLATIONS,
     ],
     "paper_natural": NATURAL_SUBSET_EVAL,
-    "paper_evidential_all": [
+    "paper_all": [
         *SEEDS,
         *BASELINES,
         *TRUSTED_FUSION_BASELINES,
+        *I1_ABLATIONS,
+        *I2_ABLATIONS,
         *MODULE_ABLATIONS,
-        *MECHANISM_ABLATIONS,
-        *FUSION_RULE_COMPARISONS,
-        *FACTORIAL_ABLATIONS,
+        *I3_MECHANISM_ABLATIONS,
         *TRAINING_ABLATIONS,
+        *APPENDIX_SENSITIVITY,
     ],
 }
 
@@ -396,11 +288,6 @@ def _require_paths(group: str, relative_paths: list[str]) -> list[Path]:
 
 
 def resolve_targets(target: str) -> list[Path]:
-    if target in REMOVED_ALIASES:
-        raise ValueError(
-            f"Experiment alias '{target}' was removed because its method identity "
-            f"was ambiguous; {REMOVED_ALIASES[target]}."
-        )
     if target in GROUPS:
         return _require_paths(target, GROUPS[target])
     if target == "all":
@@ -502,8 +389,8 @@ def validate_natural_subset_artifacts(root: Path = ROOT) -> None:
     guarantees = manifest.get("protocol_guarantees")
     required_true = (
         "thresholds_fit_on_validation_only",
-        "calibration_split_unseen_by_i1_i2",
-        "i1_success_is_not_defined_by_i1_reliability",
+        "model_selection_disjoint_from_decision_calibration",
+        "competence_success_is_not_defined_by_predicted_competence",
         "label_dependent_subsets_are_diagnostic_only",
     )
     if (
@@ -512,17 +399,146 @@ def validate_natural_subset_artifacts(root: Path = ROOT) -> None:
         or guarantees.get("target_split_used_for_threshold_selection") is not False
     ):
         raise RuntimeError(
-            f"Natural-subset manifest lacks the frozen-validation safeguards. {rebuild}"
+            f"Natural-subset manifest lacks the v1 competence-validation safeguards. {rebuild}"
         )
     if (
-        str(manifest.get("calibration_split", "")) != "val_selection"
+        str(manifest.get("calibration_split", "")) != "val_model_selection"
         or str(manifest.get("target_split", "")) != "test_clean"
     ):
         raise RuntimeError(
             "Natural-subset manifest uses the wrong lifecycle splits; expected "
-            "calibration_split='val_selection' and target_split='test_clean'. "
+            "calibration_split='val_model_selection' and "
+            "target_split='test_clean'. "
             f"{rebuild}"
         )
+    try:
+        tail_fraction = float(manifest.get("tail_fraction"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Natural-subset manifest has no registered tail fraction. {rebuild}"
+        ) from exc
+    if not math.isclose(
+        tail_fraction,
+        NATURAL_SUBSET_TAIL_FRACTION,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        raise RuntimeError(
+            "Natural-subset tail fraction differs from the registered protocol: "
+            f"found={tail_fraction!r}, expected={NATURAL_SUBSET_TAIL_FRACTION}. "
+            f"{rebuild}"
+        )
+
+    source_run = manifest.get("source_run")
+    if not isinstance(source_run, dict):
+        raise RuntimeError(
+            f"Natural-subset manifest is not bound to a source run. {rebuild}"
+        )
+    try:
+        source_seed = int(source_run.get("seed"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Natural-subset source seed is invalid. {rebuild}"
+        ) from exc
+    if (
+        source_seed != NATURAL_SUBSET_SOURCE_SEED
+        or str(source_run.get("method_protocol_id") or "")
+        != NATURAL_SUBSET_SOURCE_METHOD_PROTOCOL_ID
+    ):
+        raise RuntimeError(
+            "Natural subsets were not frozen from the registered seed-42 "
+            f"primary method. {rebuild}"
+        )
+    source_summary_path = Path(str(source_run.get("summary") or ""))
+    if not source_summary_path.is_absolute():
+        raise RuntimeError(
+            f"Natural-subset source summary path must be absolute. {rebuild}"
+        )
+    source_summary_sha = str(source_run.get("summary_sha256") or "")
+    if (
+        not source_summary_path.is_file()
+        or len(source_summary_sha) != 64
+        or _sha256(source_summary_path) != source_summary_sha
+    ):
+        raise RuntimeError(
+            f"Natural-subset source summary changed or is unavailable. {rebuild}"
+        )
+    try:
+        source_summary = (
+            yaml.safe_load(source_summary_path.read_text(encoding="utf-8")) or {}
+        )
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(
+            f"Natural-subset source summary is unreadable. {rebuild}"
+        ) from exc
+    source_identity = (
+        source_summary.get("run_identity")
+        if isinstance(source_summary, dict)
+        else None
+    )
+    if (
+        not isinstance(source_identity, dict)
+        or int(source_identity.get("seed", -1)) != NATURAL_SUBSET_SOURCE_SEED
+        or str(source_identity.get("method_protocol_id") or "")
+        != NATURAL_SUBSET_SOURCE_METHOD_PROTOCOL_ID
+        or source_identity.get("method_protocol_sha256")
+        != source_run.get("method_protocol_sha256")
+        or source_identity.get("method_implementation_sha256")
+        != source_run.get("method_implementation_sha256")
+    ):
+        raise RuntimeError(
+            f"Natural-subset source identity does not match its manifest. {rebuild}"
+        )
+    source_artifacts = (
+        source_summary.get("diagnostic_artifacts")
+        if isinstance(source_summary, dict)
+        else None
+    )
+    source_gate_artifact = (
+        source_artifacts.get("gate_diagnostics")
+        if isinstance(source_artifacts, dict)
+        else None
+    )
+    if not isinstance(source_gate_artifact, dict):
+        raise RuntimeError(
+            f"Natural-subset source summary has no bound diagnostics. {rebuild}"
+        )
+    for key in (
+        "method_protocol_sha256",
+        "method_implementation_sha256",
+        "pipeline_model_state_sha256",
+        "pipeline_decision_metadata_sha256",
+        "validation_role_assignment_semantic_sha256",
+    ):
+        if source_gate_artifact.get(key) != source_run.get(key):
+            raise RuntimeError(
+                "Natural-subset source artifact identity differs from the "
+                f"manifest field {key}. {rebuild}"
+            )
+    if (
+        source_gate_artifact.get("sha256")
+        != source_run.get("diagnostics_sha256")
+        or source_run.get("diagnostics_sha256")
+        != manifest.get("diagnostics_sha256")
+    ):
+        raise RuntimeError(
+            f"Natural-subset diagnostics identity is inconsistent. {rebuild}"
+        )
+    for key in (
+        "method_protocol_sha256",
+        "method_implementation_sha256",
+        "pipeline_model_state_sha256",
+        "pipeline_decision_metadata_sha256",
+        "validation_role_assignment_semantic_sha256",
+        "diagnostics_sha256",
+    ):
+        value = str(source_run.get(key) or "")
+        if len(value) != 64 or any(
+            char not in "0123456789abcdef" for char in value.lower()
+        ):
+            raise RuntimeError(
+                f"Natural-subset source identity has invalid {key}. {rebuild}"
+            )
     missing = [
         str(subset_dir / name)
         for name in NATURAL_SUBSET_FILES
@@ -632,8 +648,8 @@ def main() -> None:
         "--encoder-checkpoint",
         default=None,
         help=(
-            "Reuse one strict Stage-1 encoder artifact for each selected "
-            "configuration; incompatible identities fail before post-hoc fit."
+            "Reuse one strict Stage-A expert artifact for each selected "
+            "configuration; incompatible identities fail before Stage-B fit."
         ),
     )
     args = parser.parse_args()

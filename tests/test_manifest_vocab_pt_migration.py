@@ -114,12 +114,23 @@ def _write_pt(path: Path, sid: str, marker: float) -> None:
     dex = {
         "call_x": torch.tensor([[marker, marker + 1.0]], dtype=torch.float32),
         "call_edge_index": torch.empty((2, 0), dtype=torch.long),
+        "call_sensitive_mask": torch.zeros(1, dtype=torch.uint8),
         "api_ids": torch.tensor([1, 2], dtype=torch.long),
         "api_type_ids": torch.tensor([3, 4], dtype=torch.long),
+        "api_sensitive_mask": torch.ones(2, dtype=torch.uint8),
     }
     payload = current_pt_payload(dex, manifest_dim=32, sid=sid)
+    # Exercise the supported fast upgrade from the immediately preceding PT
+    # schema: the new token alignment is rebuilt from Manifest JSONL + vocab,
+    # without reparsing the APK or touching Graph/API tensors.
+    payload.pop("manifest_permission_token_ids", None)
+    payload["manifest_permission_category_map"] = torch.zeros((2, 12))
+    payload["manifest_intent_category_map"] = torch.zeros((1, 12))
+    payload["q_manifest"] = torch.tensor([1.0])
+    payload["pert_manifest"] = torch.tensor([0.0])
     payload["direct_build_meta"].update(
         {
+            "pt_schema_version": max(1, migration.PT_SCHEMA_VERSION - 1),
             "sha256": sid,
             "build_fingerprint": "old-fingerprint",
             "code_marker": f"keep-{marker}",
@@ -185,7 +196,9 @@ def _write_previous_vocab_and_bind_pts(
     )
     cfg = migration._load_direct_config(config)
     previous_fingerprint = migration._build_fingerprint(
-        migration._fingerprint_config(cfg), previous_vocab
+        migration._fingerprint_config(cfg),
+        previous_vocab,
+        pt_schema_version=migration.PT_SCHEMA_VERSION - 1,
     )
     for path in pt_dir.glob("*.pt"):
         payload = torch.load(path, map_location="cpu", weights_only=True)
@@ -307,8 +320,23 @@ def test_apply_rebuilds_vocab_from_train_only_and_preserves_code_payload(tmp_pat
         )
 
     assert migrated_train["manifest_permission_ids"].tolist() == [1]
+    assert migrated_train["manifest_permission_token_ids"].tolist() == [1]
     assert migrated_heldout["manifest_permission_ids"].numel() == 0
+    assert migrated_heldout["manifest_permission_token_ids"].tolist() == [0]
+    for migrated in (migrated_train, migrated_heldout):
+        assert "manifest_permission_category_map" not in migrated
+        assert "manifest_intent_category_map" not in migrated
+        assert "q_manifest" not in migrated
+        assert "pert_manifest" not in migrated
     assert migrated_heldout["manifest_meta"]["permissions"] == ["permission.heldout.only"]
+    assert (
+        migrated_train["direct_build_meta"]["pt_schema_version"]
+        == migration.PT_SCHEMA_VERSION
+    )
+    assert (
+        migrated_heldout["direct_build_meta"]["pt_schema_version"]
+        == migration.PT_SCHEMA_VERSION
+    )
     assert migrated_heldout["observable_metadata"]["manifest_vocab_coverage"] == pytest.approx(0.0)
     assert report["apply"] == {
         "updated_pt_count": 2,
@@ -316,6 +344,28 @@ def test_apply_rebuilds_vocab_from_train_only_and_preserves_code_payload(tmp_pat
         "vocab_written": str(vocab_out.resolve()),
     }
     assert report["after"]["needs_update_count"] == 0
+    certificate = report["after"]["pt_audit_certificate"]
+    assert certificate["pt_schema_version"] == migration.PT_SCHEMA_VERSION
+    assert certificate["pool_root"] == str(pt_dir.resolve())
+    assert certificate["build_fingerprint"] == report["proposed_build_fingerprint"]
+    assert [entry["sid"] for entry in certificate["entries"]] == sorted(
+        [train_sid, heldout_sid]
+    )
+    assert all(
+        set(entry)
+        == {
+            "sid",
+            "relative_path",
+            "size",
+            "mtime_ns",
+            "ctime_ns",
+            "call_x_dims",
+        }
+        for entry in certificate["entries"]
+    )
+    assert certificate["certificate_sha256"] == migration.pt_audit_entries_sha256(
+        certificate["entries"]
+    )
     assert json.loads(audit_path.read_text(encoding="utf-8"))["after"]["needs_update_count"] == 0
     assert not list(pt_dir.rglob("*.tmp"))
 
@@ -343,6 +393,68 @@ def test_incompatible_code_fingerprint_hard_fails_before_write(tmp_path: Path):
         )
 
     assert vocab_out.read_bytes() == previous_vocab_bytes
+    assert before == {path.name: path.read_bytes() for path in pt_dir.glob("*.pt")}
+
+
+def test_late_v4_observable_failure_hard_fails_before_any_write(tmp_path: Path):
+    train_csv, pt_dir, jsonl, config, _, heldout_sid = _fixture_pool(tmp_path)
+    vocab_out = tmp_path / "new_vocab.yaml"
+    previous_vocab_bytes = _write_previous_vocab_and_bind_pts(
+        config, vocab_out, pt_dir
+    )
+    # The held-out SID sorts after the train SID, so this catches a
+    # write-as-you-audit implementation that would migrate the first PT before
+    # discovering an invalid observable value in the second.
+    late_pt = pt_dir / f"{heldout_sid}.pt"
+    payload = torch.load(late_pt, map_location="cpu", weights_only=True)
+    payload["observable_metadata"]["api_parse_ok"] = "false"
+    torch.save(payload, late_pt)
+    before = {path.name: path.read_bytes() for path in pt_dir.glob("*.pt")}
+
+    with pytest.raises(
+        ValueError,
+        match=r"observable_metadata\.api_parse_ok must be bool or numeric 0/1",
+    ):
+        migration.run_migration(
+            train_csv=train_csv,
+            pt_dir=pt_dir,
+            build_config=config,
+            vocab_out=vocab_out,
+            manifest_jsonl=[jsonl],
+            apply=True,
+        )
+
+    assert vocab_out.read_bytes() == previous_vocab_bytes
+    assert before == {path.name: path.read_bytes() for path in pt_dir.glob("*.pt")}
+
+
+def test_current_schema_missing_permission_alignment_is_not_treated_as_legacy(
+    tmp_path: Path,
+):
+    train_csv, pt_dir, jsonl, config, _, _ = _fixture_pool(tmp_path)
+    vocab_out = tmp_path / "new_vocab.yaml"
+    _write_previous_vocab_and_bind_pts(config, vocab_out, pt_dir)
+    first_pt = next(pt_dir.glob("*.pt"))
+    payload = torch.load(first_pt, map_location="cpu", weights_only=True)
+    payload["direct_build_meta"]["pt_schema_version"] = (
+        migration.PT_SCHEMA_VERSION
+    )
+    torch.save(payload, first_pt)
+    before = {path.name: path.read_bytes() for path in pt_dir.glob("*.pt")}
+
+    with pytest.raises(
+        ValueError,
+        match="schema-5 is missing top-level fields.*manifest_permission_token_ids",
+    ):
+        migration.run_migration(
+            train_csv=train_csv,
+            pt_dir=pt_dir,
+            build_config=config,
+            vocab_out=vocab_out,
+            manifest_jsonl=[jsonl],
+            apply=True,
+        )
+
     assert before == {path.name: path.read_bytes() for path in pt_dir.glob("*.pt")}
 
 

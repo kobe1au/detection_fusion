@@ -13,7 +13,7 @@ selective_prediction:
 eval:
   eval_only: true
   output_name: i3_class_conditional_conformal_eval
-  checkpoint_path: results/tri_modal_robust/evidential_seed_42/42/best_tri_modal_robust.pt
+  checkpoint_path: results/tri_modal_robust/competence_anchored_seed_42/42/best_tri_modal_robust.pt
   refit_decision_calibration: true
   run_test: true
   run_robust_test: true

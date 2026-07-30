@@ -256,6 +256,9 @@ class _PosthocCalibrationModel(nn.Module):
         ):
             outputs[f"{name}_logits_aux"] = logits
         outputs["fusion_availability"] = graph.evidence
+        # The production model derives this from the current encoder-visible
+        # API sequence. This encoder-free fixture uses full observed support.
+        outputs["api_observed_support"] = graph.evidence.new_ones(batch_size)
         outputs["selective_eligible"] = graph.evidence[:, :3].gt(0).any(dim=-1)
         return outputs["final_logits"], outputs
 
@@ -365,6 +368,14 @@ def test_route_only_kernel_preserves_full_route_loss_and_gradients(
 
     fusion.zero_grad(set_to_none=True)
     full_outputs = fusion(*logits, evidence)
+    if availability == "all_dead":
+        # The explicit 0.5/0.5 fallback uses the same conservative binary tie
+        # policy as evaluate(): p(malware) >= 0.5 predicts malware.  I3 still
+        # marks these rows ineligible and forces rejection.
+        assert torch.equal(
+            full_outputs["routing_mixture_pred"],
+            torch.ones_like(full_outputs["routing_mixture_pred"]),
+        )
     full_per_row = torch.nn.functional.nll_loss(
         routing_mixture_log_prob(full_outputs),
         labels,
@@ -660,6 +671,11 @@ def test_nested_crossfit_uses_every_identity_and_restores_deployment_models():
                     },
                 },
             },
+            "classification_threshold": {
+                "enabled": True,
+                "objective": "macro_f1",
+                "selection_rule": "macro_f1_unconstrained_v1",
+            },
         },
     )
 
@@ -675,6 +691,36 @@ def test_nested_crossfit_uses_every_identity_and_restores_deployment_models():
         "final_temperature": 6,
     }
     assert len(summary["_oof_clean_rows"]) == 6
+    risk_target = summary["routing_risk_target"]
+    assert risk_target["classification_threshold_source"] == (
+        "upstream_nested_oof_raw_score"
+    )
+    assert risk_target["risk_training_cutoff_mode"] == (
+        "fold_excluded_upstream_oof_clean"
+    )
+    assert set(
+        risk_target["risk_training_raw_log_odds_threshold_by_fold"]
+    ) == {"0", "1", "2"}
+    assert len(risk_target["risk_training_cutoff_provenance"]) == 3
+    risk_objective = summary["stages"]["routing_risk"][
+        "objective_diagnostics"
+    ]
+    assert risk_objective["classification_cutoff_training_mode"] == (
+        "fold_excluded_upstream_oof_clean"
+    )
+    assert (
+        risk_objective["classification_log_odds_threshold_by_fold"]
+        == risk_target["risk_training_raw_log_odds_threshold_by_fold"]
+    )
+    router = model.discount_fusion.opinion_router
+    assert router.risk_decision_threshold_active is True
+    assert float(
+        router._risk_decision_log_odds_threshold.detach().cpu().item()
+    ) == pytest.approx(risk_target["raw_log_odds_threshold"])
+    for provenance in risk_target["risk_training_cutoff_provenance"]:
+        assert provenance["held_out_fold"] not in provenance["fit_folds"]
+        assert provenance["num_fit_rows"] == 4
+        assert provenance["num_held_out_rows"] == 2
     # Final I1 is a single joint clean/partial correctness-calibration fit.
     # Reused inner fits execute zero additional optimization steps.
     expected_cross_fit_steps = 0
@@ -1020,13 +1066,12 @@ def test_all_posthoc_parameters_are_inactive_during_main_training():
     )
 
 
-def test_routed_outputs_export_branchwise_reliability_weighted_conflict():
+def test_routed_conflict_is_risk_only_and_never_changes_route_scores():
     fusion = DiscountProbabilityFusion(
         {
             "combination": "routed",
             "routing": {
                 "enabled": True,
-                "route_conflict_enabled": True,
                 "risk_conflict_enabled": True,
             },
             "reliability_calibration": {"enabled": False},
@@ -1040,28 +1085,30 @@ def test_routed_outputs_export_branchwise_reliability_weighted_conflict():
     )
     outputs = fusion(*logits, _availability())
 
-    conflicts = []
-    penalties = []
-    for name in ("api", "graph", "manifest"):
-        conflict = outputs[f"routing_cross_modal_conflict_{name}"]
-        penalty = outputs[f"routing_conflict_penalty_{name}"]
-        assert conflict.shape == (1,)
-        assert penalty.shape == (1,)
-        assert torch.isfinite(conflict).all()
-        assert torch.all((conflict >= 0.0) & (conflict <= 1.0))
-        assert torch.isfinite(penalty).all() and torch.all(penalty >= 0.0)
-        conflicts.append(conflict)
-        penalties.append(penalty)
-    # The route tensor is exactly the three alive-branch probabilities. Risk
-    # is exported independently and is not appended as a fourth pseudo-branch.
+    # I1 is disabled, so the only valid route is uniform over the three alive
+    # branches even though the third branch strongly disagrees.
+    torch.testing.assert_close(
+        outputs["routing_branch_distribution"],
+        torch.full((1, 3), 1.0 / 3.0),
+    )
     assert outputs["fusion_weights"].shape == (1, 3)
     torch.testing.assert_close(
         outputs["fusion_weights"].sum(dim=-1), torch.ones(1)
     )
-    torch.testing.assert_close(
-        outputs["routing_conflict_penalty_mean"],
-        torch.stack(penalties, dim=-1).mean(dim=-1),
-    )
+    risk_conflict = outputs["routing_risk_global_cross_modal_conflict"]
+    assert risk_conflict.shape == (1,)
+    assert torch.isfinite(risk_conflict).all()
+    assert 0.0 < risk_conflict.item() <= 1.0
+
+    # Route-conflict coefficients, penalties, and diagnostics were deleted.
+    for removed_key in (
+        "routing_conflict_penalty_mean",
+        "routing_route_conflict_feature_active",
+        "routing_route_conflict_feature_configured",
+    ):
+        assert removed_key not in outputs
+    for name in ("api", "graph", "manifest"):
+        assert f"routing_conflict_penalty_{name}" not in outputs
 
 
 def test_validation_split_is_deterministic_and_group_isolated():
@@ -1585,6 +1632,7 @@ def test_branch_prediction_row_records_per_branch_correctness():
         "api_logits_aux": torch.tensor([[-2.0, 2.0], [3.0, -3.0]]),
         "graph_logits_aux": torch.tensor([[3.0, -3.0], [-2.0, 2.0]]),
         "manifest_logits_aux": torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+        "joint_logits_aux": torch.tensor([[-3.0, 3.0], [2.0, -2.0]]),
     }
     labels = torch.tensor([1, 0])
 
@@ -1597,6 +1645,8 @@ def test_branch_prediction_row_records_per_branch_correctness():
     assert first["graph_correct"] == 0
     assert first["api_prob"] > 0.9
     assert first["api_confidence"] > 0.9
+    assert first["joint_pred"] == 1
+    assert first["joint_correct"] == 1
     assert second["manifest_pred"] == 0
     assert second["manifest_correct"] == 1
 
@@ -1646,6 +1696,49 @@ def test_branch_reliability_metrics_report_predicted_class_cells():
     assert metrics["api_predicted_malware_reliability_count"] == 2
     assert metrics["api_predicted_benign_reliability_branch_accuracy"] == 0.5
     assert metrics["api_predicted_malware_reliability_branch_accuracy"] == 0.5
+
+
+def test_anchored_competence_metrics_use_tcp_and_include_joint():
+    rows = [
+        {
+            "label": 0,
+            "joint_alive": 1,
+            "joint_prob": 0.1,
+            "joint_correct": 1,
+            "predicted_competence_joint": 0.9,
+        },
+        {
+            "label": 1,
+            "joint_alive": 1,
+            "joint_prob": 0.8,
+            "joint_correct": 1,
+            "predicted_competence_joint": 0.8,
+        },
+        {
+            "label": 1,
+            "joint_alive": 1,
+            "joint_prob": 0.4,
+            "joint_correct": 0,
+            "predicted_competence_joint": 0.3,
+        },
+        {
+            "label": 0,
+            "joint_alive": 0,
+            "joint_prob": 0.9,
+            "joint_correct": 0,
+            "predicted_competence_joint": 0.1,
+        },
+    ]
+
+    metrics = compute_branch_reliability_metrics(rows)
+
+    assert metrics["joint_competence_count"] == 3
+    assert metrics["joint_competence_tcp_mse"] == pytest.approx(0.01 / 3.0)
+    assert metrics["joint_competence_tcp_mae"] == pytest.approx(0.1 / 3.0)
+    assert metrics["joint_competence_correctness_auc_defined"] == 1
+    assert metrics["joint_competence_correctness_ap_defined"] == 1
+    assert metrics["joint_competence_correctness_auc"] == pytest.approx(1.0)
+    assert "joint_competence_brier" not in metrics
 
 
 def test_metrics_json_replaces_nonfinite_values_with_null(tmp_path):

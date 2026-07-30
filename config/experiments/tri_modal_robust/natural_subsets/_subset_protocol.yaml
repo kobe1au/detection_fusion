@@ -1,4 +1,7 @@
 eval:
+  # Enforced inside fusion.train as well as run.py, so moving an overlay or
+  # invoking ``python -m fusion.train`` cannot bypass the frozen-subset audit.
+  require_natural_subset_protocol: true
   extra_sets:
     - name: natural_branch_disagreement
       csv: labels/natural_subsets/test_branch_disagreement.csv
@@ -16,8 +19,8 @@ eval:
       csv: labels/natural_subsets/test_manifest_only_wrong.csv
       allow_pt_superset: true
       skip_if_empty: false
-    - name: natural_reliability_imbalance
-      csv: labels/natural_subsets/test_reliability_imbalance.csv
+    - name: natural_competence_imbalance
+      csv: labels/natural_subsets/test_competence_imbalance.csv
       allow_pt_superset: true
       skip_if_empty: false
     - name: natural_high_cross_modal_conflict

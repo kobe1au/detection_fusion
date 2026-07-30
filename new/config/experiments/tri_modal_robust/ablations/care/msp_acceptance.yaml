@@ -1,0 +1,17 @@
+defaults:
+  - ../../seeds/seed_42.yaml
+
+# Keep the CARE path predictor and routing rule; replace only the I3 ranking
+# score before fitting CRC on the same natural decision_cal identities.
+selective_prediction:
+  enabled: true
+  mode: risk_control
+  threshold_score: msp
+
+eval:
+  eval_only: true
+  output_name: care_ablation_msp_acceptance
+  checkpoint_path: results/tri_modal_robust/care_droid_seed_42/42/best_care_pipeline.pt
+  refit_decision_calibration: true
+  run_test: true
+  run_robust_test: true

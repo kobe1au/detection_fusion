@@ -1,0 +1,22 @@
+defaults:
+  - _base.yaml
+
+method:
+  name: baseline_fixed_logit_fusion
+  protocol_id: baseline_fixed_logit_fusion_v2
+
+train:
+  exp_name: baseline_fixed_logit_fusion
+
+model:
+  # Equal weights are normalized over this sample's alive modalities.
+  # An all-dead sample has zero weights and explicit uniform prediction.
+  fusion_mode: tri_modal_fixed_gate
+
+loss:
+  branch_aux_weight: 0.25
+  auxiliary_weight_mode: unmasked_uniform
+  branch_aux_weights:
+    api: 1.0
+    graph: 1.0
+    manifest: 1.0

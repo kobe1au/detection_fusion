@@ -41,6 +41,12 @@ from fusion.losses import (
     routing_risk_per_sample_loss,
     routing_risk_target,
 )
+from fusion.anchored_training import (
+    cache_expert_outputs,
+    competence_diagnostics,
+    fit_anchored_router,
+    fit_competence_heads,
+)
 from fusion.dataset import (
     RobustTriModalDataset,
     prepare_robust_batch,
@@ -52,13 +58,22 @@ from fusion.temperature import (
     bounded_final_temperature,
     raw_final_temperature_coordinate,
 )
-from fusion.model import TriModalRobustModel
-from fusion.perturbations import EVAL_PERTURB_TYPES
+from fusion.thresholds import (
+    MACRO_F1_THRESHOLD_SELECTION_RULE,
+    fit_binary_macro_f1_threshold,
+)
+from fusion.model import (
+    ANCHORED_JOINT_LATE_FUSION_MODES,
+    TriModalRobustModel,
+)
+from fusion.opinion_router import threshold_aligned_fn_risk_state
+from fusion.perturbations import EVAL_PERTURB_TYPES, GRADED_PERTURBATIONS
 from fusion.reliability_calibration import (
     BRANCH_NAMES,
     MONOTONIC_CORRECTNESS_METHOD,
     TEMPERATURE_SCALING_CONFIDENCE_METHOD,
     normalize_reliability_calibration_method,
+    reliability_feature_layout,
 )
 from fusion.utils import (
     build_grad_scaler,
@@ -79,6 +94,7 @@ BRANCH_EVAL_LOGIT_KEYS = {
     "api": "api_logits_aux",
     "graph": "graph_logits_aux",
     "manifest": "manifest_logits_aux",
+    "joint": "joint_logits_aux",
 }
 
 
@@ -88,8 +104,8 @@ class EmptyExtraEvalSetError(RuntimeError):
 
 CHECKPOINT_STAGE_ENCODER_SELECTED = "encoder_selected"
 CHECKPOINT_STAGE_PIPELINE_FITTED = "pipeline_fitted"
-ENCODER_STAGE_ARTIFACT_SCHEMA_VERSION = 2
-PIPELINE_ARTIFACT_SCHEMA_VERSION = 4
+ENCODER_STAGE_ARTIFACT_SCHEMA_VERSION = 3
+PIPELINE_ARTIFACT_SCHEMA_VERSION = 8
 
 _PIPELINE_VALIDATION_IDENTITY_FIELDS = (
     "role_assignment_schema_version",
@@ -106,12 +122,22 @@ _PIPELINE_MANIFEST_IDENTITY_FIELDS = (
 )
 # Bump whenever the inline optimizer/scheduler/save lifecycle inside run()
 # changes in a way not represented by the source-hashed Stage-1 functions.
-ENCODER_STAGE_TRAINING_PROTOCOL_REVISION = 2
-VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION = 1
-POSTHOC_OOF_ROWS_SCHEMA_VERSION = 5
-METRIC_SUMMARY_SCHEMA_VERSION = 10
+ENCODER_STAGE_TRAINING_PROTOCOL_REVISION = 3
+# This exact Stage-1 implementation produced the latest audited encoder-only
+# artifacts before the post-hoc I1/I2 simplification.  The transition changed
+# only frozen decision modules and added a diagnostic derived from the API
+# batch after the encoder had already validated it; Stage-1 logits, objective,
+# RNG reset, optimizer partition, and saved state topology are unchanged.
+# Accepting only this exact directed transition preserves expensive encoder
+# reuse without weakening the general source-identity guard, admitting an old
+# fitted pipeline checkpoint, or allowing the saved digest to bypass future
+# Stage-1 implementation changes.
+POSTHOC_ONLY_COMPATIBLE_ENCODER_IMPLEMENTATION_TRANSITIONS = frozenset()
+VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION = 2
+POSTHOC_OOF_ROWS_SCHEMA_VERSION = 6
+METRIC_SUMMARY_SCHEMA_VERSION = 14
 ACCEPTANCE_THRESHOLD_COMPARISON = "selective_eligible and score > threshold"
-CLASSIFICATION_THRESHOLD_SELECTION_RULE = "macro_f1_unconstrained_v1"
+CLASSIFICATION_THRESHOLD_SELECTION_RULE = MACRO_F1_THRESHOLD_SELECTION_RULE
 CHECKPOINT_STAGES = frozenset(
     {
         CHECKPOINT_STAGE_ENCODER_SELECTED,
@@ -121,6 +147,18 @@ CHECKPOINT_STAGES = frozenset(
 
 
 GATE_DIAGNOSTIC_KEYS = (
+    # Redesigned I1/I2 diagnostics
+    "predicted_competence_api",
+    "predicted_competence_graph",
+    "predicted_competence_manifest",
+    "predicted_competence_joint",
+    "late_weight_api",
+    "late_weight_graph",
+    "late_weight_manifest",
+    "late_gate",
+    "joint_weight",
+    "late_competence",
+    "fusion_weight_joint",
     # I1 diagnostics
     "evidential_certainty_api",
     "evidential_certainty_graph",
@@ -128,12 +166,15 @@ GATE_DIAGNOSTIC_KEYS = (
     "prediction_margin_api",
     "prediction_margin_graph",
     "prediction_margin_manifest",
+    "observed_support_api",
+    "api_observed_support_feature_active",
     "predicted_malware_indicator_api",
     "predicted_malware_indicator_graph",
     "predicted_malware_indicator_manifest",
     "api_alive",
     "graph_alive",
     "manifest_alive",
+    "joint_alive",
     "fusion_weight_api",
     "fusion_weight_graph",
     "fusion_weight_manifest",
@@ -169,15 +210,6 @@ GATE_DIAGNOSTIC_KEYS = (
     "routing_route_prior_beta",
     "routing_prior_only_odds_beta",
     "routing_prior_only_odds_beta_active",
-    "routing_conflict_penalty_mean",
-    "routing_cross_modal_conflict_api",
-    "routing_cross_modal_conflict_graph",
-    "routing_cross_modal_conflict_manifest",
-    "routing_conflict_penalty_api",
-    "routing_conflict_penalty_graph",
-    "routing_conflict_penalty_manifest",
-    "routing_route_conflict_feature_active",
-    "routing_route_conflict_feature_configured",
     "routing_risk_conflict_feature_active",
     "routing_risk_conflict_feature_configured",
     "routing_common_scale_reliability_active",
@@ -197,6 +229,7 @@ def _resolve_restored_stage_convergence(
     provisional_stop_reason: str,
     final_grad_inf_norm: float,
     gradient_tolerance: float,
+    parameter_stagnation_certified: bool = False,
 ) -> tuple[bool, str]:
     """Determine convergence at the exact restored deployment state.
 
@@ -215,6 +248,12 @@ def _resolve_restored_stage_convergence(
     if final_grad_inf_norm <= gradient_tolerance:
         return True, "restored_best_gradient_tolerance"
 
+    if (
+        provisional_stop_reason == "parameter_tolerance"
+        and parameter_stagnation_certified
+    ):
+        return True, "restored_best_parameter_tolerance"
+
     if provisional_stop_reason == "objective_plateau":
         return False, "objective_plateau_nonstationary"
 
@@ -222,6 +261,38 @@ def _resolve_restored_stage_convergence(
         return False, "provisional_gradient_not_valid_at_restored_best"
 
     return False, provisional_stop_reason
+
+
+def _resolve_provisional_stage_stop(
+    *,
+    require_convergence: bool,
+    plateau_detected: bool,
+    parameter_stagnation: bool,
+    current_grad_inf_norm: float,
+    gradient_tolerance: float,
+) -> tuple[bool, str]:
+    """Decide whether the current optimizer state may stop.
+
+    A loss plateau remains a valid efficiency heuristic for stages whose
+    configuration does not require stationarity. For strict stages, stopping
+    at a non-stationary plateau would make the later restored-state gradient
+    check fail without ever using the remaining optimization budget. Such
+    stages therefore continue until the current gradient satisfies the
+    declared tolerance or the hard step budget is exhausted.
+    """
+
+    if (
+        math.isfinite(current_grad_inf_norm)
+        and math.isfinite(gradient_tolerance)
+        and gradient_tolerance > 0.0
+        and current_grad_inf_norm <= gradient_tolerance
+    ):
+        return True, "gradient_tolerance"
+    if plateau_detected and parameter_stagnation:
+        return True, "parameter_tolerance"
+    if plateau_detected and not require_convergence:
+        return True, "objective_plateau"
+    return False, "max_steps"
 
 
 def set_seed(seed: int) -> None:
@@ -515,7 +586,58 @@ def _apply_resolved_config_defaults(cfg: dict) -> dict:
         # A standalone overlay must remain explicit-only. It is canonicalized
         # after being merged with a method root by load_config().
         return copy.deepcopy(cfg)
-    resolved = deep_update(TriModalConfigDefaults.CONFIG, cfg)
+    model_cfg = (cfg or {}).get("model") or {}
+    if not isinstance(model_cfg, dict):
+        raise ValueError("model must be a mapping")
+    requested_fusion_mode = str(
+        model_cfg.get("fusion_mode", "")
+    ).strip().lower()
+    family_defaults = copy.deepcopy(TriModalConfigDefaults.CONFIG)
+    if requested_fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES:
+        # The historical family defaults describe the independent
+        # discount/evidential comparison stack.  Deep-merging those defaults
+        # into the redesigned method would silently reintroduce the retired
+        # I1/I2 signals because YAML has no deletion operator.  Replace the
+        # complete method-specific sections before applying explicit config.
+        family_defaults["fusion"] = {
+            "mode": "model_dispatch",
+            "competence": {
+                "projection_dim": 32,
+                "hidden_dim": 16,
+                "dropout": 0.10,
+            },
+            "anchored_router": {
+                "initial_atomic_competence_scale": 1.0,
+                "initial_joint_late_scale": 1.0,
+                "initial_late_gate": 0.10,
+            },
+        }
+        family_defaults["loss"] = {
+            "objective": "anchored_stage_a",
+            "atomic_aux_weight": 0.25,
+            "auxiliary_weight_mode": "alive_masked_uniform",
+        }
+        family_defaults["calibration"] = {
+            "enabled": False,
+            "validation_fraction": 0.25,
+            "split_seed": 42,
+            "stratified_group_split": True,
+        }
+        family_defaults["classification_threshold"] = {
+            "enabled": True,
+            "objective": "macro_f1",
+            "selection_rule": CLASSIFICATION_THRESHOLD_SELECTION_RULE,
+        }
+        family_defaults["selective_prediction"] = {
+            "enabled": True,
+            "mode": "risk_control",
+            "threshold_score": "malware_fn_probability_anchor",
+            "risk_level": 0.05,
+            "risk_target": "accepted_fn_risk_among_malware",
+            "min_calibration_malware": 100,
+            "require_feasible": True,
+        }
+    resolved = deep_update(family_defaults, cfg)
     return _canonicalize_classification_threshold_config(
         _canonicalize_selective_prediction_config(resolved)
     )
@@ -595,9 +717,42 @@ def _reject_removed_config_keys(cfg: dict) -> dict:
     return cfg
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects silently shadowed configuration keys."""
+
+
+def _construct_unique_yaml_mapping(
+    loader: _UniqueKeySafeLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise ValueError(
+                f"Unhashable YAML mapping key at {key_node.start_mark}"
+            ) from exc
+        if duplicate:
+            raise ValueError(
+                f"Duplicate YAML key {key!r} at {key_node.start_mark}"
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_yaml_mapping,
+)
+
+
 def load_yaml(path: str | Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        return yaml.load(f, Loader=_UniqueKeySafeLoader) or {}
 
 
 def _load_explicit_config_path(
@@ -912,6 +1067,12 @@ def _encoder_stage_semantic_signature(
     data_cfg = cfg.get("data", {}) or {}
     fusion_cfg = cfg.get("fusion", {}) or {}
     routing_cfg = fusion_cfg.get("routing", {}) or {}
+    model_fusion_mode = str(
+        ((cfg.get("model", {}) or {}).get("fusion_mode", ""))
+    ).strip().lower()
+    anchored_stage_a = (
+        model_fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES
+    )
     encoder_cfg = cfg.get("encoder_stage", {}) or {}
     train_fields = (
         "stage1_seed",
@@ -960,33 +1121,42 @@ def _encoder_stage_semantic_signature(
             )
         ),
         "model": copy.deepcopy(cfg.get("model", {}) or {}),
-        "neutral_fusion": {
-            "mode": str(fusion_cfg.get("mode", "")),
-            "combination": str(fusion_cfg.get("combination", "")),
-            "routing_enabled": bool(routing_cfg.get("enabled", False)),
-            "prefit_prior": "alive_masked_uniform",
-            # These fields alter branch opinions or the neutral prefit result
-            # even though I1/I2 fitted parameters are inactive.
-            "evidence_activation": str(
-                fusion_cfg.get("evidence_activation", "softplus")
-            ),
-            "opinion_source": str(
-                fusion_cfg.get("opinion_source", "evidential")
-            ),
-            "softmax_opinion": copy.deepcopy(
-                fusion_cfg.get("softmax_opinion", {}) or {}
-            ),
-            "min_discount": float(
-                fusion_cfg.get("min_discount", 1.0e-8)
-            ),
-            "base_rate": float(fusion_cfg.get("base_rate", 0.5)),
-            "use_hard_alive_mask": bool(
-                fusion_cfg.get("use_hard_alive_mask", True)
-            ),
-            "force_fp32_decision": bool(
-                fusion_cfg.get("force_fp32_decision", True)
-            ),
-        },
+        "stage_a_prediction": (
+            {
+                "mode": "joint_expert",
+                "joint_input": (
+                    "masked_api_graph_manifest_embeddings_plus_alive_bits"
+                ),
+                "joint_requires_all_atomic_alive": True,
+                "checkpoint_metric": "clean_joint_anchor_macro_f1",
+            }
+            if anchored_stage_a
+            else {
+                "mode": str(fusion_cfg.get("mode", "")),
+                "combination": str(fusion_cfg.get("combination", "")),
+                "routing_enabled": bool(routing_cfg.get("enabled", False)),
+                "prefit_prior": "alive_masked_uniform",
+                "evidence_activation": str(
+                    fusion_cfg.get("evidence_activation", "softplus")
+                ),
+                "opinion_source": str(
+                    fusion_cfg.get("opinion_source", "evidential")
+                ),
+                "softmax_opinion": copy.deepcopy(
+                    fusion_cfg.get("softmax_opinion", {}) or {}
+                ),
+                "min_discount": float(
+                    fusion_cfg.get("min_discount", 1.0e-8)
+                ),
+                "base_rate": float(fusion_cfg.get("base_rate", 0.5)),
+                "use_hard_alive_mask": bool(
+                    fusion_cfg.get("use_hard_alive_mask", True)
+                ),
+                "force_fp32_decision": bool(
+                    fusion_cfg.get("force_fp32_decision", True)
+                ),
+            }
+        ),
         "loss": copy.deepcopy(cfg.get("loss", {}) or {}),
         "train": {
             **{
@@ -1097,6 +1267,7 @@ def _pipeline_decision_metadata_sha256(
             "method_implementation_sha256"
         ),
         "checkpoint_semantic_signature": _checkpoint_semantic_signature(cfg),
+        "stage_b_training": checkpoint.get("stage_b_training"),
         "calibration": checkpoint.get("calibration"),
         "posthoc_oof_clean_rows": checkpoint.get("posthoc_oof_clean_rows"),
         "posthoc_oof_clean_rows_schema_version": checkpoint.get(
@@ -1173,10 +1344,25 @@ def validate_encoder_stage_checkpoint(
     )
     current_implementation = _encoder_stage_implementation_sha256()
     if saved_implementation != current_implementation:
-        raise ValueError(
-            "Encoder artifact was produced by a different Stage-1 "
-            "implementation; retrain only the encoder artifact"
+        if (
+            (saved_implementation, current_implementation)
+            not in POSTHOC_ONLY_COMPATIBLE_ENCODER_IMPLEMENTATION_TRANSITIONS
+        ):
+            raise ValueError(
+                "Encoder artifact was produced by a different Stage-1 "
+                "implementation; retrain only the encoder artifact"
+            )
+        logger.info(
+            "encoder_stage_posthoc_only_compatibility accepted_saved_sha256=%s "
+            "current_sha256=%s",
+            saved_implementation,
+            current_implementation,
         )
+        checkpoint["encoder_stage_implementation_compatibility"] = (
+            "audited_posthoc_only_transition"
+        )
+    else:
+        checkpoint["encoder_stage_implementation_compatibility"] = "exact"
     current_identity = _encoder_stage_semantic_signature(
         current_cfg, validation_split, manifest_vocab_provenance
     )
@@ -1213,6 +1399,7 @@ def _checkpoint_semantic_signature(cfg: dict) -> dict[str, Any]:
         "model": copy.deepcopy(cfg.get("model", {}) or {}),
         "fusion": fusion_cfg,
         "loss": copy.deepcopy(cfg.get("loss", {}) or {}),
+        "stage_b": copy.deepcopy(cfg.get("stage_b", {}) or {}),
         "calibration": calibration_cfg,
         "data": {
             key: copy.deepcopy(data_cfg.get(key))
@@ -1420,6 +1607,68 @@ def validate_pipeline_checkpoint_artifact(
         raise ValueError(
             f"Pipeline checkpoint model-state hash mismatch: {checkpoint_path}"
         )
+    checkpoint_cfg = checkpoint.get("cfg") or {}
+    checkpoint_model_cfg = (
+        checkpoint_cfg.get("model", {})
+        if isinstance(checkpoint_cfg, dict)
+        else {}
+    ) or {}
+    checkpoint_fusion_mode = str(
+        checkpoint_model_cfg.get("fusion_mode", "")
+    ).strip().lower()
+    if checkpoint_fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES:
+        stage_b = checkpoint.get("stage_b_training")
+        if not isinstance(stage_b, dict):
+            raise ValueError(
+                f"Pipeline checkpoint {checkpoint_path} has no valid "
+                "anchored Stage-B deployment metadata"
+            )
+        stage_b_enabled = stage_b.get("enabled")
+        if not isinstance(stage_b_enabled, bool):
+            raise ValueError(
+                f"Pipeline checkpoint {checkpoint_path} has no boolean "
+                "stage_b_training.enabled lifecycle marker"
+            )
+        stage_b_deployment = str(
+            stage_b.get("deployment") or ""
+        ).strip().lower()
+        if stage_b_deployment not in {
+            "anchored_joint_late",
+            "joint_with_uniform_missing_fallback_selection_guard",
+        }:
+            raise ValueError(
+                f"Pipeline checkpoint {checkpoint_path} has no valid "
+                "anchored Stage-B deployment metadata"
+            )
+        if (
+            not stage_b_enabled
+            and stage_b_deployment == "anchored_joint_late"
+        ):
+            raise ValueError(
+                f"Pipeline checkpoint {checkpoint_path} declares "
+                "stage_b_training.enabled=false but attempts to deploy "
+                "unfitted anchored I1/I2 modules"
+            )
+        stage_b_threshold = stage_b.get("classification_threshold")
+        checkpoint_threshold = checkpoint.get("classification_threshold")
+        if stage_b_enabled:
+            if not isinstance(stage_b_threshold, dict) or not bool(
+                stage_b_threshold.get("locked_by_stage_b", False)
+            ):
+                raise ValueError(
+                    f"Pipeline checkpoint {checkpoint_path} has no locked "
+                    "Stage-B classification threshold"
+                )
+            if not isinstance(checkpoint_threshold, dict) or not math.isclose(
+                float(stage_b_threshold.get("threshold", float("nan"))),
+                float(checkpoint_threshold.get("threshold", float("nan"))),
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            ):
+                raise ValueError(
+                    f"Pipeline checkpoint {checkpoint_path} Stage-B and "
+                    "deployment classification thresholds disagree"
+                )
     if not str(checkpoint.get("encoder_checkpoint_path") or "").strip():
         raise ValueError(
             f"Pipeline checkpoint {checkpoint_path} does not link to its "
@@ -1881,6 +2130,7 @@ def _decision_calibration_data_identity(
     *,
     posthoc_indices: list[int] | tuple[int, ...] | None,
     decision_indices: list[int] | tuple[int, ...] | None,
+    upstream_role_name: str = "posthoc_calibration",
 ) -> dict[str, Any]:
     """Record the exact rows and source CSV used to fit decision artifacts."""
     data_cfg = cfg.get("data", {}) or {}
@@ -1891,10 +2141,18 @@ def _decision_calibration_data_identity(
         raise FileNotFoundError(
             f"Validation CSV required for decision identity was not found: {val_csv_path}"
         )
+    if upstream_role_name not in {
+        "posthoc_calibration",
+        "model_selection",
+    }:
+        raise ValueError(
+            "Unsupported upstream decision-calibration role name: "
+            f"{upstream_role_name!r}"
+        )
     return {
-        "schema_version": 1,
+        "schema_version": 2 if upstream_role_name == "model_selection" else 1,
         "validation_csv_sha256": _file_sha256(val_csv_path),
-        "posthoc_calibration": _calibration_subset_identity(
+        upstream_role_name: _calibration_subset_identity(
             dataset, posthoc_indices
         ),
         "decision_calibration": _calibration_subset_identity(
@@ -1956,6 +2214,8 @@ def _dataset_common_kwargs(
         "expected_manifest_train_csv_sha256",
         "expected_manifest_train_sample_ids_sha256",
         "expected_pt_build_fingerprint",
+        "pt_audit_certificate",
+        "require_pt_audit_certificate",
     }
     unknown_data_keys = sorted(set(data_cfg) - allowed_data_keys)
     if unknown_data_keys:
@@ -2021,6 +2281,10 @@ def _dataset_common_kwargs(
         ),
         "expected_pt_build_fingerprint": data_cfg.get(
             "expected_pt_build_fingerprint"
+        ),
+        "pt_audit_certificate": data_cfg.get("pt_audit_certificate"),
+        "require_pt_audit_certificate": bool(
+            data_cfg.get("require_pt_audit_certificate", False)
         ),
     }
 
@@ -2441,12 +2705,13 @@ def _load_fixed_validation_roles(
     cfg: dict,
     dataset,
 ) -> tuple[Subset, Subset, Subset, dict[str, Any]] | None:
-    """Load an immutable three-way validation assignment by sample identity.
+    """Load the immutable two-role 75/25 validation protocol.
 
-    Fractions remain useful when initially generating a protocol, but formal
-    reruns must not silently reshuffle checkpoint-selection samples merely
-    because a post-hoc budget changes.  A checked-in identity manifest makes
-    those three statistical roles explicit and independently auditable.
+    ``model_selection`` is used for Stage-A/Stage-B selection and the ordinary
+    classification operating threshold. ``decision_calibration`` is disjoint
+    and is consumed only by I3. The second returned subset intentionally points
+    at model selection for the existing internal "upstream threshold" slot; it
+    is not reported as an independent post-hoc role.
     """
 
     calibration_cfg = cfg.get("calibration", {}) or {}
@@ -2494,8 +2759,7 @@ def _load_fixed_validation_roles(
         )
 
     role_names = (
-        "checkpoint_selection",
-        "posthoc_calibration",
+        "model_selection",
         "decision_calibration",
     )
     roles = payload.get("roles")
@@ -2595,8 +2859,7 @@ def _load_fixed_validation_roles(
             for label in label_values
         }
 
-    selection_indices = role_indices["checkpoint_selection"]
-    posthoc_indices = role_indices["posthoc_calibration"]
+    selection_indices = role_indices["model_selection"]
     decision_indices = role_indices["decision_calibration"]
     assignment_sha = _file_sha256(path)
     assignment_semantic_sha = _canonical_mapping_sha256(
@@ -2615,35 +2878,35 @@ def _load_fixed_validation_roles(
         "role_assignment_schema_version": VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION,
         "validation_csv_sha256": actual_csv_sha,
         "split_seed": int(payload.get("split_seed", calibration_cfg.get("split_seed", 42))),
-        "validation_fraction": (len(posthoc_indices) + len(decision_indices)) / float(size),
+        "validation_fraction": len(decision_indices) / float(size),
         "num_validation": size,
         "num_selection": len(selection_indices),
-        "num_calibration": len(posthoc_indices) + len(decision_indices),
-        "num_posthoc_calibration": len(posthoc_indices),
+        "num_calibration": len(decision_indices),
+        "num_posthoc_calibration": 0,
         "num_conformal_calibration": len(decision_indices),
         "selection_fraction_of_validation": len(selection_indices) / float(size),
-        "calibration_fraction_of_validation": (len(posthoc_indices) + len(decision_indices)) / float(size),
-        "posthoc_fraction_of_validation": len(posthoc_indices) / float(size),
+        "calibration_fraction_of_validation": len(decision_indices) / float(size),
+        "posthoc_fraction_of_validation": 0.0,
         "decision_fraction_of_validation": len(decision_indices) / float(size),
         "selection_label_counts": _counts(selection_indices, label_values, dataset_labels),
-        "posthoc_label_counts": _counts(posthoc_indices, label_values, dataset_labels),
+        "upstream_selection_label_counts": _counts(selection_indices, label_values, dataset_labels),
         "conformal_label_counts": _counts(decision_indices, label_values, dataset_labels),
         "selection_year_counts": _counts(selection_indices, year_values, dataset_years),
-        "posthoc_year_counts": _counts(posthoc_indices, year_values, dataset_years),
+        "upstream_selection_year_counts": _counts(selection_indices, year_values, dataset_years),
         "conformal_year_counts": _counts(decision_indices, year_values, dataset_years),
         "selection_year_label_counts": _joint_counts(selection_indices),
-        "posthoc_year_label_counts": _joint_counts(posthoc_indices),
+        "upstream_selection_year_label_counts": _joint_counts(selection_indices),
         "conformal_year_label_counts": _joint_counts(decision_indices),
         "num_selection_groups": len({dataset_groups[index] for index in selection_indices}),
-        "num_calibration_groups": len({dataset_groups[index] for index in [*posthoc_indices, *decision_indices]}),
+        "num_calibration_groups": len({dataset_groups[index] for index in decision_indices}),
         "selection_indices": selection_indices,
-        "calibration_indices": sorted([*posthoc_indices, *decision_indices]),
-        "posthoc_calibration_indices": posthoc_indices,
+        "calibration_indices": decision_indices,
+        "upstream_selection_indices": selection_indices,
         "conformal_calibration_indices": decision_indices,
     }
     return (
         Subset(dataset, selection_indices),
-        Subset(dataset, posthoc_indices),
+        Subset(dataset, selection_indices),
         Subset(dataset, decision_indices),
         summary,
     )
@@ -2739,6 +3002,341 @@ def _build_eval_perturbation_view(
     view.eval_perturb_type = perturb_type
     view.eval_perturb_strength = strength
     return view
+
+
+def _build_train_single_degradation_view(
+    base_dataset: RobustTriModalDataset,
+    config: dict[str, Any],
+    *,
+    seed: int,
+) -> RobustTriModalDataset:
+    """Clone the validated train pool into one deterministic degraded view.
+
+    Each identity is transformed by exactly one registered single-modality
+    mechanism at one continuous strength.  The clone shares immutable PT
+    metadata and therefore does not repeat the expensive pool preflight.
+    """
+
+    if not isinstance(base_dataset, RobustTriModalDataset) or not bool(
+        base_dataset.is_train
+    ):
+        raise ValueError(
+            "Stage-B degradation view requires a validated training dataset"
+        )
+    raw_mechanisms = config.get(
+        "mechanisms",
+        list(GRADED_PERTURBATIONS),
+    )
+    if not isinstance(raw_mechanisms, (list, tuple)) or not raw_mechanisms:
+        raise ValueError(
+            "stage_b.degradation.mechanisms must be a non-empty sequence"
+        )
+    mechanisms = tuple(str(item).strip().lower() for item in raw_mechanisms)
+    if (
+        len(mechanisms) != len(set(mechanisms))
+        or set(mechanisms) - set(GRADED_PERTURBATIONS)
+    ):
+        raise ValueError(
+            "stage_b.degradation.mechanisms must be distinct registered "
+            f"single-modality mechanisms: {list(GRADED_PERTURBATIONS)}"
+        )
+    minimum = float(config.get("strength_min", 0.1))
+    maximum = float(config.get("strength_max", 0.9))
+    if (
+        not math.isfinite(minimum)
+        or not math.isfinite(maximum)
+        or not 0.0 < minimum <= maximum <= 1.0
+    ):
+        raise ValueError(
+            "stage_b degradation strengths must satisfy 0 < min <= max <= 1"
+        )
+    view = copy.copy(base_dataset)
+    view.is_train = True
+    view.eval_perturb_type = None
+    view.eval_perturb_strength = 0.0
+    view.train_perturbations = mechanisms
+    view.train_perturb_strength_min = minimum
+    view.train_perturb_strength_max = maximum
+    view.train_perturb_seed = int(seed)
+    return view
+
+
+def _stage_b_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Validate the closed Stage-B method contract.
+
+    Keeping this schema small is intentional: retired quality priors,
+    perturbation metadata features, conflict heads, and nested OOF switches
+    cannot be reintroduced by a stale overlay.
+    """
+
+    raw = cfg.get("stage_b", {}) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("stage_b must be a mapping")
+    allowed = {
+        "enabled",
+        "degradation",
+        "competence",
+        "router",
+        "validation_perturb_strength",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(f"Unsupported stage_b settings: {unknown}")
+    degradation = raw.get("degradation", {}) or {}
+    competence = raw.get("competence", {}) or {}
+    router = raw.get("router", {}) or {}
+    for name, section, section_allowed in (
+        (
+            "degradation",
+            degradation,
+            {"mechanisms", "strength_min", "strength_max"},
+        ),
+        (
+            "competence",
+            competence,
+            {
+                "epochs",
+                "patience",
+                "lr",
+                "weight_decay",
+                "ranking_weight",
+                "ranking_tie_tolerance",
+                "degraded_loss_weight",
+                "clean_noninferiority_relative_tolerance",
+                "clean_noninferiority_absolute_tolerance",
+                "regression",
+                "grad_clip",
+            },
+        ),
+        (
+            "router",
+            router,
+            {
+                "epochs",
+                "patience",
+                "lr",
+                "weight_decay",
+                "grad_clip",
+                "degradation_loss_weights",
+                "clean_anchor_kl_weight",
+                "clean_noninferiority_tolerance",
+                "degraded_source_noninferiority_tolerance",
+                "minimum_robust_gain",
+            },
+        ),
+    ):
+        if not isinstance(section, dict):
+            raise ValueError(f"stage_b.{name} must be a mapping")
+        section_unknown = sorted(set(section) - section_allowed)
+        if section_unknown:
+            raise ValueError(
+                f"Unsupported stage_b.{name} settings: {section_unknown}"
+            )
+    validation_strength = float(
+        raw.get("validation_perturb_strength", 0.5)
+    )
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("stage_b.enabled must be boolean")
+    if (
+        not math.isfinite(validation_strength)
+        or not 0.0 < validation_strength <= 1.0
+    ):
+        raise ValueError(
+            "stage_b.validation_perturb_strength must lie within (0, 1]"
+        )
+    return {
+        "enabled": bool(enabled),
+        "degradation": copy.deepcopy(degradation),
+        "competence": copy.deepcopy(competence),
+        "router": copy.deepcopy(router),
+        "validation_perturb_strength": validation_strength,
+    }
+
+
+def _validation_degradation_loaders(
+    cfg: dict[str, Any],
+    validation_dataset: RobustTriModalDataset,
+    selection_indices: list[int] | None,
+    *,
+    strength: float,
+) -> dict[str, Any]:
+    """Build fixed model-selection views without touching I3 identities."""
+
+    if not isinstance(validation_dataset, RobustTriModalDataset):
+        raise TypeError(
+            "Stage-B validation views require the validated base val dataset"
+        )
+    resolved_indices = (
+        list(range(len(validation_dataset)))
+        if selection_indices is None
+        else [int(index) for index in selection_indices]
+    )
+    loaders: dict[str, Any] = {}
+    for mechanism in GRADED_PERTURBATIONS:
+        view = _build_eval_perturbation_view(
+            validation_dataset,
+            perturb_type=mechanism,
+            perturb_strength=strength,
+        )
+        loaders[mechanism] = build_loader(
+            cfg,
+            Subset(view, resolved_indices),
+            is_train=False,
+            seed_namespace=f"stage_b_validation_{mechanism}",
+        )
+    return loaders
+
+
+def fit_anchored_stage_b(
+    model,
+    *,
+    train_dataset: RobustTriModalDataset,
+    validation_dataset: RobustTriModalDataset,
+    validation_loader,
+    selection_indices: list[int] | None,
+    device: torch.device,
+    use_amp: bool,
+    cfg: dict[str, Any],
+    seed: int,
+) -> dict[str, Any]:
+    """Fit the redesigned I1/I2 lifecycle on train, select it on validation."""
+
+    stage_cfg = _stage_b_config(cfg)
+    if not bool(stage_cfg["enabled"]):
+        raise ValueError(
+            "fit_anchored_stage_b cannot be called when stage_b.enabled=false"
+        )
+    degraded_train_dataset = _build_train_single_degradation_view(
+        train_dataset,
+        stage_cfg["degradation"],
+        seed=int(seed),
+    )
+    train_clean_loader = build_loader(
+        cfg,
+        train_dataset,
+        is_train=False,
+        seed_namespace="stage_b_train_clean",
+    )
+    train_degraded_loader = build_loader(
+        cfg,
+        degraded_train_dataset,
+        is_train=False,
+        seed_namespace="stage_b_train_single_degradation",
+    )
+    validation_degraded_loaders = _validation_degradation_loaders(
+        cfg,
+        validation_dataset,
+        selection_indices,
+        strength=float(stage_cfg["validation_perturb_strength"]),
+    )
+
+    # Stage B may optimize only the two explicitly declared modules.  The hash
+    # check in run() independently verifies this freeze at artifact level.
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.set_anchored_fusion_active(False)
+
+    train_clean, train_clean_summary = cache_expert_outputs(
+        model,
+        train_clean_loader,
+        device,
+        use_amp=use_amp,
+        source_name="train_clean",
+    )
+    train_degraded, train_degraded_summary = cache_expert_outputs(
+        model,
+        train_degraded_loader,
+        device,
+        use_amp=use_amp,
+        source_name="train_single_degradation",
+    )
+    validation_clean, validation_clean_summary = cache_expert_outputs(
+        model,
+        validation_loader,
+        device,
+        use_amp=use_amp,
+        source_name="val_model_selection_clean",
+    )
+    validation_sources = {
+        "clean": validation_clean,
+    }
+    cache_summaries: dict[str, Any] = {
+        "train_clean": train_clean_summary,
+        "train_single_degradation": train_degraded_summary,
+        "val_model_selection_clean": validation_clean_summary,
+    }
+    for name, loader in validation_degraded_loaders.items():
+        cached, cache_summary = cache_expert_outputs(
+            model,
+            loader,
+            device,
+            use_amp=use_amp,
+            source_name=f"val_model_selection_{name}",
+        )
+        validation_sources[name] = cached
+        cache_summaries[f"val_model_selection_{name}"] = cache_summary
+
+    competence_validation_sources = (
+        validation_sources
+        if float(
+            stage_cfg["competence"].get("degraded_loss_weight", 0.25)
+        )
+        > 0.0
+        else {"clean": validation_clean}
+    )
+    competence_summary = fit_competence_heads(
+        model,
+        train_clean=train_clean,
+        train_degraded=train_degraded,
+        validation_sources=competence_validation_sources,
+        clean_validation_source="clean",
+        device=device,
+        config=stage_cfg["competence"],
+    )
+    model.set_competence_diagnostics_active(True)
+    competence_summary["diagnostics"] = competence_diagnostics(
+        model,
+        {
+            "train_clean": train_clean,
+            "train_single_degradation": train_degraded,
+            **{
+                f"val_model_selection_{name}": cache
+                for name, cache in validation_sources.items()
+            },
+        },
+        device,
+    )
+    router_summary = fit_anchored_router(
+        model,
+        train_clean=train_clean,
+        train_degraded=train_degraded,
+        validation_sources=validation_sources,
+        clean_validation_source="clean",
+        device=device,
+        config=stage_cfg["router"],
+    )
+    return {
+        "enabled": True,
+        "protocol": "train_tcp_joint_anchor_v1",
+        "parameter_fit_population": "train_only",
+        "validation_role": "model_selection_only",
+        "decision_calibration_used_for_parameters": False,
+        "test_used_for_parameters_or_selection": False,
+        "single_degradation_per_train_identity": True,
+        "degradation_metadata_is_model_input": False,
+        "i1_diagnostics_available_when_router_falls_back": True,
+        "validation_perturb_strength": float(
+            stage_cfg["validation_perturb_strength"]
+        ),
+        "cache": cache_summaries,
+        "competence": competence_summary,
+        "router": router_summary,
+        "classification_threshold": copy.deepcopy(
+            router_summary["classification_threshold"]
+        ),
+        "deployment": router_summary["deployment"],
+    }
 
 
 def _normalize_robust_test_protocol(
@@ -2986,6 +3584,8 @@ TRAIN_LOG_DIAGNOSTIC_KEYS = (
     "fusion_weight_api",
     "fusion_weight_graph",
     "fusion_weight_manifest",
+    "fusion_weight_joint",
+    "late_gate",
     "uncertainty_proxy_api",
     "uncertainty_proxy_graph",
     "uncertainty_proxy_manifest",
@@ -2993,6 +3593,11 @@ TRAIN_LOG_DIAGNOSTIC_KEYS = (
 )
 TRAIN_LOG_LOSS_PART_KEYS = (
     "loss",
+    "joint_ce",
+    "atomic_ce",
+    "atomic_aux_weight",
+    "joint_active_fraction",
+    "atomic_active_fraction",
     "ce",
     "branch_aux",
     "branch_aux_weight",
@@ -3250,19 +3855,6 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
     gate_cfg = model_cfg.get("gate", {})
     graph_node_budget = _resolve_graph_node_budget(model_cfg)
     fusion_cfg = cfg.get("fusion", {}) or {}
-    removed_joint_config: list[str] = []
-    if "joint_emb_dim" in model_cfg:
-        removed_joint_config.append("model.joint_emb_dim")
-    if "linear_use_joint_branch" in fusion_cfg:
-        removed_joint_config.append("fusion.linear_use_joint_branch")
-    branch_aux_weights = ((cfg.get("loss", {}) or {}).get("branch_aux_weights", {}) or {})
-    if isinstance(branch_aux_weights, dict) and "joint" in branch_aux_weights:
-        removed_joint_config.append("loss.branch_aux_weights.joint")
-    if removed_joint_config:
-        raise ValueError(
-            "The Joint branch and its learned four-branch gate were removed; "
-            "delete these obsolete settings: " + ", ".join(removed_joint_config)
-        )
     fusion_mode = str(model_cfg.get("fusion_mode", "discount_probability"))
     configured_fusion_mode = str(fusion_cfg.get("mode", "")).lower()
     if configured_fusion_mode == "discount_probability":
@@ -3291,6 +3883,51 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
     combination = str(fusion_cfg.get("combination", "")).lower()
     routing_cfg = fusion_cfg.get("routing", {}) or {}
     reliability_cfg = fusion_cfg.get("reliability_calibration", {}) or {}
+    anchored_mode = fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES
+    if anchored_mode:
+        _stage_b_config(cfg)
+        allowed_main_keys = {
+            "mode",
+            "competence",
+            "anchored_router",
+        }
+        unknown_main_keys = sorted(set(fusion_cfg) - allowed_main_keys)
+        if unknown_main_keys:
+            raise ValueError(
+                "anchored_joint_late accepts only the explicit competence and "
+                f"anchor-router interface; unsupported fusion keys: "
+                f"{unknown_main_keys}"
+            )
+        forbidden_main_keys = sorted(
+            set(fusion_cfg)
+            & {
+                "combination",
+                "evidence_activation",
+                "opinion_source",
+                "reliability_calibration",
+                "routing",
+                "use_i1_reliability",
+            }
+        )
+        if forbidden_main_keys:
+            raise ValueError(
+                "anchored_joint_late is independent of the retired evidential "
+                "I1/I2 path; remove these incompatible fusion keys: "
+                f"{forbidden_main_keys}"
+            )
+        if bool((cfg.get("calibration", {}) or {}).get("enabled", False)):
+            raise ValueError(
+                "anchored_joint_late trains I1/I2 on train-only cached expert "
+                "outputs and requires calibration.enabled=false"
+            )
+        branch_aux_weights = (
+            (cfg.get("loss", {}) or {}).get("branch_aux_weights", {}) or {}
+        )
+        if isinstance(branch_aux_weights, dict) and "joint" in branch_aux_weights:
+            raise ValueError(
+                "The Joint expert is the primary Stage-A objective, not an "
+                "auxiliary branch; remove loss.branch_aux_weights.joint"
+            )
     removed_fusion_keys = sorted(
         set(fusion_cfg)
         & {
@@ -3338,9 +3975,35 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
             f"fusion={removed_fusion_keys}, reliability_calibration="
             f"{removed_reliability_keys}"
         )
-    normalize_reliability_calibration_method(
+    reliability_method = normalize_reliability_calibration_method(
         reliability_cfg.get("method", MONOTONIC_CORRECTNESS_METHOD)
     )
+    if (
+        bool(reliability_cfg.get("use_api_observed_support", False))
+        and reliability_method != MONOTONIC_CORRECTNESS_METHOD
+    ):
+        raise ValueError(
+            "fusion.reliability_calibration.use_api_observed_support is "
+            "only valid for method=monotonic_correctness"
+        )
+    opinion_source = str(
+        fusion_cfg.get("opinion_source", "evidential")
+    ).strip().lower()
+    if (
+        opinion_source == "softmax_fixed_uncertainty"
+        and (
+            bool(fusion_cfg.get("use_i1_reliability", False))
+            or bool(reliability_cfg.get("enabled", False))
+        )
+    ):
+        raise ValueError(
+            "fusion.opinion_source='softmax_fixed_uncertainty' is incompatible "
+            f"with I1 reliability calibration method {reliability_method!r}: "
+            "that ablation exposes fixed alpha=1 while retaining non-uniform "
+            "softmax expected probabilities, so alpha-derived I1 certainty, "
+            "margin, and predicted class would be internally inconsistent. "
+            "Disable I1 for this no-EDL ablation or use evidential opinions."
+        )
     if combination == "routed" and bool(routing_cfg.get("enabled", False)):
         learned_route = str(routing_cfg.get("mode", "learned")).lower() == "learned"
         learned_risk = str(routing_cfg.get("risk_mode", "learned")).lower() == "learned"
@@ -3395,6 +4058,7 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
         removed_router_objectives = sorted(
             set(routing_cfg)
             & {
+                "route_conflict_enabled",
                 "route_oracle_loss_weight",
                 "route_oracle_temperature",
                 "subset_oracle_loss_weight",
@@ -3407,8 +4071,8 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
         )
         if removed_router_objectives:
             raise ValueError(
-                "Source-oracle and soft-worst routing objectives were removed "
-                "from the final method; remove these keys: "
+                "Retired route-conflict/source-oracle/soft-worst routing "
+                "options were removed from the final method; remove these keys: "
                 f"{removed_router_objectives}"
             )
         risk_support_cfg = routing_cfg.get("risk_support", {}) or {}
@@ -3480,14 +4144,38 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
 
     loss_cfg = cfg.get("loss", {}) or {}
     training_objective = str(loss_cfg.get("objective", "standard")).strip().lower()
+    if anchored_mode:
+        if training_objective != "anchored_stage_a":
+            raise ValueError(
+                "anchored_joint_late requires "
+                "loss.objective='anchored_stage_a'"
+            )
+        allowed_loss_keys = {
+            "objective",
+            "atomic_aux_weight",
+            "auxiliary_weight_mode",
+            "label_smoothing",
+        }
+        unknown_loss_keys = sorted(set(loss_cfg) - allowed_loss_keys)
+        if unknown_loss_keys:
+            raise ValueError(
+                "anchored Stage A has a closed loss contract; unsupported "
+                f"loss keys: {unknown_loss_keys}"
+            )
+        if str(
+            loss_cfg.get(
+                "auxiliary_weight_mode", "alive_masked_uniform"
+            )
+        ).strip().lower() != "alive_masked_uniform":
+            raise ValueError(
+                "anchored Stage A requires "
+                "loss.auxiliary_weight_mode='alive_masked_uniform'"
+            )
     expected_combination = {"tmc": "dempster", "ecml": "ecml"}.get(
         training_objective
     )
     if expected_combination is not None:
         violations: list[str] = []
-        opinion_source = str(
-            fusion_cfg.get("opinion_source", "evidential")
-        ).strip().lower()
         if fusion_mode != "discount_probability":
             violations.append("model/fusion mode must be discount_probability")
         if combination != expected_combination:
@@ -3575,6 +4263,39 @@ def build_model(cfg: dict, feature_dim: int) -> TriModalRobustModel:
         manifest_emb_dim=int(manifest_cfg.get("emb_dim", 128)),
         manifest_hidden_dim=int(manifest_cfg.get("hidden_dim", 256)),
         manifest_dropout=float(manifest_cfg.get("dropout", 0.1)),
+        joint_emb_dim=int(
+            (model_cfg.get("joint_expert", {}) or {}).get("emb_dim", 128)
+        ),
+        joint_hidden_dim=int(
+            (model_cfg.get("joint_expert", {}) or {}).get("hidden_dim", 256)
+        ),
+        joint_dropout=float(
+            (model_cfg.get("joint_expert", {}) or {}).get("dropout", 0.15)
+        ),
+        competence_projection_dim=int(
+            (fusion_cfg.get("competence", {}) or {}).get("projection_dim", 32)
+        ),
+        competence_hidden_dim=int(
+            (fusion_cfg.get("competence", {}) or {}).get("hidden_dim", 16)
+        ),
+        competence_dropout=float(
+            (fusion_cfg.get("competence", {}) or {}).get("dropout", 0.10)
+        ),
+        initial_atomic_competence_scale=float(
+            (fusion_cfg.get("anchored_router", {}) or {}).get(
+                "initial_atomic_competence_scale", 1.0
+            )
+        ),
+        initial_joint_late_scale=float(
+            (fusion_cfg.get("anchored_router", {}) or {}).get(
+                "initial_joint_late_scale", 1.0
+            )
+        ),
+        initial_late_gate=float(
+            (fusion_cfg.get("anchored_router", {}) or {}).get(
+                "initial_late_gate", 0.10
+            )
+        ),
         quality_fusion_temperature=float(model_cfg.get("quality_fusion_temperature", 10.0)),
         gate_hidden_dim=int(gate_cfg.get("hidden_dim", 128)),
         gate_detach=bool(gate_cfg.get("detach", True)),
@@ -3728,9 +4449,105 @@ def _row_selective_eligible(row: dict[str, Any]) -> bool:
 
 
 def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Audit I1 correctness and the explicitly configured I2 risk event."""
+    """Audit both I1 contracts and the configured legacy I2 risk event.
+
+    The redesigned anchored path predicts the continuous TCP target
+    ``p_expert(y)``.  Its squared error is therefore reported as TCP MSE, not
+    as a Brier score against binary correctness.  Correctness AUROC/AP remain
+    useful ranking diagnostics, but are explicitly named as such.  Historical
+    ``predicted_reliability_*`` rows retain their binary-calibration metrics so
+    old baseline implementations remain independently auditable.
+    """
     out: dict[str, float | int] = {}
     for branch in BRANCH_EVAL_LOGIT_KEYS:
+        competence_values: list[float] = []
+        tcp_values: list[float] = []
+        competence_correctness_values: list[float] = []
+        for row in rows:
+            alive = _finite_row_float(row, f"{branch}_alive")
+            if alive is not None and alive < 0.5:
+                continue
+            competence = _finite_row_float(
+                row, f"predicted_competence_{branch}"
+            )
+            probability = _finite_row_float(row, f"{branch}_prob")
+            label = _finite_row_float(row, "label")
+            correctness = _finite_row_float(row, f"{branch}_correct")
+            if (
+                competence is None
+                or probability is None
+                or label is None
+                or correctness is None
+            ):
+                continue
+            bounded_probability = min(1.0, max(0.0, probability))
+            tcp = (
+                bounded_probability
+                if label >= 0.5
+                else 1.0 - bounded_probability
+            )
+            competence_values.append(min(1.0, max(0.0, competence)))
+            tcp_values.append(tcp)
+            competence_correctness_values.append(
+                1.0 if correctness >= 0.5 else 0.0
+            )
+        if competence_values:
+            competence_arr = np.asarray(
+                competence_values, dtype=np.float64
+            )
+            tcp_arr = np.asarray(tcp_values, dtype=np.float64)
+            competence_correctness_arr = np.asarray(
+                competence_correctness_values, dtype=np.float64
+            )
+            out[f"{branch}_competence_count"] = int(
+                competence_arr.size
+            )
+            out[f"{branch}_competence_mean"] = float(
+                competence_arr.mean()
+            )
+            out[f"{branch}_tcp_mean"] = float(tcp_arr.mean())
+            out[f"{branch}_competence_tcp_gap"] = float(
+                competence_arr.mean() - tcp_arr.mean()
+            )
+            out[f"{branch}_competence_tcp_mse"] = float(
+                np.mean((competence_arr - tcp_arr) ** 2)
+            )
+            out[f"{branch}_competence_tcp_mae"] = float(
+                np.mean(np.abs(competence_arr - tcp_arr))
+            )
+            out[f"{branch}_competence_branch_accuracy"] = float(
+                competence_correctness_arr.mean()
+            )
+            competence_correctness_defined = (
+                len(set(competence_correctness_values)) > 1
+            )
+            out[
+                f"{branch}_competence_correctness_auc_defined"
+            ] = int(competence_correctness_defined)
+            out[
+                f"{branch}_competence_correctness_ap_defined"
+            ] = int(competence_correctness_defined)
+            if competence_correctness_defined:
+                out[f"{branch}_competence_correctness_auc"] = float(
+                    roc_auc_score(
+                        competence_correctness_arr, competence_arr
+                    )
+                )
+                out[f"{branch}_competence_correctness_ap"] = float(
+                    average_precision_score(
+                        competence_correctness_arr, competence_arr
+                    )
+                )
+            else:
+                out[f"{branch}_competence_correctness_auc"] = float(
+                    "nan"
+                )
+                out[f"{branch}_competence_correctness_ap"] = float(
+                    "nan"
+                )
+
+        # Legacy binary correctness reliability, retained only for comparison
+        # methods that still emit predicted_reliability_*.
         reliability_values: list[float] = []
         correctness_values: list[float] = []
         predicted_class_values: list[int] = []
@@ -3751,72 +4568,92 @@ def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, 
                 else -1
             )
         count = len(reliability_values)
-        if count == 0:
-            continue
-        out[f"{branch}_reliability_count"] = count
-        reliability_arr = np.asarray(reliability_values, dtype=np.float64)
-        correctness_arr = np.asarray(correctness_values, dtype=np.float64)
-        out[f"{branch}_reliability_brier"] = float(
-            np.mean((reliability_arr - correctness_arr) ** 2)
-        )
-        out[f"{branch}_reliability_ece_10"] = _calibration_ece(
-            reliability_arr,
-            correctness_arr,
-            bins=10,
-        )
-        out[f"{branch}_reliability_mean"] = float(reliability_arr.mean())
-        out[f"{branch}_branch_accuracy"] = float(correctness_arr.mean())
-        out[f"{branch}_reliability_accuracy_gap"] = float(
-            reliability_arr.mean() - correctness_arr.mean()
-        )
-        if len(set(correctness_values)) > 1:
-            out[f"{branch}_reliability_auc_defined"] = 1
-            out[f"{branch}_reliability_ap_defined"] = 1
-            out[f"{branch}_reliability_auc"] = float(
-                roc_auc_score(correctness_arr, reliability_arr)
+        if count > 0:
+            out[f"{branch}_reliability_count"] = count
+            reliability_arr = np.asarray(
+                reliability_values, dtype=np.float64
             )
-            out[f"{branch}_reliability_ap"] = float(
-                average_precision_score(correctness_arr, reliability_arr)
+            correctness_arr = np.asarray(
+                correctness_values, dtype=np.float64
             )
-        else:
-            out[f"{branch}_reliability_auc_defined"] = 0
-            out[f"{branch}_reliability_ap_defined"] = 0
-            out[f"{branch}_reliability_auc"] = float("nan")
-            out[f"{branch}_reliability_ap"] = float("nan")
-
-        # Formal I1 may include a signed predicted-class intercept. Report
-        # calibration in both predicted-class cells so a pooled score
-        # cannot hide a fragile predicted-benign (FN-relevant) region.
-        predicted_arr = np.asarray(predicted_class_values, dtype=np.int64)
-        for class_index, class_name in (
-            (0, "predicted_benign"),
-            (1, "predicted_malware"),
-        ):
-            mask = predicted_arr == class_index
-            subgroup_count = int(mask.sum())
-            prefix = f"{branch}_{class_name}_reliability"
-            out[f"{prefix}_count"] = subgroup_count
-            if subgroup_count == 0:
-                continue
-            subgroup_reliability = reliability_arr[mask]
-            subgroup_correctness = correctness_arr[mask]
-            subgroup_mean = float(subgroup_reliability.mean())
-            subgroup_accuracy = float(subgroup_correctness.mean())
-            out[f"{prefix}_brier"] = float(
-                np.mean((subgroup_reliability - subgroup_correctness) ** 2)
+            out[f"{branch}_reliability_brier"] = float(
+                np.mean((reliability_arr - correctness_arr) ** 2)
             )
-            out[f"{prefix}_ece_10"] = _calibration_ece(
-                subgroup_reliability,
-                subgroup_correctness,
+            out[f"{branch}_reliability_ece_10"] = _calibration_ece(
+                reliability_arr,
+                correctness_arr,
                 bins=10,
             )
-            out[f"{prefix}_mean"] = subgroup_mean
-            out[f"{prefix}_branch_accuracy"] = subgroup_accuracy
-            out[f"{prefix}_accuracy_gap"] = subgroup_mean - subgroup_accuracy
+            out[f"{branch}_reliability_mean"] = float(
+                reliability_arr.mean()
+            )
+            out[f"{branch}_branch_accuracy"] = float(
+                correctness_arr.mean()
+            )
+            out[f"{branch}_reliability_accuracy_gap"] = float(
+                reliability_arr.mean() - correctness_arr.mean()
+            )
+            if len(set(correctness_values)) > 1:
+                out[f"{branch}_reliability_auc_defined"] = 1
+                out[f"{branch}_reliability_ap_defined"] = 1
+                out[f"{branch}_reliability_auc"] = float(
+                    roc_auc_score(correctness_arr, reliability_arr)
+                )
+                out[f"{branch}_reliability_ap"] = float(
+                    average_precision_score(
+                        correctness_arr, reliability_arr
+                    )
+                )
+            else:
+                out[f"{branch}_reliability_auc_defined"] = 0
+                out[f"{branch}_reliability_ap_defined"] = 0
+                out[f"{branch}_reliability_auc"] = float("nan")
+                out[f"{branch}_reliability_ap"] = float("nan")
+
+            # Formal legacy I1 may include a signed predicted-class intercept.
+            # Report both cells so a pooled score cannot hide a fragile
+            # predicted-benign (FN-relevant) region.
+            predicted_arr = np.asarray(
+                predicted_class_values, dtype=np.int64
+            )
+            for class_index, class_name in (
+                (0, "predicted_benign"),
+                (1, "predicted_malware"),
+            ):
+                mask = predicted_arr == class_index
+                subgroup_count = int(mask.sum())
+                prefix = f"{branch}_{class_name}_reliability"
+                out[f"{prefix}_count"] = subgroup_count
+                if subgroup_count == 0:
+                    continue
+                subgroup_reliability = reliability_arr[mask]
+                subgroup_correctness = correctness_arr[mask]
+                subgroup_mean = float(subgroup_reliability.mean())
+                subgroup_accuracy = float(subgroup_correctness.mean())
+                out[f"{prefix}_brier"] = float(
+                    np.mean(
+                        (
+                            subgroup_reliability
+                            - subgroup_correctness
+                        )
+                        ** 2
+                    )
+                )
+                out[f"{prefix}_ece_10"] = _calibration_ece(
+                    subgroup_reliability,
+                    subgroup_correctness,
+                    bins=10,
+                )
+                out[f"{prefix}_mean"] = subgroup_mean
+                out[f"{prefix}_branch_accuracy"] = subgroup_accuracy
+                out[f"{prefix}_accuracy_gap"] = (
+                    subgroup_mean - subgroup_accuracy
+                )
 
     risk_values: list[float] = []
     risk_target_values: list[float] = []
     mixture_error_values: list[float] = []
+    risk_predicted_benign_values: list[bool] = []
     threshold_aligned_count = 0
     all_missing_count = 0
     all_missing_forced_rejection_count = 0
@@ -3865,6 +4702,9 @@ def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, 
                 "decision threshold and final predictions in evaluation rows"
             )
         threshold_aligned_count += 1
+        risk_predicted_benign_values.append(
+            int(round(final_pred)) == 0
+        )
         risk_target_values.append(
             float(
                 int(round(label)) == 1
@@ -3915,6 +4755,53 @@ def compute_branch_reliability_metrics(rows: list[dict[str, Any]]) -> dict[str, 
             out["routing_risk_ap_defined"] = 0
             out["routing_risk_auc"] = float("nan")
             out["routing_risk_ap"] = float("nan")
+
+        predicted_benign_mask = np.asarray(
+            risk_predicted_benign_values, dtype=np.bool_
+        )
+        if predicted_benign_mask.size != risk_arr.size:
+            raise RuntimeError(
+                "Risk score and classifier-side counts disagree during "
+                "conditional calibration audit"
+            )
+        benign_risk = risk_arr[predicted_benign_mask]
+        benign_target = target_arr[predicted_benign_mask]
+        benign_count = int(benign_risk.size)
+        out["routing_risk_predicted_benign_count"] = benign_count
+        if benign_count == 0:
+            out["routing_risk_predicted_benign_event_rate"] = float("nan")
+            out["routing_risk_predicted_benign_brier"] = float("nan")
+            out["routing_risk_predicted_benign_ece_10"] = float("nan")
+            out["routing_risk_predicted_benign_auc_defined"] = 0
+            out["routing_risk_predicted_benign_ap_defined"] = 0
+            out["routing_risk_predicted_benign_auc"] = float("nan")
+            out["routing_risk_predicted_benign_ap"] = float("nan")
+        else:
+            out["routing_risk_predicted_benign_event_rate"] = float(
+                benign_target.mean()
+            )
+            out["routing_risk_predicted_benign_brier"] = float(
+                np.mean((benign_risk - benign_target) ** 2)
+            )
+            out["routing_risk_predicted_benign_ece_10"] = _calibration_ece(
+                benign_risk,
+                benign_target,
+                bins=10,
+            )
+            if len(set(benign_target.tolist())) > 1:
+                out["routing_risk_predicted_benign_auc_defined"] = 1
+                out["routing_risk_predicted_benign_ap_defined"] = 1
+                out["routing_risk_predicted_benign_auc"] = float(
+                    roc_auc_score(benign_target, benign_risk)
+                )
+                out["routing_risk_predicted_benign_ap"] = float(
+                    average_precision_score(benign_target, benign_risk)
+                )
+            else:
+                out["routing_risk_predicted_benign_auc_defined"] = 0
+                out["routing_risk_predicted_benign_ap_defined"] = 0
+                out["routing_risk_predicted_benign_auc"] = float("nan")
+                out["routing_risk_predicted_benign_ap"] = float("nan")
     out["routing_all_missing_count"] = int(all_missing_count)
     out["routing_all_missing_forced_rejection_count"] = int(
         all_missing_forced_rejection_count
@@ -4271,64 +5158,14 @@ def fit_malware_classification_threshold(
             "Classification-threshold fitting requires both benign and malware samples"
         )
 
-    unique_probabilities = sorted({probability for probability, _label in valid})
-    candidates = [unique_probabilities[0]]
-    candidates.extend(
-        (left + right) / 2.0
-        for left, right in zip(unique_probabilities[:-1], unique_probabilities[1:])
-    )
-    candidates.append(math.nextafter(unique_probabilities[-1], float("inf")))
     probabilities = np.asarray(
         [probability for probability, _label in valid], dtype=np.float64
     )
-
-    best: dict[str, Any] | None = None
-    best_key: tuple[float, float, float] | None = None
-    for threshold in candidates:
-        predictions = (probabilities >= float(threshold)).astype(np.int64)
-        malware_recall = float(
-            recall_score(labels, predictions, pos_label=1, zero_division=0)
-        )
-        macro_f1 = float(
-            f1_score(labels, predictions, average="macro", zero_division=0)
-        )
-        accuracy = float(accuracy_score(labels, predictions))
-        # Exact macro-F1 ties prefer the neutral boundary and then the smaller
-        # threshold. Accuracy/recall remain diagnostics, never hidden objectives.
-        key = (
-            macro_f1,
-            -abs(float(threshold) - 0.5),
-            -float(threshold),
-        )
-        if best_key is None or key > best_key:
-            best_key = key
-            best = {
-                "threshold": float(threshold),
-                "macro_f1": macro_f1,
-                "malware_recall": malware_recall,
-                "accuracy": accuracy,
-            }
-    if best is None:
-        raise RuntimeError("No finite classification threshold candidate exists")
-
-    fixed_predictions = (probabilities >= 0.5).astype(np.int64)
+    fitted = fit_binary_macro_f1_threshold(labels, probabilities)
     return {
-        "enabled": True,
-        "objective": objective,
-        "selection_rule": CLASSIFICATION_THRESHOLD_SELECTION_RULE,
-        "constraint": "none",
         "calibration_split": "val_posthoc_calibration",
-        "num_calibration": int(len(valid)),
-        "num_calibration_benign": int((labels == 0).sum()),
-        "num_calibration_malware": int((labels == 1).sum()),
-        "num_candidates": int(len(candidates)),
-        "fixed_0_5_macro_f1": float(
-            f1_score(labels, fixed_predictions, average="macro", zero_division=0)
-        ),
-        "fixed_0_5_malware_recall": float(
-            recall_score(labels, fixed_predictions, pos_label=1, zero_division=0)
-        ),
-        **best,
+        **fitted,
+        "objective": objective,
     }
 
 
@@ -4453,6 +5290,132 @@ def fit_oof_malware_classification_threshold(
     }
 
 
+def fit_fold_excluded_oof_classification_thresholds(
+    rows_by_fold: dict[int, list[dict[str, Any]]],
+    config: dict | None,
+    *,
+    deployment_temperature: float,
+) -> dict[str, Any]:
+    """Fit one upstream-OOF classifier cutoff excluding each risk fold.
+
+    The classifier cutoff is an upstream nuisance parameter of both the I2
+    false-negative target and its decision-boundary feature.  A target row
+    therefore cannot help select the cutoff used to label that same row.
+    """
+    if not isinstance(rows_by_fold, dict) or len(rows_by_fold) < 3:
+        raise ValueError(
+            "Fold-excluded threshold fitting requires at least three folds"
+        )
+    validated_by_fold: dict[int, list[dict[str, Any]]] = {}
+    seen_sample_ids: dict[str, int] = {}
+    group_owner: dict[str, int] = {}
+    for raw_fold, raw_rows in sorted(
+        rows_by_fold.items(), key=lambda item: int(item[0])
+    ):
+        fold = int(raw_fold)
+        if fold in validated_by_fold:
+            raise ValueError(f"Duplicate OOF fold identifier {fold}")
+        validated = validate_posthoc_oof_rows(raw_rows)
+        if not validated:
+            raise ValueError(f"OOF fold {fold} contains no clean rows")
+        for row in validated:
+            sid_key = str(row["sid"]).strip().lower()
+            previous_sid_fold = seen_sample_ids.setdefault(sid_key, fold)
+            if previous_sid_fold != fold:
+                raise ValueError(
+                    f"OOF sample {row['sid']!r} occurs in folds "
+                    f"{previous_sid_fold} and {fold}"
+                )
+            group_key = str(row["group"]).strip().lower()
+            previous_group_fold = group_owner.setdefault(group_key, fold)
+            if previous_group_fold != fold:
+                raise ValueError(
+                    f"OOF package group {row['group']!r} crosses folds "
+                    f"{previous_group_fold} and {fold}"
+                )
+        validated_by_fold[fold] = validated
+
+    def _identity_digest(rows: list[dict[str, Any]]) -> str:
+        digest = hashlib.sha256()
+        identities = sorted(
+            (
+                str(row["sid"]).strip().lower(),
+                str(row["group"]).strip().lower(),
+                strict_binary_integer(
+                    row["label"], field_name="fold-excluded OOF label"
+                ),
+            )
+            for row in rows
+        )
+        for sid, group, label in identities:
+            digest.update(f"{sid}\0{group}\0{label}\n".encode("utf-8"))
+        return digest.hexdigest()
+
+    threshold_by_fold: dict[int, float] = {}
+    fold_summaries: list[dict[str, Any]] = []
+    all_folds = sorted(validated_by_fold)
+    for held_out_fold in all_folds:
+        fit_folds = [fold for fold in all_folds if fold != held_out_fold]
+        fit_rows = [
+            row
+            for fold in fit_folds
+            for row in validated_by_fold[fold]
+        ]
+        held_out_rows = validated_by_fold[held_out_fold]
+        fitted = fit_oof_malware_classification_threshold(
+            fit_rows,
+            config,
+            deployment_temperature=deployment_temperature,
+        )
+        if not fitted:
+            raise RuntimeError(
+                "Fold-excluded classification-threshold fitting was enabled "
+                f"but produced no cutoff for held-out fold {held_out_fold}"
+            )
+        raw_threshold = float(fitted["raw_log_odds_threshold"])
+        if not math.isfinite(raw_threshold):
+            raise RuntimeError(
+                f"Fold-excluded cutoff for fold {held_out_fold} is not finite"
+            )
+        threshold_by_fold[held_out_fold] = raw_threshold
+        fold_summaries.append(
+            {
+                "held_out_fold": held_out_fold,
+                "fit_folds": fit_folds,
+                "prediction_source": (
+                    "upstream_nested_oof_clean_excluding_risk_fold"
+                ),
+                "num_fit_rows": int(len(fit_rows)),
+                "num_held_out_rows": int(len(held_out_rows)),
+                "num_fit_groups": int(
+                    len({str(row["group"]).lower() for row in fit_rows})
+                ),
+                "num_held_out_groups": int(
+                    len(
+                        {
+                            str(row["group"]).lower()
+                            for row in held_out_rows
+                        }
+                    )
+                ),
+                "fit_row_identity_sha256": _identity_digest(fit_rows),
+                "held_out_row_identity_sha256": _identity_digest(
+                    held_out_rows
+                ),
+                "raw_log_odds_threshold": raw_threshold,
+                "fit_macro_f1": float(fitted["macro_f1"]),
+                "fit_malware_recall": float(fitted["malware_recall"]),
+                "fit_accuracy": float(fitted["accuracy"]),
+            }
+        )
+    return {
+        "mode": "fold_excluded_upstream_oof_clean",
+        "num_folds": int(len(all_folds)),
+        "threshold_by_fold": threshold_by_fold,
+        "folds": fold_summaries,
+    }
+
+
 def fit_rejection_threshold(rows: list[dict[str, Any]], config: dict | None = None) -> float | None:
     """Choose an acceptance threshold on validation data for target coverage."""
     config = {} if config is None else config
@@ -4546,6 +5509,7 @@ def _selective_score_type(config: dict | None = None) -> str:
         "predictive_entropy_certainty",
         "evidential_certainty",
         "mixture_certainty",
+        "malware_fn_probability_anchor",
         "model_acceptance",
     }
     if score_type not in allowed:
@@ -4628,6 +5592,21 @@ def _batch_selective_score(
             + complement * torch.log(complement.clamp_min(tiny))
         )
         return (1.0 - entropy / math.log(2.0)).clamp(0.0, 1.0)
+    if score_type == "malware_fn_probability_anchor":
+        # I3 is one-sided: predictions already classified as malware cannot be
+        # a malware false negative and are therefore maximally safe. For a
+        # deployed benign prediction, 1-p(malware) is the monotone acceptance
+        # anchor. The disjoint CRC split calibrates its threshold.
+        predicted_malware = (
+            predicted_malware_override.bool().view(-1)
+            if isinstance(predicted_malware_override, torch.Tensor)
+            else probability >= float(classification_threshold)
+        )
+        return torch.where(
+            predicted_malware,
+            torch.ones_like(probability),
+            1.0 - probability,
+        ).clamp(0.0, 1.0)
     if score_type == "evidential_certainty":
         uncertainty = extra.get("fused_uncertainty")
         if not isinstance(uncertainty, torch.Tensor):
@@ -5285,6 +6264,9 @@ def evaluate_checkpoint_selection(
     branch_probability_batches: dict[str, list[torch.Tensor]] = {
         branch: [] for branch in BRANCH_EVAL_LOGIT_KEYS
     }
+    branch_alive_batches: dict[str, list[torch.Tensor]] = {
+        branch: [] for branch in BRANCH_EVAL_LOGIT_KEYS
+    }
     branch_outputs_available = {
         branch: True for branch in BRANCH_EVAL_LOGIT_KEYS
     }
@@ -5307,11 +6289,54 @@ def evaluate_checkpoint_selection(
             if not isinstance(branch_logits, torch.Tensor):
                 branch_outputs_available[branch] = False
                 branch_probability_batches[branch].clear()
+                branch_alive_batches[branch].clear()
                 continue
             if branch_outputs_available[branch]:
                 branch_probability_batches[branch].append(
                     torch.softmax(branch_logits.float(), dim=-1)[:, 1]
                 )
+                expert_alive = extra.get("expert_alive")
+                raw_alive = (
+                    expert_alive.get(branch)
+                    if isinstance(expert_alive, dict)
+                    else extra.get(f"{branch}_alive")
+                )
+                if isinstance(raw_alive, torch.Tensor):
+                    flat_alive = raw_alive.detach().view(-1)
+                    if flat_alive.numel() != labels.numel():
+                        raise RuntimeError(
+                            "Checkpoint-selection "
+                            f"{branch} availability disagrees with labels"
+                        )
+                    if flat_alive.is_floating_point():
+                        valid_alive = (
+                            torch.isfinite(flat_alive)
+                            & (
+                                (flat_alive == 0.0)
+                                | (flat_alive == 1.0)
+                            )
+                        ).all()
+                    else:
+                        valid_alive = (
+                            (flat_alive == 0) | (flat_alive == 1)
+                        ).all()
+                    if not bool(valid_alive.detach().cpu().item()):
+                        raise RuntimeError(
+                            "Checkpoint-selection "
+                            f"{branch} availability must be hard binary"
+                        )
+                    alive_mask = flat_alive.bool()
+                else:
+                    # Comparison models without an explicit branch
+                    # availability export are evaluated on their full branch
+                    # population. The anchored model always takes the exact
+                    # expert_alive path above.
+                    alive_mask = torch.ones(
+                        labels.numel(),
+                        dtype=torch.bool,
+                        device=labels.device,
+                    )
+                branch_alive_batches[branch].append(alive_mask)
         label_batches.append(labels.long().view(-1))
 
     if not label_batches:
@@ -5338,21 +6363,59 @@ def evaluate_checkpoint_selection(
     metrics = _metrics(labels_cpu, probabilities_cpu, predictions_cpu)
     branch_metrics: dict[str, dict[str, Any]] = {}
     for branch, batches in branch_probability_batches.items():
-        if not branch_outputs_available[branch] or len(batches) != len(label_batches):
+        alive_batches = branch_alive_batches[branch]
+        if (
+            not branch_outputs_available[branch]
+            or len(batches) != len(label_batches)
+            or len(alive_batches) != len(label_batches)
+        ):
             continue
-        branch_probabilities = torch.cat(batches, dim=0).cpu()
+        branch_probabilities = torch.cat(batches, dim=0)
+        branch_alive = torch.cat(alive_batches, dim=0).bool()
         if branch_probabilities.numel() != labels.numel():
             raise RuntimeError(
                 f"Checkpoint-selection {branch} branch rows disagree with labels"
             )
-        branch_probs_cpu = [float(value) for value in branch_probabilities.tolist()]
+        if branch_alive.numel() != labels.numel():
+            raise RuntimeError(
+                f"Checkpoint-selection {branch} availability rows disagree "
+                "with labels"
+            )
+        eligible_count = int(branch_alive.sum().detach().cpu().item())
+        branch_probabilities = branch_probabilities[branch_alive].cpu()
+        branch_labels = labels[branch_alive].cpu()
+        branch_probs_cpu = [
+            float(value) for value in branch_probabilities.tolist()
+        ]
+        branch_labels_cpu = [
+            int(value) for value in branch_labels.tolist()
+        ]
         branch_preds_cpu = [int(value >= 0.5) for value in branch_probs_cpu]
-        current = _metrics(labels_cpu, branch_probs_cpu, branch_preds_cpu)
+        current = _metrics(
+            branch_labels_cpu,
+            branch_probs_cpu,
+            branch_preds_cpu,
+        )
+        current["num_eval"] = eligible_count
+        current["num_total"] = int(labels.numel())
+        current["eligible_fraction"] = float(
+            eligible_count / max(int(labels.numel()), 1)
+        )
         branch_metrics[branch] = current
         for key in ("macro_f1", "f1", "auc", "acc"):
             metrics[f"{branch}_{key}"] = current[key]
+        metrics[f"{branch}_num_eval"] = current["num_eval"]
+        metrics[f"{branch}_eligible_fraction"] = current[
+            "eligible_fraction"
+        ]
     if branch_metrics:
         metrics["branch_metrics"] = branch_metrics
+    if "joint" in branch_metrics:
+        # Full-population Stage-A deployment is the Joint anchor where Joint
+        # is eligible and the explicit alive-uniform atomic fallback
+        # otherwise. Keep it distinct from the pure-Joint eligible subset.
+        metrics["joint_anchor_macro_f1"] = metrics["macro_f1"]
+        metrics["joint_anchor_num_eval"] = int(labels.numel())
     metrics["num_failed"] = int(num_failed)
     metrics["num_eval"] = int(len(labels_cpu))
     return metrics
@@ -5451,6 +6514,7 @@ def evaluate(
                         "fusion_weight_api",
                         "fusion_weight_graph",
                         "fusion_weight_manifest",
+                        "fusion_weight_joint",
                     }:
                         fusion_weight_square_sums[key] = (
                             fusion_weight_square_sums.get(key, 0.0)
@@ -5512,6 +6576,7 @@ def evaluate(
                 # diagnostic. Keep the experiment-selected score under the
                 # canonical column used for threshold fitting and subset cuts.
                 row["acceptance_score"] = acceptance_i
+                row["fn_risk_score"] = float(1.0 - acceptance_i)
                 row["selective_eligible"] = int(selective_eligible_i)
                 row["selective_score_type"] = str(selective_score_type)
                 if selective_threshold is not None:
@@ -5961,6 +7026,9 @@ def fit_posthoc_calibration(
             "calibration.enabled=true requires model fusion_mode=discount_probability"
         )
     discount_fusion = getattr(model, "discount_fusion", None)
+    api_observed_support_required = bool(
+        getattr(discount_fusion, "use_api_observed_support", False)
+    )
     parameters = list(model.calibration_parameters())
     final_temperature_parameters = (
         list(discount_fusion.final_temperature_parameters())
@@ -6180,37 +7248,61 @@ def fit_posthoc_calibration(
                 with get_amp_context(device, use_amp):
                     _logits, extra = model(graph)
                 availability = extra.get("fusion_availability")
+                api_observed_support = extra.get("api_observed_support")
                 branch_logits = {
                     name: extra.get(f"{name}_logits_aux")
                     for name in ("api", "graph", "manifest")
                 }
-                if not isinstance(availability, torch.Tensor) or any(
-                    not isinstance(value, torch.Tensor) for value in branch_logits.values()
+                if (
+                    not isinstance(availability, torch.Tensor)
+                    or (
+                        api_observed_support_required
+                        and not isinstance(
+                            api_observed_support, torch.Tensor
+                        )
+                    )
+                    or any(
+                        not isinstance(value, torch.Tensor)
+                        for value in branch_logits.values()
+                    )
                 ):
                     raise RuntimeError(
                         "Post-hoc calibration cache requires the alive-mask "
-                        "carrier and all branch logits"
+                        "carrier, current-view API support, and all branch logits"
                     )
-                cached_batches.append(
-                    {
-                        "labels": labels.detach(),
-                        "availability": availability.detach().float(),
-                        "loader_index": int(loader_index),
-                        "scenario_name": source["name"],
-                        "scenario_group": source["scenario_group"],
-                        "objective_family": source["objective_family"],
-                        "perturb_type": source["perturb_type"],
-                        "strength": source["strength"],
-                        "reliability_branches": source["reliability_branches"],
-                        "sample_ids": sample_ids,
-                        "sample_groups": sample_groups,
-                        "group_source": group_source,
-                        "branch_logits": {
-                            name: value.detach().float()
-                            for name, value in branch_logits.items()
-                        },
-                    }
-                )
+                if (
+                    isinstance(api_observed_support, torch.Tensor)
+                    and tuple(api_observed_support.shape) != (batch_size,)
+                ):
+                    raise RuntimeError(
+                        "Post-hoc calibration cache expected "
+                        f"api_observed_support [{batch_size}], got "
+                        f"{tuple(api_observed_support.shape)}"
+                    )
+                cached_item = {
+                    "labels": labels.detach(),
+                    "availability": availability.detach().float(),
+                    "loader_index": int(loader_index),
+                    "scenario_name": source["name"],
+                    "scenario_group": source["scenario_group"],
+                    "objective_family": source["objective_family"],
+                    "perturb_type": source["perturb_type"],
+                    "strength": source["strength"],
+                    "reliability_branches": source["reliability_branches"],
+                    "sample_ids": sample_ids,
+                    "sample_groups": sample_groups,
+                    "group_source": group_source,
+                    "branch_logits": {
+                        name: value.detach().float()
+                        for name, value in branch_logits.items()
+                    },
+                }
+                if api_observed_support_required:
+                    assert isinstance(api_observed_support, torch.Tensor)
+                    cached_item["api_observed_support"] = (
+                        api_observed_support.detach().float()
+                    )
+                cached_batches.append(cached_item)
     for loader_index, source in enumerate(calibration_sources):
         source_failed = source_failed_counts[loader_index]
         if source_failed:
@@ -6264,6 +7356,14 @@ def fit_posthoc_calibration(
                 },
             }
         )
+        if api_observed_support_required:
+            merged_cached_batches[-1]["api_observed_support"] = torch.cat(
+                [
+                    item["api_observed_support"]
+                    for item in source_batches
+                ],
+                dim=0,
+            )
     cached_batches = merged_cached_batches
     cache_wall_time_seconds = float(time.perf_counter() - cache_started_at)
     logger.info(
@@ -6375,7 +7475,8 @@ def fit_posthoc_calibration(
     if not full_clean_cached:
         raise RuntimeError("Post-hoc calibration requires clean samples")
 
-    # I1 consumes only intrinsic branch opinion state plus the hard alive mask.
+    # I1 consumes branch-local current model state plus the hard alive mask;
+    # API may additionally consume current encoder-visible event support.
     # No extraction-quality, coverage, or validation-global reference is
     # exposed to any outer holdout.
 
@@ -6495,6 +7596,15 @@ def fit_posthoc_calibration(
     ) -> dict[str, torch.Tensor]:
         branch_logits = cached["branch_logits"]
         availability = cached["availability"]
+        api_observed_support = cached.get("api_observed_support")
+        if (
+            api_observed_support_required
+            and not isinstance(api_observed_support, torch.Tensor)
+        ):
+            raise RuntimeError(
+                "cached calibration item is missing current-view "
+                "api_observed_support"
+            )
         reliability_override = (
             cached.get(reliability_key) if reliability_key is not None else None
         )
@@ -6512,6 +7622,11 @@ def fit_posthoc_calibration(
             override_kwargs["reliability_override"] = reliability_override
         if isinstance(route_override, torch.Tensor):
             override_kwargs["branch_distribution_override"] = route_override
+        if api_observed_support_required:
+            assert isinstance(api_observed_support, torch.Tensor)
+            override_kwargs[
+                "api_observed_support"
+            ] = api_observed_support
         outputs = model.discount_fusion(
             branch_logits["api"],
             branch_logits["graph"],
@@ -6567,6 +7682,11 @@ def fit_posthoc_calibration(
                     for name in ("api", "graph", "manifest")
                 },
             }
+            if api_observed_support_required:
+                packed["api_observed_support"] = torch.cat(
+                    [item["api_observed_support"] for item in items],
+                    dim=0,
+                )
             for key in (reliability_key, route_key):
                 if key is None:
                     continue
@@ -6778,8 +7898,15 @@ def fit_posthoc_calibration(
         stable_steps = 0
         converged = False
         stop_reason = "max_steps"
+        plateau_detected = False
         max_grad_norm = 0.0
         final_grad_inf_norm = float("inf")
+        current_parameter_step_inf_norm = float("inf")
+        parameter_step_tolerance = float("nan")
+        parameter_stagnation_certified = False
+        previous_evaluated_parameters = [
+            value.clone() for value in initial_parameters
+        ]
         function_evaluations = 0
         decision_forward_evaluations = 0
         lightweight_forward_evaluations = 0
@@ -6876,6 +8003,24 @@ def fit_posthoc_calibration(
 
         for step in range(0, optimization["max_steps"] + 1):
             optimizer.zero_grad(set_to_none=True)
+            parameter_scale = 1.0
+            current_parameter_step_inf_norm = 0.0
+            for parameter, previous_value in zip(
+                stage_parameters, previous_evaluated_parameters
+            ):
+                current = parameter.detach()
+                if current.numel():
+                    parameter_scale = max(
+                        parameter_scale,
+                        float(current.abs().max().item()),
+                    )
+                    current_parameter_step_inf_norm = max(
+                        current_parameter_step_inf_norm,
+                        float((current - previous_value).abs().max().item()),
+                    )
+            parameter_step_tolerance = (
+                optimization["convergence_tolerance"] * parameter_scale
+            )
             loss = _objective()
             function_evaluations += 1
             step_loss = float(loss.detach().item())
@@ -6897,21 +8042,40 @@ def fit_posthoc_calibration(
                     else 0
                 )
                 if stable_steps >= optimization["convergence_patience"]:
-                    converged = True
-                    stop_reason = "objective_plateau"
-            if optimization["optimizer"] == "adam":
-                # Evaluate convergence with the gradient at the current
-                # parameters. Reusing the previous pre-update gradient is
-                # stale under Adam momentum and can stop one iterate early.
+                    plateau_detected = True
+
+            # Adam needs the current gradient for its update. Strict LBFGS
+            # stages additionally need it as a stationarity certificate; a
+            # closure gradient can describe a strong-Wolfe trial rather than
+            # the accepted iterate. Non-strict LBFGS stages retain the cheaper
+            # plateau heuristic and are audited once at the restored state.
+            needs_current_gradient = (
+                optimization["optimizer"] == "adam"
+                or optimization["require_convergence"]
+            )
+            if needs_current_gradient:
                 loss.backward()
                 grad_norm_value, final_grad_inf_norm = _raw_gradient_norms()
                 max_grad_norm = max(max_grad_norm, grad_norm_value)
-            if (
-                step >= optimization["min_steps"]
-                and final_grad_inf_norm <= optimization["gradient_tolerance"]
-            ):
-                converged = True
-                stop_reason = "gradient_tolerance"
+            else:
+                final_grad_inf_norm = float("inf")
+            if step >= optimization["min_steps"]:
+                parameter_stagnation = bool(
+                    plateau_detected
+                    and current_parameter_step_inf_norm
+                    <= parameter_step_tolerance
+                )
+                converged, stop_reason = _resolve_provisional_stage_stop(
+                    require_convergence=optimization["require_convergence"],
+                    plateau_detected=plateau_detected,
+                    parameter_stagnation=parameter_stagnation,
+                    current_grad_inf_norm=final_grad_inf_norm,
+                    gradient_tolerance=optimization["gradient_tolerance"],
+                )
+                parameter_stagnation_certified = bool(
+                    stop_reason == "parameter_tolerance"
+                    and parameter_stagnation
+                )
             if (
                 step == 0
                 or step % optimization["log_every"] == 0
@@ -6929,6 +8093,9 @@ def fit_posthoc_calibration(
             if converged or step == optimization["max_steps"]:
                 break
 
+            previous_evaluated_parameters = [
+                parameter.detach().clone() for parameter in stage_parameters
+            ]
             if optimization["optimizer"] == "adam":
                 torch.nn.utils.clip_grad_norm_(
                     stage_parameters, optimization["grad_clip"]
@@ -6937,6 +8104,8 @@ def fit_posthoc_calibration(
                 assert scheduler is not None
                 scheduler.step(step_loss)
             else:
+                # The LBFGS closure owns the gradients used for its update.
+                optimizer.zero_grad(set_to_none=True)
                 closure_evaluations = 0
 
                 def _closure() -> torch.Tensor:
@@ -6982,12 +8151,12 @@ def fit_posthoc_calibration(
         optimizer.zero_grad(set_to_none=True)
 
         provisional_stop_reason = stop_reason
-        plateau_detected = provisional_stop_reason == "objective_plateau"
 
         converged, stop_reason = _resolve_restored_stage_convergence(
             provisional_stop_reason=provisional_stop_reason,
             final_grad_inf_norm=final_grad_inf_norm,
             gradient_tolerance=optimization["gradient_tolerance"],
+            parameter_stagnation_certified=parameter_stagnation_certified,
         )
 
         stopped_early = total_steps < optimization["max_steps"]
@@ -7020,6 +8189,11 @@ def fit_posthoc_calibration(
                 f"final_stop_reason={stop_reason}, "
                 f"final_grad_inf_norm={final_grad_inf_norm:.6g}, "
                 f"gradient_tolerance={optimization['gradient_tolerance']:.6g}, "
+                "final_parameter_step_inf_norm="
+                f"{current_parameter_step_inf_norm:.6g}, "
+                f"parameter_step_tolerance={parameter_step_tolerance:.6g}, "
+                "parameter_stagnation_certified="
+                f"{parameter_stagnation_certified}, "
                 f"best_loss={best_loss:.9g}, "
                 f"total_steps={total_steps}, "
                 f"max_steps={optimization['max_steps']}"
@@ -7041,7 +8215,21 @@ def fit_posthoc_calibration(
             "best_epoch": best_step,
             "stopped_early": bool(stopped_early),
             "plateau_detected": bool(plateau_detected),
-            "restored_gradient_converged": bool(converged),
+            "parameter_stagnation_certified": bool(
+                parameter_stagnation_certified
+            ),
+            "final_parameter_step_inf_norm": float(
+                current_parameter_step_inf_norm
+            ),
+            "parameter_step_tolerance": float(parameter_step_tolerance),
+            "restored_gradient_converged": bool(
+                math.isfinite(final_grad_inf_norm)
+                and final_grad_inf_norm
+                <= optimization["gradient_tolerance"]
+            ),
+            "restored_parameter_stagnation_converged": bool(
+                parameter_stagnation_certified
+            ),
             "provisional_stop_reason": provisional_stop_reason,
             "converged": bool(converged),
             "stop_reason": stop_reason,
@@ -7416,13 +8604,27 @@ def fit_posthoc_calibration(
                     "I1 feature precomputation is missing calibrator outputs: "
                     f"{missing}"
                 )
+            feature_layout = reliability_feature_layout(
+                use_api_observed_support=bool(
+                    getattr(
+                        discount_fusion,
+                        "use_api_observed_support",
+                        False,
+                    )
+                )
+            )
             for branch in reliability_branches:
                 features = packed_outputs[f"reliability_features_{branch}"]
                 alive = packed_outputs[f"alive_{branch}"]
-                if tuple(features.shape) != (total_rows, 3):
+                expected_width = len(feature_layout[branch])
+                if tuple(features.shape) != (
+                    total_rows,
+                    expected_width,
+                ):
                     raise RuntimeError(
                         f"I1 reliability_features_{branch} must have shape "
-                        f"[{total_rows}, 3], got {tuple(features.shape)}"
+                        f"[{total_rows}, {expected_width}], got "
+                        f"{tuple(features.shape)}"
                     )
                 if alive.numel() != total_rows:
                     raise RuntimeError(
@@ -7956,14 +9158,16 @@ def fit_posthoc_calibration(
     def _risk_objective(
         reliability_key: str | None,
         route_key: str | None,
+        classification_threshold_by_fold: dict[int, float] | None = None,
     ):
-        # With OOF reliability and route fixed, I2's three risk features are
-        # immutable.  Materialize them once for the complete stage and optimize
-        # only the monotone logistic head thereafter.  The previous path rebuilt
-        # opinions, routing and diagnostics on every one of the hundreds of risk
-        # optimizer steps even though none of those tensors depended on the risk
-        # parameters. Source-normalized masks are likewise compiled once, so
-        # the learned head is evaluated exactly once over the packed stage.
+        # With OOF reliability, route, and fold-excluded classifier cutoffs
+        # fixed, I2's three risk features are immutable. Materialize them once
+        # for the complete stage and optimize only the monotone logistic head
+        # thereafter. The previous path rebuilt opinions, routing and
+        # diagnostics on every one of the hundreds of risk optimizer steps even
+        # though none of those tensors depended on the risk parameters.
+        # Source-normalized masks are likewise compiled once, so the learned
+        # head is evaluated exactly once over the packed stage.
         risk_options = risk_cfg.get("routing", {}) or {}
         risk_objective_weight = float(risk_options.get("risk_loss_weight", 1.0))
         risk_effective_l2 = float(risk_options.get("risk_effective_l2", 0.0))
@@ -7973,6 +9177,25 @@ def fit_posthoc_calibration(
         ):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"fusion.routing.{name} must be finite and non-negative")
+        normalized_threshold_by_fold: dict[int, float] | None = None
+        if classification_threshold_by_fold is not None:
+            normalized_threshold_by_fold = {}
+            for raw_fold, raw_threshold in classification_threshold_by_fold.items():
+                fold = int(raw_fold)
+                threshold = float(raw_threshold)
+                if fold in normalized_threshold_by_fold:
+                    raise ValueError(
+                        f"Duplicate risk-training cutoff for fold {fold}"
+                    )
+                if not math.isfinite(threshold):
+                    raise ValueError(
+                        f"Risk-training cutoff for fold {fold} must be finite"
+                    )
+                normalized_threshold_by_fold[fold] = threshold
+            if not normalized_threshold_by_fold:
+                raise ValueError(
+                    "Fold-excluded risk fitting requires per-fold cutoffs"
+                )
 
         static_inputs: dict[str, Any] = {}
         static_item_signature: tuple[int, ...] | None = None
@@ -8025,6 +9248,51 @@ def fit_posthoc_calibration(
                     f"{missing}"
                 )
             labels = selection["packed"]["labels"].detach().long().view(-1)
+            boundary_proximity = packed_outputs[
+                "routing_risk_decision_boundary_proximity"
+            ].view(-1)
+            threshold_by_row: torch.Tensor | None = None
+            if normalized_threshold_by_fold is not None:
+                packed_fold_ids = torch.cat(
+                    [
+                        item["fold_ids"].detach().long().view(-1)
+                        for item in all_items
+                    ],
+                    dim=0,
+                )
+                if packed_fold_ids.numel() != labels.numel():
+                    raise RuntimeError(
+                        "Packed fold IDs disagree with risk-training rows"
+                    )
+                fold_values = packed_fold_ids.detach().cpu().tolist()
+                missing_folds = sorted(
+                    {
+                        int(fold)
+                        for fold in fold_values
+                        if int(fold) not in normalized_threshold_by_fold
+                    }
+                )
+                if missing_folds:
+                    raise RuntimeError(
+                        "Risk-training rows have no fold-excluded cutoff for "
+                        f"folds {missing_folds}"
+                    )
+                raw_log_prob = packed_outputs[
+                    "uncalibrated_final_log_prob"
+                ]
+                threshold_by_row = torch.tensor(
+                    [
+                        normalized_threshold_by_fold[int(fold)]
+                        for fold in fold_values
+                    ],
+                    device=raw_log_prob.device,
+                    dtype=raw_log_prob.dtype,
+                )
+                _, boundary_proximity = threshold_aligned_fn_risk_state(
+                    raw_log_prob.detach()[:, 1]
+                    - raw_log_prob.detach()[:, 0],
+                    threshold_by_row,
+                )
             (
                 error_target,
                 risk_valid,
@@ -8034,6 +9302,7 @@ def fit_posthoc_calibration(
                 packed_outputs,
                 labels,
                 risk_options,
+                classification_log_odds_threshold_by_row=threshold_by_row,
             )
             source_masses = _compile_posthoc_source_masses(
                 objective_groups,
@@ -8043,7 +9312,15 @@ def fit_posthoc_calibration(
             static_inputs.update(
                 {
                     "features": torch.stack(
-                        [packed_outputs[key].view(-1) for key in feature_keys],
+                        [
+                            packed_outputs[
+                                "routing_risk_reliability_deficit"
+                            ].view(-1),
+                            boundary_proximity.view(-1),
+                            packed_outputs[
+                                "routing_risk_global_cross_modal_conflict"
+                            ].view(-1),
+                        ],
                         dim=-1,
                     ).detach(),
                     "error_target": error_target,
@@ -8129,7 +9406,19 @@ def fit_posthoc_calibration(
             metadata: dict[str, Any] = {
                 "risk_effective_l2": risk_effective_l2,
                 "risk_target": static_inputs.get("risk_target_type"),
+                "classification_cutoff_training_mode": (
+                    "fold_excluded_upstream_oof_clean"
+                    if normalized_threshold_by_fold is not None
+                    else "single_deployment_cutoff"
+                ),
             }
+            if normalized_threshold_by_fold is not None:
+                metadata["classification_log_odds_threshold_by_fold"] = {
+                    str(int(fold)): float(threshold)
+                    for fold, threshold in sorted(
+                        normalized_threshold_by_fold.items()
+                    )
+                }
             risk_logit = static_inputs.get("last_risk_logit")
             if isinstance(risk_logit, torch.Tensor):
                 probability = torch.sigmoid(risk_logit.detach().float())
@@ -8509,9 +9798,21 @@ def fit_posthoc_calibration(
         *,
         reliability_key: str | None,
         route_key: str | None,
-        raw_threshold: float,
+        raw_threshold_by_fold: dict[int, float],
+        cutoff_mode: str,
     ) -> dict[str, Any]:
-        """Audit whether threshold-aligned FN risk has identifiable labels."""
+        """Audit labels under the same fold-excluded cutoffs used for I2."""
+        normalized_thresholds = {
+            int(fold): float(threshold)
+            for fold, threshold in raw_threshold_by_fold.items()
+        }
+        if not normalized_thresholds or any(
+            not math.isfinite(threshold)
+            for threshold in normalized_thresholds.values()
+        ):
+            raise ValueError(
+                "Threshold-FN support requires finite per-fold cutoffs"
+            )
         scenario_stats: dict[str, dict[str, Any]] = {}
         with torch.no_grad():
             for cached in items:
@@ -8530,10 +9831,38 @@ def fit_posthoc_calibration(
                         "and routing_has_available"
                     )
                 labels = cached["labels"].detach().long().view(-1)
+                fold_ids = cached.get("fold_ids")
+                if not isinstance(fold_ids, torch.Tensor) or (
+                    fold_ids.numel() != labels.numel()
+                ):
+                    raise RuntimeError(
+                        "Threshold-FN support requires one fold ID per row"
+                    )
+                fold_values = fold_ids.detach().long().view(-1).cpu().tolist()
+                missing_folds = sorted(
+                    {
+                        int(fold)
+                        for fold in fold_values
+                        if int(fold) not in normalized_thresholds
+                    }
+                )
+                if missing_folds:
+                    raise RuntimeError(
+                        "Threshold-FN support has no cutoff for folds "
+                        f"{missing_folds}"
+                    )
+                row_thresholds = torch.tensor(
+                    [
+                        normalized_thresholds[int(fold)]
+                        for fold in fold_values
+                    ],
+                    device=raw_log_prob.device,
+                    dtype=raw_log_prob.dtype,
+                )
                 predicted_benign = (
                     raw_log_prob.detach()[:, 1]
                     - raw_log_prob.detach()[:, 0]
-                    < float(raw_threshold)
+                    < row_thresholds
                 )
                 valid = available.detach().view(-1).bool() & predicted_benign
                 positive = valid & labels.eq(1)
@@ -8652,6 +9981,11 @@ def fit_posthoc_calibration(
                         )
         result = {
             "enabled": enabled,
+            "classification_cutoff_training_mode": str(cutoff_mode),
+            "classification_log_odds_threshold_by_fold": {
+                str(int(fold)): float(threshold)
+                for fold, threshold in sorted(normalized_thresholds.items())
+            },
             "minima": minima,
             "scenario_objective_weights": dict(routing_scenario_weights),
             "families": aggregates,
@@ -8685,6 +10019,7 @@ def fit_posthoc_calibration(
         "classification_threshold_source": None,
     }
     oof_clean_rows: list[dict[str, Any]] = []
+    risk_training_threshold_by_fold: dict[int, float] | None = None
     cross_fit_summary: dict[str, Any] = {
         **cross_fitting,
         "outer_folds": [],
@@ -9057,12 +10392,50 @@ def fit_posthoc_calibration(
                         else None
                     ),
                 )
+                oof_clean_rows_by_fold: dict[int, list[dict[str, Any]]] = {
+                    int(fold): [] for fold in all_folds
+                }
+                for row in oof_clean_rows:
+                    group = str(row["group"])
+                    if group not in group_to_fold:
+                        raise RuntimeError(
+                            "OOF threshold row has no cross-fitting fold for "
+                            f"package group {group!r}"
+                        )
+                    oof_clean_rows_by_fold[
+                        int(group_to_fold[group])
+                    ].append(row)
+                empty_threshold_folds = [
+                    fold
+                    for fold, rows in sorted(oof_clean_rows_by_fold.items())
+                    if not rows
+                ]
+                if empty_threshold_folds:
+                    raise RuntimeError(
+                        "Fold-excluded I2 cutoff fitting has empty clean folds: "
+                        f"{empty_threshold_folds}"
+                    )
                 classification_enabled_for_risk = bool(
                     (cfg.get("classification_threshold", {}) or {}).get(
                         "enabled", False
                     )
                 )
                 if classification_enabled_for_risk:
+                    fold_excluded_thresholds = (
+                        fit_fold_excluded_oof_classification_thresholds(
+                            oof_clean_rows_by_fold,
+                            cfg.get("classification_threshold", {}) or {},
+                            # The raw cutoff alone defines each fold's target
+                            # and boundary feature.
+                            deployment_temperature=1.0,
+                        )
+                    )
+                    risk_training_threshold_by_fold = {
+                        int(fold): float(threshold)
+                        for fold, threshold in dict(
+                            fold_excluded_thresholds["threshold_by_fold"]
+                        ).items()
+                    }
                     threshold_for_risk = (
                         fit_oof_malware_classification_threshold(
                             oof_clean_rows,
@@ -9096,6 +10469,49 @@ def fit_posthoc_calibration(
                     threshold_source = "protocol_neutral_fixed_0_5"
                     threshold_macro_f1 = None
                     threshold_malware_recall = None
+                    risk_training_threshold_by_fold = {
+                        int(fold): 0.0 for fold in all_folds
+                    }
+                    fold_excluded_thresholds = {
+                        "mode": (
+                            "fold_excluded_protocol_neutral_fixed_0_5"
+                        ),
+                        "num_folds": int(len(all_folds)),
+                        "threshold_by_fold": dict(
+                            risk_training_threshold_by_fold
+                        ),
+                        "folds": [
+                            {
+                                "held_out_fold": int(held_out_fold),
+                                "fit_folds": [
+                                    int(fold)
+                                    for fold in all_folds
+                                    if fold != held_out_fold
+                                ],
+                                "prediction_source": (
+                                    "protocol_neutral_fixed_0_5"
+                                ),
+                                "num_fit_rows": int(
+                                    sum(
+                                        len(rows)
+                                        for fold, rows in (
+                                            oof_clean_rows_by_fold.items()
+                                        )
+                                        if fold != held_out_fold
+                                    )
+                                ),
+                                "num_held_out_rows": int(
+                                    len(
+                                        oof_clean_rows_by_fold[
+                                            held_out_fold
+                                        ]
+                                    )
+                                ),
+                                "raw_log_odds_threshold": 0.0,
+                            }
+                            for held_out_fold in all_folds
+                        ],
+                    }
                 risk_cfg["routing"][
                     "classification_log_odds_threshold"
                 ] = raw_threshold
@@ -9106,10 +10522,26 @@ def fit_posthoc_calibration(
                     {
                         "classification_threshold_source": threshold_source,
                         "raw_log_odds_threshold": raw_threshold,
+                        "deployment_classification_threshold_source": (
+                            threshold_source
+                        ),
+                        "deployment_raw_log_odds_threshold": raw_threshold,
                         "num_threshold_rows": int(len(oof_clean_rows)),
                         "threshold_macro_f1": threshold_macro_f1,
                         "threshold_malware_recall": (
                             threshold_malware_recall
+                        ),
+                        "risk_training_cutoff_mode": (
+                            fold_excluded_thresholds["mode"]
+                        ),
+                        "risk_training_raw_log_odds_threshold_by_fold": {
+                            str(int(fold)): float(threshold)
+                            for fold, threshold in sorted(
+                                risk_training_threshold_by_fold.items()
+                            )
+                        },
+                        "risk_training_cutoff_provenance": (
+                            fold_excluded_thresholds["folds"]
                         ),
                     }
                 )
@@ -9125,7 +10557,12 @@ def fit_posthoc_calibration(
                                 if uses_routed_output
                                 else None
                             ),
-                            raw_threshold=raw_threshold,
+                            raw_threshold_by_fold=(
+                                risk_training_threshold_by_fold
+                            ),
+                            cutoff_mode=str(
+                                fold_excluded_thresholds["mode"]
+                            ),
                         )
                     )
 
@@ -9164,6 +10601,7 @@ def fit_posthoc_calibration(
                     _risk_objective(
                         "oof_reliability" if has_reliability else None,
                         "oof_route_distribution" if uses_routed_output else None,
+                        risk_training_threshold_by_fold,
                     ),
                     config_stage_name="routing_risk",
                     global_objective=True,
@@ -9417,6 +10855,14 @@ def fit_posthoc_calibration(
             name: float(reliability_temperature(name).detach().cpu().item())
             for name in reliability_branches
         }
+    final_i1_parameter_details: dict[str, Any] = {}
+    final_i1_detail_builder = getattr(
+        reliability_calibrator,
+        "effective_parameter_details",
+        None,
+    )
+    if callable(final_i1_detail_builder):
+        final_i1_parameter_details = final_i1_detail_builder()
     full_clean_sample_count = int(
         sum(item["labels"].numel() for item in full_clean_cached)
     )
@@ -9448,7 +10894,7 @@ def fit_posthoc_calibration(
     )
     return {
         "enabled": True,
-        "i2_diagnostics_schema_version": 2,
+        "i2_diagnostics_schema_version": 3,
         "strategy": (
             "identity_grouped_nested_crossfit_staged_refit"
             if cross_fitting["enabled"]
@@ -9465,6 +10911,7 @@ def fit_posthoc_calibration(
             i1_scenario_weights
         ),
         "reliability_temperatures": reliability_temperatures,
+        "final_i1_parameter_details": final_i1_parameter_details,
         "posthoc_fit_perturbations": [
             str(value).strip().lower()
             for value in (calibration_cfg.get("fit_perturbations") or [])
@@ -9880,10 +11327,13 @@ _METHOD_IMPLEMENTATION_FILES = (
     "quality.py",
     "reliability_calibration.py",
     "temperature.py",
+    "thresholds.py",
     "semantic_categories.py",
     "evidential.py",
     "opinion_router.py",
     "discount_fusion.py",
+    "competence_fusion.py",
+    "anchored_training.py",
     "model.py",
     "losses.py",
     "train.py",
@@ -9984,6 +11434,171 @@ def build_run_identity(cfg: dict, experiment_name: str, seed: int) -> dict[str, 
     selective_cfg = normalized.get("selective_prediction", {}) or {}
     classification_cfg = normalized.get("classification_threshold", {}) or {}
     loss_cfg = normalized.get("loss", {}) or {}
+    model_fusion_mode = str(
+        (normalized.get("model", {}) or {}).get("fusion_mode", "")
+    ).strip().lower()
+    if model_fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES:
+        robust_eval_perturbations, robust_eval_strengths = (
+            _normalize_robust_test_protocol(eval_cfg)
+        )
+        method_cfg = normalized.get("method", {}) or {}
+        stage_b_cfg = normalized.get("stage_b", {}) or {}
+        degradation_cfg = stage_b_cfg.get("degradation", {}) or {}
+        competence_cfg = stage_b_cfg.get("competence", {}) or {}
+        router_cfg = stage_b_cfg.get("router", {}) or {}
+        stage_b_enabled = bool(stage_b_cfg.get("enabled", True))
+        selective_enabled = bool(selective_cfg.get("enabled", False))
+        selective_mode = (
+            str(selective_cfg.get("mode", "threshold")).lower()
+            if selective_enabled
+            else "disabled"
+        )
+        classification_enabled = bool(
+            classification_cfg.get("enabled", False)
+        )
+        return {
+            "method_name": str(method_cfg.get("name", experiment_name)),
+            "method_protocol_id": method_cfg.get("protocol_id"),
+            "experiment_name": str(experiment_name),
+            "seed": int(seed),
+            "resolved_config_sha256": hashlib.sha256(
+                serialized
+            ).hexdigest(),
+            "method_protocol_sha256": hashlib.sha256(
+                protocol_serialized
+            ).hexdigest(),
+            "method_implementation_sha256": _method_implementation_sha256(),
+            "model_fusion_mode": model_fusion_mode,
+            "training_objective": str(
+                loss_cfg.get("objective", "")
+            ).strip().lower(),
+            "stage_a_primary_expert": "joint",
+            "stage_a_atomic_aux_weight": float(
+                loss_cfg.get("atomic_aux_weight", 0.25)
+            ),
+            "stage_b_enabled": stage_b_enabled,
+            "stage_b_fit_population": (
+                "train_clean_plus_single_degradation"
+                if stage_b_enabled
+                else "none"
+            ),
+            "stage_b_degradation_mechanisms": [
+                str(value).strip().lower()
+                for value in (
+                    degradation_cfg.get("mechanisms")
+                    or list(GRADED_PERTURBATIONS)
+                )
+            ],
+            "stage_b_degradation_strength_interval": [
+                float(degradation_cfg.get("strength_min", 0.1)),
+                float(degradation_cfg.get("strength_max", 0.9)),
+            ],
+            "i1_target": (
+                "continuous_true_class_probability"
+                if stage_b_enabled
+                else "disabled"
+            ),
+            "i1_inputs": (
+                "detached_current_embedding_plus_softmax_probability_plus_alive"
+            ),
+            "i1_regression": str(
+                competence_cfg.get("regression", "mse")
+            ).strip().lower(),
+            "i1_ranking_weight": float(
+                competence_cfg.get("ranking_weight", 0.10)
+            ),
+            "i1_degraded_loss_weight": float(
+                competence_cfg.get("degraded_loss_weight", 0.25)
+            ),
+            "i1_clean_noninferiority_relative_tolerance": float(
+                competence_cfg.get(
+                    "clean_noninferiority_relative_tolerance", 0.01
+                )
+            ),
+            "i1_clean_noninferiority_absolute_tolerance": float(
+                competence_cfg.get(
+                    "clean_noninferiority_absolute_tolerance", 0.0
+                )
+            ),
+            "i1_early_stopping_population": (
+                "val_model_selection_clean_constrained_fixed_degradations"
+                if float(
+                    competence_cfg.get("degraded_loss_weight", 0.25)
+                )
+                > 0.0
+                else "val_model_selection_clean_only"
+            ),
+            "i2_formula": (
+                "joint_anchor_plus_competence_weighted_atomic_late_fallback"
+                if stage_b_enabled
+                else "joint_anchor_with_uniform_missing_fallback"
+            ),
+            "i2_clean_anchor_kl_weight": float(
+                router_cfg.get("clean_anchor_kl_weight", 0.10)
+            ),
+            "i2_clean_noninferiority_tolerance": float(
+                router_cfg.get("clean_noninferiority_tolerance", 0.0)
+            ),
+            "i2_degraded_source_noninferiority_tolerance": float(
+                router_cfg.get(
+                    "degraded_source_noninferiority_tolerance", 0.0
+                )
+            ),
+            "i2_minimum_robust_gain": float(
+                router_cfg.get("minimum_robust_gain", 0.0)
+            ),
+            "classification_threshold_enabled": classification_enabled,
+            "classification_threshold_objective": (
+                str(classification_cfg.get("objective", "macro_f1"))
+                if classification_enabled
+                else "disabled"
+            ),
+            "classification_threshold_selection_rule": (
+                (
+                    "per_candidate_clean_model_selection_macro_f1_v1"
+                    if stage_b_enabled
+                    else str(classification_cfg.get("selection_rule"))
+                )
+                if classification_enabled
+                else "disabled"
+            ),
+            "selective_prediction_enabled": selective_enabled,
+            "selective_prediction_mode": selective_mode,
+            "selective_score_type": (
+                _selective_score_type(selective_cfg)
+                if selective_enabled
+                else "disabled"
+            ),
+            "risk_control_level": (
+                float(selective_cfg.get("risk_level", 0.0))
+                if selective_enabled and selective_mode == "risk_control"
+                else None
+            ),
+            "risk_control_guarantee_type": (
+                "expected_crc"
+                if selective_enabled and selective_mode == "risk_control"
+                else "disabled"
+            ),
+            "risk_control_risk_target": (
+                str(selective_cfg.get("risk_target"))
+                if selective_enabled and selective_mode == "risk_control"
+                else "disabled"
+            ),
+            "risk_control_risk_denominator": (
+                "all_malware"
+                if selective_enabled and selective_mode == "risk_control"
+                else "disabled"
+            ),
+            "robust_eval_perturbations": robust_eval_perturbations,
+            "robust_eval_perturbation_strengths": robust_eval_strengths,
+            "robust_eval_expected_result_count": (
+                _robust_test_result_count(
+                    robust_eval_perturbations,
+                    robust_eval_strengths,
+                )
+            ),
+        }
+    calibration_enabled = bool(calibration_cfg.get("enabled", False))
     reliability_enabled = bool(reliability_cfg.get("enabled", False))
     reliability_method = normalize_reliability_calibration_method(
         reliability_cfg.get("method", MONOTONIC_CORRECTNESS_METHOD)
@@ -10038,6 +11653,11 @@ def build_run_identity(cfg: dict, experiment_name: str, seed: int) -> dict[str, 
     )
     routing_reliability_prior_active = bool(
         routing_enabled and use_i1_reliability
+    )
+    routing_posthoc_refinement_active = bool(
+        routing_enabled
+        and calibration_enabled
+        and routing_cfg.get("posthoc_refine", True)
     )
     auxiliary_weight_mode = resolve_auxiliary_weight_mode(loss_cfg)
     selective_enabled = bool(selective_cfg.get("enabled", False))
@@ -10103,16 +11723,8 @@ def build_run_identity(cfg: dict, experiment_name: str, seed: int) -> dict[str, 
         ),
         "routing_reliability_input_enabled": routing_reliability_prior_active,
         "routing_distribution_formula": (
-            "beta_logit_reliability_minus_nonnegative_consensus_conflict"
-            if routing_reliability_prior_active
-            and routing_mode == "learned"
-            and routing_cfg.get("route_conflict_enabled", True)
-            else "beta_logit_reliability"
+            "alive_masked_softmax_beta_logit_reliability"
             if routing_reliability_prior_active and routing_mode == "learned"
-            else "negative_nonnegative_consensus_conflict"
-            if routing_enabled
-            and routing_mode == "learned"
-            and routing_cfg.get("route_conflict_enabled", True)
             else f"fixed_odds_prior_beta_{routing_fixed_prior_beta:g}"
             if routing_reliability_prior_active and routing_mode == "prior_only"
             else "alive_masked_uniform"
@@ -10120,23 +11732,6 @@ def build_run_identity(cfg: dict, experiment_name: str, seed: int) -> dict[str, 
             else "disabled"
         ),
         "routing_free_residual_enabled": False,
-        "routing_route_conflict_enabled": bool(
-            routing_enabled
-            and routing_mode == "learned"
-            and routing_cfg.get("route_conflict_enabled", True)
-        ),
-        "routing_route_conflict_metric": (
-            "reliability_weighted_leave_one_out_normalized_js_v1"
-            if routing_enabled
-            and routing_mode == "learned"
-            and routing_cfg.get("route_conflict_enabled", True)
-            and use_i1_reliability
-            else "alive_uniform_leave_one_out_normalized_js_v1"
-            if routing_enabled
-            and routing_mode == "learned"
-            and routing_cfg.get("route_conflict_enabled", True)
-            else "disabled"
-        ),
         "routing_risk_conflict_enabled": bool(
             routing_enabled
             and routing_risk_mode == "learned"
@@ -10195,11 +11790,14 @@ def build_run_identity(cfg: dict, experiment_name: str, seed: int) -> dict[str, 
             else None
         ),
         "routing_posthoc_distribution_loss_enabled": bool(
-            routing_enabled
+            routing_posthoc_refinement_active
+            and routing_mode == "learned"
+            and use_i1_reliability
+            and reliability_enabled
             and routing_prediction_loss_weight > 0.0
         ),
         "routing_posthoc_risk_loss_enabled": bool(
-            routing_enabled
+            routing_posthoc_refinement_active
             and routing_risk_mode == "learned"
             and routing_risk_loss_weight > 0.0
         ),
@@ -10220,7 +11818,14 @@ def build_run_identity(cfg: dict, experiment_name: str, seed: int) -> dict[str, 
             (
                 "per_branch_scalar_temperature_max_softmax"
                 if reliability_method == TEMPERATURE_SCALING_CONFIDENCE_METHOD
-                else "per_branch_monotonic_logistic_correctness"
+                else (
+                    "per_branch_monotonic_logistic_correctness_"
+                    "with_api_current_view_support"
+                    if reliability_cfg.get(
+                        "use_api_observed_support", False
+                    )
+                    else "per_branch_monotonic_logistic_correctness"
+                )
             )
             if reliability_enabled
             else "disabled"
@@ -10269,9 +11874,7 @@ def build_run_identity(cfg: dict, experiment_name: str, seed: int) -> dict[str, 
         ),
         "router_trained_end_to_end": False,
         "router_posthoc_refinement_enabled": bool(
-            routing_enabled
-            and calibration_cfg.get("enabled", False)
-            and routing_cfg.get("posthoc_refine", True)
+            routing_posthoc_refinement_active
         ),
         "router_encoder_training_reliability_source": (
             "alive_masked_uniform" if routing_enabled else "disabled"
@@ -10280,7 +11883,14 @@ def build_run_identity(cfg: dict, experiment_name: str, seed: int) -> dict[str, 
             (
                 "temperature_scaled_max_softmax_confidence"
                 if reliability_method == TEMPERATURE_SCALING_CONFIDENCE_METHOD
-                else "calibrated_branch_correctness"
+                else (
+                    "calibrated_branch_correctness_with_"
+                    "api_current_view_support"
+                    if reliability_cfg.get(
+                        "use_api_observed_support", False
+                    )
+                    else "calibrated_branch_correctness"
+                )
             )
             if routing_enabled
             and use_i1_reliability
@@ -10297,6 +11907,42 @@ def build_run_identity(cfg: dict, experiment_name: str, seed: int) -> dict[str, 
             reliability_enabled
             and reliability_method == MONOTONIC_CORRECTNESS_METHOD
             and reliability_cfg.get("use_prediction_margin", True)
+        ),
+        "api_observed_support_reliability_enabled": bool(
+            reliability_enabled
+            and reliability_method == MONOTONIC_CORRECTNESS_METHOD
+            and reliability_cfg.get("use_api_observed_support", False)
+        ),
+        "api_observed_support_formula": (
+            "log1p_current_visible_events_div_log1p_api_encoder_capacity"
+            if reliability_enabled
+            and reliability_method == MONOTONIC_CORRECTNESS_METHOD
+            and reliability_cfg.get("use_api_observed_support", False)
+            else "disabled"
+        ),
+        "api_observed_support_source": (
+            "current_encoder_api_batch_only"
+            if reliability_enabled
+            and reliability_method == MONOTONIC_CORRECTNESS_METHOD
+            and reliability_cfg.get("use_api_observed_support", False)
+            else "disabled"
+        ),
+        "api_observed_support_uses_original_count": False,
+        "api_observed_support_uses_perturbation_metadata": False,
+        "reliability_feature_layout": (
+            {
+                branch: list(names)
+                for branch, names in reliability_feature_layout(
+                    use_api_observed_support=bool(
+                        reliability_cfg.get(
+                            "use_api_observed_support", False
+                        )
+                    )
+                ).items()
+            }
+            if reliability_enabled
+            and reliability_method == MONOTONIC_CORRECTNESS_METHOD
+            else {}
         ),
         "predicted_class_intercept_enabled": bool(
             reliability_enabled
@@ -10433,6 +12079,39 @@ def prepare_output_directory(
     return path
 
 
+def validate_declared_natural_subset_protocol(cfg: dict[str, Any]) -> None:
+    """Prevent direct fusion.train calls from bypassing frozen-subset checks."""
+
+    eval_cfg = cfg.get("eval", {}) or {}
+    extra_sets = _normalize_extra_eval_sets(eval_cfg.get("extra_sets"))
+    references_natural_subsets = any(
+        "labels/natural_subsets/"
+        in str(
+            item.get("csv")
+            or item.get("csv_path")
+            or item.get("test_csv")
+            or ""
+        )
+        .replace("\\", "/")
+        .lower()
+        for item in extra_sets
+    )
+    declared = eval_cfg.get("require_natural_subset_protocol")
+    if references_natural_subsets and declared is not True:
+        raise ValueError(
+            "Evaluation references labels/natural_subsets but does not declare "
+            "eval.require_natural_subset_protocol=true"
+        )
+    if declared is not True:
+        return
+
+    # Keep one validator for run.py and direct ``python -m fusion.train`` calls.
+    # The lazy import avoids a module-import cycle during ordinary training.
+    from run import validate_natural_subset_artifacts
+
+    validate_natural_subset_artifacts()
+
+
 def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
     # CLI loading already canonicalizes these sections. Repeating the
     # idempotent steps protects direct programmatic callers and keeps
@@ -10440,6 +12119,7 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
     cfg = _canonicalize_classification_threshold_config(
         _canonicalize_selective_prediction_config(cfg)
     )
+    validate_declared_natural_subset_protocol(cfg)
     logging.basicConfig(level=getattr(logging, str(cfg.get("log_level", "INFO")).upper(), logging.INFO))
     train_cfg = cfg["train"]
     data_cfg = cfg["data"]
@@ -10513,6 +12193,36 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
     )
     configured_fusion_mode = str((cfg.get("fusion", {}) or {}).get("mode", "")).lower()
     model_fusion_mode = str((cfg.get("model", {}) or {}).get("fusion_mode", "")).lower()
+    anchored_pipeline = model_fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES
+    anchored_stage_b_enabled = False
+    if anchored_pipeline:
+        anchored_stage_b_enabled = bool(
+            _stage_b_config(cfg)["enabled"]
+        )
+        if refit_posthoc_calibration:
+            raise ValueError(
+                "The redesigned method has no validation-fitted post-hoc "
+                "stack. Reuse an encoder artifact to refit train-only Stage B, "
+                "or load a complete pipeline checkpoint for evaluation."
+            )
+        if not bool(calibration_cfg.get("require_role_assignment", False)):
+            raise ValueError(
+                "anchored_joint_late requires the immutable two-role "
+                "validation assignment"
+            )
+        if not str(
+            calibration_cfg.get("role_assignment_path") or ""
+        ).strip():
+            raise ValueError(
+                "anchored_joint_late requires "
+                "calibration.role_assignment_path"
+            )
+        if anchored_stage_b_enabled and not classification_threshold_enabled:
+            raise ValueError(
+                "anchored Stage B requires classification_threshold.enabled=true "
+                "because every I2 candidate and the Joint anchor receive the "
+                "same clean model-selection threshold budget"
+            )
     discount_probability_mode = (
         configured_fusion_mode == "discount_probability"
         or (not configured_fusion_mode and model_fusion_mode == "discount_probability")
@@ -10687,7 +12397,18 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
     }
     decision_calibration_data_identity: dict[str, Any] | None = None
     prebuilt_extra_eval_sets: list[dict[str, Any]] = []
+    two_role_validation_protocol = False
 
+    upstream_validation_split_name = (
+        "val_model_selection"
+        if anchored_pipeline
+        else "val_posthoc_calibration"
+    )
+    decision_validation_split_name = (
+        "val_decision_calibration"
+        if anchored_pipeline
+        else "val_conformal_calibration"
+    )
     if pure_external_eval_only:
         for idx, extra in enumerate(extra_eval_sets):
             name = str(extra.get("name") or f"extra_{idx}")
@@ -10763,7 +12484,10 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 selection_indices = list(validation_split["selection_indices"])
                 calibration_indices = list(validation_split["calibration_indices"])
                 posthoc_calibration_indices = list(
-                    validation_split["posthoc_calibration_indices"]
+                    validation_split.get(
+                        "upstream_selection_indices",
+                        validation_split.get("posthoc_calibration_indices", []),
+                    )
                 )
                 decision_calibration_indices = list(
                     validation_split["conformal_calibration_indices"]
@@ -10778,7 +12502,32 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 needs_decision_calibration_split = (
                     classification_threshold_enabled or selective_enabled
                 )
-                if needs_decision_calibration_split:
+                if anchored_pipeline:
+                    # The redesigned I1/I2 is fitted on train. Validation has
+                    # only two roles: upstream model/threshold selection and a
+                    # disjoint I3 decision-calibration subset.
+                    val_posthoc_calibration_ds = val_selection_ds
+                    val_conformal_calibration_ds = val_holdout_ds
+                    posthoc_calibration_indices = selection_indices
+                    decision_calibration_indices = calibration_indices
+                    validation_split.update(
+                        {
+                            "num_posthoc_calibration": 0,
+                            "num_conformal_calibration": len(
+                                decision_calibration_indices
+                            ),
+                            "posthoc_fraction_of_validation": 0.0,
+                            "decision_fraction_of_validation": (
+                                len(decision_calibration_indices)
+                                / float(len(val_ds))
+                            ),
+                            "upstream_selection_indices": selection_indices,
+                            "conformal_calibration_indices": (
+                                decision_calibration_indices
+                            ),
+                        }
+                    )
+                elif needs_decision_calibration_split:
                     (
                         val_posthoc_calibration_ds,
                         val_conformal_calibration_ds,
@@ -10850,9 +12599,21 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 "selection_indices",
                 "calibration_indices",
                 "posthoc_calibration_indices",
+                "upstream_selection_indices",
                 "conformal_calibration_indices",
             }
         }
+        two_role_validation_protocol = (
+            int(
+                validation_split_summary.get(
+                    "role_assignment_schema_version", -1
+                )
+            )
+            == VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION
+        )
+        if two_role_validation_protocol:
+            upstream_validation_split_name = "val_model_selection"
+            decision_validation_split_name = "val_decision_calibration"
         if classification_threshold_enabled or selective_enabled:
             decision_calibration_data_identity = (
                 _decision_calibration_data_identity(
@@ -10860,23 +12621,42 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                     val_ds,
                     posthoc_indices=posthoc_calibration_indices,
                     decision_indices=decision_calibration_indices,
+                    upstream_role_name=(
+                        "model_selection"
+                        if two_role_validation_protocol
+                        else "posthoc_calibration"
+                    ),
                 )
             )
             validation_split_summary["decision_calibration_data_identity"] = (
                 decision_calibration_data_identity
             )
-        logger.info(
-            "validation_protocol split_seed=%s selection=%d (%.4f) "
-            "posthoc=%d (%.4f) decision=%d (%.4f) total=%d",
-            validation_split_summary.get("split_seed"),
-            int(validation_split_summary["num_selection"]),
-            float(validation_split_summary["selection_fraction_of_validation"]),
-            int(validation_split_summary["num_posthoc_calibration"]),
-            float(validation_split_summary["posthoc_fraction_of_validation"]),
-            int(validation_split_summary["num_conformal_calibration"]),
-            float(validation_split_summary["decision_fraction_of_validation"]),
-            int(validation_split_summary["num_validation"]),
-        )
+        if two_role_validation_protocol:
+            logger.info(
+                "validation_protocol split_seed=%s model_selection=%d (%.4f) "
+                "decision=%d (%.4f) total=%d",
+                validation_split_summary.get("split_seed"),
+                int(validation_split_summary["num_selection"]),
+                float(
+                    validation_split_summary["selection_fraction_of_validation"]
+                ),
+                int(validation_split_summary["num_conformal_calibration"]),
+                float(validation_split_summary["decision_fraction_of_validation"]),
+                int(validation_split_summary["num_validation"]),
+            )
+        else:
+            logger.info(
+                "validation_protocol split_seed=%s selection=%d (%.4f) "
+                "posthoc=%d (%.4f) decision=%d (%.4f) total=%d",
+                validation_split_summary.get("split_seed"),
+                int(validation_split_summary["num_selection"]),
+                float(validation_split_summary["selection_fraction_of_validation"]),
+                int(validation_split_summary["num_posthoc_calibration"]),
+                float(validation_split_summary["posthoc_fraction_of_validation"]),
+                int(validation_split_summary["num_conformal_calibration"]),
+                float(validation_split_summary["decision_fraction_of_validation"]),
+                int(validation_split_summary["num_validation"]),
+            )
         val_loader = build_loader(cfg, val_selection_ds, is_train=False)
         val_posthoc_calibration_loader = build_loader(
             cfg, val_posthoc_calibration_ds, is_train=False
@@ -10884,14 +12664,18 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
         val_conformal_calibration_loader = build_loader(
             cfg, val_conformal_calibration_ds, is_train=False
         )
-        if not eval_only and encoder_stage_mode == "fit":
+        if not eval_only and (
+            encoder_stage_mode == "fit"
+            or (anchored_pipeline and anchored_stage_b_enabled)
+        ):
             train_ds = build_dataset(cfg, "train", is_train=True)
-            train_loader = build_loader(
-                cfg,
-                train_ds,
-                is_train=True,
-                seed_namespace="stage1_train",
-            )
+            if encoder_stage_mode == "fit":
+                train_loader = build_loader(
+                    cfg,
+                    train_ds,
+                    is_train=True,
+                    seed_namespace="stage1_train",
+                )
         robust_calibration_loaders = (
             build_reliability_calibration_loaders(
                 cfg, val_ds, posthoc_calibration_indices
@@ -10904,16 +12688,20 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
         feature_dim = train_ds.feature_dim if train_ds is not None else val_ds.feature_dim
     if (
         not eval_only
-        and encoder_stage_mode == "fit"
+        and (
+            encoder_stage_mode == "fit"
+            or (anchored_pipeline and anchored_stage_b_enabled)
+        )
         and train_ds is None
     ):
         train_ds = build_dataset(cfg, "train", is_train=True)
-        train_loader = build_loader(
-            cfg,
-            train_ds,
-            is_train=True,
-            seed_namespace="stage1_train",
-        )
+        if encoder_stage_mode == "fit":
+            train_loader = build_loader(
+                cfg,
+                train_ds,
+                is_train=True,
+                seed_namespace="stage1_train",
+            )
     test_ds: RobustTriModalDataset | None = None
     test_loader = None
     if run_test:
@@ -10929,6 +12717,7 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
     source_checkpoint_path: Path | None = None
     requested_checkpoint_path: Path | None = None
     posthoc_oof_clean_rows: list[dict[str, Any]] = []
+    stage_b_summary: dict[str, Any] = {"enabled": False}
     classification_log_odds_threshold: float | None = None
     encoder_state_sha_before_posthoc: str | None = None
     encoder_state_sha_after_posthoc: str | None = None
@@ -10990,6 +12779,31 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 current_data_identity=decision_calibration_data_identity,
             )
             model.load_state_dict(ckpt["model"])
+            if anchored_pipeline:
+                loaded_stage_b = ckpt.get("stage_b_training")
+                if not isinstance(loaded_stage_b, dict):
+                    raise ValueError(
+                        "Anchored pipeline checkpoint has no stage_b_training "
+                        "deployment metadata; retrain it"
+                    )
+                deployment = str(
+                    loaded_stage_b.get("deployment") or ""
+                ).strip().lower()
+                if deployment not in {
+                    "anchored_joint_late",
+                    "joint_with_uniform_missing_fallback_selection_guard",
+                }:
+                    raise ValueError(
+                        "Anchored pipeline checkpoint has an invalid Stage-B "
+                        f"deployment: {deployment!r}"
+                    )
+                model.set_anchored_fusion_active(
+                    deployment == "anchored_joint_late"
+                )
+                model.set_competence_diagnostics_active(
+                    bool(loaded_stage_b.get("enabled", False))
+                )
+                stage_b_summary = copy.deepcopy(loaded_stage_b)
             encoder_state_sha_before_posthoc = _state_dict_sha256(
                 model.encoder_stage_state_dict()
             )
@@ -11019,7 +12833,9 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
         best_score = float(ckpt.get("checkpoint_score", -1.0))
         best_val_f1 = float((ckpt.get("val") or {}).get("macro_f1", -1.0))
         checkpoint_metric_name = str(ckpt.get("checkpoint_metric", "loaded_checkpoint"))
-        calibration_summary = dict(ckpt.get("calibration") or {"enabled": False})
+        calibration_summary = dict(
+            ckpt.get("calibration") or {"enabled": False}
+        )
         posthoc_oof_clean_rows = list(
             ckpt.get("posthoc_oof_clean_rows") or []
         )
@@ -11248,7 +13064,11 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
             scaler = build_grad_scaler(device, use_amp)
             best_score = -1.0
             best_val_f1 = -1.0
-            checkpoint_metric_name = "clean_macro_f1"
+            checkpoint_metric_name = (
+                "clean_joint_anchor_macro_f1"
+                if anchored_pipeline
+                else "clean_macro_f1"
+            )
             saved_checkpoint_this_run = False
             patience = int(train_cfg.get("patience", 10))
             stale = 0
@@ -11371,21 +13191,65 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
         encoder_state_sha_before_posthoc = _state_dict_sha256(
             model.encoder_stage_state_dict()
         )
-        calibration_loaders = [
-            {
-                "name": "clean",
-                "loader": val_posthoc_calibration_loader,
-                "reliability_branches": ["api", "graph", "manifest"],
-            },
-            *robust_calibration_loaders,
-        ]
-        calibration_summary = fit_posthoc_calibration(
-            model,
-            calibration_loaders,
-            device,
-            use_amp,
-            cfg,
-        )
+        if anchored_pipeline:
+            resolved_stage_b = _stage_b_config(cfg)
+            if bool(resolved_stage_b["enabled"]):
+                if (
+                    train_ds is None
+                    or val_loader is None
+                    or not isinstance(val_ds, RobustTriModalDataset)
+                ):
+                    raise RuntimeError(
+                        "Anchored Stage B requires train and model-selection "
+                        "validation datasets"
+                    )
+                stage_b_summary = fit_anchored_stage_b(
+                    model,
+                    train_dataset=train_ds,
+                    validation_dataset=val_ds,
+                    validation_loader=val_loader,
+                    selection_indices=selection_indices,
+                    device=device,
+                    use_amp=use_amp,
+                    cfg=cfg,
+                    seed=int(train_cfg.get("stage_b_seed", seed)),
+                )
+            else:
+                model.set_anchored_fusion_active(False)
+                model.set_competence_diagnostics_active(False)
+                stage_b_summary = {
+                    "enabled": False,
+                    "protocol": "joint_anchor_without_i1_i2_ablation_v1",
+                    "parameter_fit_population": "none",
+                    "validation_role": "not_used_by_i1_i2",
+                    "decision_calibration_used_for_parameters": False,
+                    "test_used_for_parameters_or_selection": False,
+                    "deployment": (
+                        "joint_with_uniform_missing_fallback_selection_guard"
+                    ),
+                }
+            calibration_summary = {
+                "enabled": False,
+                "reason": (
+                    "redesigned_I1_I2_use_train_only_explicit_stage_b"
+                ),
+            }
+        else:
+            calibration_loaders = [
+                {
+                    "name": "clean",
+                    "loader": val_posthoc_calibration_loader,
+                    "reliability_branches": ["api", "graph", "manifest"],
+                },
+                *robust_calibration_loaders,
+            ]
+            calibration_summary = fit_posthoc_calibration(
+                model,
+                calibration_loaders,
+                device,
+                use_amp,
+                cfg,
+            )
         encoder_state_sha_after_posthoc = _state_dict_sha256(
             model.encoder_stage_state_dict()
         )
@@ -11399,7 +13263,10 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
         posthoc_oof_clean_rows = validate_posthoc_oof_rows(
             posthoc_oof_clean_rows
         )
-        if bool(calibration_summary.get("enabled", False)):
+        if (
+            not anchored_pipeline
+            and bool(calibration_summary.get("enabled", False))
+        ):
             calibration_summary["posthoc_perturbation_scenarios"] = [
                 {
                     "name": str(item["name"]),
@@ -11412,8 +13279,25 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
         rejection_threshold = None
         conformal_thresholds = None
         risk_control_thresholds = None
-        classification_threshold_summary = None
-        classification_threshold = 0.5
+        if anchored_pipeline and bool(stage_b_summary.get("enabled", False)):
+            classification_threshold_summary = copy.deepcopy(
+                stage_b_summary.get("classification_threshold")
+            )
+            if not isinstance(classification_threshold_summary, dict) or not bool(
+                classification_threshold_summary.get(
+                    "locked_by_stage_b", False
+                )
+            ):
+                raise RuntimeError(
+                    "Anchored Stage B did not return its locked "
+                    "classification threshold"
+                )
+            classification_threshold = float(
+                classification_threshold_summary["threshold"]
+            )
+        else:
+            classification_threshold_summary = None
+            classification_threshold = 0.5
         classification_log_odds_threshold = None
 
     if pure_external_eval_only:
@@ -11435,7 +13319,7 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
             val_posthoc_calibration_loader,
             device,
             use_amp,
-            "val_posthoc_calibration",
+            upstream_validation_split_name,
             dump_rows=True,
             selective_score_type=selective_score_type,
             classification_threshold=classification_threshold,
@@ -11443,10 +13327,21 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 classification_log_odds_threshold
             ),
         )
-        enforce_failed_ratio(val_calibration_metrics, cfg, "val_posthoc_calibration")
+        enforce_failed_ratio(
+            val_calibration_metrics,
+            cfg,
+            upstream_validation_split_name,
+        )
+        stage_b_threshold_locked = bool(
+            anchored_pipeline
+            and isinstance(classification_threshold_summary, dict)
+            and classification_threshold_summary.get(
+                "locked_by_stage_b", False
+            )
+        )
         if classification_threshold_enabled and (
             not eval_only or refit_decision_calibration
-        ):
+        ) and not stage_b_threshold_locked:
             cross_fit_enabled = bool(
                 (calibration_summary.get("cross_fitting") or {}).get(
                     "enabled", False
@@ -11491,6 +13386,10 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 )
             if classification_threshold_summary is None:
                 raise RuntimeError("Enabled classification-threshold fitting returned no result")
+            if two_role_validation_protocol:
+                classification_threshold_summary["calibration_split"] = (
+                    upstream_validation_split_name
+                )
             classification_threshold = float(
                 classification_threshold_summary["threshold"]
             )
@@ -11515,7 +13414,7 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 ):
                     raise RuntimeError(
                         "The final classification cutoff differs from the OOF "
-                        "cutoff that supervised I2 risk; rerun post-hoc "
+                        "deployment cutoff installed in I2; rerun post-hoc "
                         "calibration instead of reusing this risk head"
                     )
                 classification_threshold_summary[
@@ -11542,7 +13441,7 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 val_posthoc_calibration_loader,
                 device,
                 use_amp,
-                "val_posthoc_calibration",
+                upstream_validation_split_name,
                 dump_rows=True,
                 selective_score_type=selective_score_type,
                 classification_threshold=classification_threshold,
@@ -11551,7 +13450,9 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 ),
             )
             enforce_failed_ratio(
-                val_calibration_metrics, cfg, "val_posthoc_calibration"
+                val_calibration_metrics,
+                cfg,
+                upstream_validation_split_name,
             )
         validate_threshold_aligned_risk_cutoff(
             model,
@@ -11563,7 +13464,7 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
             val_conformal_calibration_loader,
             device,
             use_amp,
-            "val_conformal_calibration",
+            decision_validation_split_name,
             dump_rows=True,
             selective_score_type=selective_score_type,
             classification_threshold=classification_threshold,
@@ -11571,7 +13472,11 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 classification_log_odds_threshold
             ),
         )
-        enforce_failed_ratio(val_conformal_metrics, cfg, "val_conformal_calibration")
+        enforce_failed_ratio(
+            val_conformal_metrics,
+            cfg,
+            decision_validation_split_name,
+        )
         if not eval_only or refit_decision_calibration:
             rejection_threshold = fit_rejection_threshold(
                 val_conformal_rows, cfg.get("selective_prediction", {}) or {}
@@ -11639,6 +13544,10 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 ckpt["model"]
             )
             ckpt["calibration"] = calibration_summary
+            if anchored_pipeline:
+                ckpt["stage_b_training"] = copy.deepcopy(stage_b_summary)
+            else:
+                ckpt.pop("stage_b_training", None)
             if (
                 posthoc_oof_clean_rows
                 and decision_calibration_data_identity is not None
@@ -11692,12 +13601,17 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
             )
         )
 
+        final_validation_split_name = (
+            upstream_validation_split_name
+            if two_role_validation_protocol
+            else "val_selection"
+        )
         val_metrics, val_rows = evaluate(
             model,
             val_loader,
             device,
             use_amp,
-            "val_selection",
+            final_validation_split_name,
             dump_rows=True,
             selective_threshold=rejection_threshold,
             selective_score_type=selective_score_type,
@@ -11706,7 +13620,11 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 classification_log_odds_threshold
             ),
         )
-        enforce_failed_ratio(val_metrics, cfg, "val_selection")
+        enforce_failed_ratio(
+            val_metrics,
+            cfg,
+            final_validation_split_name,
+        )
         val_metrics.update(conformal_selective_metrics(val_rows, conformal_thresholds))
         val_metrics.update(
             risk_control_selective_metrics(val_rows, risk_control_thresholds)
@@ -11769,14 +13687,20 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
                 robust_results[result_key] = metrics
                 test_rows.extend(rows)
 
-    # Preserve all three disjoint validation roles in the audit dump. In
-    # particular, val_conformal_rows are the exact rows used to fit I3.
-    all_rows = (
-        val_rows
-        + val_calibration_rows
-        + val_conformal_rows
-        + test_rows
-    )
+    # Under validation role schema v2 ``val_loader`` and the internal
+    # upstream-threshold loader are the same immutable model-selection role
+    # for every method, including baselines. Keep only the final evaluation
+    # rows so each identity appears once in the audit dump. Legacy protocols
+    # retain their genuinely distinct row sets.
+    if two_role_validation_protocol:
+        all_rows = val_rows + val_conformal_rows + test_rows
+    else:
+        all_rows = (
+            val_rows
+            + val_calibration_rows
+            + val_conformal_rows
+            + test_rows
+        )
 
     extra_results = {}
     extra_rows: list[dict[str, Any]] = []
@@ -11869,8 +13793,76 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
         # so gate_diagnostics.csv and gate_diagnostics_extra_eval.csv are disjoint.
         extra_rows.extend(rows)
 
-    write_gate_dump(out_dir / "gate_diagnostics.csv", all_rows)
-    write_gate_dump(out_dir / "gate_diagnostics_extra_eval.csv", extra_rows)
+    gate_diagnostics_path = out_dir / "gate_diagnostics.csv"
+    gate_diagnostics_extra_path = out_dir / "gate_diagnostics_extra_eval.csv"
+    write_gate_dump(gate_diagnostics_path, all_rows)
+    write_gate_dump(gate_diagnostics_extra_path, extra_rows)
+    run_identity_summary = build_run_identity(cfg, exp_name, seed)
+    diagnostic_artifacts: dict[str, Any] = {}
+    if gate_diagnostics_path.is_file():
+        diagnostic_artifacts["gate_diagnostics"] = {
+            "path": str(gate_diagnostics_path.resolve()),
+            "sha256": _file_sha256(gate_diagnostics_path),
+            "splits": sorted(
+                {
+                    str(row.get("split") or "")
+                    for row in all_rows
+                    if str(row.get("split") or "")
+                }
+            ),
+            "method_protocol_id": run_identity_summary.get(
+                "method_protocol_id"
+            ),
+            "method_protocol_sha256": run_identity_summary.get(
+                "method_protocol_sha256"
+            ),
+            "method_implementation_sha256": run_identity_summary.get(
+                "method_implementation_sha256"
+            ),
+            "pipeline_model_state_sha256": ckpt.get(
+                "pipeline_model_state_sha256"
+            ),
+            "pipeline_decision_metadata_sha256": ckpt.get(
+                "pipeline_decision_metadata_sha256"
+            ),
+            "validation_role_assignment_semantic_sha256": (
+                validation_split_summary.get(
+                    "role_assignment_semantic_sha256"
+                )
+            ),
+        }
+    if gate_diagnostics_extra_path.is_file():
+        diagnostic_artifacts["gate_diagnostics_extra_eval"] = {
+            "path": str(gate_diagnostics_extra_path.resolve()),
+            "sha256": _file_sha256(gate_diagnostics_extra_path),
+            "splits": sorted(
+                {
+                    str(row.get("split") or "")
+                    for row in extra_rows
+                    if str(row.get("split") or "")
+                }
+            ),
+            "method_protocol_id": run_identity_summary.get(
+                "method_protocol_id"
+            ),
+            "method_protocol_sha256": run_identity_summary.get(
+                "method_protocol_sha256"
+            ),
+            "method_implementation_sha256": run_identity_summary.get(
+                "method_implementation_sha256"
+            ),
+            "pipeline_model_state_sha256": ckpt.get(
+                "pipeline_model_state_sha256"
+            ),
+            "pipeline_decision_metadata_sha256": ckpt.get(
+                "pipeline_decision_metadata_sha256"
+            ),
+            "validation_role_assignment_semantic_sha256": (
+                validation_split_summary.get(
+                    "role_assignment_semantic_sha256"
+                )
+            ),
+        }
     risk_coverage_path = out_dir / "risk_coverage_curve.csv"
     extra_risk_coverage_path = out_dir / "risk_coverage_curve_extra_eval.csv"
     risk_coverage_points = write_risk_coverage_curve(
@@ -11883,7 +13875,7 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
         _write_metrics_json(out_dir / "metrics_extra_eval.json", extra_results)
     summary = {
         "metric_schema_version": METRIC_SUMMARY_SCHEMA_VERSION,
-        "run_identity": build_run_identity(cfg, exp_name, seed),
+        "run_identity": run_identity_summary,
         "eval_only": eval_only,
         "refit_posthoc_calibration": refit_posthoc_calibration,
         "refit_decision_calibration": refit_decision_calibration,
@@ -11929,6 +13921,19 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
             "selection_metrics": copy.deepcopy(ckpt.get("val") or {}),
             "selection_score": ckpt.get("checkpoint_score"),
             "selection_metric": ckpt.get("checkpoint_metric"),
+            "selection_joint_eligible_fraction": (
+                (ckpt.get("val") or {}).get(
+                    "joint_eligible_fraction"
+                )
+            ),
+            "selection_joint_macro_f1": (
+                (ckpt.get("val") or {}).get("joint_macro_f1")
+            ),
+            "selection_joint_anchor_macro_f1": (
+                (ckpt.get("val") or {}).get(
+                    "joint_anchor_macro_f1"
+                )
+            ),
             "artifact_state_sha256": ckpt.get(
                 "encoder_stage_state_sha256"
             ),
@@ -11937,6 +13942,13 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
             ),
             "artifact_implementation_sha256": ckpt.get(
                 "encoder_stage_implementation_sha256"
+            ),
+            "current_implementation_sha256": (
+                _encoder_stage_implementation_sha256()
+            ),
+            "implementation_compatibility": ckpt.get(
+                "encoder_stage_implementation_compatibility",
+                "exact",
             ),
             "state_sha256_before_posthoc": (
                 encoder_state_sha_before_posthoc
@@ -11962,12 +13974,15 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
             "selective"
         ]["acceptance_comparison"],
         "calibration": calibration_summary,
+        "stage_b_training": (
+            stage_b_summary if anchored_pipeline else None
+        ),
         "classification_threshold": classification_threshold_summary,
         "conformal_thresholds": conformal_thresholds,
         "risk_control_thresholds": risk_control_thresholds,
-        "val_selection": val_metrics,
-        "val_posthoc_calibration": val_calibration_metrics,
-        "val_conformal_calibration": val_conformal_metrics,
+        "val_model_selection": val_metrics,
+        "val_model_selection_threshold_fit": val_calibration_metrics,
+        "val_decision_calibration": val_conformal_metrics,
         "validation_split": validation_split_summary,
         "manifest_vocab_provenance": manifest_vocab_provenance,
         "test": test_metrics,
@@ -11983,7 +13998,34 @@ def run(cfg: dict, *, overwrite: bool = False) -> dict[str, Any]:
             ),
             "extra_eval_points": int(extra_risk_coverage_points),
         },
+        "diagnostic_artifacts": diagnostic_artifacts,
     }
+    if anchored_pipeline:
+        # The redesigned main path has no validation-fitted post-hoc stack and
+        # no three-role calibration protocol.  Do not retain misleading legacy
+        # aliases in a schema-v14 summary.
+        summary.pop("calibration", None)
+        summary.pop("refit_posthoc_calibration", None)
+        summary["stage_b_refit_from_encoder_artifact"] = bool(
+            not eval_only and encoder_stage_mode == "reuse"
+        )
+        encoder_summary = summary["encoder_stage"]
+        encoder_summary["state_sha256_before_stage_b"] = (
+            encoder_summary.pop("state_sha256_before_posthoc")
+        )
+        encoder_summary["state_sha256_after_stage_b"] = (
+            encoder_summary.pop("state_sha256_after_posthoc")
+        )
+        encoder_summary["stage_b_preserved_stage_a_state"] = (
+            encoder_summary.pop("posthoc_preserved_encoder_state")
+        )
+        encoder_summary["selection_to_deployment_clean_macro_f1_delta"] = (
+            encoder_summary.pop(
+                "selection_to_posthoc_clean_macro_f1_delta"
+            )
+        )
+    else:
+        summary.pop("stage_b_training", None)
     if rejection_threshold is not None:
         summary["rejection_threshold"] = rejection_threshold
     with open(out_dir / "summary.yaml", "w", encoding="utf-8") as f:
@@ -12004,8 +14046,8 @@ def main() -> None:
         "--encoder-checkpoint",
         default=None,
         help=(
-            "Reuse a strict encoder-only Stage-1 artifact and run only "
-            "post-hoc I1/I2/I3 fitting plus evaluation."
+            "Reuse a strict Stage-A expert artifact, fit the configured "
+            "train-only Stage B, calibrate I3, and evaluate."
         ),
     )
     args = parser.parse_args()

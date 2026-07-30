@@ -214,7 +214,7 @@ def test_route_nll_does_not_update_risk_parameters():
 
 
 def test_route_prior_uses_positive_learnable_common_log_odds_scale():
-    fusion = _fusion(route_conflict_enabled=False)
+    fusion = _fusion()
     router = fusion.opinion_router
     assert router is not None
     assert torch.nn.functional.softplus(router.raw_route_prior_beta).item() == pytest.approx(
@@ -276,7 +276,7 @@ def test_encoder_training_route_is_uniform_over_alive_branches():
 
 
 def test_posthoc_route_uses_fitted_i1_reliability():
-    fusion = _fusion(route_conflict_enabled=False)
+    fusion = _fusion()
     fitted_reliability = (0.20, 0.50, 0.80)
     fusion.reliability_calibrator = _FixedReliabilityCalibrator(
         fitted_reliability
@@ -338,24 +338,42 @@ def test_fusion_exports_exactly_the_three_risk_feature_semantics():
         expected_boundary,
     )
 
-    branch_conflicts = torch.stack(
-        [
-            outputs[f"routing_cross_modal_conflict_{name}"]
-            for name in BRANCHES
-        ],
-        dim=-1,
-    )
-    torch.testing.assert_close(
-        outputs["routing_risk_global_cross_modal_conflict"],
-        branch_conflicts.mean(dim=-1),
-    )
+    risk_conflict = outputs["routing_risk_global_cross_modal_conflict"]
+    assert risk_conflict.shape == (2,)
+    assert torch.isfinite(risk_conflict).all()
+    assert torch.all((risk_conflict >= 0.0) & (risk_conflict <= 1.0))
     for removed_key in (
+        "routing_conflict_penalty_mean",
+        "routing_route_conflict_feature_active",
+        "routing_route_conflict_feature_configured",
         "routing_risk_uncertainty_burden",
         "routing_risk_structural_conflict",
         "routing_risk_missing_fraction",
         "routing_mean_disagreement",
     ):
         assert removed_key not in outputs
+    for name in BRANCHES:
+        assert f"routing_conflict_penalty_{name}" not in outputs
+
+
+def test_i1_disabled_route_is_alive_masked_uniform_and_has_no_parameters():
+    fusion = _fusion(use_i1_reliability=False)
+    fusion.set_calibration_active(True)
+
+    assert fusion.routing_distribution_parameters() == []
+    outputs = fusion(*_logits(), _evidence())
+    torch.testing.assert_close(
+        outputs["routing_branch_distribution"],
+        torch.full((2, 3), 1.0 / 3.0),
+    )
+
+    evidence = _evidence()
+    evidence[:, AvailabilityIndex.GRAPH_ALIVE] = 0.0
+    missing_outputs = fusion(*_logits(), evidence)
+    torch.testing.assert_close(
+        missing_outputs["routing_branch_distribution"],
+        torch.tensor([[0.5, 0.0, 0.5]]).expand(2, -1),
+    )
 
 
 def test_disabled_risk_features_share_effective_weights_in_loss_and_deployment():
@@ -481,10 +499,11 @@ def test_static_route_and_learned_risk_are_independent_modes():
         ("hidden_dim", 8),
         ("train_end_to_end", False),
         ("acceptance_score_mode", "fused_risk"),
+        ("route_conflict_enabled", True),
     ],
 )
 def test_removed_i2_v1_keys_fail_fast(removed_key, value):
-    with pytest.raises(ValueError, match="Removed I2-v1"):
+    with pytest.raises(ValueError, match="Removed or retired I2"):
         _fusion(**{removed_key: value})
 
 
@@ -503,7 +522,6 @@ def test_run_identity_reports_route_and_risk_semantics():
                 "enabled": True,
                 "mode": "learned",
                 "risk_mode": "learned",
-                "route_conflict_enabled": True,
                 "risk_conflict_enabled": False,
                 "prediction_loss_weight": 1.0,
                 "risk_loss_weight": 1.0,
@@ -529,7 +547,7 @@ def test_run_identity_reports_route_and_risk_semantics():
     identity = build_run_identity(cfg, "v2", 42)
     assert identity["routing_mode"] == "learned"
     assert identity["routing_risk_mode"] == "learned"
-    assert identity["routing_route_conflict_enabled"] is True
+    assert "routing_route_conflict_enabled" not in identity
     assert identity["routing_risk_conflict_enabled"] is False
     assert "routing_acceptance_score_mode" not in identity
     assert "routing_mass_constraint" not in identity

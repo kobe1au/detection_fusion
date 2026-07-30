@@ -1,0 +1,12 @@
+defaults:
+  - _base.yaml
+
+method:
+  name: baseline_manifest_only
+  protocol_id: baseline_manifest_only_v1
+
+train:
+  exp_name: baseline_manifest_only
+
+model:
+  fusion_mode: manifest_only

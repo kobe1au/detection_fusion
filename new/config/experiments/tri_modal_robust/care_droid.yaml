@@ -1,0 +1,91 @@
+defaults:
+  - base_tri_modal_robust.yaml
+
+runner:
+  module: fusion.care_train
+
+method:
+  name: care_droid
+  protocol_id: care_droid_v1
+
+train:
+  exp_name: care_droid_seed_42
+
+model:
+  fusion_mode: care_droid
+
+loss:
+  objective: care_stage_a_clean
+
+# CARE-Droid is a closed lifecycle rather than a collection of independently
+# tunable fusion tricks. The path order and role names are protocol identity.
+care:
+  protocol_seed: 424242
+  paths:
+    - agm
+    - ag
+    - am
+    - gm
+
+  roles:
+    expert_val_fraction: 0.10
+    expert_split_seed: 4242
+    validation_role_assignment_path: labels/validation_roles_protocol_v3.json
+    validation_role_schema_version: 2
+    routing_cal_source_role: model_selection
+    decision_cal_source_role: decision_calibration
+    require_fixed_assignment: true
+
+  stage_a:
+    clean_only: true
+
+  risk_training:
+    enabled: true
+    folds: 3
+    epochs: 20
+    batch_size: 256
+    lr: 0.001
+    weight_decay: 0.0001
+    hidden_dim: 16
+    grad_clip: 5.0
+    fixed_epochs: true
+    early_stopping: false
+
+  views:
+    deterministic: true
+    protocol_seed: 424242
+    clean: true
+    graded_mechanisms:
+      - api_event_dropout
+      - graph_sparsify
+      - manifest_permission_mask
+    graded_strength_min: 0.1
+    graded_strength_max: 0.9
+    strength_assignment: sid_mechanism_hash_uniform
+    missing_mechanisms:
+      - api_missing
+      - graph_missing
+      - manifest_missing
+    expose_view_metadata_to_model: false
+
+  routing:
+    enabled: true
+    route_on_all_samples: false
+    anchor_path: agm
+    exactly_two_alive_policy: unique_pair
+    at_most_one_alive_policy: reject
+
+  decision:
+    natural_only_crc: true
+
+classification_threshold:
+  enabled: false
+
+selective_prediction:
+  enabled: true
+  mode: risk_control
+  threshold_score: care_selected_path_correctness
+  risk_target: malware_conditional_accepted_fn
+  risk_level: 0.05
+  min_calibration_malware: 100
+  require_feasible: true

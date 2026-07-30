@@ -1,0 +1,11 @@
+defaults:
+  - ../../competence_anchored_fusion.yaml
+
+method:
+  name: training_no_atomic_auxiliary
+
+train:
+  exp_name: training_no_atomic_auxiliary
+
+loss:
+  atomic_aux_weight: 0.0

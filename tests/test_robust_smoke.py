@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+import os
 import random
 from pathlib import Path
 
@@ -20,7 +21,13 @@ from fusion.dataset import (
     robust_collate_fn,
 )
 from fusion.losses import compute_robust_loss
-from fusion.manifest_features import DEFAULT_CATEGORIES, load_manifest_vocab, vectorize_manifest_record
+from fusion.manifest_features import (
+    DEFAULT_CATEGORIES,
+    category_counts_from_strings,
+    load_manifest_vocab,
+    normalize_manifest_permissions,
+    vectorize_manifest_record,
+)
 from fusion.model import ApiSequenceEncoder, TriModalRobustModel
 from fusion.train import (
     _dataset_common_kwargs,
@@ -373,7 +380,14 @@ def test_robust_model_forward_and_loss():
         manifest_in_dim=32,
         manifest_emb_dim=32,
         manifest_hidden_dim=64,
-        discount_fusion_config={"combination": "dempster"},
+        discount_fusion_config={
+            "combination": "dempster",
+            "reliability_calibration": {
+                "enabled": True,
+                "method": "monotonic_correctness",
+                "use_api_observed_support": True,
+            },
+        },
     )
     model.eval()
     logits, extra = model(batch)
@@ -391,6 +405,24 @@ def test_robust_model_forward_and_loss():
         AvailabilityIndex.BASE_DIM,
     )
     assert torch.equal(extra["fusion_availability"], torch.ones(2, 3))
+    expected_api_support = torch.full(
+        (2,),
+        math.log1p(6.0) / math.log1p(16.0),
+    )
+    assert torch.allclose(
+        extra["api_observed_support"],
+        expected_api_support,
+    )
+    assert torch.allclose(
+        extra["observed_support_api"],
+        expected_api_support,
+    )
+    assert extra["reliability_features_api"].shape == (2, 4)
+    assert extra["reliability_features_graph"].shape == (2, 3)
+    assert torch.equal(
+        extra["api_observed_support_feature_active"],
+        torch.ones(2),
+    )
     assert "api_integrity" not in extra
     assert "api_encoder_coverage" not in extra
     assert "api_graph_anchor_support" not in extra
@@ -520,7 +552,7 @@ def test_robust_dataset_collate(tmp_path: Path, monkeypatch):
                 "pert_manifest": torch.tensor([0.0]),
             }
         ],
-        manifest_dim=16,
+        manifest_dim=32,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -546,7 +578,7 @@ def test_robust_dataset_collate(tmp_path: Path, monkeypatch):
         str(pt_dir),
         str(csv_path),
         is_train=True,
-        manifest_dim=16,
+        manifest_dim=32,
         manifest_category_dim=12,
         manifest_stats_dim=11,
         max_graph_nodes_per_sample=8,
@@ -570,7 +602,7 @@ def test_robust_dataset_collate(tmp_path: Path, monkeypatch):
         "graph_alive",
         "manifest_alive",
     }
-    assert graph.manifest_x.shape == (1, 16)
+    assert graph.manifest_x.shape == (1, 32)
     assert not hasattr(graph, "q_manifest")
     assert graph.api_ids.numel() == 3
     assert graph.api_type_ids.numel() == 3
@@ -594,7 +626,10 @@ def test_robust_dataset_collate(tmp_path: Path, monkeypatch):
     assert graph.graph_encoder_budget_max_nodes.view(-1).tolist() == [8]
     assert graph.graph_encoder_budget_contract == [1, 8, [3]]
     assert graph.to(torch.device("cpu")).graph_encoder_budget_contract == [1, 8, [3]]
-    assert len(mmap_paths) >= 2  # feature-dimension inference and __getitem__
+    if os.name == "nt":
+        assert mmap_paths == []
+    else:
+        assert len(mmap_paths) >= 2  # split preflight and __getitem__
 
 
 def test_dataset_strict_split_integrity_rejects_csv_pt_mismatch(tmp_path: Path):
@@ -620,7 +655,7 @@ def _make_label_contract_fixture(
     pt_dir = tmp_path / "pts"
     pt_dir.mkdir()
     sid = "sample"
-    save_current_pt(pt_dir / f"{sid}.pt", {}, manifest_dim=16)
+    save_current_pt(pt_dir / f"{sid}.pt", {}, manifest_dim=32)
     csv_path = tmp_path / "labels.csv"
     fieldnames = ["id", "label"] + (["year"] if year is not None else [])
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
@@ -639,7 +674,7 @@ def test_dataset_rejects_non_finite_or_non_binary_labels(tmp_path: Path, label: 
 
     with pytest.raises(ValueError, match="finite binary integers"):
         RobustTriModalDataset(
-            str(pt_dir), str(csv_path), is_train=False, manifest_dim=16
+            str(pt_dir), str(csv_path), is_train=False, manifest_dim=32
         )
 
 
@@ -652,7 +687,7 @@ def test_dataset_rejects_invalid_label_map_values(tmp_path: Path, mapped_value: 
             str(pt_dir),
             str(csv_path),
             is_train=False,
-            manifest_dim=16,
+            manifest_dim=32,
             label_map={"malware": mapped_value},
         )
 
@@ -664,7 +699,7 @@ def test_dataset_accepts_explicit_string_label_map(tmp_path: Path):
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        manifest_dim=16,
+        manifest_dim=32,
         label_map={"malware": 1},
     )
 
@@ -677,7 +712,7 @@ def test_dataset_rejects_non_finite_or_fractional_years(tmp_path: Path, year: ob
 
     with pytest.raises(ValueError, match="years that are not finite integers"):
         RobustTriModalDataset(
-            str(pt_dir), str(csv_path), is_train=False, manifest_dim=16
+            str(pt_dir), str(csv_path), is_train=False, manifest_dim=32
         )
 
 
@@ -705,7 +740,7 @@ def test_dataset_allows_pt_superset_for_real_failure_slice(tmp_path: Path):
                 "api_type_ids": torch.tensor([1]),
                 "manifest_x": torch.ones(16),
             },
-            manifest_dim=16,
+            manifest_dim=32,
         )
     csv_path = tmp_path / "slice.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -717,7 +752,7 @@ def test_dataset_allows_pt_superset_for_real_failure_slice(tmp_path: Path):
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        manifest_dim=16,
+        manifest_dim=32,
         allow_pt_superset=True,
     )
     assert len(dataset) == 1
@@ -741,7 +776,7 @@ def test_all_ghost_graph_is_not_alive_and_transports_no_runtime_quality_fields(
             "method_api_edge_index": torch.tensor([[0], [0]], dtype=torch.long),
             "manifest_x": torch.ones(16),
         },
-        manifest_dim=16,
+        manifest_dim=32,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -753,7 +788,7 @@ def test_all_ghost_graph_is_not_alive_and_transports_no_runtime_quality_fields(
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        manifest_dim=16,
+        manifest_dim=32,
         eval_perturb_type="graph_sparsify",
         eval_perturb_strength=0.5,
     )[0]
@@ -802,7 +837,7 @@ def test_multidex_api_limit_is_sample_level_and_keeps_encoder_vectors_aligned(
                 "method_api_edge_index": torch.tensor([[0, 1], [0, 1]], dtype=torch.long),
             },
         ],
-        manifest_dim=16,
+        manifest_dim=32,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -814,7 +849,7 @@ def test_multidex_api_limit_is_sample_level_and_keeps_encoder_vectors_aligned(
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        manifest_dim=16,
+        manifest_dim=32,
         max_api_events_per_sample=3,
     )
     graph = next(iter(DataLoader(dataset, batch_size=1, collate_fn=robust_collate_fn)))["graph_batch"]
@@ -901,11 +936,11 @@ def test_dataset_rejects_manifest_x_larger_than_configured_dim(tmp_path: Path):
             "api_method_index": torch.tensor([0], dtype=torch.long),
             "api_in_graph_mask": torch.ones(1),
             "method_api_edge_index": torch.tensor([[0], [0]], dtype=torch.long),
-            "manifest_x": torch.ones(20),
+            "manifest_x": torch.ones(40),
             "manifest_category_counts": torch.ones(12),
             "manifest_stats": torch.ones(11),
         },
-        manifest_dim=20,
+        manifest_dim=40,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -913,23 +948,12 @@ def test_dataset_rejects_manifest_x_larger_than_configured_dim(tmp_path: Path):
         writer.writeheader()
         writer.writerow({"id": sid, "label": 0, "year": 2024})
 
-    dataset = RobustTriModalDataset(str(pt_dir), str(csv_path), is_train=False, manifest_dim=16)
     with pytest.raises(FatalDatasetConfigError, match="manifest_x dimension"):
-        dataset[0]
-
-
-def test_dataset_requires_current_manifest_semantic_maps(tmp_path: Path):
-    pt_dir, csv_path = _make_graph_source_pt(tmp_path, sid="missing_manifest_maps")
-    path = pt_dir / "missing_manifest_maps.pt"
-    raw = torch.load(path, map_location="cpu", weights_only=True)
-    del raw["manifest_permission_category_map"]
-    torch.save(raw, path)
-    with pytest.raises(FatalDatasetConfigError, match="missing top-level fields"):
         RobustTriModalDataset(
             str(pt_dir),
             str(csv_path),
             is_train=False,
-            manifest_dim=16,
+            manifest_dim=32,
         )
 
 
@@ -944,7 +968,7 @@ def test_dataset_rejects_non_current_pt_schema_version(tmp_path: Path):
             str(pt_dir),
             str(csv_path),
             is_train=False,
-            manifest_dim=16,
+            manifest_dim=32,
         )
 
 
@@ -961,14 +985,56 @@ def test_removed_legacy_loss_weights_are_rejected():
             compute_robust_loss(logits, labels, extra, cfg)
 
 
-def _perturbation_sample():
+_DEFAULT_PERMISSION_TOKENS = normalize_manifest_permissions(
+    [
+        "android.permission.READ_SMS",
+        "android.permission.INTERNET",
+        "android.permission.CAMERA",
+        "android.permission.ACCESS_FINE_LOCATION",
+    ]
+)
+_NON_PERMISSION_CATEGORY_COUNTS = torch.ones(12)
+
+
+def _perturbation_sample(
+    permission_tokens: list[str] | None = None,
+    permission_token_ids: list[int] | None = None,
+    *,
+    permission_dim: int = 4,
+):
+    permission_tokens = (
+        list(_DEFAULT_PERMISSION_TOKENS)
+        if permission_tokens is None
+        else list(permission_tokens)
+    )
+    assert permission_tokens == normalize_manifest_permissions(permission_tokens)
+    permission_token_ids = (
+        list(range(1, len(permission_tokens) + 1))
+        if permission_token_ids is None
+        else list(permission_token_ids)
+    )
+    assert len(permission_token_ids) == len(permission_tokens)
+    known_ids = sorted({value for value in permission_token_ids if value > 0})
+    assert all(value <= permission_dim for value in known_ids)
+
+    manifest_category_counts = (
+        _NON_PERMISSION_CATEGORY_COUNTS
+        + category_counts_from_strings(permission_tokens)
+    )
     manifest_stats = torch.ones(11)
-    manifest_stats[0] = math.log1p(4) / 6.0
-    manifest_x = torch.zeros(32)
-    manifest_x[:4] = 1.0
-    manifest_x[4:6] = 1.0
-    manifest_x[6:18] = 1.0 / 12.0
-    manifest_x[18:29] = manifest_stats
+    manifest_stats[0] = math.log1p(len(permission_tokens)) / 6.0
+    intent_dim = 2
+    feature_dim = 0
+    category_start = permission_dim + intent_dim + feature_dim
+    stats_start = category_start + 12
+    manifest_x = torch.zeros(max(64, stats_start + manifest_stats.numel()))
+    if known_ids:
+        manifest_x[torch.tensor(known_ids) - 1] = 1.0
+    manifest_x[permission_dim : permission_dim + intent_dim] = 1.0
+    manifest_x[category_start : category_start + 12] = (
+        manifest_category_counts / manifest_category_counts.sum()
+    )
+    manifest_x[stats_start : stats_start + 11] = manifest_stats
     return {
         "api_ids": torch.tensor([1, 2, 3], dtype=torch.long),
         "api_type_ids": torch.tensor([1, 2, 3], dtype=torch.long),
@@ -977,13 +1043,16 @@ def _perturbation_sample():
         "edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
         "sensitive_mask": torch.ones(3, dtype=torch.uint8),
         "manifest_x": manifest_x,
-        "manifest_permission_ids": torch.tensor([1, 2, 3, 4], dtype=torch.long),
-        "manifest_permission_category_map": torch.ones((4, 12)),
-        "manifest_category_counts": torch.ones(12),
+        "manifest_permission_tokens": permission_tokens,
+        "manifest_permission_token_ids": torch.tensor(
+            permission_token_ids, dtype=torch.long
+        ),
+        "manifest_permission_ids": torch.tensor(known_ids, dtype=torch.long),
+        "manifest_category_counts": manifest_category_counts,
         "manifest_stats": manifest_stats,
-        "manifest_permission_dim": 4,
-        "manifest_intent_dim": 2,
-        "manifest_feature_dim": 0,
+        "manifest_permission_dim": permission_dim,
+        "manifest_intent_dim": intent_dim,
+        "manifest_feature_dim": feature_dim,
     }
 
 
@@ -1072,80 +1141,146 @@ def test_graph_sparsify_strength_one_removes_all_edges():
 
 
 def test_manifest_perturbation_updates_feature_vector_and_semantic_counts():
-    """Manifest perturbations must keep feature vectors and category-count
-    evidence in sync under the controlled permission-mask view."""
+    """Known permission bits, counts, and semantics change together."""
     data = _perturbation_sample()
     before = data["manifest_category_counts"].clone()
     before_x = data["manifest_x"].clone()
     data = apply_manifest_permission_mask(data, 0.5)
     assert not torch.equal(before, data["manifest_category_counts"])
-    # The feature vector IS modified.
     assert not torch.equal(before_x, data["manifest_x"])
     assert data["manifest_alive"] == 1.0
-    expected_count_stat = math.log1p(data["manifest_permission_ids"].numel()) / 6.0
+    expected_count_stat = (
+        math.log1p(len(data["manifest_permission_tokens"])) / 6.0
+    )
     stats_start = 4 + 2 + 0 + 12
     assert data["manifest_stats"][0].item() == pytest.approx(expected_count_stat)
     assert data["manifest_x"][stats_start].item() == pytest.approx(
         expected_count_stat
     )
-    assert data["manifest_permission_count"] == data["manifest_permission_ids"].numel()
+    assert data["manifest_permission_count"] == len(
+        data["manifest_permission_tokens"]
+    )
 
 
-def test_sparse_manifest_permission_mask_changes_an_eligible_position():
-    data = _perturbation_sample()
-    data["manifest_x"] = torch.zeros(64)
-    data["manifest_x"][[1, 7]] = 1.0
-    data["manifest_permission_dim"] = 16
-    data["manifest_permission_ids"] = torch.tensor([2, 8], dtype=torch.long)
-    data["manifest_permission_category_map"] = torch.ones((16, 12))
-    data["manifest_stats"][0] = math.log1p(2) / 6.0
-    stats_start = 16 + 2 + 0 + 12
-    data["manifest_x"][stats_start : stats_start + 11] = data["manifest_stats"]
+def _assert_manifest_permission_state_consistent(data: dict) -> None:
+    tokens = data["manifest_permission_tokens"]
+    token_ids = data["manifest_permission_token_ids"].long()
+    permission_dim = int(data["manifest_permission_dim"])
+    expected_known_ids = token_ids[token_ids > 0].unique(sorted=True)
+    active_ids = (
+        torch.where(data["manifest_x"][:permission_dim].abs() > 1.0e-8)[0]
+        + 1
+    )
+    assert tokens == normalize_manifest_permissions(tokens)
+    assert len(tokens) == token_ids.numel()
+    assert torch.equal(data["manifest_permission_ids"], expected_known_ids)
+    assert torch.equal(active_ids, expected_known_ids)
+    assert data["manifest_permission_count"] == len(tokens)
+
+    expected_stat = math.log1p(len(tokens)) / 6.0
+    stats_start = (
+        permission_dim
+        + int(data["manifest_intent_dim"])
+        + int(data["manifest_feature_dim"])
+        + 12
+    )
+    assert data["manifest_stats"][0].item() == pytest.approx(expected_stat)
+    assert data["manifest_x"][stats_start].item() == pytest.approx(expected_stat)
+
+    expected_counts = (
+        _NON_PERMISSION_CATEGORY_COUNTS
+        + category_counts_from_strings(tokens)
+    )
+    assert torch.equal(data["manifest_category_counts"], expected_counts)
+    category_start = stats_start - 12
+    expected_normalized = expected_counts / expected_counts.sum()
+    assert torch.allclose(
+        data["manifest_x"][category_start:stats_start],
+        expected_normalized,
+    )
+
+
+def test_permission_mask_strengths_cover_all_oov_permissions_proportionally():
+    tokens = [
+        f"oov.permission.network_{index:02d}" for index in range(10)
+    ]
+    weak = _perturbation_sample(tokens, [0] * 10)
+    medium = _perturbation_sample(tokens, [0] * 10)
+    torch.manual_seed(781)
+    weak = apply_manifest_permission_mask(weak, 0.1)
+    torch.manual_seed(781)
+    medium = apply_manifest_permission_mask(medium, 0.3)
+
+    assert len(weak["manifest_permission_tokens"]) == 9
+    assert len(medium["manifest_permission_tokens"]) == 7
+    assert set(medium["manifest_permission_tokens"]).issubset(
+        weak["manifest_permission_tokens"]
+    )
+    assert weak["manifest_permission_ids"].numel() == 0
+    assert medium["manifest_permission_ids"].numel() == 0
+    _assert_manifest_permission_state_consistent(weak)
+    _assert_manifest_permission_state_consistent(medium)
+
+
+def test_permission_mask_keeps_mixed_known_oov_alignment_consistent():
+    tokens = normalize_manifest_permissions(
+        [
+            "android.permission.INTERNET",
+            "custom.permission.OOV_NETWORK",
+            "android.permission.READ_SMS",
+            "custom.permission.OOV_SMS",
+        ]
+    )
+    token_to_id = {
+        "android.permission.internet": 2,
+        "android.permission.read_sms": 8,
+    }
+    token_ids = [token_to_id.get(token, 0) for token in tokens]
+    data = _perturbation_sample(
+        tokens,
+        token_ids,
+        permission_dim=8,
+    )
+    torch.manual_seed(991)
     masked = apply_manifest_permission_mask(data, 0.5)
-    assert int((masked["manifest_x"][:16] > 0).sum().item()) == 1
-    assert masked["manifest_permission_ids"].numel() == 1
-    expected = math.log1p(1) / 6.0
-    assert masked["manifest_stats"][0].item() == pytest.approx(expected)
-    assert masked["manifest_x"][stats_start].item() == pytest.approx(expected)
+
+    assert len(masked["manifest_permission_tokens"]) == 2
+    _assert_manifest_permission_state_consistent(masked)
 
 
-def test_permission_mask_removes_count_side_channel_without_vocab_hits():
-    data = _perturbation_sample()
-    data["manifest_x"][:4] = 0.0
-    data["manifest_permission_ids"] = torch.empty(0, dtype=torch.long)
-    data["manifest_stats"][0] = math.log1p(3) / 6.0
-    stats_start = 4 + 2 + 0 + 12
-    data["manifest_x"][stats_start] = data["manifest_stats"][0]
-
+def test_permission_mask_strength_one_removes_known_and_oov_permissions():
+    tokens = normalize_manifest_permissions(
+        [
+            "android.permission.INTERNET",
+            "custom.permission.OOV_NETWORK",
+            "android.permission.READ_SMS",
+        ]
+    )
+    token_ids = [
+        1 if token == "android.permission.internet" else 0
+        for token in tokens
+    ]
+    data = _perturbation_sample(tokens, token_ids)
     out = apply_manifest_permission_mask(data, 1.0)
 
+    assert out["manifest_permission_tokens"] == []
+    assert out["manifest_permission_token_ids"].numel() == 0
     assert out["manifest_permission_ids"].numel() == 0
-    assert out["manifest_permission_count"] == 0
-    assert out["manifest_stats"][0].item() == 0.0
-    assert out["manifest_x"][stats_start].item() == 0.0
-    assert out["manifest_alive"] in {0.0, 1.0}
+    assert torch.equal(
+        out["manifest_category_counts"],
+        _NON_PERMISSION_CATEGORY_COUNTS,
+    )
+    _assert_manifest_permission_state_consistent(out)
 
 
-def test_manifest_permission_mask_updates_semantic_counts_when_mapping_is_available():
+def test_permission_mask_rejects_payload_without_token_alignment():
     data = _perturbation_sample()
-    data["manifest_x"] = torch.zeros(32)
-    data["manifest_x"][0] = 1.0
-    data["manifest_permission_dim"] = 2
-    data["manifest_intent_dim"] = 0
-    data["manifest_feature_dim"] = 0
-    data["manifest_permission_ids"] = torch.tensor([1], dtype=torch.long)
-    data["manifest_category_counts"] = torch.zeros(12)
-    data["manifest_category_counts"][0] = 1.0
-    mapping = torch.zeros(2, 12)
-    mapping[0, 0] = 1.0
-    data["manifest_permission_category_map"] = mapping
-    data["manifest_stats"][0] = math.log1p(1) / 6.0
-    stats_start = 2 + 12
-    data["manifest_x"][stats_start : stats_start + 11] = data["manifest_stats"]
-    out = apply_manifest_permission_mask(data, 1.0)
-    assert out["manifest_category_counts"][0].item() == 0.0
-    assert out["manifest_stats"][0].item() == 0.0
-    assert out["manifest_x"][stats_start].item() == 0.0
+    del data["manifest_permission_token_ids"]
+    with pytest.raises(
+        ValueError,
+        match="missing Manifest permission-alignment tensors",
+    ):
+        apply_manifest_permission_mask(data, 0.3)
 
 
 def test_zero_strength_degradation_is_noop():
@@ -1188,7 +1323,7 @@ def test_eval_perturbation_is_deterministic_per_sample(tmp_path: Path):
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        manifest_dim=16,
+        manifest_dim=32,
         manifest_stats_dim=11,
         eval_perturb_type="api_event_dropout",
         eval_perturb_strength=0.5,
@@ -1201,12 +1336,71 @@ def test_eval_perturbation_is_deterministic_per_sample(tmp_path: Path):
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        manifest_dim=16,
+        manifest_dim=32,
         manifest_stats_dim=11,
         eval_perturb_type="api_event_dropout",
         eval_perturb_strength=0.9,
     )[0]
     assert first.api_aug_type == stronger.api_aug_type
+
+
+def test_manifest_permission_alignment_state_never_enters_model_batch(
+    tmp_path: Path,
+):
+    sid = "manifest_mask_hidden_state"
+    pt_dir = tmp_path / "pts"
+    pt_dir.mkdir()
+    manifest_payload = vectorize_manifest_record(
+        {
+            "sha256": sid,
+            "permissions": [
+                "android.permission.INTERNET",
+                "custom.permission.OOV_NETWORK",
+            ],
+            "component_count": 1,
+        },
+        {
+            "categories": list(DEFAULT_CATEGORIES),
+            "permission_vocab": ["android.permission.internet"],
+            "intent_vocab": [],
+            "feature_vocab": [],
+        },
+        manifest_dim=32,
+    )
+    save_current_pt(
+        pt_dir / f"{sid}.pt",
+        {
+            "call_x": torch.ones((1, 8)),
+            "call_edge_index": torch.empty((2, 0), dtype=torch.long),
+            "call_sensitive_mask": torch.zeros(1, dtype=torch.uint8),
+            "api_ids": torch.tensor([1], dtype=torch.long),
+            "api_type_ids": torch.tensor([1], dtype=torch.uint8),
+            "api_sensitive_mask": torch.zeros(1, dtype=torch.uint8),
+        },
+        top_level=manifest_payload,
+        manifest_dim=32,
+    )
+    csv_path = tmp_path / "labels.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["id", "label", "year"])
+        writer.writeheader()
+        writer.writerow({"id": sid, "label": 1, "year": 2024})
+
+    sample = RobustTriModalDataset(
+        str(pt_dir),
+        str(csv_path),
+        is_train=False,
+        manifest_dim=32,
+        manifest_permission_dim=1,
+        manifest_intent_dim=0,
+        manifest_feature_dim=0,
+        eval_perturb_type="manifest_permission_mask",
+        eval_perturb_strength=0.5,
+    )[0]
+
+    assert sample.manifest_aug_type == "manifest_permission_mask"
+    assert not hasattr(sample, "manifest_permission_tokens")
+    assert not hasattr(sample, "manifest_permission_token_ids")
 
 
 def test_manifest_missing_zeroes_manifest_counts_and_availability():
@@ -1277,7 +1471,7 @@ def test_manifest_vectorization_rejects_layout_truncation():
         vectorize_manifest_record(record, vocab, manifest_dim=required - 1)
 
 
-def test_manifest_vectorization_stores_semantic_maps_and_coverage_quality():
+def test_manifest_vectorization_stores_permission_alignment_and_audit_coverage():
     vocab = {
         "categories": list(DEFAULT_CATEGORIES),
         "permission_vocab": ["android.permission.internet"],
@@ -1285,15 +1479,31 @@ def test_manifest_vectorization_stores_semantic_maps_and_coverage_quality():
         "feature_vocab": [],
     }
     record = {
-        "permissions": ["android.permission.internet", "unknown.permission"],
+        "permissions": [
+            "UNKNOWN.PERMISSION",
+            "android.permission.internet",
+            "android.permission.INTERNET",
+        ],
         "component_count": 1,
     }
     required = 1 + len(DEFAULT_CATEGORIES) + 11
     payload = vectorize_manifest_record(record, vocab, manifest_dim=required)
-    assert payload["manifest_permission_category_map"].shape == (1, 12)
-    assert payload["manifest_permission_category_map"][:, CATEGORY_TO_INDEX["network"]].sum().item() > 0
     assert payload["manifest_component_category_counts"].shape == (12,)
-    assert payload["q_manifest"].item() == pytest.approx(0.75)
+    assert "q_manifest" not in payload
+    assert "pert_manifest" not in payload
+    assert payload["observable_metadata"]["manifest_vocab_coverage"] == pytest.approx(
+        0.5
+    )
+    assert payload["manifest_meta"]["permissions"] == [
+        "android.permission.internet",
+        "unknown.permission",
+    ]
+    assert payload["manifest_permission_token_ids"].tolist() == [1, 0]
+    assert payload["manifest_permission_ids"].tolist() == [1]
+    assert payload["observable_metadata"]["manifest_permission_count"] == 2
+    assert payload["manifest_stats"][0].item() == pytest.approx(
+        math.log1p(2) / 6.0
+    )
 
 
 def test_direct_build_fingerprint_changes_with_extraction_schema():
@@ -1371,7 +1581,7 @@ def test_direct_resume_requires_matching_current_schema(tmp_path: Path):
     assert status is False
     assert row["status"] == "failed"
 
-    del payload["manifest_permission_category_map"]
+    del payload["manifest_permission_token_ids"]
     torch.save(payload, path)
     status, row = _resume_existing(job, cfg, "match")
     assert status is False
@@ -1482,7 +1692,7 @@ def _make_graph_source_pt(tmp_path: Path, sid: str = "graph_src_sample"):
                 "pert_manifest": torch.tensor([0.0]),
             }
         ],
-        manifest_dim=16,
+        manifest_dim=32,
     )
     csv_path = tmp_path / "labels.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:

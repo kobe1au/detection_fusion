@@ -1,5 +1,5 @@
 defaults:
-  - ../ablations/i2/combination_cumulative.yaml
+  - ../baselines/trusted/cumulative.yaml
   - _subset_protocol.yaml
 
 method:

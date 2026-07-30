@@ -1,5 +1,5 @@
 defaults:
-  - ../ablations/i2/combination_dempster.yaml
+  - ../baselines/trusted/dempster.yaml
   - _subset_protocol.yaml
 
 method:

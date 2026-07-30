@@ -194,7 +194,7 @@ def test_dense_embedding_model_mode_fuses_only_alive_branches():
     )
 
 
-def test_dense_embedding_gate_adapted_config_has_independent_identity_and_i3_budget():
+def test_dense_embedding_gate_adapted_config_has_independent_identity():
     cfg = load_config_path(ROOT / "baselines/dense_embedding_gate_adapted.yaml")
 
     assert cfg["method"]["name"] == "dense_embedding_gate_adapted"
@@ -208,9 +208,10 @@ def test_dense_embedding_gate_adapted_config_has_independent_identity_and_i3_bud
     assert cfg["loss"]["auxiliary_weight_mode"] == "alive_masked_uniform"
     assert cfg["calibration"]["enabled"] is False
     assert cfg["calibration"]["holdout_enabled"] is True
+    # Every main-table fusion method receives the same model-selection
+    # macro-F1 threshold budget. I3 remains a separate decision layer.
     assert cfg["classification_threshold"]["enabled"] is True
-    assert cfg["selective_prediction"]["mode"] == "risk_control"
-    assert cfg["selective_prediction"]["threshold_score"] == "msp"
+    assert cfg["selective_prediction"]["enabled"] is False
 
     # I3 is a model-agnostic decision layer when it consumes only final class
     # probabilities.  The baseline must not be rejected merely because it does
@@ -299,16 +300,10 @@ def test_fixed_prior_beta_is_restricted_to_the_prior_only_sensitivity():
         GlobalOpinionRouter(mode="learned", fixed_prior_beta=0.5)
 
 
-def test_fixed_prior_beta_appendix_configs_are_not_learned_router_cells():
-    configs = (
-        (ROOT / "appendix/prior_beta_0_5.yaml", 0.5),
-        (ROOT / "ablations/i2/router_prior_only.yaml", 1.0),
-        (ROOT / "appendix/prior_beta_2_0.yaml", 2.0),
+def test_retired_prior_beta_configs_are_absent_from_formal_catalog():
+    retired = (
+        ROOT / "appendix/prior_beta_0_5.yaml",
+        ROOT / "ablations/i2/router_prior_only.yaml",
+        ROOT / "appendix/prior_beta_2_0.yaml",
     )
-    for path, expected in configs:
-        cfg = load_config_path(path)
-        routing = cfg["fusion"]["routing"]
-        assert routing["mode"] == "prior_only"
-        assert routing["fixed_prior_beta"] == pytest.approx(expected)
-        assert routing["prediction_loss_weight"] == 0.0
-        assert "route_oracle_loss_weight" not in routing
+    assert all(not path.exists() for path in retired)

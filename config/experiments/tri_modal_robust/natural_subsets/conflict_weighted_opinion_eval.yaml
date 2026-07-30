@@ -1,5 +1,5 @@
 defaults:
-  - ../ablations/i2/combination_conflict_weighted_opinion.yaml
+  - ../baselines/trusted/conflict_weighted_opinion.yaml
   - _subset_protocol.yaml
 
 method:

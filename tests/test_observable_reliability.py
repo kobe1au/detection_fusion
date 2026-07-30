@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from pathlib import Path
 
 import pytest
@@ -70,7 +71,7 @@ def test_observable_schema_strict_missing_fields(tmp_path: Path):
             str(pt_dir),
             str(csv_path),
             is_train=False,
-            manifest_dim=16,
+            manifest_dim=32,
         )
 
 
@@ -102,7 +103,7 @@ def test_current_pt_loads_but_runtime_data_contains_only_hard_availability(
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        manifest_dim=16,
+        manifest_dim=32,
     )[0]
     assert sample.api_alive.item() == 1.0
     assert sample.graph_alive.item() == 1.0
@@ -167,7 +168,7 @@ def test_historical_quality_payload_cannot_change_availability_or_fusion_output(
         str(pt_dir),
         str(csv_path),
         is_train=False,
-        manifest_dim=16,
+        manifest_dim=32,
     )
     first, second = dataset[0], dataset[1]
     assert torch.equal(first.api_ids, second.api_ids)
@@ -190,8 +191,30 @@ def test_historical_quality_payload_cannot_change_availability_or_fusion_output(
     assert torch.equal(availability, torch.ones_like(availability))
     assert set(diagnostics) == {"api_alive", "graph_alive", "manifest_alive"}
 
-    fusion = DiscountProbabilityFusion({"combination": "cumulative"})
-    outputs = fusion(logits, logits, logits, availability)
+    current_counts = torch.bincount(batch.api_batch, minlength=2).float()
+    api_observed_support = torch.log1p(current_counts) / math.log1p(2048.0)
+    assert api_observed_support[0] == api_observed_support[1]
+    fusion = DiscountProbabilityFusion(
+        {
+            "combination": "cumulative",
+            "reliability_calibration": {
+                "enabled": True,
+                "method": "monotonic_correctness",
+                "use_api_observed_support": True,
+            },
+        }
+    )
+    outputs = fusion(
+        logits,
+        logits,
+        logits,
+        availability,
+        api_observed_support=api_observed_support,
+    )
+    assert torch.equal(
+        outputs["observed_support_api"],
+        api_observed_support,
+    )
     assert torch.allclose(outputs["final_prob"][0], outputs["final_prob"][1])
 
 
@@ -265,8 +288,6 @@ def test_partial_and_missing_perturbations_refresh_hard_availability():
         "manifest_permission_dim": 2,
         "manifest_intent_dim": 1,
         "manifest_feature_dim": 0,
-        "manifest_permission_category_map": torch.zeros((2, 12)),
-        "manifest_intent_category_map": torch.zeros((1, 12)),
         "api_semantic_category_counts": torch.ones(12),
         "graph_semantic_category_counts": torch.ones(12),
         "graph_semantic_source": "alignment",

@@ -28,35 +28,45 @@ def _inputs(
     return probabilities, reliability_map, alive_map
 
 
-def test_route_conflict_is_an_explicit_non_positive_score_term():
-    with_conflict = GlobalOpinionRouter(
-        route_conflict_enabled=True,
-        risk_conflict_enabled=False,
+def test_route_depends_only_on_reliability_not_branch_conflict():
+    router = GlobalOpinionRouter(risk_conflict_enabled=True)
+    consensus = router(
+        *_inputs(
+            (0.2, 0.2, 0.2),
+            reliabilities=(0.9, 0.6, 0.3),
+        ),
+        learned_active=True,
     )
-    without_conflict = GlobalOpinionRouter(
-        route_conflict_enabled=False,
-        risk_conflict_enabled=False,
+    conflicting = router(
+        *_inputs(
+            (0.2, 0.2, 0.9),
+            reliabilities=(0.9, 0.6, 0.3),
+        ),
+        learned_active=True,
     )
-    without_conflict.load_state_dict(with_conflict.state_dict())
 
-    inputs = _inputs((0.2, 0.2, 0.8))
-    penalized = with_conflict(*inputs, learned_active=True)
-    unpenalized = without_conflict(*inputs, learned_active=True)
-
-    assert torch.all(penalized["conflict_penalty"] >= 0.0)
-    assert penalized["reliability_weighted_cross_modal_conflict"][
-        0, 2
-    ] > penalized[
-        "reliability_weighted_cross_modal_conflict"
-    ][0, 0]
-    assert torch.allclose(
-        penalized["routing_scores"],
-        unpenalized["routing_scores"] - penalized["conflict_penalty"],
-        atol=1.0e-6,
+    torch.testing.assert_close(
+        conflicting["routing_scores"],
+        consensus["routing_scores"],
     )
-    assert penalized["branch_distribution"][0, 2] < unpenalized[
-        "branch_distribution"
-    ][0, 2]
+    torch.testing.assert_close(
+        conflicting["branch_distribution"],
+        consensus["branch_distribution"],
+    )
+    assert conflicting["global_cross_modal_conflict"].item() > consensus[
+        "global_cross_modal_conflict"
+    ].item()
+    assert conflicting["risk_probability"].item() > consensus[
+        "risk_probability"
+    ].item()
+    for removed_key in (
+        "routing_cross_modal_conflict",
+        "conflict_penalty_scale",
+        "conflict_penalty",
+        "route_conflict_feature_configured",
+        "route_conflict_feature_active",
+    ):
+        assert removed_key not in conflicting
 
 
 def test_peer_consensus_is_equivariant_to_modality_permutation():
@@ -149,8 +159,8 @@ def test_identical_branch_opinions_have_zero_peer_consensus_js():
         (0.0, 0.0, 0.0),
     ],
 )
-def test_dead_or_no_peer_placeholders_do_not_create_route_conflict(alive):
-    router = GlobalOpinionRouter(route_conflict_enabled=True)
+def test_dead_or_no_peer_placeholders_do_not_create_cross_modal_conflict(alive):
+    router = GlobalOpinionRouter()
     outputs = router(
         *_inputs(
             (0.12, 0.88, 0.51),
@@ -172,19 +182,12 @@ def test_dead_or_no_peer_placeholders_do_not_create_route_conflict(alive):
         rtol=0.0,
         atol=0.0,
     )
-    torch.testing.assert_close(
-        outputs["conflict_penalty"],
-        torch.zeros(1, 3),
-        rtol=0.0,
-        atol=0.0,
-    )
 
 
 def test_effective_regularizers_and_scale_diagnostics_are_finite():
     router = GlobalOpinionRouter()
     with torch.no_grad():
         router.raw_route_prior_beta.fill_(2.5)
-        router.raw_conflict_scale.copy_(torch.tensor([-3.0, 0.0, 1.5]))
         router.raw_risk_feature_weights.copy_(
             torch.linspace(-1.5, 1.5, router.raw_risk_feature_weights.numel())
         )
@@ -198,19 +201,15 @@ def test_effective_regularizers_and_scale_diagnostics_are_finite():
     diagnostics = router.effective_parameter_diagnostics()
     assert diagnostics.keys() == {
         "route_prior_beta",
-        "route_conflict_scale_max",
         "risk_feature_weight_max",
         "risk_bias_abs",
     }
     assert all(math.isfinite(value) and value >= 0.0 for value in diagnostics.values())
 
     details = router.effective_parameter_details()
-    assert details["route_conflict_active"] is True
     assert details["risk_conflict_active"] is True
-    assert details["route_score_semantics"] == (
-        "beta_logit_reliability_minus_nonnegative_consensus_conflict"
-    )
-    assert set(details["route_conflict_scale"]) == set(BRANCHES)
+    assert details["route_score_semantics"] == "beta_logit_reliability"
+    assert not any(key.startswith("route_conflict") for key in details)
     assert set(details["risk_feature_weights"]) == {
         "reliability_deficit",
         "decision_boundary_proximity",
@@ -223,25 +222,17 @@ def test_effective_parameter_details_report_operative_ablation_semantics():
     router = GlobalOpinionRouter(
         mode="prior_only",
         fixed_prior_beta=0.5,
-        route_conflict_enabled=False,
         risk_mode="reliability_prior",
         risk_conflict_enabled=False,
     )
     with torch.no_grad():
         router.raw_route_prior_beta.fill_(8.0)
-        router.raw_conflict_scale.fill_(8.0)
         router.raw_risk_feature_weights.fill_(8.0)
         router.risk_bias.fill_(8.0)
 
     details = router.effective_parameter_details()
     assert details["route_mode"] == "prior_only"
-    assert details["route_conflict_enabled"] is False
-    assert details["route_conflict_active"] is False
     assert details["route_prior_beta"] == pytest.approx(0.5)
-    assert all(
-        value == pytest.approx(0.0)
-        for value in details["route_conflict_scale"].values()
-    )
     assert details["route_score_semantics"] == "beta_logit_reliability"
     assert details["risk_mode"] == "reliability_prior"
     assert details["risk_conflict_enabled"] is False
@@ -251,18 +242,13 @@ def test_effective_parameter_details_report_operative_ablation_semantics():
     assert details["risk_bias"] is None
     diagnostics = router.effective_parameter_diagnostics()
     assert diagnostics["route_prior_beta"] == pytest.approx(0.5)
-    assert diagnostics["route_conflict_scale_max"] == pytest.approx(0.0)
     assert diagnostics["risk_feature_weight_max"] == pytest.approx(0.0)
     assert diagnostics["risk_bias_abs"] == pytest.approx(0.0)
 
 
-def test_route_and_risk_conflict_switches_are_independent():
-    base = GlobalOpinionRouter(
-        route_conflict_enabled=True,
-        risk_conflict_enabled=True,
-    )
+def test_risk_conflict_switch_does_not_change_route():
+    base = GlobalOpinionRouter(risk_conflict_enabled=True)
     no_risk_conflict = GlobalOpinionRouter(
-        route_conflict_enabled=True,
         risk_conflict_enabled=False,
     )
     no_risk_conflict.load_state_dict(base.state_dict())
@@ -442,33 +428,26 @@ def test_one_hot_probabilities_remain_finite_in_float16_with_small_eps():
         assert torch.isfinite(outputs[key]).all(), key
 
 
-def test_learned_route_parameter_set_contains_only_beta_and_conflict_scales():
+def test_learned_route_parameter_set_contains_only_beta():
     router = GlobalOpinionRouter()
 
     assert not hasattr(router, "route_residual")
-    route_parameters = router.route_parameters()
-    assert len(route_parameters) == 2
-    assert route_parameters[0] is router.raw_route_prior_beta
-    assert route_parameters[1] is router.raw_conflict_scale
-    assert sum(parameter.numel() for parameter in router.route_parameters()) == 4
-    assert sum(parameter.numel() for parameter in router.risk_parameters()) == 4
-
-    no_conflict = GlobalOpinionRouter(route_conflict_enabled=False)
-    no_conflict_parameters = no_conflict.route_parameters()
-    assert len(no_conflict_parameters) == 1
-    assert no_conflict_parameters[0] is no_conflict.raw_route_prior_beta
-    expected_l2 = torch.nn.functional.softplus(
-        no_conflict.raw_route_prior_beta
-    ).square() / 4.0
-    torch.testing.assert_close(no_conflict.route_effective_l2(), expected_l2)
-
-
-def test_no_i1_route_is_conflict_only_and_beta_is_not_optimized():
-    router = GlobalOpinionRouter(reliability_input_enabled=False)
+    assert not hasattr(router, "raw_conflict_scale")
     route_parameters = router.route_parameters()
     assert len(route_parameters) == 1
-    assert route_parameters[0] is router.raw_conflict_scale
+    assert route_parameters[0] is router.raw_route_prior_beta
+    assert sum(parameter.numel() for parameter in router.route_parameters()) == 1
+    assert sum(parameter.numel() for parameter in router.risk_parameters()) == 4
 
+    expected_l2 = torch.nn.functional.softplus(
+        router.raw_route_prior_beta
+    ).square()
+    torch.testing.assert_close(router.route_effective_l2(), expected_l2)
+
+
+def test_no_i1_route_is_alive_uniform_and_has_no_route_parameters():
+    router = GlobalOpinionRouter(reliability_input_enabled=False)
+    assert router.route_parameters() == []
     first = router(
         *_inputs(
             (0.1, 0.5, 0.9),
@@ -479,31 +458,34 @@ def test_no_i1_route_is_conflict_only_and_beta_is_not_optimized():
     )
     second = router(
         *_inputs(
-            (0.1, 0.5, 0.9),
+            (0.9, 0.5, 0.1),
             reliabilities=(0.10, 0.55, 0.99),
         ),
         learned_active=True,
         compute_risk=False,
     )
-    torch.testing.assert_close(
-        first["branch_distribution"], second["branch_distribution"]
-    )
+    expected = torch.full((1, 3), 1.0 / 3.0)
+    torch.testing.assert_close(first["branch_distribution"], expected)
+    torch.testing.assert_close(second["branch_distribution"], expected)
     assert float(first["route_prior_beta"]) == pytest.approx(0.0)
     assert router.effective_parameter_details()["route_score_semantics"] == (
-        "negative_nonnegative_consensus_conflict"
+        "alive_masked_uniform"
     )
+    assert router.route_effective_l2().item() == pytest.approx(0.0)
 
-    loss = -first["mixture_probability"][0, 1].log()
-    loss = loss + 0.1 * router.route_effective_l2()
-    loss.backward()
-    assert router.raw_route_prior_beta.grad is None
-    assert router.raw_conflict_scale.grad is not None
+
+def test_removed_route_conflict_checkpoint_is_rejected_strictly():
+    router = GlobalOpinionRouter()
+    removed_state = dict(router.state_dict())
+    removed_state["raw_conflict_scale"] = torch.zeros(3)
+
+    with pytest.raises(RuntimeError, match="Unexpected key.*raw_conflict_scale"):
+        router.load_state_dict(removed_state, strict=True)
 
 
 def test_fully_ablated_route_is_static_alive_uniform_with_no_parameters():
     router = GlobalOpinionRouter(
         reliability_input_enabled=False,
-        route_conflict_enabled=False,
         risk_mode="disabled",
     )
     assert router.route_parameters() == []
@@ -570,8 +552,8 @@ def test_legacy_five_feature_risk_checkpoint_is_rejected():
         router.load_state_dict(legacy_state, strict=True)
 
 
-def test_route_weight_is_monotone_in_own_reliability_without_conflict():
-    router = GlobalOpinionRouter(route_conflict_enabled=False)
+def test_route_weight_is_monotone_in_own_reliability():
+    router = GlobalOpinionRouter()
     lower = router(
         *_inputs(reliabilities=(0.60, 0.70, 0.80)), learned_active=True
     )
@@ -584,7 +566,7 @@ def test_route_weight_is_monotone_in_own_reliability_without_conflict():
 
 
 def test_router_public_api_excludes_raw_edl_uncertainty_and_old_risk_features():
-    router = GlobalOpinionRouter(route_conflict_enabled=True)
+    router = GlobalOpinionRouter()
     outputs = router(
         *_inputs(
             (0.2, 0.5, 0.8),
@@ -654,7 +636,6 @@ def _parameter_gradients(
 
 def test_prepared_full_path_preserves_every_output_and_parameter_gradient():
     router = GlobalOpinionRouter(
-        route_conflict_enabled=True,
         risk_conflict_enabled=True,
         risk_mode="learned",
     )
@@ -711,7 +692,7 @@ def test_prepared_full_path_preserves_every_output_and_parameter_gradient():
 def test_prepared_route_only_path_preserves_alive_mask_outputs_and_gradients(
     alive,
 ):
-    router = GlobalOpinionRouter(route_conflict_enabled=True)
+    router = GlobalOpinionRouter()
     inputs = _inputs(
         (0.1, 0.6, 0.88),
         reliabilities=(0.9, 0.55, 0.2),

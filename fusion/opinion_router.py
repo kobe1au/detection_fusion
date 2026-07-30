@@ -17,6 +17,42 @@ RISK_FEATURE_NAMES = (
 RISK_TARGETS = ("threshold_malware_false_negative",)
 
 
+def threshold_aligned_fn_risk_state(
+    raw_log_odds: torch.Tensor,
+    raw_log_odds_threshold: float | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the deployed class side and benign-side boundary proximity.
+
+    ``raw_log_odds_threshold`` may be the scalar deployment cutoff used at
+    inference or one cutoff per row during fold-excluded risk-head fitting.
+    Keeping this transformation shared prevents the I2 target, training
+    feature, and deployed gating rule from drifting apart.
+    """
+    if not isinstance(raw_log_odds, torch.Tensor) or raw_log_odds.ndim != 1:
+        raise ValueError("raw_log_odds must be a rank-one tensor")
+    threshold = torch.as_tensor(
+        raw_log_odds_threshold,
+        device=raw_log_odds.device,
+        dtype=raw_log_odds.dtype,
+    )
+    if threshold.ndim == 0:
+        threshold = threshold.expand_as(raw_log_odds)
+    elif threshold.shape != raw_log_odds.shape:
+        raise ValueError(
+            "raw_log_odds_threshold must be scalar or match raw_log_odds"
+        )
+    predicted_malware = raw_log_odds >= threshold
+    # Conditional malware-FN risk is defined only on the predicted-benign
+    # side. Its boundary feature rises monotonically from zero towards one as
+    # a benign decision approaches the fitted malware cutoff.
+    decision_boundary_proximity = torch.where(
+        predicted_malware,
+        torch.zeros_like(raw_log_odds),
+        (2.0 * torch.sigmoid(raw_log_odds - threshold)).clamp(0.0, 1.0),
+    )
+    return predicted_malware, decision_boundary_proximity
+
+
 def _inverse_softplus(value: float) -> float:
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError("inverse-softplus input must be finite and positive")
@@ -35,13 +71,13 @@ class GlobalOpinionRouter(nn.Module):
     * ``u`` is trained by BCE/Brier against its explicitly configured event.
 
     The class-routing score is deliberately restricted to
-    ``beta * logit(reliability_m) - softplus(lambda_m) * conflict_m``.
-    ``conflict_m`` is the normalized JS divergence between branch ``m`` and the
-    reliability-weighted consensus of its alive peers, scaled by the peers'
-    mean reliability. The independent monotone risk head has exactly three
-    fixed features: routed reliability deficit, proximity to the deployed
-    classification boundary, and global cross-modal conflict. Raw evidential
-    uncertainty and missing fractions are intentionally not router inputs.
+    ``beta * logit(reliability_m)`` over alive branches. Cross-modal conflict
+    does not identify which branch is wrong, so it cannot change branch
+    weights. It remains an input to the independent monotone risk head, whose
+    three fixed features are routed reliability deficit, proximity to the
+    deployed classification boundary, and global cross-modal conflict. Raw
+    evidential uncertainty and missing fractions are intentionally not router
+    inputs.
     """
 
     MODES = ("learned", "prior_only")
@@ -50,7 +86,6 @@ class GlobalOpinionRouter(nn.Module):
         self,
         *,
         mode: str = "learned",
-        route_conflict_enabled: bool = True,
         risk_conflict_enabled: bool = True,
         risk_mode: str = "learned",
         risk_target: str = "threshold_malware_false_negative",
@@ -87,7 +122,6 @@ class GlobalOpinionRouter(nn.Module):
             raise ValueError(
                 "routing risk_mode must be learned, reliability_prior, or disabled"
             )
-        self.route_conflict_enabled = bool(route_conflict_enabled)
         self.risk_conflict_enabled = bool(risk_conflict_enabled)
         self.risk_mode = risk_mode
         risk_target = str(risk_target).strip().lower()
@@ -115,12 +149,6 @@ class GlobalOpinionRouter(nn.Module):
         # and cannot silently learn branch-specific competence priors.
         self.raw_route_prior_beta = nn.Parameter(
             torch.tensor(_inverse_softplus(1.0))
-        )
-
-        # Starts near prior-only routing; post-hoc fitting learns how strongly an
-        # otherwise comparable outlier should be penalised.
-        self.raw_conflict_scale = nn.Parameter(
-            torch.full((len(ROUTING_BRANCHES),), _inverse_softplus(0.05))
         )
 
         # A compact monotone risk calibrator. Every input is oriented so a larger
@@ -169,14 +197,11 @@ class GlobalOpinionRouter(nn.Module):
     def route_parameters(self) -> list[nn.Parameter]:
         if self.mode == "prior_only":
             return []
-        parameters = (
+        return (
             [self.raw_route_prior_beta]
             if self.reliability_input_enabled
             else []
         )
-        if self.route_conflict_enabled:
-            parameters.append(self.raw_conflict_scale)
-        return parameters
 
     def risk_parameters(self) -> list[nn.Parameter]:
         if self.risk_mode != "learned":
@@ -197,28 +222,11 @@ class GlobalOpinionRouter(nn.Module):
         return weights * feature_mask
 
     def route_effective_l2(self) -> torch.Tensor:
-        """Fixed-four-slot L2 penalty in the operative parameterization.
+        """L2 penalty on the operative positive reliability-odds exponent."""
 
-        Penalizing raw softplus coordinates would make the regularizer depend
-        on an arbitrary reparameterization and would not prevent the effective
-        odds/conflict scales from drifting toward hard routing. Disabled slots
-        remain explicit zeros so ablations do not change the regularizer's
-        denominator.
-        """
-
-        if self.mode != "learned":
+        if self.mode != "learned" or not self.reliability_input_enabled:
             return self.raw_route_prior_beta.new_zeros(())
-        beta = (
-            F.softplus(self.raw_route_prior_beta)
-            if self.reliability_input_enabled
-            else self.raw_route_prior_beta.new_zeros(())
-        )
-        conflict = (
-            F.softplus(self.raw_conflict_scale)
-            if self.route_conflict_enabled
-            else torch.zeros_like(self.raw_conflict_scale)
-        )
-        return torch.cat([beta.view(-1), conflict.view(-1)]).square().mean()
+        return F.softplus(self.raw_route_prior_beta).square()
 
     def risk_effective_l2(self) -> torch.Tensor:
         """Fixed-four-slot L2 on effective risk coefficients and intercept."""
@@ -251,11 +259,6 @@ class GlobalOpinionRouter(nn.Module):
                 .detach()
                 .cpu()
             )
-            conflict = (
-                F.softplus(self.raw_conflict_scale).detach().cpu()
-                if learned_route and self.route_conflict_enabled
-                else torch.zeros_like(self.raw_conflict_scale.detach().cpu())
-            )
             risk = (
                 self.effective_risk_feature_weights().detach().cpu()
                 if learned_risk
@@ -265,7 +268,6 @@ class GlobalOpinionRouter(nn.Module):
             )
             return {
                 "route_prior_beta": beta,
-                "route_conflict_scale_max": float(conflict.max()),
                 "risk_feature_weight_max": float(risk.max()),
                 "risk_bias_abs": (
                     float(self.risk_bias.detach().abs().cpu())
@@ -286,11 +288,6 @@ class GlobalOpinionRouter(nn.Module):
             learned_route = self.mode == "learned"
             reliability_prior_active = bool(self.reliability_input_enabled)
             learned_risk = self.risk_mode == "learned"
-            conflict_tensor = (
-                F.softplus(self.raw_conflict_scale).detach().cpu()
-                if learned_route and self.route_conflict_enabled
-                else torch.zeros_like(self.raw_conflict_scale.detach().cpu())
-            )
             risk_tensor = (
                 self.effective_risk_feature_weights().detach().cpu()
                 if learned_risk
@@ -298,23 +295,13 @@ class GlobalOpinionRouter(nn.Module):
                     self.raw_risk_feature_weights.detach().cpu()
                 )
             )
-            if learned_route and self.route_conflict_enabled:
-                route_semantics = (
-                    "beta_logit_reliability_minus_nonnegative_consensus_conflict"
-                    if reliability_prior_active
-                    else "negative_nonnegative_consensus_conflict"
-                )
-            elif reliability_prior_active:
+            if reliability_prior_active:
                 route_semantics = "beta_logit_reliability"
             else:
                 route_semantics = "alive_masked_uniform"
             return {
                 "route_mode": self.mode,
                 "route_reliability_input_enabled": reliability_prior_active,
-                "route_conflict_enabled": bool(self.route_conflict_enabled),
-                "route_conflict_active": bool(
-                    learned_route and self.route_conflict_enabled
-                ),
                 "route_prior_beta": float(
                     (
                         F.softplus(self.raw_route_prior_beta)
@@ -326,12 +313,6 @@ class GlobalOpinionRouter(nn.Module):
                     .detach()
                     .cpu()
                 ),
-                "route_conflict_scale": {
-                    branch: float(value)
-                    for branch, value in zip(
-                        ROUTING_BRANCHES, conflict_tensor.tolist()
-                    )
-                },
                 "route_score_semantics": route_semantics,
                 "risk_mode": self.risk_mode,
                 "risk_conflict_enabled": bool(self.risk_conflict_enabled),
@@ -702,15 +683,7 @@ class GlobalOpinionRouter(nn.Module):
         learned_route_active = bool(
             learned_active
             and self.mode == "learned"
-            and (
-                self.reliability_input_enabled
-                or self.route_conflict_enabled
-            )
-        )
-        routing_conflict = (
-            reliability_weighted_cross_modal_conflict
-            if self.route_conflict_enabled and learned_route_active
-            else torch.zeros_like(reliability_weighted_cross_modal_conflict)
+            and self.reliability_input_enabled
         )
         learned_route_prior_beta = (
             F.softplus(self.raw_route_prior_beta).to(
@@ -746,30 +719,8 @@ class GlobalOpinionRouter(nn.Module):
             prior_branch_distribution,
             torch.zeros_like(prior_branch_distribution),
         )
-        conflict_scale = (
-            F.softplus(self.raw_conflict_scale).to(
-                device=reference.device, dtype=reference.dtype
-            )
-            if self.route_conflict_enabled and learned_route_active
-            else torch.zeros(
-                len(ROUTING_BRANCHES),
-                device=reference.device,
-                dtype=reference.dtype,
-            )
-        )
-        conflict_penalty = routing_conflict * conflict_scale.unsqueeze(0)
-        routing_scores = (prior_scores - conflict_penalty).masked_fill(
-            unavailable, torch.finfo(reference.dtype).min
-        )
-        if not learned_route_active:
-            branch_distribution = prior_branch_distribution
-        else:
-            branch_distribution = F.softmax(routing_scores, dim=-1)
-            branch_distribution = torch.where(
-                has_available.unsqueeze(-1),
-                branch_distribution,
-                torch.zeros_like(branch_distribution),
-            )
+        routing_scores = prior_scores
+        branch_distribution = prior_branch_distribution
 
         override_active = branch_distribution_override is not None
         if override_active:
@@ -828,10 +779,7 @@ class GlobalOpinionRouter(nn.Module):
                 "reliability_weighted_cross_modal_conflict": (
                     reliability_weighted_cross_modal_conflict
                 ),
-                "routing_cross_modal_conflict": routing_conflict,
                 "global_cross_modal_conflict": global_cross_modal_conflict,
-                "conflict_penalty_scale": conflict_scale,
-                "conflict_penalty": conflict_penalty,
                 "has_available": has_available.to(dtype=reference.dtype),
             }
 
@@ -857,16 +805,12 @@ class GlobalOpinionRouter(nn.Module):
             decision_threshold = torch.zeros(
                 (), device=reference.device, dtype=reference.dtype
             )
-        predicted_malware = raw_log_odds >= decision_threshold
-        # On the benign side, proximity increases monotonically towards the
-        # fixed malware boundary. The FN event is impossible on the malware
-        # side and is therefore gated to zero.
-        decision_boundary_proximity = torch.where(
+        (
             predicted_malware,
-            torch.zeros_like(raw_log_odds),
-            (2.0 * torch.sigmoid(raw_log_odds - decision_threshold)).clamp(
-                0.0, 1.0
-            ),
+            decision_boundary_proximity,
+        ) = threshold_aligned_fn_risk_state(
+            raw_log_odds,
+            decision_threshold,
         )
 
         risk_conflict = (
@@ -968,10 +912,7 @@ class GlobalOpinionRouter(nn.Module):
             "reliability_weighted_cross_modal_conflict": (
                 reliability_weighted_cross_modal_conflict
             ),
-            "routing_cross_modal_conflict": routing_conflict,
             "global_cross_modal_conflict": global_cross_modal_conflict,
-            "conflict_penalty_scale": conflict_scale,
-            "conflict_penalty": conflict_penalty,
             "risk_probability": risk_probability,
             "risk_logit": risk_logit,
             "risk_training_logit": risk_training_logit,
@@ -1005,15 +946,8 @@ class GlobalOpinionRouter(nn.Module):
             "prefit_uniform_prior_active": torch.full_like(
                 risk_probability, float(not bool(learned_active))
             ),
-            "route_conflict_feature_configured": torch.full_like(
-                risk_probability, float(self.route_conflict_enabled)
-            ),
             "risk_conflict_feature_configured": torch.full_like(
                 risk_probability, float(self.risk_conflict_enabled)
-            ),
-            "route_conflict_feature_active": torch.full_like(
-                risk_probability,
-                float(self.route_conflict_enabled and learned_route_active),
             ),
             "risk_conflict_feature_active": torch.full_like(
                 risk_probability,

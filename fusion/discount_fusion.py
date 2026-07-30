@@ -27,6 +27,7 @@ from fusion.reliability_calibration import (
     MonotonicReliabilityCalibrator,
     build_reliability_features,
     normalize_reliability_calibration_method,
+    reliability_feature_layout,
 )
 
 
@@ -158,6 +159,7 @@ class DiscountProbabilityFusion(nn.Module):
         removed_routing_keys = sorted(
             set(routing_cfg)
             & {
+                "route_conflict_enabled",
                 "use_disagreement",
                 "risk_enabled",
                 "target_loss_weight",
@@ -174,7 +176,7 @@ class DiscountProbabilityFusion(nn.Module):
         )
         if removed_routing_keys:
             raise ValueError(
-                "Removed I2-v1 routing keys are not supported: "
+                "Removed or retired I2 routing keys are not supported: "
                 f"{removed_routing_keys}"
             )
         self.routing_mode = str(routing_cfg.get("mode", "learned")).strip().lower()
@@ -184,9 +186,6 @@ class DiscountProbabilityFusion(nn.Module):
                 f"{GlobalOpinionRouter.MODES}, got {self.routing_mode!r}"
             )
         routing_enabled = bool(routing_cfg.get("enabled", False))
-        self.routing_route_conflict_enabled = bool(
-            routing_cfg.get("route_conflict_enabled", True)
-        )
         self.i1_reliability_input_enabled = bool(
             self.config.get("use_i1_reliability", True)
         )
@@ -216,7 +215,6 @@ class DiscountProbabilityFusion(nn.Module):
         self.opinion_router = (
             GlobalOpinionRouter(
                 mode=self.routing_mode,
-                route_conflict_enabled=self.routing_route_conflict_enabled,
                 risk_conflict_enabled=self.routing_risk_conflict_enabled,
                 risk_mode=self.routing_risk_mode,
                 risk_target=self.routing_risk_target,
@@ -256,6 +254,24 @@ class DiscountProbabilityFusion(nn.Module):
                 f"{removed_i1_density_keys}"
             )
         reliability_enabled = bool(reliability_cfg.get("enabled", False))
+        requested_api_observed_support = bool(
+            reliability_cfg.get("use_api_observed_support", False)
+        )
+        if (
+            requested_api_observed_support
+            and self.reliability_calibration_method
+            != MONOTONIC_CORRECTNESS_METHOD
+        ):
+            raise ValueError(
+                "fusion.reliability_calibration.use_api_observed_support is "
+                "only valid for method=monotonic_correctness"
+            )
+        self.use_api_observed_support = bool(
+            reliability_enabled
+            and requested_api_observed_support
+            and self.reliability_calibration_method
+            == MONOTONIC_CORRECTNESS_METHOD
+        )
         if (
             reliability_enabled
             and self.reliability_calibration_method
@@ -276,6 +292,7 @@ class DiscountProbabilityFusion(nn.Module):
                 use_prediction_margin=bool(
                     reliability_cfg.get("use_prediction_margin", True)
                 ),
+                use_api_observed_support=self.use_api_observed_support,
                 use_predicted_class_intercept=bool(
                     reliability_cfg.get(
                         "use_predicted_class_intercept", True
@@ -466,6 +483,7 @@ class DiscountProbabilityFusion(nn.Module):
         manifest_logits: torch.Tensor,
         availability: torch.Tensor,
         *,
+        api_observed_support: torch.Tensor | None = None,
         reliability_override: torch.Tensor | None = None,
         branch_distribution_override: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -478,8 +496,13 @@ class DiscountProbabilityFusion(nn.Module):
                 "DiscountProbabilityFusion expected exact binary fusion "
                 f"availability [B, {AvailabilityIndex.BASE_DIM}], got "
                 f"{tuple(availability.shape)}"
-            )
+        )
         _validate_binary_availability(availability)
+        if self.use_api_observed_support and api_observed_support is None:
+            raise ValueError(
+                "Configured API observed-support reliability requires the "
+                "current encoder-visible api_observed_support tensor"
+            )
         combination = str(cfg.get("combination", self.combination)).lower()
         if combination != "routed" and combination not in COMBINATION_RULES:
             raise ValueError(
@@ -496,6 +519,11 @@ class DiscountProbabilityFusion(nn.Module):
                 availability.float(),
                 cfg,
                 combination,
+                (
+                    None
+                    if api_observed_support is None
+                    else api_observed_support.float()
+                ),
                 None if reliability_override is None else reliability_override.float(),
                 (
                     None
@@ -512,6 +540,7 @@ class DiscountProbabilityFusion(nn.Module):
         availability: torch.Tensor,
         cfg: dict,
         rule: str,
+        api_observed_support: torch.Tensor | None = None,
         reliability_override: torch.Tensor | None = None,
         branch_distribution_override: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -570,7 +599,15 @@ class DiscountProbabilityFusion(nn.Module):
             ),
         }
         reliability_features = build_reliability_features(
-            {name: opinions[name]["alpha"] for name in BRANCH_NAMES}
+            {name: opinions[name]["alpha"] for name in BRANCH_NAMES},
+            api_observed_support=(
+                api_observed_support
+                if self.use_api_observed_support
+                else None
+            ),
+        )
+        reliability_layout = reliability_feature_layout(
+            use_api_observed_support=self.use_api_observed_support
         )
         # Predictive conflict is measured before trust discounting, but a
         # missing modality is first converted to a vacuous opinion. Otherwise
@@ -590,24 +627,45 @@ class DiscountProbabilityFusion(nn.Module):
             eps=eps,
         )
 
-        # I1 has exactly one branch-local input tensor: evidential certainty,
-        # decision margin and predicted-class indicator. Extraction integrity,
-        # perturbation metadata and cross-modal information never enter it.
+        # I1 has one branch-local input tensor per modality. Every branch uses
+        # evidential certainty, decision margin and predicted class; API may
+        # additionally use current encoder-visible support. Extraction-time
+        # completeness, perturbation metadata and cross-modal information
+        # never enter it.
         reliability_outputs: dict[str, torch.Tensor] = {
             f"reliability_features_{name}": reliability_features[name]
             for name in BRANCH_NAMES
         }
         for name in BRANCH_NAMES:
+            branch_layout = reliability_layout[name]
             reliability_outputs[f"evidential_certainty_{name}"] = (
-                reliability_features[name][:, 0]
+                reliability_features[name][
+                    :, branch_layout.index("evidential_certainty")
+                ]
             )
             reliability_outputs[f"prediction_margin_{name}"] = (
-                reliability_features[name][:, 1]
+                reliability_features[name][
+                    :, branch_layout.index("prediction_margin")
+                ]
             )
             reliability_outputs[f"predicted_malware_indicator_{name}"] = (
-                reliability_features[name][:, 2]
+                reliability_features[name][
+                    :, branch_layout.index("predicted_malware_indicator")
+                ]
             )
             reliability_outputs[f"alive_{name}"] = alive_by_branch[name]
+        if self.use_api_observed_support:
+            reliability_outputs["observed_support_api"] = (
+                reliability_features["api"][
+                    :, reliability_layout["api"].index("observed_support")
+                ]
+            )
+        reliability_outputs["api_observed_support_feature_active"] = (
+            torch.full_like(
+                alive_by_branch["api"],
+                float(self.use_api_observed_support),
+            )
+        )
         # Strict OOF route/risk fitting supplies already materialized I1 values.
         # Re-running the calibrator here and immediately overwriting its output
         # is both wasteful and, with dozens of scenario views, a dominant source
@@ -947,9 +1005,9 @@ class DiscountProbabilityFusion(nn.Module):
                 else final_prob[:, 1]
             ),
             "routing_mixture_pred": (
-                routing_outputs["mixture_probability"].argmax(dim=-1)
+                routing_outputs["mixture_probability"][:, 1].ge(0.5)
                 if routing_active
-                else final_prob.argmax(dim=-1)
+                else final_prob[:, 1].ge(0.5)
             ).to(dtype=final_logits.dtype),
             "routing_branch_distribution": (
                 routing_outputs["branch_distribution"]
@@ -994,7 +1052,7 @@ class DiscountProbabilityFusion(nn.Module):
             "routing_risk_predicted_malware": (
                 routing_outputs["risk_predicted_malware"]
                 if routing_active
-                else final_prob.argmax(dim=-1).to(final_prob.dtype)
+                else final_prob[:, 1].ge(0.5).to(final_prob.dtype)
             ),
             "routing_risk_decision_log_odds_threshold": (
                 routing_outputs["risk_decision_log_odds_threshold"]
@@ -1017,21 +1075,6 @@ class DiscountProbabilityFusion(nn.Module):
                 routing_outputs["risk_global_cross_modal_conflict"]
                 if routing_active
                 else predictive_conflict
-            ),
-            "routing_conflict_penalty_mean": (
-                routing_outputs["conflict_penalty"].mean(dim=-1)
-                if routing_active
-                else torch.zeros_like(routing_risk_probability)
-            ),
-            "routing_route_conflict_feature_active": (
-                routing_outputs["route_conflict_feature_active"]
-                if routing_active
-                else torch.zeros_like(fusion_weights[:, -1])
-            ),
-            "routing_route_conflict_feature_configured": (
-                routing_outputs["route_conflict_feature_configured"]
-                if routing_active
-                else torch.zeros_like(fusion_weights[:, -1])
             ),
             "routing_risk_conflict_feature_active": (
                 routing_outputs["risk_conflict_feature_active"]
@@ -1062,19 +1105,6 @@ class DiscountProbabilityFusion(nn.Module):
                 (batch,), float(self.calibration_active), device=final_logits.device, dtype=final_logits.dtype
             ),
         }
-        for branch_index, name in enumerate(BRANCH_NAMES):
-            outputs[f"routing_cross_modal_conflict_{name}"] = (
-                routing_outputs[
-                    "reliability_weighted_cross_modal_conflict"
-                ][:, branch_index]
-                if routing_active
-                else torch.zeros_like(routing_risk_probability)
-            )
-            outputs[f"routing_conflict_penalty_{name}"] = (
-                routing_outputs["conflict_penalty"][:, branch_index]
-                if routing_active
-                else torch.zeros_like(routing_risk_probability)
-            )
         outputs.update(reliability_outputs)
         for name in BRANCH_NAMES:
             if name not in self.reliability_calibration_branches:

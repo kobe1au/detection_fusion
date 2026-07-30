@@ -1,293 +1,246 @@
-# Tri-Modal Trusted-Fusion Experiments
+# Tri-Modal Competence-Anchored Fusion Experiments
 
-This directory is the formal experiment catalog for the current API/Graph/
-Manifest pipeline. Stable implementation defaults live in
-`fusion/constants.py`; experiment YAML files declare only intentional protocol
-differences.
+This directory is the formal experiment catalog for the API/Graph/Manifest
+malware detector. The paper asks one question: when the useful information in
+the three modalities differs from sample to sample, can fusion remain strong
+on clean inputs while adapting safely to an unreliable or missing modality?
 
-The paper studies one problem: when the three modality branches have unequal
-sample-level reliability, a fixed or equal-confidence fusion rule is not
-appropriate. The method therefore follows one ordered chain:
+The registered method is `tcp_joint_anchor_crc_v1`, configured by
+`competence_anchored_fusion.yaml`.
 
-1. estimate each branch's intrinsic correctness reliability (I1);
-2. use those comparable reliabilities to route and estimate final-decision risk
-   (I2);
-3. control accepted malware false-negative risk on a disjoint calibration set
-   (I3).
+## Method lifecycle
 
-I1, I2, and I3 are not three independent classifiers. They are three stages of
-one trusted-fusion decision pipeline.
+### Stage A: Joint anchor plus atomic experts
 
-## Final method
+One training pass learns four experts:
 
-### Stage 1: clean branch learning
+- one Joint expert over the three encoded modalities;
+- one API expert;
+- one Graph expert;
+- one Manifest expert.
 
-The primary method has three encoders and three binary branch heads: API,
-Graph, and Manifest. It has no concatenation head and no `joint` branch.
-All three branches are trained together on clean inputs. Before I1/I2 have
-been fitted, available branches are fused with an alive-masked uniform mean:
+The clean Stage-A objective is
 
 ```text
-p_uniform = sum_m alive_m * p_m / sum_m alive_m
+L_stage_A = CE(Joint, y)
+          + lambda_atomic * mean_alive_m CE(atomic_m, y)
 ```
 
-The Stage-1 objective is:
+with `lambda_atomic=0.25`. Atomic losses are averaged over alive experts within
+each sample before the batch mean. The Joint expert is the primary objective
+and the clean anchor; the lower atomic weight makes the three atomic heads
+deep supervision and missing-modality fallback experts rather than co-equal
+primary tasks. It is not an average of atomic predictions. There is no EDL
+loss and no uniform-fusion checkpoint proxy in the proposed method.
+
+The checkpoint is selected by clean **Joint-anchor deployment Macro-F1** on
+the fixed `model_selection` identities: the real Joint expert is used when all
+three atomic inputs are alive, otherwise the explicit alive-uniform atomic
+fallback is used. The pure-Joint Macro-F1 and Joint-eligible fraction are
+reported separately, so the full-population checkpoint score is not
+mislabelled as a pure-Joint result.
+
+### I1: expert-local TCP competence
+
+After Stage A, all encoders and expert heads are frozen. For each expert `m`,
+I1 predicts
 
 ```text
-L = L_uniform_fusion_CE
-  + 0.25 * L_alive_uniform_branch_CE
-  + 0.05 * L_EDL
+q_m ~= p_m[y]
 ```
 
-The checkpoint score is the clean validation Macro-F1 of this neutral uniform
-fusion. The selected artifact contains only the three encoders and branch
-heads. It does not contain a fitted I1 calibrator, I2 router/risk head,
-temperature, or I3 threshold.
+where `p_m[y]` is that expert's probability assigned to the true class
+(true-class probability, TCP). The competence head receives only the current
+expert embedding, its current probability vector, and its hard alive mask.
 
-Stage 1 is deliberately clean-only. Controlled
-partial degradation is reserved for the frozen-encoder post-hoc protocol, so
-augmentation cannot obscure whether I1/I2 add value.
+I1 is fitted on train identities under clean and one randomly sampled
+single-modality degradation view. The degraded TCP loss is an auxiliary
+regularizer with weight `0.25`. Every epoch is evaluated separately on clean
+and the three fixed single-modality `model_selection` views. Selection first
+keeps epochs whose clean TCP loss is within the pre-registered 1% relative
+band of the best clean epoch, then minimizes degraded-source mean loss and
+worst-source loss. Thus no arbitrary weighted validation mixture defines the
+chosen head. Its loss also contains a small pairwise ranking term.
+Perturbation name, perturbation strength,
+pre-degradation counts, retained ratios, cross-modal conflict, and test
+statistics are not model inputs.
 
-### I1: intrinsic branch-correctness calibration
+This target is continuous: a confidently correct expert receives a target
+near one, a confidently wrong expert a target near zero, and ambiguous
+predictions remain intermediate. I1 is therefore a competence estimator, not
+the retired branch-argmax correctness calibrator.
 
-For each alive branch `m`, I1 estimates:
+### I2: Joint-anchored adaptive late fusion
+
+I2 constructs a competence-weighted late expert from the alive atomic
+probabilities and combines it with the Joint anchor:
 
 ```text
-r_m = P(branch m's argmax prediction is correct | its own opinion)
+score_m = b_m + beta_atomic * log(q_m)
+w_m = softmax_alive(score_m)
+p_late = sum_m w_m * p_m
+g = sigmoid(b_gate + beta_gate * (log(q_late) - log(q_joint)))
+p_final = (1 - g) * p_joint + g * p_late
 ```
 
-The deployed input contains exactly four branch-local quantities:
+Both scale parameters are constrained positive, so increasing an expert's
+competence cannot reduce its atomic score, and increasing late competence
+relative to Joint cannot reduce `g`. The small router is learned after Stage
+A. Its training contains:
 
-- evidential certainty `1 - K / sum(alpha_m)`;
-- probability margin `top1(p_m) - top2(p_m)`;
-- an optional predicted-malware class intercept;
-- `alive_m`, used only as a hard availability mask.
+- clean classification loss;
+- single-modality degradation loss with a registered candidate-weight grid;
+- a clean KL anchor to the frozen Joint prediction.
 
-The calibrated logit has a branch-specific intercept, non-negative certainty
-and margin coefficients, and an optional signed predicted-class intercept.
-The non-negative coefficients make reliability monotone in both continuous
-confidence signals. The supervision target is branch correctness
-`1{argmax(p_m) = y}`.
+Each candidate and the Joint anchor independently fit an unconstrained
+Macro-F1 threshold on the same clean `model_selection` rows; those thresholds
+are then frozen across clean and all three degraded sources. Deployment is
+fail-closed: the adaptive router is enabled only if clean Macro-F1 is not below
+Joint, none of the three degraded sources is below Joint, and the mean
+degraded-source gain is strictly positive. Candidate ranking is minimum
+source delta, mean delta, clean delta, then negative NLL. Otherwise the saved
+pipeline uses the clean-thresholded Joint anchor when all
+modalities are alive, an alive-uniform atomic fallback when Joint is
+ineligible, and a uniform class distribution only when every modality is
+dead.
 
-I1 does **not** consume perturbation type or strength, pre-degradation counts,
-missing ratios, integrity heuristics, runtime coverage, other branch outputs,
-or cross-modal disagreement. Perturbation identity is used only to select and
-balance calibration rows; it is not a deployed feature.
+I1 and I2 are coupled parts of one trusted-fusion mechanism. The old I1×I2
+factorial, log-odds reliability prior, conflict risk head, source oracle,
+scenario-prior grid, and nested five-fold post-hoc stack are not part of this
+method.
 
-Each branch is fitted on clean OOF rows plus that branch's controlled partial-
-degradation OOF rows. A missing branch is assigned reliability zero through
-the alive mask and is excluded from correctness fitting. The primary clean/
-perturb objective mass is 0.50/0.50. Per-branch temperature-scaled confidence
-is the simple matched-budget comparator.
+The causal module ablation disables the complete Stage B and deploys the
+unchanged Joint anchor from the same Stage-A checkpoint. It does not pretend
+that I2 can operate without the I1 competence values that define its atomic
+late expert.
 
-### I2: reliability-conditioned routing and final-FN risk
+### I3: malware false-negative risk control
 
-I2 receives only branch probabilities, I1 reliabilities, and alive masks.
-For each available branch it computes a reliability-weighted peer-consensus
-conflict, then routes with:
+The ordinary classification threshold is selected for Macro-F1 on
+`model_selection` and then frozen. A disjoint `decision_calibration` role is
+used only by I3 to choose an acceptance threshold subject to
 
 ```text
-score_m = beta * logit(r_m) - lambda_m * conflict_m
-pi = alive-masked softmax(score)
-p_mix = sum_m pi_m * p_m
+(accepted malware false negatives + 1) / (number of malware + 1) <= alpha
 ```
 
-`beta` and every conflict scale are non-negative. The route is fitted by the
-proper conditional-mixture NLL. There is no feature-embedding gate, free
-residual router, subset oracle, per-row oracle, soft worst-group objective, or
-Group-DRO state in the primary method.
+with `alpha=0.05`. The score
+`malware_fn_probability_anchor` ranks samples by the deployed classifier's
+probability of making the malware-as-benign error. The code reports an
+expected conformal risk-control guarantee under exchangeability; it does not
+claim a high-probability guarantee or a guarantee under arbitrary shift.
 
-After the deployable classification boundary is fixed from strict OOF mixture
-predictions, I2 fits a separate monotone risk head for the aligned event
-`malware predicted as benign`. Its three inputs are:
+## Data lifecycle
 
-- reliability deficit `1 - sum_m pi_m r_m`;
-- proximity to the fitted classification decision boundary;
-- global reliability-weighted cross-modal conflict.
+`labels/validation_roles_protocol_v2.json` freezes a package-group-disjoint
+75/25 partition:
 
-Branch probabilities and I1 reliabilities are detached while fitting I2, so
-post-hoc objectives cannot modify the Stage-1 encoders or redefine I1.
-The risk head outputs `u`; the primary acceptance score is exactly `1 - u`.
-Clean and controlled-perturbation rows have an explicit configurable objective
-prior (0.50/0.50 in the main cell, with 0.70/0.30 and 0.30/0.70 sensitivity
-cells).
+- 75% `model_selection`: Stage-A checkpoint selection, Stage-B early stopping
+  and candidate selection, and the ordinary classification threshold;
+- 25% `decision_calibration`: I3 only.
 
-### I3: malware-FN conformal risk control
+Stage-B parameters are fitted on train identities. Validation selects fitted
+states and hyperparameters; it is not described as unseen by I1/I2. Test data
+is never used for fitting, candidate selection, or thresholds.
 
-The classification boundary is selected first for Macro-F1 on strict OOF
-post-hoc rows and then frozen. I3 does not change this classifier. On a
-disjoint decision-calibration set, it selects an acceptance threshold over
-`1 - u` subject to:
+Protocol warning for the current study: earlier method revisions were informed
+by summaries from the existing `labels/test.csv`, so that split must now be
+treated as a development test rather than an untouched confirmatory set. The
+final paper claim requires a newly locked, previously unseen test set or an
+external confirmation dataset. Code-level split isolation cannot undo
+researcher-side reuse of already inspected test results.
 
-```text
-(accepted_malware_false_negatives + 1)
------------------------------------------ <= alpha
-       (number_of_malware + 1)
-```
-
-The primary `alpha` is 0.05. If no non-empty acceptance set is feasible, the
-conservative fallback is reject-all.
-
-This is an **expected conformal risk-control guarantee** under the stated
-exchangeability assumptions. It is not a high-probability `1-delta` guarantee,
-not a guarantee under arbitrary distribution shift, and not a guarantee for
-FNR conditional only on accepted malware. Those quantities are reported as
-empirical operating metrics without stronger claims.
-
-## Validation and leakage-control lifecycle
-
-The executable protocol never fits on its evaluation set: all learned modules,
-classification thresholds, acceptance thresholds, perturbation choices, and
-hyperparameters come from train or the declared validation roles. The
-validation identities are frozen in
-`labels/validation_roles_protocol_v1.json` and divided by package-isolation
-group into:
-
-1. 40% for Stage-1 checkpoint selection;
-2. 35% for nested I1/I2 fitting and classification-boundary fitting;
-3. 25% for the final I3 decision calibration.
-
-The YAML representation is nested:
-`calibration.validation_fraction=0.60` reserves the joint post-hoc/I3 holdout,
-then `calibration.conformal_fraction=5/12` assigns 25% of the original
-validation set to I3.
-
-The 35% post-hoc subset uses five deterministic package-group folds.
-Every view of one package remains in the same fold. Nested cross-fitting is
-required: every row used to fit a downstream stage is predicted by upstream
-modules that did not fit that row. Deployment modules are refitted only after
-strict OOF rows and the fixed classification boundary have been produced.
-
-To intentionally create a new role protocol:
-
-```bash
-python scripts/build_validation_roles.py \
-  --validation-csv labels/val.csv \
-  --output labels/validation_roles_protocol_v1.json \
-  --seed 42 \
-  --validation-fraction 0.60 \
-  --decision-fraction-within-holdout 0.4166666666666667
-```
-
-Changing this role file changes the experiment protocol and requires rerunning
-all affected experiments.
-
-## Controlled evidence-availability protocol
-
-The registered partial-degradation mechanisms are:
+The controlled degradation registry contains one evidence-availability stress
+test per modality:
 
 - API: `api_event_dropout`;
 - Graph: `graph_sparsify`;
 - Manifest: `manifest_permission_mask`.
 
-Post-hoc fitting uses strengths 0.3, 0.5, and 0.7. Together with clean and the
-three whole-modality missing endpoints, I2 sees 13 logical sources:
-`1 + 3*3 + 3`. I1 uses only clean plus the affected branch's own partial views;
-whole-modality missing rows supervise neither branch correctness nor a
-fabricated quality ratio.
+Training samples one mechanism and a continuous strength in `[0.1, 0.9]`.
+Stage-B selection evaluates the three fixed mechanisms at strength `0.5`.
+Formal evaluation reports five strengths `[0.1, 0.3, 0.5, 0.7, 0.9]`, plus
+clean and the three whole-modality-missing endpoints. These are controlled
+availability tests, not claims about unseen attacks or temporal
+generalization.
 
-Formal evaluation uses the same three mechanisms at strengths 0.1, 0.3, 0.5,
-0.7, and 0.9, plus clean and the three missing endpoints: 19 result cells in
-total. These are controlled evidence-availability stress tests, not claims of
-unseen attacks, semantic corruption, or external-domain generalization.
+## Comparisons and ablations
 
-The registered curves are evaluation outputs and the code never feeds them
-back into fitting. In this project history, however, results on the current
-`test.csv` were inspected while the method was redesigned. That split must
-therefore be described as a development/diagnostic test, not as an untouched
-confirmatory test. A final unbiased paper claim requires a newly locked test
-set or an independent external set that is evaluated only after the protocol
-is frozen.
+Representation/fusion baselines:
 
-## Comparison protocol
-
-Main representation/fusion baselines:
-
-- API only;
-- Graph only;
-- Manifest only;
-- API+Graph concatenation;
-- tri-modal concatenation;
+- API only, Graph only, Manifest only;
+- API+Graph concat and tri-modal concat;
 - fixed logit fusion;
-- dense embedding gate adapted to these encoders.
+- dense embedding gate adapted.
 
-Trusted-fusion baselines:
+Trusted-fusion comparisons:
 
-- **TMC-style adapted**;
-- **ECML-style adapted**;
-- **QMF-Energy component baseline**.
+- Dempster, cumulative, log-pool, conflict-weighted opinion;
+- TMC-style adapted;
+- ECML-style adapted;
+- QMF energy component.
 
-The phrases `TMC-style adapted` and `ECML-style adapted` are mandatory. These
-cells preserve relevant objectives or fusion mechanisms under this
-repository's APK modalities, encoders, split, missing-view handling, and
-training budget; they are not strict reproductions of the original papers.
+`TMC-style adapted` and `ECML-style adapted` are mandatory paper names. These
+experiments share the APK inputs and encoders but are not strict
+reproductions.
 
-Dempster, cumulative subjective logic, log-pool, and the custom
-conflict-weighted opinion rule are complete fusion-rule comparisons. Their
-fusion rule is active during Stage 1, they train their own Stage-1 artifact,
-and `selective_prediction.enabled` is false. They evaluate forced
-classification and are not post-hoc-only I2 ablations.
+All main fusion baselines receive the same fixed `model_selection` identities
+and the same unconstrained Macro-F1 threshold budget as the proposed method.
+That fitted-threshold result is the primary classification table. A separate
+fixed-0.5 table is retained as a no-threshold-tuning sensitivity analysis; I3
+remains disabled for fusion baselines and is compared in its dedicated table.
 
-The formal ablations are:
+The compact method ablation set is:
 
-- module removal: exactly one complete no-I1 cell, learned I2, or I3;
-- I1 atomic: evidential certainty, margin, or predicted-class intercept;
-- I1 comparator: per-branch temperature-scaled confidence;
-- I2 atomic: learned route prior, learned FN-risk head, route conflict, and
-  risk conflict;
-- I2 scenario-prior sensitivity: clean/perturb 0.70/0.30 and 0.30/0.70;
-- I1 x I2 factorial: both on, only I1, only I2, and both off;
-- I3: the same CRC rule ranked by learned risk, MSP, or deployed-class
-  probability, plus fixed-coverage/conformal mechanism baselines.
+- `no_i1_i2`: disable the complete competence/router Stage B and deploy the
+  matched Joint anchor;
+- `no_degraded_competence`: fit I1 on clean train outputs only;
+- `no_tcp_ranking`: remove only I1's ranking regularizer;
+- `router_clean_only`: remove degraded-router training;
+- `no_clean_anchor_kl`: remove I2's clean Joint-anchor regularizer;
+- `no_atomic_auxiliary`: remove Stage-A atomic supervision;
+- `no_i3`: disable only selective risk control;
+- I3 score/rule comparisons: MSP, deployed-class probability, fixed coverage,
+  marginal conformal, and class-conditional conformal.
 
-Predictive entropy is only a numerical sanity check in this binary task because
-it is rank-equivalent to MSP. It must not be presented as an independent
-selective-prediction baseline.
+There is no I1×I2 2×2 grid because I2 is explicitly defined in terms of I1
+competence. “I2 on, I1 off” would be a different model rather than an atomic
+ablation.
 
-## Experiment commands
+The I1/I2 ablations, including complete `no_i1_i2`, reuse the hash-checked
+seed-42 `best_encoder_selected.pt`; they do not retrain Stage A. The
+`no_atomic_auxiliary` cell changes the Stage-A objective and therefore trains
+its own artifact. Run `final` before `paper_ablation`; the ablation group does
+not rerun or overwrite the primary result.
 
-Use the AutoDL path overlay for every AutoDL run:
+## Commands
+
+On AutoDL, always append the machine-path overlay:
 
 ```bash
+# Primary seed
 python run.py final \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 
-python run.py seed_2024 seed_3407 \
+# Repeated seeds
+python run.py seed \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 
+# Main comparison methods
 python run.py baselines trusted_baselines \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 
-python run.py module i1_atomic i1_comparator i2_atomic \
-  i2_scenario_weights fusion_rules factorial_remaining \
+# Proposed-method ablations and I3 comparisons
+python run.py paper_ablation \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 
-python run.py i3_mechanism \
-  --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
-
-python run.py training_ablation appendix \
-  --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
+# Inspect without executing
+python run.py paper_all --dry-run
+python run.py --list
 ```
 
-Use `python run.py --list` to inspect the current catalog and
-`python run.py <targets> --dry-run` before a long batch.
-
-After the primary seed-42 run has produced diagnostics, freeze the natural
-difficulty subsets on validation diagnostics and only then run their test
-evaluations:
-
-```bash
-python scripts/build_natural_subset_csvs.py \
-  --diagnostics results/tri_modal_robust/evidential_seed_42/42/gate_diagnostics.csv \
-  --test-csv labels/test.csv \
-  --out-dir labels/natural_subsets
-
-python run.py natural_subsets \
-  --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
-```
-
-Main-table baselines must also be repeated with the registered seed overlays
-when reporting mean and standard deviation:
+Cross-method mean/std tables require repeating comparison methods with the
+registered seed overlays:
 
 ```bash
 python run.py baselines trusted_baselines \
@@ -301,10 +254,10 @@ python run.py baselines trusted_baselines \
     config/experiments/tri_modal_robust/_seed_3407_overlay.yaml
 ```
 
-An encoder checkpoint may be reused only when architecture, Stage-1 loss,
-training data, PT build, loader/RNG protocol, and validation-role identities
-are unchanged. Post-hoc I1/I2/I3 ablations normally satisfy that contract.
-Representation, fusion-rule, and Stage-1 objective baselines do not.
+An existing output directory is rejected. Use `--overwrite` only when
+replacement is intentional. Stage-A reuse is allowed only when the strict
+architecture, objective, data, PT provenance, RNG/loader, and validation-role
+identity checks pass:
 
 ```bash
 python run.py final \
@@ -313,15 +266,45 @@ python run.py final \
   --overwrite
 ```
 
-## Manifest vocabulary preflight
-
-After a split change, rebuild the vocabulary from the current train identities
-and migrate only Manifest-owned PT fields. This preserves the expensive
-API/Graph payload and does not reparse APKs. Do not run extraction, migration,
-or training concurrently.
+Collect schema-v14 results and source-separated I1 diagnostics with:
 
 ```bash
-# Read-only audit
+python scripts/collect_experiment_results.py
+python scripts/analyze_reliability_evidence.py
+```
+
+The I1 analysis reports competence-versus-TCP MSE/MAE, Pearson/Spearman
+alignment, error AUROC, cross-expert ordering accuracy, and TCP calibration
+diagrams. Old EDL/reliability signal tables are intentionally unsupported.
+
+## Natural difficulty subsets
+
+After freezing the final seed-42 method, rebuild the schema-v9 subsets from
+its validation diagnostics:
+
+```bash
+python scripts/build_natural_subset_csvs.py \
+  --diagnostics \
+    results/tri_modal_robust/competence_anchored_seed_42/42/gate_diagnostics.csv \
+  --test-csv labels/test.csv \
+  --out-dir labels/natural_subsets
+
+python run.py natural_subsets \
+  --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
+```
+
+The registered label-free subsets include branch disagreement,
+competence imbalance, and high cross-modal conflict. “Exactly one branch
+wrong” subsets use test labels and are diagnostic only. Validation chooses
+subset cutoffs; target test scores never choose them.
+
+## Manifest vocabulary preflight
+
+After a split change, rebuild the vocabulary from current train identities and
+migrate only Manifest-owned PT fields. This preserves the expensive API/Graph
+payload:
+
+```bash
 python scripts/migrate_manifest_vocab_pts.py \
   --train-csv labels/train.csv \
   --pt-dir /root/autodl-tmp/pts_all \
@@ -330,7 +313,6 @@ python scripts/migrate_manifest_vocab_pts.py \
   --manifest-jsonl-dir /root/autodl-tmp/pts_all/_manifest_jsonl \
   --audit-json manifest_migration_dry_run.json
 
-# Apply only after the read-only audit reports complete coverage
 python scripts/migrate_manifest_vocab_pts.py \
   --train-csv labels/train.csv \
   --pt-dir /root/autodl-tmp/pts_all \
@@ -341,27 +323,5 @@ python scripts/migrate_manifest_vocab_pts.py \
   --apply
 ```
 
-The formal run checks train/vocabulary provenance and the expected PT build
-fingerprint before accepting the pool. This migration changes the experiment
-identity, so old checkpoints are intentionally not supported.
-
-## Reporting boundary
-
-For I1 report per-branch correctness calibration and discrimination (Brier,
-ECE, AUC/AP, and reliability-versus-accuracy diagnostics). For I2 report
-forced-classification Macro-F1/AUC/AP, mixture NLL, routing diagnostics, and
-threshold-aligned malware-FN risk calibration/ranking. For I3 report coverage,
-accepted-malware recall, CRC-aligned accepted-FN risk among all malware,
-conditional accepted-malware FNR as an empirical metric, and risk-coverage
-curves.
-
-Natural hard subsets are diagnostic analyses generated by
-`scripts/build_natural_subset_csvs.py`. Reliability-imbalance and
-high-conflict cutoffs are frozen on `val_selection`, whose identities were not
-used to fit I1/I2, and only then applied to `test_clean`; test scores never
-choose a cutoff. Branch disagreement
-is label-free. The three "exactly one branch wrong" sets use test labels to
-explain complementarity and must be reported explicitly as post-hoc diagnostic
-sets, not deployment-detectable selection rules. Reliability imbalance may
-stress I2 routing, but it cannot be used as an independent validation of I1
-because I1 reliability defines that subset.
+Do not run PT migration and training concurrently. Old checkpoints and
+schema-v12 summaries are intentionally incompatible with this protocol.

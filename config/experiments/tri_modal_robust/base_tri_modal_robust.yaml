@@ -19,7 +19,12 @@ data:
   require_manifest_vocab_provenance: true
   # Produced by config/build_pts.yaml + the current train-only Manifest vocab.
   # The migration dry-run reports this as proposed_build_fingerprint.
-  expected_pt_build_fingerprint: 552a68bc09a51c81111a75b1a58d5abfbf08d09d84b1e7ba809faca62dcf7610
+  expected_pt_build_fingerprint: 7825ef23db92b98a7055b72275317f045e234d305f1d5803a063e4b0edbf25da
+  # The --apply migration report contains a stat-bound certificate for every
+  # schema-v5 PT. Formal runs verify this certificate instead of reloading the
+  # complete 14k-file pool before training.
+  pt_audit_certificate: manifest_migration_apply.json
+  require_pt_audit_certificate: true
 
 train:
   seed: 42

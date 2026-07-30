@@ -18,6 +18,7 @@ from fusion.train import (
     PIPELINE_ARTIFACT_SCHEMA_VERSION,
     _calibration_subset_identity,
     _fit_routed_final_temperature,
+    _resolve_provisional_stage_stop,
     _resolve_restored_stage_convergence,
     _decision_calibration_signature,
     _decision_calibration_data_identity,
@@ -125,6 +126,70 @@ def test_restored_gradient_rejects_nonstationary_plateau():
 
     assert converged is False
     assert reason == "objective_plateau_nonstationary"
+
+
+def test_strict_stage_continues_through_nonstationary_plateau():
+    should_stop, reason = _resolve_provisional_stage_stop(
+        require_convergence=True,
+        plateau_detected=True,
+        parameter_stagnation=False,
+        current_grad_inf_norm=2.5e-5,
+        gradient_tolerance=1.0e-5,
+    )
+
+    assert should_stop is False
+    assert reason == "max_steps"
+
+
+def test_non_strict_stage_may_stop_at_objective_plateau():
+    should_stop, reason = _resolve_provisional_stage_stop(
+        require_convergence=False,
+        plateau_detected=True,
+        parameter_stagnation=False,
+        current_grad_inf_norm=2.5e-5,
+        gradient_tolerance=1.0e-5,
+    )
+
+    assert should_stop is True
+    assert reason == "objective_plateau"
+
+
+def test_strict_stage_stops_at_current_gradient_tolerance():
+    should_stop, reason = _resolve_provisional_stage_stop(
+        require_convergence=True,
+        plateau_detected=False,
+        parameter_stagnation=False,
+        current_grad_inf_norm=5.0e-6,
+        gradient_tolerance=1.0e-5,
+    )
+
+    assert should_stop is True
+    assert reason == "gradient_tolerance"
+
+
+def test_strict_stage_accepts_loss_and_parameter_stagnation_together():
+    should_stop, reason = _resolve_provisional_stage_stop(
+        require_convergence=True,
+        plateau_detected=True,
+        parameter_stagnation=True,
+        current_grad_inf_norm=2.5e-5,
+        gradient_tolerance=1.0e-5,
+    )
+
+    assert should_stop is True
+    assert reason == "parameter_tolerance"
+
+
+def test_restored_parameter_stagnation_is_a_distinct_convergence_reason():
+    converged, reason = _resolve_restored_stage_convergence(
+        provisional_stop_reason="parameter_tolerance",
+        final_grad_inf_norm=2.5e-5,
+        gradient_tolerance=1.0e-5,
+        parameter_stagnation_certified=True,
+    )
+
+    assert converged is True
+    assert reason == "restored_best_parameter_tolerance"
 
 
 def test_restored_gradient_accepts_stationary_best():
@@ -449,6 +514,123 @@ def test_posthoc_refit_resolves_encoder_stage_and_preserves_router_start(tmp_pat
     assert loaded_path == encoder_path
     assert checkpoint["checkpoint_stage"] == CHECKPOINT_STAGE_ENCODER_SELECTED
     assert checkpoint["model"]["opinion_router.weight"].item() == 3.0
+
+
+def test_disabled_stage_b_pipeline_artifact_round_trips(tmp_path):
+    encoder_path = tmp_path / "best_encoder_selected.pt"
+    pipeline_path = tmp_path / "best_tri_modal_robust.pt"
+    torch.save(
+        {
+            "checkpoint_stage": CHECKPOINT_STAGE_ENCODER_SELECTED,
+            "model": {"joint_expert.weight": torch.tensor([3.0])},
+        },
+        encoder_path,
+    )
+    pipeline_model = {
+        "joint_expert.weight": torch.tensor([3.0]),
+        "competence_estimator.weight": torch.tensor([0.0]),
+    }
+    pipeline = {
+        "checkpoint_stage": CHECKPOINT_STAGE_PIPELINE_FITTED,
+        "pipeline_artifact_schema_version": PIPELINE_ARTIFACT_SCHEMA_VERSION,
+        "encoder_checkpoint_path": encoder_path.name,
+        "encoder_checkpoint_sha256": _file_sha256(encoder_path),
+        "model": pipeline_model,
+        "pipeline_model_state_sha256": _state_dict_sha256(pipeline_model),
+        "cfg": {"model": {"fusion_mode": "anchored_joint_late"}},
+        "stage_b_training": {
+            "enabled": False,
+            "protocol": "joint_anchor_without_i1_i2_ablation_v1",
+            "parameter_fit_population": "none",
+            "deployment": (
+                "joint_with_uniform_missing_fallback_selection_guard"
+            ),
+        },
+    }
+    pipeline["pipeline_decision_metadata_sha256"] = (
+        _pipeline_decision_metadata_sha256(pipeline)
+    )
+    torch.save(pipeline, pipeline_path)
+
+    loaded_path, loaded = _load_eval_checkpoint(
+        pipeline_path,
+        refit_posthoc_calibration=False,
+        map_location="cpu",
+    )
+
+    assert loaded_path == pipeline_path
+    assert loaded["stage_b_training"]["enabled"] is False
+    assert loaded["stage_b_training"]["deployment"] == (
+        "joint_with_uniform_missing_fallback_selection_guard"
+    )
+
+
+def test_anchored_pipeline_rejects_unknown_stage_b_deployment(tmp_path):
+    encoder_path = tmp_path / "best_encoder_selected.pt"
+    pipeline_path = tmp_path / "best_tri_modal_robust.pt"
+    torch.save(
+        {"checkpoint_stage": CHECKPOINT_STAGE_ENCODER_SELECTED, "model": {}},
+        encoder_path,
+    )
+    pipeline_model = {"joint_expert.weight": torch.tensor([3.0])}
+    pipeline = {
+        "checkpoint_stage": CHECKPOINT_STAGE_PIPELINE_FITTED,
+        "pipeline_artifact_schema_version": PIPELINE_ARTIFACT_SCHEMA_VERSION,
+        "encoder_checkpoint_path": encoder_path.name,
+        "encoder_checkpoint_sha256": _file_sha256(encoder_path),
+        "model": pipeline_model,
+        "pipeline_model_state_sha256": _state_dict_sha256(pipeline_model),
+        "cfg": {"model": {"fusion_mode": "anchored_joint_late"}},
+        "stage_b_training": {
+            "enabled": False,
+            "deployment": "unknown_fallback",
+        },
+    }
+    pipeline["pipeline_decision_metadata_sha256"] = (
+        _pipeline_decision_metadata_sha256(pipeline)
+    )
+    torch.save(pipeline, pipeline_path)
+
+    with pytest.raises(ValueError, match="Stage-B deployment"):
+        _load_eval_checkpoint(
+            pipeline_path,
+            refit_posthoc_calibration=False,
+            map_location="cpu",
+        )
+
+
+def test_disabled_stage_b_cannot_activate_unfitted_router(tmp_path):
+    encoder_path = tmp_path / "best_encoder_selected.pt"
+    pipeline_path = tmp_path / "best_tri_modal_robust.pt"
+    torch.save(
+        {"checkpoint_stage": CHECKPOINT_STAGE_ENCODER_SELECTED, "model": {}},
+        encoder_path,
+    )
+    pipeline_model = {"joint_expert.weight": torch.tensor([3.0])}
+    pipeline = {
+        "checkpoint_stage": CHECKPOINT_STAGE_PIPELINE_FITTED,
+        "pipeline_artifact_schema_version": PIPELINE_ARTIFACT_SCHEMA_VERSION,
+        "encoder_checkpoint_path": encoder_path.name,
+        "encoder_checkpoint_sha256": _file_sha256(encoder_path),
+        "model": pipeline_model,
+        "pipeline_model_state_sha256": _state_dict_sha256(pipeline_model),
+        "cfg": {"model": {"fusion_mode": "anchored_joint_late"}},
+        "stage_b_training": {
+            "enabled": False,
+            "deployment": "anchored_joint_late",
+        },
+    }
+    pipeline["pipeline_decision_metadata_sha256"] = (
+        _pipeline_decision_metadata_sha256(pipeline)
+    )
+    torch.save(pipeline, pipeline_path)
+
+    with pytest.raises(ValueError, match="enabled=false"):
+        _load_eval_checkpoint(
+            pipeline_path,
+            refit_posthoc_calibration=False,
+            map_location="cpu",
+        )
 
 
 def test_ordinary_eval_requires_pipeline_stage(tmp_path):
@@ -878,6 +1060,17 @@ def test_i1_correctness_and_i2_threshold_fn_risk_metrics_are_reported():
     assert metrics["routing_risk_error_rate_gap"] == pytest.approx(0.0)
     assert metrics["routing_risk_auc"] == pytest.approx(1.0)
     assert metrics["routing_risk_ap"] == pytest.approx(1.0)
+    assert metrics["routing_risk_predicted_benign_count"] == 2
+    assert metrics["routing_risk_predicted_benign_event_rate"] == pytest.approx(
+        0.5
+    )
+    assert metrics["routing_risk_predicted_benign_brier"] == pytest.approx(
+        0.04
+    )
+    assert metrics["routing_risk_predicted_benign_auc_defined"] == 1
+    assert metrics["routing_risk_predicted_benign_ap_defined"] == 1
+    assert metrics["routing_risk_predicted_benign_auc"] == pytest.approx(1.0)
+    assert metrics["routing_risk_predicted_benign_ap"] == pytest.approx(1.0)
     assert metrics["routing_all_missing_count"] == 0
     assert metrics["routing_all_missing_forced_rejection_count"] == 0
 

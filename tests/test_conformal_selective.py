@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 import torch
 
@@ -15,6 +16,7 @@ from fusion.train import (
     fit_risk_control_thresholds,
     risk_control_selective_metrics,
 )
+from fusion.thresholds import fit_binary_macro_f1_threshold
 
 
 def _rows(probs_labels):
@@ -57,6 +59,19 @@ def test_classification_threshold_maximizes_unconstrained_macro_f1():
     assert fitted["selection_rule"] == "macro_f1_unconstrained_v1"
     assert fitted["constraint"] == "none"
     assert fitted["calibration_split"] == "val_posthoc_calibration"
+
+
+def test_shared_threshold_fitter_explicitly_prefers_neutral_boundary_in_gap():
+    # Every threshold in (0.2, 0.8] yields the same perfect predictions. The
+    # observed-probability midpoint is 0.5 here, but adding extra outer values
+    # creates multiple equivalent midpoint candidates and audits that 0.5 is
+    # explicitly retained as the neutral tie-break.
+    labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+    probabilities = np.asarray([0.05, 0.10, 0.70, 0.95], dtype=np.float64)
+    fitted = fit_binary_macro_f1_threshold(labels, probabilities)
+
+    assert fitted["threshold"] == pytest.approx(0.5)
+    assert fitted["macro_f1"] == pytest.approx(1.0)
 
 
 def test_classification_threshold_rejects_removed_recall_constraint():

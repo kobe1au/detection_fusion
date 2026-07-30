@@ -9,6 +9,7 @@ from fusion.model import TriModalRobustModel
 from fusion.train import (
     CHECKPOINT_STAGE_ENCODER_SELECTED,
     ENCODER_STAGE_ARTIFACT_SCHEMA_VERSION,
+    POSTHOC_ONLY_COMPATIBLE_ENCODER_IMPLEMENTATION_TRANSITIONS,
     _canonical_mapping_sha256,
     _encoder_stage_implementation_sha256,
     _encoder_stage_semantic_signature,
@@ -149,6 +150,22 @@ def test_encoder_artifact_contract_validates_identity_and_tensor_hash(tmp_path):
     )
     assert validated is state
 
+    # The redesigned architecture intentionally supports no old encoder
+    # implementation fingerprints. A compatibility allow-list would silently
+    # reintroduce the best.pt lifecycle the current protocol removed.
+    assert POSTHOC_ONLY_COMPATIBLE_ENCODER_IMPLEMENTATION_TRANSITIONS == frozenset()
+
+    unknown_implementation = dict(artifact)
+    unknown_implementation["encoder_stage_implementation_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="different Stage-1 implementation"):
+        validate_encoder_stage_checkpoint(
+            unknown_implementation,
+            current_cfg=cfg,
+            validation_split=roles,
+            manifest_vocab_provenance=manifest,
+            checkpoint_path=tmp_path / "unknown_encoder.pt",
+        )
+
     tampered = dict(artifact)
     tampered_state = OrderedDict(
         (key, value.detach().clone()) for key, value in state.items()
@@ -165,6 +182,66 @@ def test_encoder_artifact_contract_validates_identity_and_tensor_hash(tmp_path):
             validation_split=roles,
             manifest_vocab_provenance=manifest,
             checkpoint_path=tmp_path / "encoder.pt",
+        )
+
+
+def test_encoder_implementation_fingerprint_has_no_legacy_transition(
+    tmp_path,
+    monkeypatch,
+):
+    model = _small_model()
+    state = model.encoder_stage_state_dict()
+    cfg = {
+        "encoder_stage": {"protocol_id": "unit-stage-v1"},
+        "train": {"seed": 7, "epochs": 1, "batch_size": 2},
+        "model": {"unit": True},
+        "fusion": {
+            "mode": "discount_probability",
+            "combination": "routed",
+            "routing": {"enabled": True},
+        },
+        "loss": {},
+        "robust": {},
+        "data": {},
+    }
+    roles = {
+        "role_assignment_sha256": "a" * 64,
+        "validation_csv_sha256": "b" * 64,
+        "num_selection": 4,
+    }
+    manifest = {
+        "manifest_vocab_sha256": "c" * 64,
+        "train_csv_sha256": "d" * 64,
+        "train_sample_ids_sha256": "e" * 64,
+        "num_train_samples": 8,
+    }
+    identity = _encoder_stage_semantic_signature(cfg, roles, manifest)
+    current_implementation = _encoder_stage_implementation_sha256()
+    artifact = {
+        "checkpoint_stage": CHECKPOINT_STAGE_ENCODER_SELECTED,
+        "encoder_stage_artifact_schema_version": (
+            ENCODER_STAGE_ARTIFACT_SCHEMA_VERSION
+        ),
+        "encoder_stage_state": state,
+        "encoder_stage_state_sha256": _state_dict_sha256(state),
+        "encoder_stage_identity": identity,
+        "encoder_stage_identity_sha256": _canonical_mapping_sha256(identity),
+        "encoder_stage_implementation_sha256": current_implementation,
+    }
+
+    future_implementation = "f" * 64
+    assert future_implementation != current_implementation
+    monkeypatch.setattr(
+        "fusion.train._encoder_stage_implementation_sha256",
+        lambda: future_implementation,
+    )
+    with pytest.raises(ValueError, match="different Stage-1 implementation"):
+        validate_encoder_stage_checkpoint(
+            artifact,
+            current_cfg=cfg,
+            validation_split=roles,
+            manifest_vocab_provenance=manifest,
+            checkpoint_path=tmp_path / "future_encoder.pt",
         )
 
 

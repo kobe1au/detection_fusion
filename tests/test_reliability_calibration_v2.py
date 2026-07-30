@@ -7,6 +7,8 @@ import torch
 
 import fusion.reliability_calibration as reliability_module
 from fusion.reliability_calibration import (
+    API_SUPPORT_RELIABILITY_FEATURE_LAYOUT,
+    API_SUPPORT_RELIABILITY_FEATURE_NAMES,
     BRANCH_NAMES,
     MONOTONIC_CORRECTNESS_METHOD,
     RELIABILITY_FEATURE_LAYOUT,
@@ -17,6 +19,7 @@ from fusion.reliability_calibration import (
     MonotonicReliabilityCalibrator,
     build_reliability_features,
     normalize_reliability_calibration_method,
+    reliability_feature_layout,
 )
 
 
@@ -33,8 +36,13 @@ def _alphas(
 
 def _features(
     alpha: torch.Tensor | None = None,
+    *,
+    api_observed_support: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    return build_reliability_features(_alphas(alpha))
+    return build_reliability_features(
+        _alphas(alpha),
+        api_observed_support=api_observed_support,
+    )
 
 
 def _alive(
@@ -67,6 +75,27 @@ def test_formal_i1_feature_layout_is_exact_and_branch_local():
     }
 
 
+def test_api_support_layout_changes_only_the_api_branch():
+    expected_api = (
+        "evidential_certainty",
+        "prediction_margin",
+        "observed_support",
+        "predicted_malware_indicator",
+    )
+    assert API_SUPPORT_RELIABILITY_FEATURE_NAMES == expected_api
+    assert API_SUPPORT_RELIABILITY_FEATURE_LAYOUT == {
+        "api": expected_api,
+        "graph": RELIABILITY_FEATURE_NAMES,
+        "manifest": RELIABILITY_FEATURE_NAMES,
+    }
+    assert reliability_feature_layout(
+        use_api_observed_support=True
+    ) == API_SUPPORT_RELIABILITY_FEATURE_LAYOUT
+    assert reliability_feature_layout(
+        use_api_observed_support=False
+    ) == RELIABILITY_FEATURE_LAYOUT
+
+
 def test_feature_builder_uses_exact_binary_dirichlet_definitions():
     alpha = torch.tensor(
         [
@@ -85,6 +114,59 @@ def test_feature_builder_uses_exact_binary_dirichlet_definitions():
             [0.0, 2.0 / 3.0, 2.0 / 3.0]
         )
         assert features[branch][:, 2].tolist() == [0.0, 0.0, 1.0]
+
+
+def test_feature_builder_appends_only_explicit_api_observed_support():
+    support = torch.tensor([0.0, 0.4, 1.0])
+    alpha = torch.tensor(
+        [
+            [1.0, 1.0],
+            [5.0, 1.0],
+            [1.0, 5.0],
+        ]
+    )
+    features = build_reliability_features(
+        _alphas(alpha),
+        api_observed_support=support,
+    )
+
+    assert features["api"].shape == (3, 4)
+    assert features["graph"].shape == (3, 3)
+    assert features["manifest"].shape == (3, 3)
+    assert features["api"][:, 2].tolist() == pytest.approx(
+        support.tolist()
+    )
+    assert features["api"][:, 3].tolist() == [0.0, 0.0, 1.0]
+    assert torch.equal(
+        features["graph"],
+        build_reliability_features(_alphas(alpha))["graph"],
+    )
+    assert torch.equal(
+        features["manifest"],
+        build_reliability_features(_alphas(alpha))["manifest"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("support", "message"),
+    [
+        (torch.tensor([[0.5], [0.5]]), "shape"),
+        (torch.tensor([0.5]), "shape"),
+        (torch.tensor([0, 1]), "floating point"),
+        (torch.tensor([-0.1, 0.5]), r"\[0, 1\]"),
+        (torch.tensor([0.5, 1.1]), r"\[0, 1\]"),
+        (torch.tensor([0.5, float("nan")]), "non-finite"),
+    ],
+)
+def test_feature_builder_strictly_validates_api_observed_support(
+    support: torch.Tensor,
+    message: str,
+):
+    with pytest.raises(ValueError, match=message):
+        build_reliability_features(
+            _alphas(),
+            api_observed_support=support,
+        )
 
 
 def test_feature_builder_has_no_cross_branch_dependency():
@@ -174,6 +256,101 @@ def test_continuous_feature_gradients_are_nonnegative_by_construction():
     branch.forward_logit(features).sum().backward()
     assert features.grad is not None
     assert torch.all(features.grad[:, :2] > 0.0)
+
+
+def test_api_observed_support_weight_is_positive_and_monotone():
+    branch = MonotonicBranchCorrectnessCalibrator(
+        use_evidential_certainty=False,
+        use_prediction_margin=False,
+        use_observed_support=True,
+        use_predicted_class_intercept=False,
+    )
+    weights = branch.effective_continuous_weights()
+    assert set(weights) == {
+        "evidential_certainty",
+        "prediction_margin",
+        "observed_support",
+    }
+    assert weights["evidential_certainty"].item() == 0.0
+    assert weights["prediction_margin"].item() == 0.0
+    assert weights["observed_support"].item() > 0.0
+
+    low = torch.tensor([[0.5, 0.5, 0.1, 0.0]])
+    high = torch.tensor([[0.5, 0.5, 0.9, 0.0]])
+    assert branch(high).item() > branch(low).item()
+
+    features = torch.tensor(
+        [[0.2, 0.3, 0.4, 0.0], [0.6, 0.8, 0.9, 1.0]],
+        requires_grad=True,
+    )
+    branch.forward_logit(features).sum().backward()
+    assert features.grad is not None
+    assert torch.all(features.grad[:, 2] > 0.0)
+
+
+def test_support_aware_calibrator_keeps_graph_and_manifest_intrinsic():
+    intrinsic = MonotonicReliabilityCalibrator(
+        use_api_observed_support=False
+    )
+    calibrator = MonotonicReliabilityCalibrator(
+        use_api_observed_support=True
+    )
+    assert calibrator.feature_layout == API_SUPPORT_RELIABILITY_FEATURE_LAYOUT
+    assert calibrator.branches["api"].raw_continuous_weights.shape == (3,)
+    assert calibrator.branches["graph"].raw_continuous_weights.shape == (2,)
+    assert (
+        calibrator.branches["manifest"].raw_continuous_weights.shape == (2,)
+    )
+
+    support = torch.tensor([0.25, 0.75])
+    features = _features(api_observed_support=support)
+    outputs = calibrator(features, alive=_alive())
+    intrinsic_outputs = intrinsic(_features(), alive=_alive())
+    assert outputs["reliability_features_api"].shape == (2, 4)
+    assert outputs["reliability_features_graph"].shape == (2, 3)
+    assert outputs["reliability_features_manifest"].shape == (2, 3)
+    assert torch.equal(outputs["observed_support_api"], support)
+    assert outputs["api_observed_support_feature_active"].eq(1).all()
+    for branch in ("graph", "manifest"):
+        assert torch.equal(
+            calibrator.branches[branch].raw_continuous_weights,
+            intrinsic.branches[branch].raw_continuous_weights,
+        )
+        assert torch.equal(
+            outputs[f"predicted_reliability_{branch}"],
+            intrinsic_outputs[f"predicted_reliability_{branch}"],
+        )
+
+
+def test_support_layout_mismatch_fails_closed_per_branch():
+    support_aware = MonotonicReliabilityCalibrator(
+        use_api_observed_support=True
+    )
+    with pytest.raises(ValueError, match=r"features\['api'\].*shape"):
+        support_aware(_features(), alive=_alive())
+
+    intrinsic = MonotonicReliabilityCalibrator(
+        use_api_observed_support=False
+    )
+    with pytest.raises(ValueError, match=r"features\['api'\].*shape"):
+        intrinsic(
+            _features(api_observed_support=torch.tensor([0.3, 0.7])),
+            alive=_alive(),
+        )
+
+    invalid_graph = _features(
+        api_observed_support=torch.tensor([0.3, 0.7])
+    )
+    invalid_graph["graph"] = invalid_graph["api"].clone()
+    with pytest.raises(ValueError, match=r"features\['graph'\].*shape"):
+        support_aware(invalid_graph, alive=_alive())
+
+    invalid_support = _features(
+        api_observed_support=torch.tensor([0.3, 0.7])
+    )
+    invalid_support["api"][0, 2] = 1.01
+    with pytest.raises(ValueError, match="within"):
+        support_aware(invalid_support, alive=_alive())
 
 
 def test_predicted_class_intercept_is_optional_and_signed():
@@ -296,6 +473,64 @@ def test_new_checkpoint_round_trip_is_strict_and_old_topology_is_rejected():
     old_state["branches.api.competence.bias"] = torch.tensor(0.0)
     with pytest.raises(RuntimeError, match="Unexpected key"):
         restored.load_state_dict(old_state, strict=True)
+
+
+def test_api_support_checkpoint_requires_the_support_aware_topology():
+    source = MonotonicReliabilityCalibrator(
+        use_api_observed_support=True
+    )
+    with torch.no_grad():
+        source.branches["api"].raw_continuous_weights[2].fill_(
+            _raw_softplus(0.9)
+        )
+    restored = MonotonicReliabilityCalibrator(
+        use_api_observed_support=True
+    )
+    incompatible = restored.load_state_dict(
+        source.state_dict(),
+        strict=True,
+    )
+    assert incompatible.missing_keys == []
+    assert incompatible.unexpected_keys == []
+    assert torch.equal(
+        restored.branches["api"].raw_continuous_weights,
+        source.branches["api"].raw_continuous_weights,
+    )
+
+    intrinsic = MonotonicReliabilityCalibrator(
+        use_api_observed_support=False
+    )
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        intrinsic.load_state_dict(source.state_dict(), strict=True)
+
+
+def test_effective_parameter_details_expose_deployed_api_support_weight():
+    calibrator = MonotonicReliabilityCalibrator(
+        use_api_observed_support=True
+    )
+    with torch.no_grad():
+        calibrator.branches["api"].raw_continuous_weights[2].fill_(
+            _raw_softplus(0.9)
+        )
+
+    details = calibrator.effective_parameter_details()
+
+    assert details["api_observed_support_enabled"] is True
+    assert details["feature_layout"]["api"] == [
+        "evidential_certainty",
+        "prediction_margin",
+        "observed_support",
+        "predicted_malware_indicator",
+    ]
+    assert details["branches"]["api"]["continuous_weights"][
+        "observed_support"
+    ] == pytest.approx(0.9)
+    assert "observed_support" not in details["branches"]["graph"][
+        "continuous_weights"
+    ]
+    assert "observed_support" not in details["branches"]["manifest"][
+        "continuous_weights"
+    ]
 
 
 def test_removed_quality_and_two_stage_apis_do_not_exist():

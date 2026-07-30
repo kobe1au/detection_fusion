@@ -14,7 +14,6 @@ if str(ROOT) not in sys.path:
 from fusion.dataset import build_package_isolation_groups
 from fusion.train import (
     VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION,
-    split_posthoc_conformal_dataset,
     split_validation_dataset,
 )
 
@@ -77,52 +76,101 @@ class ValidationMetadata:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Freeze three disjoint validation roles by sample identity."
+        description="Freeze the two-role model-selection/I3 validation protocol."
     )
     parser.add_argument("--validation-csv", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--validation-fraction", type=float, default=0.60)
     parser.add_argument(
-        "--decision-fraction-within-holdout",
+        "--decision-fraction",
         type=float,
-        default=5.0 / 12.0,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--source-v1",
+        type=Path,
+        default=None,
+        help=(
+            "Non-cherry-picked migration: union the v1 checkpoint/posthoc roles "
+            "and retain its untouched decision role."
+        ),
     )
     args = parser.parse_args()
 
     csv_path = args.validation_csv.resolve()
     dataset = ValidationMetadata(csv_path)
-    cfg = {
-        "train": {"seed": int(args.seed)},
-        "calibration": {
-            "validation_fraction": float(args.validation_fraction),
-            "conformal_fraction": float(args.decision_fraction_within_holdout),
-            "split_seed": int(args.seed),
-            "stratified_group_split": True,
-        },
-    }
-    selection, holdout, outer = split_validation_dataset(cfg, dataset)
-    posthoc, decision, _inner = split_posthoc_conformal_dataset(
-        cfg, dataset, list(holdout.indices)
-    )
-    role_indices = {
-        "checkpoint_selection": list(selection.indices),
-        "posthoc_calibration": list(posthoc.indices),
-        "decision_calibration": list(decision.indices),
-    }
+    migration_source = None
+    if args.source_v1 is not None:
+        source_path = args.source_v1.resolve()
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        if str(source.get("validation_csv_sha256") or "") != _sha256(csv_path):
+            raise ValueError("source-v1 was built for a different validation CSV")
+        source_roles = source.get("roles") or {}
+        expected = {
+            "checkpoint_selection",
+            "posthoc_calibration",
+            "decision_calibration",
+        }
+        if set(source_roles) != expected:
+            raise ValueError(
+                f"source-v1 must contain exactly roles {sorted(expected)}"
+            )
+        index_by_sid = {
+            sid: index for index, sid in enumerate(dataset.sample_sids)
+        }
+        model_ids = [
+            *source_roles["checkpoint_selection"],
+            *source_roles["posthoc_calibration"],
+        ]
+        decision_ids = list(source_roles["decision_calibration"])
+        if (
+            len(model_ids) != len(set(model_ids))
+            or set(model_ids) & set(decision_ids)
+            or set(model_ids) | set(decision_ids) != set(dataset.sample_sids)
+        ):
+            raise ValueError("source-v1 roles do not form a complete partition")
+        role_indices = {
+            "model_selection": sorted(index_by_sid[sid] for sid in model_ids),
+            "decision_calibration": sorted(
+                index_by_sid[sid] for sid in decision_ids
+            ),
+        }
+        outer = {
+            "migration": "union_v1_checkpoint_and_posthoc_keep_decision",
+            "source_path": args.source_v1.as_posix(),
+            "source_sha256": _sha256(source_path),
+        }
+        migration_source = {
+            "path": args.source_v1.as_posix(),
+            "sha256": _sha256(source_path),
+        }
+    else:
+        cfg = {
+            "train": {"seed": int(args.seed)},
+            "calibration": {
+                "validation_fraction": float(args.decision_fraction),
+                "split_seed": int(args.seed),
+                "stratified_group_split": True,
+            },
+        }
+        selection, decision, outer = split_validation_dataset(cfg, dataset)
+        role_indices = {
+            "model_selection": list(selection.indices),
+            "decision_calibration": list(decision.indices),
+        }
     flattened = [index for values in role_indices.values() for index in values]
     if len(flattened) != len(dataset) or set(flattened) != set(range(len(dataset))):
         raise RuntimeError("Generated validation roles do not form a partition")
     payload = {
         "schema_version": VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION,
-        "protocol": "year_label_stratified_package_group_40_35_25_v1",
+        "protocol": "year_label_stratified_package_group_75_25_v2",
         "validation_csv": args.validation_csv.as_posix(),
         "validation_csv_sha256": _sha256(csv_path),
         "split_seed": int(args.seed),
-        "validation_fraction": float(args.validation_fraction),
-        "decision_fraction_within_holdout": float(
-            args.decision_fraction_within_holdout
+        "decision_fraction": (
+            len(role_indices["decision_calibration"]) / float(len(dataset))
         ),
+        "migration_source": migration_source,
         "counts": {
             name: len(indices) for name, indices in role_indices.items()
         },
