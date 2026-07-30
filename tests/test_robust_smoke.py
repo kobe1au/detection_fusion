@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import math
 import os
 import random
@@ -13,6 +14,7 @@ from torch.utils.data import DataLoader
 from torch_geometric.data import Batch, Data
 
 import fusion.perturbations as perturbations_module
+from fusion.baseline_train import _binary_metrics as _metrics
 from fusion.constants import AvailabilityIndex
 from fusion.dataset import (
     FatalDatasetConfigError,
@@ -28,15 +30,14 @@ from fusion.manifest_features import (
     normalize_manifest_permissions,
     vectorize_manifest_record,
 )
-from fusion.model import ApiSequenceEncoder, TriModalRobustModel
-from fusion.train import (
+from fusion.model import TriModalRobustModel
+from fusion.modality_encoders import ApiSequenceEncoder
+from fusion.runtime import (
     _dataset_common_kwargs,
     _json_compatible,
-    _metrics,
     enforce_failed_ratio,
     load_config_path,
-    run as run_training,
-    validate_eval_checkpoint_config,
+    validate_manifest_vocab_provenance,
     validate_split_partitions,
 )
 from fusion.semantic_categories import (
@@ -46,6 +47,7 @@ from fusion.semantic_categories import (
     api_semantic_counts_from_type_ids,
     validate_api_type_mapping,
 )
+from fusion.view_protocol import deterministic_view_seed
 from scripts.build_tri_modal_pts_direct import (
     PT_SCHEMA_VERSION,
     _build_one,
@@ -66,6 +68,23 @@ from fusion.perturbations import (
     apply_manifest_permission_mask,
 )
 from tests.pt_factory import current_pt_payload, save_current_pt
+
+
+def _attach_controlled_view(
+    dataset: RobustTriModalDataset,
+    *,
+    sid: str,
+    mechanism: str,
+    strength: float,
+) -> RobustTriModalDataset:
+    dataset.eval_perturb_plan = (
+        (
+            mechanism,
+            float(strength),
+            deterministic_view_seed(sid, mechanism, 424242),
+        ),
+    )
+    return dataset
 
 
 def test_metrics_report_macro_f1_as_primary_f1():
@@ -92,18 +111,18 @@ def test_metrics_mark_auc_and_ap_undefined_for_single_class():
     metrics = _metrics([1, 1], [0.8, 0.9], [1, 1])
 
     assert metrics["auc_defined"] == 0
-    assert metrics["auc"] != metrics["auc"]
+    assert metrics["auc"] is None
     assert metrics["ap_defined"] == 0
-    assert metrics["ap"] != metrics["ap"]
+    assert metrics["ap"] is None
 
 
 def test_confidence_metrics_are_independent_of_operating_threshold():
     metrics = _metrics(
         labels=[0, 1],
-        probs=[0.4, 0.4],
+        probabilities=[0.4, 0.4],
         # A tuned operating threshold can label the second sample malware even
         # though benign remains the maximum-probability class.
-        preds=[0, 1],
+        predictions=[0, 1],
     )
 
     assert metrics["acc"] == pytest.approx(1.0)
@@ -139,15 +158,24 @@ def test_config_loader_allows_shared_parent_defaults(tmp_path: Path):
     left = tmp_path / "left.yaml"
     right = tmp_path / "right.yaml"
     child = tmp_path / "child.yaml"
-    parent.write_text("model:\n  hidden: 64\n", encoding="utf-8")
-    left.write_text("defaults: [parent.yaml]\nloss:\n  left: 1\n", encoding="utf-8")
-    right.write_text("defaults: [parent.yaml]\nloss:\n  right: 2\n", encoding="utf-8")
+    parent.write_text("model:\n  num_classes: 2\n", encoding="utf-8")
+    left.write_text(
+        "defaults: [parent.yaml]\nloss:\n  branch_aux_weight: 0.25\n",
+        encoding="utf-8",
+    )
+    right.write_text(
+        "defaults: [parent.yaml]\nloss:\n  evidential_loss_weight: 0.05\n",
+        encoding="utf-8",
+    )
     child.write_text("defaults: [left.yaml, right.yaml]\n", encoding="utf-8")
 
     cfg = load_config_path(child)
 
-    assert cfg["model"]["hidden"] == 64
-    assert cfg["loss"] == {"left": 1, "right": 2}
+    assert cfg["model"]["num_classes"] == 2
+    assert cfg["loss"] == {
+        "branch_aux_weight": 0.25,
+        "evidential_loss_weight": 0.05,
+    }
 
 
 def test_unknown_data_and_builder_settings_fail_fast(tmp_path: Path):
@@ -167,75 +195,70 @@ def test_unknown_data_and_builder_settings_fail_fast(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
+    ("field", "consumer"),
+    [
+        ("allow_pt_superset", "dataset"),
+        ("strict_split_integrity", "dataset"),
+        ("require_pt_audit_certificate", "dataset"),
+        ("strict_partition_isolation", "partition"),
+        ("require_manifest_vocab_provenance", "manifest"),
+    ],
+)
+def test_data_protocol_flags_reject_string_booleans(
+    field: str,
+    consumer: str,
+) -> None:
+    cfg = load_config_path(
+        "config/experiments/tri_modal_robust/seeds/seed_42.yaml"
+    )
+    cfg = copy.deepcopy(cfg)
+    cfg["data"][field] = "false"
+    with pytest.raises(ValueError, match=rf"data\.{field}"):
+        if consumer == "dataset":
+            _dataset_common_kwargs(cfg, is_train=False)
+        elif consumer == "partition":
+            validate_split_partitions(cfg, include_test=False)
+        else:
+            validate_manifest_vocab_provenance(cfg)
+
+
+def test_graph_behavior_hint_drop_flag_rejects_string_boolean() -> None:
+    cfg = load_config_path(
+        "config/experiments/tri_modal_robust/seeds/seed_42.yaml"
+    )
+    cfg["model"]["graph_encoder"][
+        "drop_extracted_behavior_hints"
+    ] = "false"
+    with pytest.raises(
+        ValueError,
+        match="model.graph_encoder.drop_extracted_behavior_hints",
+    ):
+        _dataset_common_kwargs(cfg, is_train=False)
+
+
+@pytest.mark.parametrize(
     ("payload", "message"),
     [
         (
-            {"train": {"tuning_mode": True}},
-            "Removed Stage-1 tuning settings",
+            {"train": {"unregistered_option": True}},
+            "Unsupported train configuration keys",
         ),
         (
-            {"train": {"checkpoint_metric": "robust_composite"}},
-            "Removed Stage-1 tuning settings",
-        ),
-        (
-            {"eval": {"robust_val": {"enabled": True}}},
-            "eval.robust_val was removed",
+            {"eval": {"unregistered_option": True}},
+            "Unsupported eval configuration keys",
         ),
     ],
 )
-def test_removed_stage1_tuning_settings_fail_at_config_load(
+def test_unknown_config_fields_fail_at_config_load(
     tmp_path: Path,
     payload: dict,
     message: str,
 ):
-    path = tmp_path / "removed_stage1_tuning.yaml"
+    path = tmp_path / "unknown_field.yaml"
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
         load_config_path(path)
-
-
-def test_posthoc_calibration_requires_discount_probability_fusion():
-    with pytest.raises(ValueError, match="require discount_probability fusion"):
-        run_training(
-            {
-                "train": {"device": "cpu"},
-                "data": {},
-                "model": {"fusion_mode": "tri_modal_fixed_gate"},
-                "fusion": {"mode": "model_dispatch"},
-                "calibration": {"enabled": True},
-                "eval": {"run_test": False, "run_robust_test": False},
-            }
-        )
-
-
-def test_eval_only_requires_checkpoint_path():
-    with pytest.raises(ValueError, match="requires eval.checkpoint_path"):
-        run_training(
-            {
-                "train": {"device": "cpu"},
-                "data": {},
-                "model": {"gate": {}},
-                "eval": {
-                    "eval_only": True,
-                    "run_test": False,
-                    "run_robust_test": False,
-                },
-            }
-        )
-
-
-def test_eval_only_checkpoint_config_rejects_semantic_mismatch():
-    saved = {
-        "model": {"fusion_mode": "tri_modal_fixed_gate", "graph_encoder": {"use_behavior_hint": False}},
-        "data": {},
-    }
-    current = {
-        "model": {"fusion_mode": "tri_modal_fixed_gate", "graph_encoder": {"use_behavior_hint": True}},
-        "data": {},
-    }
-    with pytest.raises(ValueError, match="changes model/data semantics"):
-        validate_eval_checkpoint_config(current, saved)
 
 
 def test_partition_validation_rejects_cross_split_package_leakage(tmp_path: Path):
@@ -382,11 +405,6 @@ def test_robust_model_forward_and_loss():
         manifest_hidden_dim=64,
         discount_fusion_config={
             "combination": "dempster",
-            "reliability_calibration": {
-                "enabled": True,
-                "method": "monotonic_correctness",
-                "use_api_observed_support": True,
-            },
         },
     )
     model.eval()
@@ -405,24 +423,8 @@ def test_robust_model_forward_and_loss():
         AvailabilityIndex.BASE_DIM,
     )
     assert torch.equal(extra["fusion_availability"], torch.ones(2, 3))
-    expected_api_support = torch.full(
-        (2,),
-        math.log1p(6.0) / math.log1p(16.0),
-    )
-    assert torch.allclose(
-        extra["api_observed_support"],
-        expected_api_support,
-    )
-    assert torch.allclose(
-        extra["observed_support_api"],
-        expected_api_support,
-    )
-    assert extra["reliability_features_api"].shape == (2, 4)
-    assert extra["reliability_features_graph"].shape == (2, 3)
-    assert torch.equal(
-        extra["api_observed_support_feature_active"],
-        torch.ones(2),
-    )
+    assert "observed_support_api" not in extra
+    assert "reliability_features_api" not in extra
     assert "api_integrity" not in extra
     assert "api_encoder_coverage" not in extra
     assert "api_graph_anchor_support" not in extra
@@ -678,34 +680,6 @@ def test_dataset_rejects_non_finite_or_non_binary_labels(tmp_path: Path, label: 
         )
 
 
-@pytest.mark.parametrize("mapped_value", [0.5, 2, float("nan"), float("inf"), True])
-def test_dataset_rejects_invalid_label_map_values(tmp_path: Path, mapped_value: object):
-    pt_dir, csv_path = _make_label_contract_fixture(tmp_path, label="malware")
-
-    with pytest.raises(ValueError, match=r"data\.label_map"):
-        RobustTriModalDataset(
-            str(pt_dir),
-            str(csv_path),
-            is_train=False,
-            manifest_dim=32,
-            label_map={"malware": mapped_value},
-        )
-
-
-def test_dataset_accepts_explicit_string_label_map(tmp_path: Path):
-    pt_dir, csv_path = _make_label_contract_fixture(tmp_path, label="malware")
-
-    dataset = RobustTriModalDataset(
-        str(pt_dir),
-        str(csv_path),
-        is_train=False,
-        manifest_dim=32,
-        label_map={"malware": 1},
-    )
-
-    assert dataset.sample_labels == [1]
-
-
 @pytest.mark.parametrize("year", [2020.5, "nan", "inf", "true"])
 def test_dataset_rejects_non_finite_or_fractional_years(tmp_path: Path, year: object):
     pt_dir, csv_path = _make_label_contract_fixture(tmp_path, label=1, year=year)
@@ -784,13 +758,17 @@ def test_all_ghost_graph_is_not_alive_and_transports_no_runtime_quality_fields(
         writer.writeheader()
         writer.writerow({"id": sid, "label": 0})
 
-    data = RobustTriModalDataset(
+    dataset = RobustTriModalDataset(
         str(pt_dir),
         str(csv_path),
         is_train=False,
         manifest_dim=32,
-        eval_perturb_type="graph_sparsify",
-        eval_perturb_strength=0.5,
+    )
+    data = _attach_controlled_view(
+        dataset,
+        sid=sid,
+        mechanism="graph_sparsify",
+        strength=0.5,
     )[0]
     assert data.graph_alive.item() == 0.0
     assert not hasattr(data, "graph_integrity")
@@ -911,8 +889,12 @@ def test_manifest_perturbation_uses_payload_vocab_dims(tmp_path: Path):
         manifest_dim=32,
         manifest_permission_dim=128,
         manifest_intent_dim=64,
-        eval_perturb_type="manifest_permission_mask",
-        eval_perturb_strength=1.0,
+    )
+    _attach_controlled_view(
+        dataset,
+        sid=sid,
+        mechanism="manifest_permission_mask",
+        strength=1.0,
     )
     data = dataset[0]
     manifest_x = data.manifest_x.view(-1)
@@ -972,17 +954,17 @@ def test_dataset_rejects_non_current_pt_schema_version(tmp_path: Path):
         )
 
 
-def test_removed_legacy_loss_weights_are_rejected():
+def test_unknown_loss_weights_are_rejected():
     logits = torch.zeros(2, 2, requires_grad=True)
     labels = torch.tensor([0, 1], dtype=torch.long)
     extra = {}
-    for cfg in (
-        {"gate_prior_weight": 0.0},
-        {"cross_source_consistency_weight": 0.0},
-        {"semantic_reconstruction_weight": 0.0},
-    ):
-        with pytest.raises(ValueError, match="Removed loss configuration keys"):
-            compute_robust_loss(logits, labels, extra, cfg)
+    with pytest.raises(ValueError, match="Unsupported loss configuration"):
+        compute_robust_loss(
+            logits,
+            labels,
+            extra,
+            {"unregistered_weight": 0.0},
+        )
 
 
 _DEFAULT_PERMISSION_TOKENS = normalize_manifest_permissions(
@@ -1325,21 +1307,29 @@ def test_eval_perturbation_is_deterministic_per_sample(tmp_path: Path):
         is_train=False,
         manifest_dim=32,
         manifest_stats_dim=11,
-        eval_perturb_type="api_event_dropout",
-        eval_perturb_strength=0.5,
+    )
+    _attach_controlled_view(
+        dataset,
+        sid="deterministic_eval",
+        mechanism="api_event_dropout",
+        strength=0.5,
     )
     first = dataset[0]
     second = dataset[0]
     assert first.api_aug_type == second.api_aug_type
     assert torch.equal(first.api_ids, second.api_ids)
-    stronger = RobustTriModalDataset(
+    stronger_dataset = RobustTriModalDataset(
         str(pt_dir),
         str(csv_path),
         is_train=False,
         manifest_dim=32,
         manifest_stats_dim=11,
-        eval_perturb_type="api_event_dropout",
-        eval_perturb_strength=0.9,
+    )
+    stronger = _attach_controlled_view(
+        stronger_dataset,
+        sid="deterministic_eval",
+        mechanism="api_event_dropout",
+        strength=0.9,
     )[0]
     assert first.api_aug_type == stronger.api_aug_type
 
@@ -1386,7 +1376,7 @@ def test_manifest_permission_alignment_state_never_enters_model_batch(
         writer.writeheader()
         writer.writerow({"id": sid, "label": 1, "year": 2024})
 
-    sample = RobustTriModalDataset(
+    dataset = RobustTriModalDataset(
         str(pt_dir),
         str(csv_path),
         is_train=False,
@@ -1394,8 +1384,12 @@ def test_manifest_permission_alignment_state_never_enters_model_batch(
         manifest_permission_dim=1,
         manifest_intent_dim=0,
         manifest_feature_dim=0,
-        eval_perturb_type="manifest_permission_mask",
-        eval_perturb_strength=0.5,
+    )
+    sample = _attach_controlled_view(
+        dataset,
+        sid=sid,
+        mechanism="manifest_permission_mask",
+        strength=0.5,
     )[0]
 
     assert sample.manifest_aug_type == "manifest_permission_mask"
@@ -1407,28 +1401,6 @@ def test_manifest_missing_zeroes_manifest_counts_and_availability():
     data = apply_manifest_missing(_perturbation_sample())
     assert data["manifest_category_counts"].sum().item() == 0.0
     assert data["manifest_alive"] == 0.0
-
-
-def test_removed_cross_source_and_semantic_losses_are_not_supported():
-    logits = torch.zeros(1, 2, requires_grad=True)
-    labels = torch.tensor([0], dtype=torch.long)
-    with pytest.raises(ValueError, match="Removed loss configuration keys"):
-        compute_robust_loss(
-            logits,
-            labels,
-            {},
-            {"semantic_reconstruction_weight": 0.1, "cross_source_consistency_weight": 0.1},
-        )
-
-
-def test_loss_rejects_removed_cross_source_weight_regardless_of_value():
-    with pytest.raises(ValueError, match="Removed loss configuration keys"):
-        compute_robust_loss(
-            torch.zeros(1, 2),
-            torch.tensor([0]),
-            {},
-            {"cross_source_consistency_weight": -0.1},
-        )
 
 
 def test_empty_manifest_vocab_rejected_by_default(tmp_path: Path):

@@ -24,10 +24,10 @@ from fusion.utils import strict_binary_integer, strict_finite_integer
 
 VALIDATION_ROLE_ASSIGNMENT_SCHEMA_VERSION = 2
 VALIDATION_ROLE_ASSIGNMENT_PROTOCOL = (
-    "year_label_stratified_package_group_75_25_v2"
+    "year_label_stratified_package_group_2to1_v3"
 )
 DEFAULT_VALIDATION_ROLE_ASSIGNMENT = Path(
-    "labels/validation_roles_protocol_v2.json"
+    "labels/validation_roles_protocol_v3.json"
 )
 
 
@@ -105,7 +105,7 @@ def validation_selection_indices(
     validation_csv_path: str | Path,
     role_assignment_path: str | Path = DEFAULT_VALIDATION_ROLE_ASSIGNMENT,
 ) -> tuple[list[int], dict[str, Any]]:
-    """Load the immutable v2 ``model_selection`` identities.
+    """Load the immutable v3 ``model_selection`` identities.
 
     Paper baselines must not independently redraw validation subsets. The
     assignment file is accepted only when it exactly matches the bytes and

@@ -20,7 +20,6 @@ FUSION_RULE_TARGETS = {
     "dempster_rule_only": "dempster",
     "cumulative_subjective_logic": "cumulative",
     "log_pool": "log_pool",
-    "conflict_weighted_opinion": "conflict_weighted_opinion",
 }
 
 FORMAL_TARGETS = {**METHOD_TARGETS, **FUSION_RULE_TARGETS}

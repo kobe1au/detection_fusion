@@ -1,9 +1,6 @@
 defaults:
-  - ../competence_anchored_fusion.yaml
-
-method:
-  name: competence_anchored_seed_2024
+  - ../care_droid.yaml
 
 train:
-  exp_name: competence_anchored_seed_2024
+  exp_name: care_droid_seed_2024
   seed: 2024

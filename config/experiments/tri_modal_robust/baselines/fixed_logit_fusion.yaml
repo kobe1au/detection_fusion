@@ -3,11 +3,14 @@ defaults:
 
 method:
   name: baseline_fixed_logit_fusion
+  protocol_id: baseline_fixed_logit_fusion_v2
 
 train:
   exp_name: baseline_fixed_logit_fusion
 
 model:
+  # Equal weights are normalized over this sample's alive modalities.
+  # An all-dead sample has zero weights and explicit uniform prediction.
   fusion_mode: tri_modal_fixed_gate
 
 loss:

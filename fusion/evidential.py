@@ -1,9 +1,8 @@
 """Evidential (subjective-logic) primitives for the tri-modal robust pipeline.
 
-This module provides the opinion representation, trust discounting, conflict
-diagnostics, and the comparison rules used by the pipeline. Dempster,
-cumulative fusion, log pooling, and conflictive aggregation are independent
-comparison rules; the routed main method does not call them.
+This module provides the opinion representation, hard availability discount,
+conflict diagnostics, and the fixed comparison rules used by the registered
+trusted-fusion baselines. CARE-Droid does not call these rules.
 
 Everything here is pure functional tensor code so it can be unit-tested in
 isolation and runs under an explicit FP32 context from the caller.
@@ -25,42 +24,37 @@ COMBINATION_RULES = (
     "cumulative",
     "log_pool",
     "ecml",
-    "conflict_weighted_opinion",
 )
 
-def logits_to_softmax_opinion(
-    logits: torch.Tensor,
+
+def _coerce_availability_masks(
+    availability_masks: list[torch.Tensor] | torch.Tensor | None,
     *,
-    uncertainty: float = 0.5,
-    temperature: float = 1.0,
-    eps: float = 1e-8,
-) -> dict[str, torch.Tensor]:
-    """Map logits to a pseudo subjective-logic opinion without Dirichlet evidence.
+    batch_size: int,
+    num_sources: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Return an explicit ``[B, S]`` Boolean source-availability matrix."""
+    if availability_masks is None:
+        return None
+    if isinstance(availability_masks, torch.Tensor):
+        if availability_masks.shape != (batch_size, num_sources):
+            raise ValueError(
+                "availability tensor must have shape [B, S], got "
+                f"{tuple(availability_masks.shape)}"
+            )
+        return availability_masks.to(device=device, dtype=torch.bool)
+    if len(availability_masks) != num_sources:
+        raise ValueError("availability mask count must match source count")
+    masks: list[torch.Tensor] = []
+    for mask in availability_masks:
+        if mask.numel() != batch_size:
+            raise ValueError(
+                "each availability mask must contain one value per sample"
+            )
+        masks.append(mask.to(device=device).view(-1).to(dtype=torch.bool))
+    return torch.stack(masks, dim=1)
 
-    This is used for the no-EDL-opinion ablation: the branch still provides
-    class probabilities, but uncertainty is fixed, so conflict-aware fusion can
-    be tested without learned Dirichlet evidence.
-    """
-    if logits.ndim != 2 or logits.size(-1) < 2:
-        raise ValueError(f"logits_to_softmax_opinion expects [B, C>=2], got {tuple(logits.shape)}")
-    if temperature <= 0:
-        raise ValueError("temperature must be positive")
-    u_value = float(uncertainty)
-    if not 0.0 <= u_value <= 1.0:
-        raise ValueError("uncertainty must be within [0, 1]")
-
-    prob = F.softmax(logits / float(temperature), dim=-1)
-    u = torch.full((logits.size(0),), u_value, device=logits.device, dtype=logits.dtype)
-    belief = prob * (1.0 - u.view(-1, 1))
-
-    return {
-        "evidence": torch.zeros_like(logits),
-        "alpha": torch.ones_like(logits),
-        "strength": torch.full((logits.size(0),), float(logits.size(-1)), device=logits.device, dtype=logits.dtype),
-        "belief": belief,
-        "uncertainty": u,
-        "expected_prob": prob,
-    }
 
 def logits_to_opinion(
     logits: torch.Tensor,
@@ -111,8 +105,7 @@ def trust_discount(
 
     ``b'_k = r * b_k`` and ``u' = 1 - r * (1 - u)``. Lower reliability moves
     belief mass into uncertainty, so an unreliable source contributes little to
-    the combined opinion (and raises the rejection signal) rather than voting at
-    full strength.
+    the combined opinion rather than voting at full strength.
     """
     r = reliability.clamp(0.0, 1.0).view(-1, 1)
     discounted_belief = belief * r
@@ -135,8 +128,13 @@ def _combine_log_pool_opinions(
     beliefs: list[torch.Tensor],
     uncertainties: list[torch.Tensor],
     eps: float,
+    availability_masks: list[torch.Tensor] | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply one source-symmetric log-pool definition for any source count."""
+    """Apply a source-symmetric log pool over the available sources.
+
+    A hard-missing source must be the identity, rather than an extra uniform
+    factor that silently flattens the remaining predictions.
+    """
     probabilities = []
     uncertainty_values = []
     for belief, uncertainty in zip(beliefs, uncertainties):
@@ -146,15 +144,37 @@ def _combine_log_pool_opinions(
             (b + u / float(b.size(-1))).clamp_min(eps)
         )
         uncertainty_values.append(u.clamp(0.0, 1.0))
-    log_prob = torch.stack([value.log() for value in probabilities], dim=0).mean(dim=0)
+    probability_stack = torch.stack(probabilities, dim=1)  # [B, S, C]
+    uncertainty_stack = torch.stack(uncertainty_values, dim=1).squeeze(-1)
+    available = _coerce_availability_masks(
+        availability_masks,
+        batch_size=probability_stack.size(0),
+        num_sources=probability_stack.size(1),
+        device=probability_stack.device,
+    )
+    if available is None:
+        # An exactly vacuous opinion is the pipeline's missing-view sentinel.
+        available = uncertainty_stack < 1.0 - eps
+    available_float = available.to(dtype=probability_stack.dtype)
+    available_count = available_float.sum(dim=1, keepdim=True)
+    log_prob = (
+        probability_stack.clamp_min(eps).log()
+        * available_float.unsqueeze(-1)
+    ).sum(dim=1) / available_count.clamp_min(1.0)
     probability = torch.softmax(log_prob, dim=-1)
     uncertainty = (
-        torch.stack(uncertainty_values, dim=0)
-        .clamp_min(eps)
-        .log()
-        .mean(dim=0)
-        .exp()
-        .clamp(0.0, 1.0)
+        (
+            uncertainty_stack
+            .clamp_min(eps)
+            .log()
+            * available_float
+        ).sum(dim=1, keepdim=True)
+        / available_count.clamp_min(1.0)
+    ).exp().clamp(0.0, 1.0)
+    uncertainty = torch.where(
+        available_count > 0.0,
+        uncertainty,
+        torch.ones_like(uncertainty),
     )
     belief = probability * (1.0 - uncertainty)
     return belief, uncertainty.view(-1)
@@ -214,11 +234,6 @@ def combine_opinions(
             beliefs, uncertainties, eps=eps
         )
         return belief, uncertainty
-    if rule == "conflict_weighted_opinion":
-        belief, uncertainty, _diagnostics = combine_conflict_weighted_opinions(
-            beliefs, uncertainties, eps=eps
-        )
-        return belief, uncertainty
     if len(beliefs) == 1:
         belief, u = _as_masses(beliefs[0], uncertainties[0])
         return belief, u.view(-1)
@@ -249,8 +264,8 @@ def _multisource_intersection(
 
     ``m(k) = prod_i (b_i(k) + u_i) - prod_i u_i``.
 
-    The remaining mass is raw conflict. This is order-independent and is used
-    as a diagnostic and rejection signal.
+    The remaining mass is raw conflict. This is order-independent and is
+    reported as a baseline diagnostic.
     """
     if not beliefs:
         raise ValueError("multisource intersection requires at least one opinion")
@@ -470,97 +485,6 @@ def combine_ecml_opinions(
     return belief, uncertainty, diagnostics
 
 
-def combine_conflict_weighted_opinions(
-    beliefs: list[torch.Tensor],
-    uncertainties: list[torch.Tensor],
-    eps: float = 1e-8,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Custom conflict-weighted probability aggregation baseline.
-
-    This mechanism is an internal rule ablation, not an ECML implementation.
-    It tests whether a view's contribution should decrease when a confident
-    prediction conflicts with other confident predictions:
-
-    * convert each opinion to pignistic probabilities;
-    * compute pairwise conflict as probability projection distance multiplied
-      by the two views' certainty;
-    * weight each view by ``certainty * (1 - view_conflict)``;
-    * average probabilities with those weights and return an opinion whose
-      uncertainty is the residual conflict-penalised uncertainty.
-
-    The rule is source-order invariant and has no dataset-tuned hyperparameter,
-    which makes it suitable as a paper baseline against the routed method and
-    other evidence-combination rules.
-    """
-    if not beliefs:
-        raise ValueError("combine_conflict_weighted_opinions requires at least one opinion")
-    if len(beliefs) != len(uncertainties):
-        raise ValueError("beliefs and uncertainties length mismatch")
-
-    norm_beliefs: list[torch.Tensor] = []
-    norm_uncertainties: list[torch.Tensor] = []
-    probs: list[torch.Tensor] = []
-    certainties: list[torch.Tensor] = []
-    for belief, uncertainty in zip(beliefs, uncertainties):
-        b, u = _as_masses(belief, uncertainty)
-        u = u.view(-1).clamp(0.0, 1.0)
-        norm_beliefs.append(b)
-        norm_uncertainties.append(u)
-        probs.append(opinion_to_prob(b, u, eps=eps))
-        certainties.append((1.0 - u).clamp(0.0, 1.0))
-
-    prob_stack = torch.stack(probs, dim=1)  # [B, S, C]
-    certainty_stack = torch.stack(certainties, dim=1)  # [B, S]
-    num_sources = prob_stack.size(1)
-    if num_sources == 1:
-        b, u = _as_masses(norm_beliefs[0], norm_uncertainties[0])
-        zero = torch.zeros_like(u.view(-1))
-        return b, u.view(-1), {
-            "raw_conflict": zero,
-            "conflict_weighted_view_conflict_mean": zero,
-        }
-
-    pair_conflicts: list[torch.Tensor] = []
-    view_conflict = torch.zeros_like(certainty_stack)
-    counts = torch.zeros_like(certainty_stack)
-    for i in range(num_sources):
-        for j in range(i + 1, num_sources):
-            # 0.5 * L1 distance is in [0, 1] for probability vectors.
-            distance = 0.5 * (prob_stack[:, i, :] - prob_stack[:, j, :]).abs().sum(dim=-1)
-            pair = (distance * certainty_stack[:, i] * certainty_stack[:, j]).clamp(0.0, 1.0)
-            pair_conflicts.append(pair)
-            view_conflict[:, i] += pair
-            view_conflict[:, j] += pair
-            counts[:, i] += 1.0
-            counts[:, j] += 1.0
-
-    view_conflict = (view_conflict / counts.clamp_min(1.0)).clamp(0.0, 1.0)
-    view_reliability = (certainty_stack * (1.0 - view_conflict)).clamp(0.0, 1.0)
-    reliability_sum = view_reliability.sum(dim=1, keepdim=True)
-    uniform_weights = torch.full_like(view_reliability, 1.0 / float(num_sources))
-    weights = torch.where(
-        reliability_sum > eps,
-        view_reliability / reliability_sum.clamp_min(eps),
-        uniform_weights,
-    )
-
-    fused_prob = (weights.unsqueeze(-1) * prob_stack).sum(dim=1)
-    fused_certainty = (weights * view_reliability).sum(dim=1).clamp(0.0, 1.0)
-    uncertainty = (1.0 - fused_certainty).clamp(0.0, 1.0)
-    belief = fused_prob * (1.0 - uncertainty).view(-1, 1)
-    belief, uncertainty = _as_masses(belief, uncertainty)
-
-    if pair_conflicts:
-        conflictive_raw = torch.stack(pair_conflicts, dim=1).mean(dim=1).clamp(0.0, 1.0)
-    else:
-        conflictive_raw = torch.zeros_like(uncertainty)
-    diagnostics = {
-        "raw_conflict": conflictive_raw,
-        "conflict_weighted_view_conflict_mean": view_conflict.mean(dim=1).clamp(0.0, 1.0),
-    }
-    return belief, uncertainty.view(-1), diagnostics
-
-
 def combine_opinions_with_diagnostics(
     beliefs: list[torch.Tensor],
     uncertainties: list[torch.Tensor],
@@ -569,7 +493,7 @@ def combine_opinions_with_diagnostics(
     availability_masks: list[torch.Tensor] | torch.Tensor | None = None,
     eps: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Combine opinions and expose raw conflict for rejection diagnostics."""
+    """Combine opinions and expose raw conflict diagnostics."""
     rule = str(rule).lower()
     raw_conflict = multisource_conflict(beliefs, uncertainties, eps=eps)
     if rule == "ecml":
@@ -581,19 +505,17 @@ def combine_opinions_with_diagnostics(
         )
         diagnostics["raw_conflict"] = raw_conflict.clamp(0.0, 1.0)
         return belief, uncertainty, diagnostics
-    if rule == "conflict_weighted_opinion":
-        belief, uncertainty, diagnostics = combine_conflict_weighted_opinions(
-            beliefs, uncertainties, eps=eps
+    if rule == "log_pool":
+        belief, uncertainty = _combine_log_pool_opinions(
+            beliefs,
+            uncertainties,
+            eps,
+            availability_masks=availability_masks,
         )
-        # Keep rejection aware of both conjunctive conflict and the custom
-        # confidence-weighted disagreement.
-        diagnostics["raw_conflict"] = torch.maximum(
-            raw_conflict.clamp(0.0, 1.0),
-            diagnostics["raw_conflict"].clamp(0.0, 1.0),
+    else:
+        belief, uncertainty = combine_opinions(
+            beliefs, uncertainties, rule=rule, eps=eps
         )
-        return belief, uncertainty, diagnostics
-
-    belief, uncertainty = combine_opinions(beliefs, uncertainties, rule=rule, eps=eps)
     diagnostics = {
         "raw_conflict": raw_conflict.clamp(0.0, 1.0),
     }
@@ -617,46 +539,6 @@ def opinion_to_prob(
         a = torch.full((1, belief.size(-1)), float(base_rate), device=belief.device, dtype=belief.dtype)
     prob = belief.clamp_min(0.0) + a * u
     return prob / prob.sum(dim=-1, keepdim=True).clamp_min(eps)
-
-
-def predictive_opinion_conflict(
-    beliefs: list[torch.Tensor],
-    uncertainties: list[torch.Tensor],
-    eps: float = 1e-8,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return mean and maximum confidence-weighted pairwise disagreement.
-
-    The score is computed from the original branch opinions, before I1 trust
-    discounting. For each source pair it multiplies total-variation distance
-    between projected probabilities by both source certainties. This exposes
-    confident disagreement as a separate routing and diagnostic signal.
-    """
-    if not beliefs:
-        raise ValueError("predictive_opinion_conflict requires at least one opinion")
-    if len(beliefs) != len(uncertainties):
-        raise ValueError("beliefs and uncertainties length mismatch")
-
-    probs: list[torch.Tensor] = []
-    certainties: list[torch.Tensor] = []
-    for belief, uncertainty in zip(beliefs, uncertainties):
-        b, u = _as_masses(belief, uncertainty)
-        u = u.view(-1).clamp(0.0, 1.0)
-        probs.append(opinion_to_prob(b, u, eps=eps))
-        certainties.append((1.0 - u).clamp(0.0, 1.0))
-
-    if len(probs) == 1:
-        zero = torch.zeros_like(certainties[0])
-        return zero, zero
-
-    pair_scores: list[torch.Tensor] = []
-    for i in range(len(probs)):
-        for j in range(i + 1, len(probs)):
-            distance = 0.5 * (probs[i] - probs[j]).abs().sum(dim=-1)
-            pair_scores.append(
-                (distance * certainties[i] * certainties[j]).clamp(0.0, 1.0)
-            )
-    stacked = torch.stack(pair_scores, dim=-1)
-    return stacked.mean(dim=-1), stacked.max(dim=-1).values
 
 
 # ── EDL training objective ────────────────────────────────────────────────────
@@ -722,7 +604,11 @@ def dirichlet_expected_ce_loss(
             raise ValueError("sample_weight must contain one value per sample")
         if not bool(torch.isfinite(weight).all().item()) or bool((weight < 0).any().item()):
             raise ValueError("sample_weight must be finite and non-negative")
-        return (per_sample * weight).sum() / weight.sum().clamp_min(1.0)
+        denominator = weight.sum()
+        weighted = (
+            (per_sample * weight).sum() / denominator.clamp_min(eps)
+        )
+        return weighted * (denominator > 0).to(dtype=weighted.dtype)
     return per_sample.mean()
 
 
@@ -757,7 +643,14 @@ def evidential_loss(
     kl = _kl_dirichlet_to_uniform(alpha_tilde, eps=eps)
     per_sample = bayes_risk + float(max(anneal_coef, 0.0)) * kl
     if sample_weight is not None:
-        w = sample_weight.to(dtype=per_sample.dtype).view(-1)
-        denom = w.sum().clamp_min(1.0)
-        return (per_sample * w).sum() / denom
+        w = sample_weight.to(
+            device=per_sample.device, dtype=per_sample.dtype
+        ).view(-1)
+        if w.numel() != per_sample.numel():
+            raise ValueError("sample_weight must contain one value per sample")
+        if not bool(torch.isfinite(w).all().item()) or bool((w < 0).any().item()):
+            raise ValueError("sample_weight must be finite and non-negative")
+        denominator = w.sum()
+        weighted = (per_sample * w).sum() / denominator.clamp_min(eps)
+        return weighted * (denominator > 0).to(dtype=weighted.dtype)
     return per_sample.mean()

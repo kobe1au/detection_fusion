@@ -1,18 +1,9 @@
 from __future__ import annotations
 
 import math
-import warnings
-from collections import OrderedDict
-from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
-from fusion.competence_fusion import (
-    ATOMIC_EXPERT_NAMES,
-    EXPERT_NAMES,
-    AnchoredCompetenceFusion,
-    ContentConditionedCompetence,
-)
 from fusion.evidence import build_fusion_availability_and_diagnostics
 
 from fusion.constants import ArchitectureConstants, AvailabilityIndex
@@ -21,10 +12,7 @@ from fusion.gates import (
     DenseTriModalEmbeddingGate,
     dense_embedding_late_fusion_logits,
 )
-from fusion.graph_encoders import GraphEncoderGAT, GraphEncoderGCN
-from fusion.semantic_categories import validate_api_type_mapping
-from fusion.utils import strict_finite_integer
-from torch_geometric.utils import softmax
+from fusion.modality_encoders import TriModalEncoderBackbone
 
 
 TRI_MODAL_FUSION_MODES = {
@@ -36,13 +24,11 @@ TRI_MODAL_FUSION_MODES = {
     "tri_modal_fixed_gate",
     "tri_modal_quality_fusion",
     "tri_modal_dense_embedding_gate",
-    "anchored_joint_late",
     "discount_probability",
 }
 
 API_GRAPH_CONCAT_FUSION_MODES = {"api_graph_concat"}
 TRI_MODAL_CONCAT_FUSION_MODES = {"tri_modal_concat"}
-ANCHORED_JOINT_LATE_FUSION_MODES = {"anchored_joint_late"}
 
 
 # ── fusion-mode dispatch helpers ──────────────────────────────────────
@@ -220,7 +206,7 @@ def _fusion_dense_embedding_gate(model, batch_size, device, dtype, tensors, extr
 
 
 def _fusion_fixed_gate(model, batch_size, device, dtype, tensors, extra):
-    """Canonical equal-weight API/Graph/Manifest late fusion."""
+    """Equal-weight late fusion over the modalities alive in each sample."""
     availability, diagnostics = build_fusion_availability_and_diagnostics(
         tensors["graph_data"],
         tensors["api_logits"],
@@ -234,9 +220,6 @@ def _fusion_fixed_gate(model, batch_size, device, dtype, tensors, extra):
     extra.update(diagnostics)
     extra["fusion_availability"] = availability.detach()
 
-    gate_weights = torch.full(
-        (batch_size, 3), 1.0 / 3.0, device=device, dtype=dtype
-    )
     alive = torch.stack(
         [
             availability[:, AvailabilityIndex.API_ALIVE],
@@ -245,10 +228,16 @@ def _fusion_fixed_gate(model, batch_size, device, dtype, tensors, extra):
         ],
         dim=-1,
     ).to(device=device, dtype=dtype)
+    alive_count = alive.sum(dim=-1, keepdim=True)
+    gate_weights = torch.where(
+        alive_count > 0,
+        alive / alive_count.clamp_min(1.0),
+        torch.zeros_like(alive),
+    )
     logits = (
-        gate_weights[:, 0:1] * alive[:, 0:1] * tensors["api_logits"]
-        + gate_weights[:, 1:2] * alive[:, 1:2] * tensors["graph_logits"]
-        + gate_weights[:, 2:3] * alive[:, 2:3] * tensors["manifest_logits"]
+        gate_weights[:, 0:1] * tensors["api_logits"]
+        + gate_weights[:, 1:2] * tensors["graph_logits"]
+        + gate_weights[:, 2:3] * tensors["manifest_logits"]
     )
     return logits, gate_weights, extra
 
@@ -276,7 +265,6 @@ def _fusion_discount_probability(model, batch_size, device, dtype, tensors, extr
         tensors["graph_logits"],
         tensors["manifest_logits"],
         availability,
-        api_observed_support=tensors["api_observed_support"],
     )
     extra.update(fusion_outputs)
     return fusion_outputs["final_logits"], fusion_outputs["fusion_weights"], extra
@@ -306,282 +294,7 @@ def build_main_head(in_dim: int, num_classes: int) -> nn.Sequential:
     )
 
 
-class ApiSequenceEncoder(nn.Module):
-    """API event encoder for the robust tri-modal pipeline."""
-
-    def __init__(
-        self,
-        num_hash_buckets: int,
-        type_vocab_size: int,
-        emb_dim: int,
-        hidden_dim: int,
-        dropout: float,
-        encoder_type: str = "transformer",
-        num_layers: int = 2,
-        num_heads: int = 4,
-        max_seq_len: int = 1024,
-    ):
-        super().__init__()
-        self.num_hash_buckets = int(num_hash_buckets)
-        self.type_vocab_size = int(type_vocab_size)
-        self.emb_dim = int(emb_dim)
-        self.encoder_type = str(encoder_type).lower()
-        self.max_seq_len = strict_finite_integer(
-            max_seq_len, field_name="ApiSequenceEncoder.max_seq_len"
-        )
-        if self.max_seq_len <= 0:
-            raise ValueError("ApiSequenceEncoder.max_seq_len must be positive")
-        self.max_valid_api_id = self.num_hash_buckets + 1
-        self.overflow_id = self.num_hash_buckets + 2
-        self.api_embedding = nn.Embedding(self.overflow_id + 1, emb_dim, padding_idx=0)
-        # Extracted API hash ids occupy 2..N+1.  Keep N+1 as a valid bucket and
-        # reserve N+2 exclusively for out-of-range values.
-        nn.init.zeros_(self.api_embedding.weight[self.overflow_id])
-        self.type_embedding = nn.Embedding(self.type_vocab_size, emb_dim)
-        self.sensitive_embedding = nn.Embedding(2, emb_dim)
-        self.input_norm = nn.LayerNorm(emb_dim)
-        self.input_dropout = nn.Dropout(dropout)
-
-        if self.encoder_type == "bigru":
-            if emb_dim % 2 != 0:
-                raise ValueError("emb_dim must be even for bigru API encoder")
-            self.sequence_encoder = nn.GRU(
-                input_size=emb_dim,
-                hidden_size=emb_dim // 2,
-                num_layers=max(1, int(num_layers)),
-                batch_first=True,
-                bidirectional=True,
-                dropout=dropout if int(num_layers) > 1 else 0.0,
-            )
-            self.pos_embedding = None
-        elif self.encoder_type == "transformer":
-            if emb_dim % int(num_heads) != 0:
-                raise ValueError("api emb_dim must be divisible by api heads")
-            self.pos_embedding = nn.Embedding(self.max_seq_len, emb_dim)
-            layer = nn.TransformerEncoderLayer(
-                d_model=emb_dim,
-                nhead=int(num_heads),
-                dim_feedforward=hidden_dim,
-                dropout=dropout,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            )
-            self.sequence_encoder = nn.TransformerEncoder(layer, num_layers=max(1, int(num_layers)))
-        else:
-            raise ValueError(f"Unsupported API encoder type: {encoder_type}")
-
-        self.out_proj = nn.Sequential(
-            nn.LayerNorm(emb_dim),
-            nn.Linear(emb_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, emb_dim),
-            nn.LayerNorm(emb_dim),
-        )
-        self.pool_score = nn.Sequential(
-            nn.Linear(emb_dim, max(hidden_dim // 2, 32)),
-            nn.Tanh(),
-            nn.Linear(max(hidden_dim // 2, 32), 1),
-        )
-
-    def _empty_output(self, num_graphs: int, device, dtype):
-        return (
-            torch.zeros((0, self.emb_dim), device=device, dtype=dtype),
-            torch.zeros((num_graphs, self.emb_dim), device=device, dtype=dtype),
-            torch.empty((0,), device=device, dtype=torch.long),
-        )
-
-    @staticmethod
-    def _padded_batch(event_emb: torch.Tensor, api_batch: torch.Tensor, num_graphs: int):
-        device = event_emb.device
-        lengths = torch.bincount(api_batch, minlength=num_graphs).to(device=device)
-        max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
-        if max_len <= 0:
-            return None, None, lengths, None
-        padded = event_emb.new_zeros((num_graphs, max_len, event_emb.size(-1)))
-        key_padding_mask = torch.ones((num_graphs, max_len), device=device, dtype=torch.bool)
-        offsets = torch.zeros((num_graphs + 1,), device=device, dtype=torch.long)
-        offsets[1:] = lengths.cumsum(dim=0)
-        restore_pos = torch.arange(event_emb.size(0), device=device) - offsets[api_batch]
-        padded[api_batch, restore_pos] = event_emb
-        key_padding_mask[api_batch, restore_pos] = False
-        empty_rows = lengths == 0
-        if empty_rows.any():
-            key_padding_mask[empty_rows, 0] = False
-        return padded, key_padding_mask, lengths, restore_pos
-
-    def _normalize_api_ids(self, api_ids: torch.Tensor, device) -> torch.Tensor:
-        api_ids = api_ids.to(device=device, dtype=torch.long)
-        overflow = torch.full_like(api_ids, self.overflow_id)
-        api_ids = torch.where(api_ids > self.max_valid_api_id, overflow, api_ids)
-        return api_ids.clamp_min(0)
-
-    def forward(self, graph_data, num_graphs: int, device, dtype):
-        api_ids = getattr(graph_data, "api_ids", None)
-        api_batch = getattr(graph_data, "api_batch", None)
-        if api_ids is None or api_batch is None or api_ids.numel() == 0:
-            return self._empty_output(num_graphs, device, dtype)
-
-        api_ids = self._normalize_api_ids(api_ids, device)
-        api_batch = api_batch.to(device=device, dtype=torch.long).view(-1)
-        if api_batch.numel() != api_ids.numel():
-            raise ValueError(
-                f"api_batch length {api_batch.numel()} does not match api_ids length {api_ids.numel()}"
-            )
-        if num_graphs <= 0 or (api_batch < 0).any() or (api_batch >= num_graphs).any():
-            raise ValueError(
-                f"api_batch contains indices outside [0, {max(num_graphs - 1, 0)}]"
-            )
-        if api_batch.numel() > 1 and (api_batch[1:] < api_batch[:-1]).any():
-            raise ValueError("api_batch must be grouped in non-decreasing sample order")
-        raw_lengths = torch.bincount(api_batch, minlength=num_graphs).to(device=device)
-        observed_max = int(raw_lengths.max().item()) if raw_lengths.numel() > 0 else 0
-        if observed_max > self.max_seq_len:
-            raise RuntimeError(
-                "API dataset/encoder budget contract was violated: the encoder "
-                "must never truncate silently because reliability evidence and "
-                "semantic counts were already computed from the dataset output; "
-                f"observed per-sample length {observed_max} exceeds max_seq_len="
-                f"{self.max_seq_len}"
-            )
-        keep = slice(None)
-
-        raw_type_ids = getattr(graph_data, "api_type_ids", None)
-        api_type_ids = (
-            torch.zeros_like(api_ids)
-            if raw_type_ids is None
-            else raw_type_ids.to(device=device, dtype=torch.long)[keep].clamp(0, self.type_vocab_size - 1)
-        )
-        raw_sensitive = getattr(graph_data, "api_sensitive_mask", None)
-        api_sensitive = (
-            torch.zeros_like(api_ids)
-            if raw_sensitive is None
-            else raw_sensitive.to(device=device)[keep].float().gt(0.5).long().clamp(0, 1)
-        )
-        event_emb = self.api_embedding(api_ids) + self.type_embedding(api_type_ids) + self.sensitive_embedding(api_sensitive)
-        event_emb = self.input_dropout(self.input_norm(event_emb))
-        padded, key_padding_mask, lengths, restore_pos = self._padded_batch(event_emb, api_batch, num_graphs)
-        if padded is None:
-            return self._empty_output(num_graphs, device, dtype)
-
-        if self.encoder_type == "transformer":
-            pos = torch.arange(padded.size(1), device=device).clamp(max=self.max_seq_len - 1)
-            encoded = self.sequence_encoder(padded + self.pos_embedding(pos).unsqueeze(0), src_key_padding_mask=key_padding_mask)
-        else:
-            encoded, _ = self.sequence_encoder(padded)
-        token_emb = encoded[api_batch, restore_pos]
-        token_emb = self.out_proj(token_emb)
-        scores = self.pool_score(token_emb).view(-1)
-        scores = scores.masked_fill(~torch.isfinite(scores), 0.0)
-        weights = softmax(scores, api_batch, num_nodes=num_graphs).view(-1, 1)
-        pooled = token_emb.new_zeros((num_graphs, self.emb_dim))
-        pooled.index_add_(0, api_batch, token_emb * weights)
-        return token_emb, pooled.to(dtype=dtype), api_batch
-
-
-class ManifestEncoder(nn.Module):
-    def __init__(self, in_dim: int, emb_dim: int = 128, hidden_dim: int = 256, dropout: float = 0.1):
-        super().__init__()
-        self.in_dim = int(in_dim)
-        self.emb_dim = int(emb_dim)
-        self.net = nn.Sequential(
-            nn.Linear(self.in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, emb_dim),
-            nn.LayerNorm(emb_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x.float())
-
-
-class JointExpert(nn.Module):
-    """A real joint representation expert over the three current-view embeddings.
-
-    The hard alive bits are part of the joint input so a zero-filled missing
-    branch cannot be confused with a valid embedding that happens to be near
-    zero.  This module belongs to Stage A and is deliberately separate from the
-    Stage-B competence/router parameters.
-    """
-
-    def __init__(
-        self,
-        embedding_dims: Mapping[str, int],
-        *,
-        joint_dim: int,
-        hidden_dim: int,
-        num_classes: int,
-        dropout: float,
-    ) -> None:
-        super().__init__()
-        if set(embedding_dims) != set(ATOMIC_EXPERT_NAMES):
-            raise ValueError(
-                "JointExpert embedding_dims must contain exactly "
-                f"{list(ATOMIC_EXPERT_NAMES)}"
-            )
-        if int(joint_dim) <= 0 or int(hidden_dim) <= 0:
-            raise ValueError("JointExpert dimensions must be positive")
-        if not 0.0 <= float(dropout) < 1.0:
-            raise ValueError("JointExpert dropout must lie within [0, 1)")
-        self.embedding_dims = {
-            name: int(embedding_dims[name]) for name in ATOMIC_EXPERT_NAMES
-        }
-        if any(width <= 0 for width in self.embedding_dims.values()):
-            raise ValueError("JointExpert embedding dimensions must be positive")
-        self.joint_dim = int(joint_dim)
-        input_dim = sum(self.embedding_dims.values()) + len(ATOMIC_EXPERT_NAMES)
-        self.representation = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, int(hidden_dim)),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(int(hidden_dim), self.joint_dim),
-            nn.LayerNorm(self.joint_dim),
-        )
-        self.classifier = build_main_head(self.joint_dim, int(num_classes))
-
-    def forward(
-        self,
-        embeddings: Mapping[str, torch.Tensor],
-        alive: Mapping[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if set(embeddings) != set(ATOMIC_EXPERT_NAMES) or set(alive) != set(
-            ATOMIC_EXPERT_NAMES
-        ):
-            raise ValueError(
-                "JointExpert requires exact API/Graph/Manifest embeddings and alive masks"
-            )
-        reference = embeddings[ATOMIC_EXPERT_NAMES[0]]
-        if reference.ndim != 2:
-            raise ValueError("JointExpert embeddings must have shape [B, D]")
-        batch_size = int(reference.size(0))
-        pieces: list[torch.Tensor] = []
-        alive_pieces: list[torch.Tensor] = []
-        for name in ATOMIC_EXPERT_NAMES:
-            embedding = embeddings[name]
-            if (
-                embedding.ndim != 2
-                or int(embedding.size(0)) != batch_size
-                or int(embedding.size(1)) != self.embedding_dims[name]
-            ):
-                raise ValueError(
-                    f"JointExpert embedding {name!r} has invalid shape "
-                    f"{tuple(embedding.shape)}"
-                )
-            mask = alive[name]
-            if not isinstance(mask, torch.Tensor) or mask.numel() != batch_size:
-                raise ValueError(f"JointExpert alive[{name!r}] must have shape [B]")
-            mask = mask.to(device=embedding.device).view(-1).bool()
-            pieces.append(embedding * mask.to(embedding).unsqueeze(-1))
-            alive_pieces.append(mask.to(embedding).unsqueeze(-1))
-        joint_input = torch.cat([*pieces, *alive_pieces], dim=-1)
-        joint_embedding = self.representation(joint_input)
-        return joint_embedding, self.classifier(joint_embedding)
-
-
-class TriModalRobustModel(nn.Module):
+class TriModalRobustModel(TriModalEncoderBackbone):
     def __init__(
         self,
         in_feat_dim: int = 515,
@@ -607,132 +320,46 @@ class TriModalRobustModel(nn.Module):
         manifest_emb_dim: int = 128,
         manifest_hidden_dim: int = 256,
         manifest_dropout: float = 0.1,
-        joint_emb_dim: int = 128,
-        joint_hidden_dim: int = 256,
-        joint_dropout: float = 0.15,
-        competence_projection_dim: int = 32,
-        competence_hidden_dim: int = 16,
-        competence_dropout: float = 0.10,
-        initial_atomic_competence_scale: float = 1.0,
-        initial_joint_late_scale: float = 1.0,
-        initial_late_gate: float = 0.10,
         quality_fusion_temperature: float = 10.0,
         gate_hidden_dim: int = 128,
         gate_detach: bool = True,
         discount_fusion_config: dict | None = None,
     ):
-        super().__init__()
-        # Defensive check: ensure DEFAULT_API_TYPE_ID_TO_CATEGORY stays
-        # consistent with the extractor taxonomy and the 12-D shared space.
-        validate_api_type_mapping()
+        super().__init__(
+            in_feat_dim=in_feat_dim,
+            api_num_hash_buckets=api_num_hash_buckets,
+            api_type_vocab_size=api_type_vocab_size,
+            api_emb_dim=api_emb_dim,
+            api_hidden_dim=api_hidden_dim,
+            api_dropout=api_dropout,
+            api_encoder_type=api_encoder_type,
+            api_layers=api_layers,
+            api_heads=api_heads,
+            api_max_seq_len=api_max_seq_len,
+            graph_emb_dim=graph_emb_dim,
+            graph_hidden=graph_hidden,
+            graph_heads=graph_heads,
+            graph_layers=graph_layers,
+            graph_encoder_type=graph_encoder_type,
+            max_nodes_gnn=max_nodes_gnn,
+            use_graph_behavior_hint=use_graph_behavior_hint,
+            manifest_in_dim=manifest_in_dim,
+            manifest_emb_dim=manifest_emb_dim,
+            manifest_hidden_dim=manifest_hidden_dim,
+            manifest_dropout=manifest_dropout,
+        )
         fusion_mode = str(fusion_mode or "discount_probability")
         if fusion_mode not in TRI_MODAL_FUSION_MODES:
             raise ValueError(f"Unsupported tri-modal fusion_mode: {fusion_mode}")
 
         self.fusion_mode = fusion_mode
         self.num_classes = int(num_classes)
-        self.api_emb_dim = int(api_emb_dim)
-        self.graph_emb_dim = int(graph_emb_dim)
-        self.manifest_in_dim = int(manifest_in_dim)
-        self.manifest_emb_dim = int(manifest_emb_dim)
-        self.joint_emb_dim = int(joint_emb_dim)
         if not math.isfinite(float(quality_fusion_temperature)) or float(quality_fusion_temperature) <= 0.0:
             raise ValueError("quality_fusion_temperature must be finite and positive")
         self.quality_fusion_temperature = float(quality_fusion_temperature)
-        self.gate_detach = bool(gate_detach)
-        self.api_encoder = ApiSequenceEncoder(
-            num_hash_buckets=api_num_hash_buckets,
-            type_vocab_size=api_type_vocab_size,
-            emb_dim=api_emb_dim,
-            hidden_dim=api_hidden_dim,
-            dropout=api_dropout,
-            encoder_type=api_encoder_type,
-            num_layers=api_layers,
-            num_heads=api_heads,
-            max_seq_len=api_max_seq_len,
-        )
-
-        graph_encoder_type = str(graph_encoder_type or "gatv2").lower()
-        if graph_encoder_type in {"gat", "gatv2"}:
-            self.graph_encoder = GraphEncoderGAT(
-                in_dim=in_feat_dim,
-                out_dim=graph_emb_dim,
-                hidden=graph_hidden,
-                heads=graph_heads,
-                num_layers=graph_layers,
-                max_nodes=max_nodes_gnn,
-                use_behavior_hint=use_graph_behavior_hint,
-            )
-        elif graph_encoder_type == "gcn":
-            self.graph_encoder = GraphEncoderGCN(
-                in_dim=in_feat_dim,
-                out_dim=graph_emb_dim,
-                hidden=graph_hidden,
-                max_nodes=max_nodes_gnn,
-                use_behavior_hint=use_graph_behavior_hint,
-            )
-        else:
-            raise ValueError(f"Unsupported graph_encoder_type: {graph_encoder_type}")
-
-        self.manifest_encoder = ManifestEncoder(
-            in_dim=manifest_in_dim,
-            emb_dim=manifest_emb_dim,
-            hidden_dim=manifest_hidden_dim,
-            dropout=manifest_dropout,
-        )
-
         self.api_head = build_main_head(api_emb_dim, num_classes)
         self.graph_head = build_main_head(graph_emb_dim, num_classes)
         self.manifest_head = build_main_head(manifest_emb_dim, num_classes)
-        self.joint_expert = (
-            JointExpert(
-                {
-                    "api": self.api_emb_dim,
-                    "graph": self.graph_emb_dim,
-                    "manifest": self.manifest_emb_dim,
-                },
-                joint_dim=self.joint_emb_dim,
-                hidden_dim=int(joint_hidden_dim),
-                num_classes=self.num_classes,
-                dropout=float(joint_dropout),
-            )
-            if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES
-            else None
-        )
-        self.competence_estimator = (
-            ContentConditionedCompetence(
-                {
-                    "api": self.api_emb_dim,
-                    "graph": self.graph_emb_dim,
-                    "manifest": self.manifest_emb_dim,
-                    "joint": self.joint_emb_dim,
-                },
-                class_count=self.num_classes,
-                projection_dim=int(competence_projection_dim),
-                hidden_dim=int(competence_hidden_dim),
-                dropout=float(competence_dropout),
-            )
-            if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES
-            else None
-        )
-        self.anchored_fusion = (
-            AnchoredCompetenceFusion(
-                initial_atomic_competence_scale=float(
-                    initial_atomic_competence_scale
-                ),
-                initial_joint_late_scale=float(initial_joint_late_scale),
-                initial_late_gate=float(initial_late_gate),
-            )
-            if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES
-            else None
-        )
-        # A Python lifecycle flag avoids a scalar accelerator synchronisation in
-        # every forward pass. Full-pipeline loading explicitly re-enables it.
-        self._anchored_fusion_active = False
-        # Separate diagnostic lifecycle: a selection-guard fallback disables
-        # I2 deployment but must still expose the already fitted I1 competence
-        # estimates for audit rows.
-        self._competence_diagnostics_active = False
         self.api_graph_concat_head = (
             build_main_head(api_emb_dim + graph_emb_dim, num_classes)
             if self.fusion_mode in API_GRAPH_CONCAT_FUSION_MODES
@@ -746,9 +373,8 @@ class TriModalRobustModel(nn.Module):
             if self.fusion_mode in TRI_MODAL_CONCAT_FUSION_MODES
             else None
         )
-        # Independent black-box routing comparison.  It is instantiated only
-        # for its explicit fusion mode, so the proposed method's RNG stream and
-        # parameterization remain unchanged.
+        # Independent learned embedding-gate comparison, instantiated only for
+        # its registered fusion mode.
         self.dense_embedding_gate = (
             DenseTriModalEmbeddingGate(
                 {
@@ -768,361 +394,30 @@ class TriModalRobustModel(nn.Module):
             else None
         )
 
-    def calibration_parameters(self) -> list[nn.Parameter]:
-        """Parameters fitted after model selection without changing encoders."""
-        if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES:
-            if self.competence_estimator is None or self.anchored_fusion is None:
-                raise RuntimeError("Anchored fusion modules were not initialized")
-            return [
-                *self.competence_estimator.parameters(),
-                *self.anchored_fusion.parameters(),
-            ]
-        if self.discount_fusion is None:
-            return []
-        return self.discount_fusion.calibration_parameters()
-
-    def set_anchored_fusion_active(self, enabled: bool) -> None:
-        if self.fusion_mode not in ANCHORED_JOINT_LATE_FUSION_MODES:
-            if enabled:
-                raise RuntimeError(
-                    "Anchored fusion can only be activated for anchored_joint_late"
-                )
-            return
-        self._anchored_fusion_active = bool(enabled)
-
-    @property
-    def anchored_fusion_active(self) -> bool:
-        return bool(self._anchored_fusion_active)
-
-    def set_competence_diagnostics_active(self, enabled: bool) -> None:
-        if self.competence_estimator is None:
-            if enabled:
-                raise ValueError(
-                    "competence diagnostics require a competence estimator"
-                )
-            self._competence_diagnostics_active = False
-            return
-        self._competence_diagnostics_active = bool(enabled)
-
-    @property
-    def competence_diagnostics_active(self) -> bool:
-        return bool(self._competence_diagnostics_active)
-
-    def _encoder_stage_modules(self) -> tuple[tuple[str, nn.Module], ...]:
-        """Return the modules whose learned state belongs to Stage-1.
-
-        The three encoders and their branch heads are always optimized by the
-        common encoder-stage objective.  Fusion-specific trainable modules are
-        included only for the modes that instantiate and optimize them during
-        that same stage.  ``discount_fusion`` is deliberately absent: its I1,
-        I2, decision-risk, and temperature state is reserved for the later
-        post-hoc lifecycle and is reconstructed from the current pipeline
-        configuration before fitting.
-
-        Keeping this as an explicit module partition also preserves any module
-        buffers needed by Stage-1 without admitting unrelated model buffers.
-        """
-
-        modules: list[tuple[str, nn.Module]] = [
-            ("api_encoder", self.api_encoder),
-            ("graph_encoder", self.graph_encoder),
-            ("manifest_encoder", self.manifest_encoder),
-            ("api_head", self.api_head),
-            ("graph_head", self.graph_head),
-            ("manifest_head", self.manifest_head),
-        ]
-        if self.api_graph_concat_head is not None:
-            modules.append(("api_graph_concat_head", self.api_graph_concat_head))
-        if self.tri_concat_head is not None:
-            modules.append(("tri_concat_head", self.tri_concat_head))
-        if self.joint_expert is not None:
-            modules.append(("joint_expert", self.joint_expert))
-        if self.dense_embedding_gate is not None:
-            modules.append(("dense_embedding_gate", self.dense_embedding_gate))
-
-        # Fail closed if a future fusion mode adds a Stage-1 parameter without
-        # declaring its owning module above.  The training loop freezes exactly
-        # ``encoder_training_frozen_parameters``; the complement must therefore
-        # equal this artifact partition rather than being silently discarded.
-        frozen_ids = {id(parameter) for parameter in self.encoder_training_frozen_parameters()}
-        expected_stage_parameters = {
-            name: parameter
-            for name, parameter in self.named_parameters()
-            if id(parameter) not in frozen_ids
-        }
-        included_parameter_ids = {
-            id(parameter)
-            for _module_name, module in modules
-            for parameter in module.parameters()
-        }
-        missing = sorted(
-            name
-            for name, parameter in expected_stage_parameters.items()
-            if id(parameter) not in included_parameter_ids
-        )
-        included_frozen = sorted(
-            name
-            for name, parameter in self.named_parameters()
-            if id(parameter) in included_parameter_ids and id(parameter) in frozen_ids
-        )
-        if missing or included_frozen:
-            raise RuntimeError(
-                "Encoder-stage module partition disagrees with the training "
-                "freeze policy: "
-                f"missing_trainable={missing}, included_posthoc={included_frozen}"
-            )
-        return tuple(modules)
-
-    def encoder_stage_state_keys(self) -> tuple[str, ...]:
-        """Return the exact, ordered key contract for a Stage-1 artifact."""
-
-        keys: list[str] = []
-        for module_name, module in self._encoder_stage_modules():
-            keys.extend(
-                f"{module_name}.{local_key}" for local_key in module.state_dict()
-            )
-        if len(keys) != len(set(keys)):
-            raise RuntimeError("Encoder-stage state contains duplicate keys")
-        return tuple(keys)
-
-    def encoder_stage_state_dict(self) -> OrderedDict[str, torch.Tensor]:
-        """Materialize an independent Stage-1-only state dictionary.
-
-        Values are cloned so the artifact cannot change later if the live model
-        is modified.  Device and dtype are preserved, matching ``state_dict``;
-        callers may serialize it directly or move tensors to CPU explicitly.
-        """
-
-        state: OrderedDict[str, torch.Tensor] = OrderedDict()
-        for module_name, module in self._encoder_stage_modules():
-            for local_key, value in module.state_dict().items():
-                if not isinstance(value, torch.Tensor):
-                    raise TypeError(
-                        "Encoder-stage artifacts support tensor parameters and "
-                        f"buffers only; {module_name}.{local_key} has type "
-                        f"{type(value).__name__}"
-                    )
-                state[f"{module_name}.{local_key}"] = value.detach().clone()
-        expected = self.encoder_stage_state_keys()
-        if tuple(state) != expected:
-            raise RuntimeError("Encoder-stage state order disagrees with its key contract")
-        return state
-
-    def load_encoder_stage_state_dict(
-        self,
-        state: Mapping[str, torch.Tensor],
-    ) -> None:
-        """Strictly load an encoder-stage artifact into the current model.
-
-        Missing, extra, non-tensor, and shape-incompatible values are rejected
-        before any live parameter is changed.  Each declared module is then
-        loaded with PyTorch's own ``strict=True`` contract; this method never
-        relies on ``strict=False`` to hide lifecycle or architecture drift.
-        """
-
-        if not isinstance(state, Mapping):
-            raise TypeError("encoder-stage state must be a mapping")
-        if any(not isinstance(key, str) for key in state):
-            raise TypeError("encoder-stage state keys must be strings")
-
-        expected_keys = self.encoder_stage_state_keys()
-        expected_set = set(expected_keys)
-        actual_set = set(state)
-        missing = sorted(expected_set - actual_set)
-        unexpected = sorted(actual_set - expected_set)
-        if missing or unexpected:
-            raise ValueError(
-                "Encoder-stage state keys disagree with the current model: "
-                f"missing={missing}, unexpected={unexpected}"
-            )
-
-        current_state = self.state_dict()
-        invalid_types: list[str] = []
-        shape_mismatches: dict[str, dict[str, tuple[int, ...]]] = {}
-        for key in expected_keys:
-            value = state[key]
-            if not isinstance(value, torch.Tensor):
-                invalid_types.append(f"{key}:{type(value).__name__}")
-                continue
-            expected_shape = tuple(current_state[key].shape)
-            actual_shape = tuple(value.shape)
-            if actual_shape != expected_shape:
-                shape_mismatches[key] = {
-                    "expected": expected_shape,
-                    "actual": actual_shape,
-                }
-        if invalid_types:
-            raise TypeError(
-                "Encoder-stage state values must be tensors: "
-                + ", ".join(invalid_types)
-            )
-        if shape_mismatches:
-            raise ValueError(
-                "Encoder-stage state tensor shapes disagree with the current "
-                f"model: {shape_mismatches}"
-            )
-
-        # All global validation is complete, so a failure cannot leave a
-        # partially loaded artifact merely because a later module had a bad key
-        # or shape.  Local dictionaries have their prefixes removed and retain
-        # the exact key set returned by each owning module.
-        for module_name, module in self._encoder_stage_modules():
-            prefix = f"{module_name}."
-            local_state = OrderedDict(
-                (key[len(prefix) :], state[key])
-                for key in expected_keys
-                if key.startswith(prefix)
-            )
-            module.load_state_dict(local_state, strict=True)
-
-    def encoder_training_frozen_parameters(self) -> list[nn.Parameter]:
-        """Parameters that must remain untouched during encoder training."""
-        if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES:
-            if self.competence_estimator is None or self.anchored_fusion is None:
-                raise RuntimeError("Anchored fusion modules were not initialized")
-            return [
-                *self.competence_estimator.parameters(),
-                *self.anchored_fusion.parameters(),
-            ]
-        if self.discount_fusion is None:
-            return []
-        return self.discount_fusion.encoder_training_frozen_parameters()
-
-    def set_calibration_active(self, enabled: bool) -> None:
-        if self.discount_fusion is None:
-            if enabled:
-                raise RuntimeError(
-                    "Post-hoc fusion calibration is only available for "
-                    "fusion_mode='discount_probability'"
-                )
-            return
-        self.discount_fusion.set_calibration_active(enabled)
-
-    def _manifest_input(self, graph_data, batch_size: int, device, dtype) -> torch.Tensor:
-        x = getattr(graph_data, "manifest_x", None)
-        if not isinstance(x, torch.Tensor):
-            return torch.zeros((batch_size, self.manifest_in_dim), device=device, dtype=dtype)
-        x = x.to(device=device, dtype=dtype).view(batch_size, -1)
-        if x.size(1) < self.manifest_in_dim:
-            x = torch.cat([x, x.new_zeros((batch_size, self.manifest_in_dim - x.size(1)))], dim=-1)
-        elif x.size(1) > self.manifest_in_dim:
-            # Truncation should not happen in normal flow (dataset guards this).
-            # Warn here so silent information loss never goes unnoticed.
-            warnings.warn(
-                f"manifest_x dim {x.size(1)} > configured {self.manifest_in_dim}; "
-                f"truncating trailing features. Check dataset or model config."
-            )
-            x = x[:, : self.manifest_in_dim]
-        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _encode_api(self, graph_data, batch_size: int, device, dtype):
-        """Encode the API stream and expose support from the stream actually used.
-
-        ``api_observed_support`` is deliberately computed from ``api_batch``
-        returned by the encoder, not from extraction-time or pre-perturbation
-        counts stored in a PT payload.  It therefore measures only how much of
-        the fixed encoder capacity is occupied by the input visible at
-        inference time:
-
-            log(1 + n_visible) / log(1 + encoder_capacity)
-
-        This is a bounded amount-of-current-evidence signal, not an estimate
-        of an APK's unknown original completeness.
-        """
-
-        _, pooled, encoded_api_batch = self.api_encoder(
-            graph_data, batch_size, device, dtype
-        )
-        if batch_size <= 0:
-            raise ValueError("API observed support requires a positive batch size")
-        if (
-            encoded_api_batch.ndim != 1
-            or encoded_api_batch.dtype != torch.long
-        ):
-            raise RuntimeError(
-                "ApiSequenceEncoder must return a one-dimensional long "
-                "api_batch index tensor"
-            )
-        counts = torch.bincount(
-            encoded_api_batch,
-            minlength=batch_size,
-        ).to(device=device, dtype=torch.float32)
-        if counts.numel() != batch_size:
-            raise RuntimeError(
-                "API observed-support counts disagree with the model batch size"
-            )
-        capacity = int(self.api_encoder.max_seq_len)
-        if capacity <= 0:
-            raise RuntimeError("API encoder capacity must be positive")
-        count_contract_valid = (counts <= float(capacity)).all()
-        count_contract_message = (
-            "API observed-support count exceeds the encoder capacity; "
-            "the dataset/encoder budget contract was violated"
-        )
-        if counts.device.type == "cpu":
-            if not bool(count_contract_valid.item()):
-                raise RuntimeError(count_contract_message)
-        else:
-            torch._assert_async(count_contract_valid, count_contract_message)
-        denominator = math.log1p(float(capacity))
-        support = torch.log1p(counts).div(denominator).clamp(0.0, 1.0)
-        return pooled, support
-
-    @staticmethod
-    def _availability_mask(
-        graph_data,
-        name: str,
-        batch_size: int,
-        device,
-        dtype,
-    ) -> torch.Tensor:
-        value = getattr(graph_data, name, None)
-        if not isinstance(value, torch.Tensor):
-            raise ValueError(
-                f"Current dataset batch is missing mandatory availability mask {name!r}"
-            )
-        value = value.to(device=device, dtype=dtype).view(batch_size, -1)
-        if value.size(1) == 0:
-            return torch.zeros((batch_size, 1), device=device, dtype=dtype)
-        return value[:, :1].gt(0.0).to(dtype=dtype)
-
     def forward(
         self,
         graph_data,
     ):
-        device = next(self.parameters()).device
-        dtype = next(self.parameters()).dtype
-        batch_size = int(getattr(graph_data, "num_graphs", 1))
+        encoded = self.encode_modalities(graph_data)
+        device = encoded["device"]
+        dtype = encoded["dtype"]
+        batch_size = int(encoded["batch_size"])
+        api_emb = encoded["api_emb"]
+        graph_emb = encoded["graph_emb"]
+        manifest_emb = encoded["manifest_emb"]
+        api_available = encoded["api_available"]
+        graph_available = encoded["graph_available"]
+        manifest_available = encoded["manifest_available"]
+        primary_available = encoded["modality_alive"]
 
-        api_emb, api_observed_support = self._encode_api(
-            graph_data, batch_size, device, dtype
-        )
-        _, graph_emb, _, _ = self.graph_encoder(graph_data)
-        manifest_x = self._manifest_input(graph_data, batch_size, device, dtype)
-        manifest_emb = self.manifest_encoder(manifest_x)
-
-        api_available = self._availability_mask(
-            graph_data, "api_alive", batch_size, device, dtype
-        )
-        graph_available = self._availability_mask(
-            graph_data, "graph_alive", batch_size, device, dtype
-        )
-        manifest_available = self._availability_mask(
-            graph_data, "manifest_alive", batch_size, device, dtype
-        )
         api_logits = self.api_head(api_emb)
         graph_logits = self.graph_head(graph_emb)
         manifest_logits = self.manifest_head(manifest_emb)
-
         extra = {
             "api_logits_aux": api_logits,
             "graph_logits_aux": graph_logits,
             "manifest_logits_aux": manifest_logits,
-            # Current-view input amount, computed only from the API events
-            # that actually reached the encoder in this forward pass.
-            "api_observed_support": api_observed_support.detach(),
         }
-
         fusion_tensors = {
             "api_logits": api_logits,
             "graph_logits": graph_logits,
@@ -1131,229 +426,33 @@ class TriModalRobustModel(nn.Module):
             "graph_emb": graph_emb,
             "manifest_emb": manifest_emb,
             "graph_data": graph_data,
-            "api_observed_support": api_observed_support,
         }
-        concat_features: dict[str, torch.Tensor] = {}
         if self.fusion_mode in API_GRAPH_CONCAT_FUSION_MODES:
-            api_emb_for_concat = api_emb * api_available
-            graph_emb_for_concat = graph_emb * graph_available
-            concat_features = {
-                "api_emb_for_concat": api_emb_for_concat,
-                "graph_emb_for_concat": graph_emb_for_concat,
-                "api_graph_concat_input": torch.cat(
-                    [api_emb_for_concat, graph_emb_for_concat], dim=-1
-                ),
-            }
+            fusion_tensors["api_graph_concat_input"] = torch.cat(
+                [
+                    api_emb * api_available,
+                    graph_emb * graph_available,
+                ],
+                dim=-1,
+            )
         elif self.fusion_mode in TRI_MODAL_CONCAT_FUSION_MODES:
-            api_emb_for_concat = api_emb * api_available
-            graph_emb_for_concat = graph_emb * graph_available
-            manifest_emb_for_concat = manifest_emb * manifest_available
-            concat_features = {
-                "api_emb_for_concat": api_emb_for_concat,
-                "graph_emb_for_concat": graph_emb_for_concat,
-                "manifest_emb_for_concat": manifest_emb_for_concat,
-                "tri_modal_concat_input": torch.cat(
-                    [
-                        api_emb_for_concat,
-                        graph_emb_for_concat,
-                        manifest_emb_for_concat,
-                    ],
-                    dim=-1,
-                ),
-            }
-        fusion_tensors.update(concat_features)
-
-        if self.fusion_mode in ANCHORED_JOINT_LATE_FUSION_MODES:
-            if (
-                self.joint_expert is None
-                or self.competence_estimator is None
-                or self.anchored_fusion is None
-            ):
-                raise RuntimeError("Anchored joint/competence modules are incomplete")
-            availability, diagnostics = build_fusion_availability_and_diagnostics(
-                graph_data,
-                api_logits,
-                graph_logits,
-                manifest_logits,
-                api_emb,
-                graph_emb,
-                manifest_emb,
-                materialize_diagnostics=not self.training,
+            fusion_tensors["tri_modal_concat_input"] = torch.cat(
+                [
+                    api_emb * api_available,
+                    graph_emb * graph_available,
+                    manifest_emb * manifest_available,
+                ],
+                dim=-1,
             )
-            extra.update(diagnostics)
-            extra["fusion_availability"] = availability.detach()
-            atomic_alive = {
-                "api": availability[:, AvailabilityIndex.API_ALIVE].bool(),
-                "graph": availability[:, AvailabilityIndex.GRAPH_ALIVE].bool(),
-                "manifest": availability[
-                    :, AvailabilityIndex.MANIFEST_ALIVE
-                ].bool(),
-            }
-            joint_emb, joint_logits = self.joint_expert(
-                {
-                    "api": api_emb,
-                    "graph": graph_emb,
-                    "manifest": manifest_emb,
-                },
-                atomic_alive,
-            )
-            joint_alive = torch.stack(
-                [atomic_alive[name] for name in ATOMIC_EXPERT_NAMES], dim=-1
-            ).all(dim=-1)
-            # Joint is a first-class Stage-A expert and receives its own TCP
-            # competence head in Stage B.  Export its eligibility explicitly
-            # so row-level diagnostics can audit that head on exactly the
-            # population on which Joint is defined.
-            extra["joint_alive"] = joint_alive
-            expert_embeddings = {
-                "api": api_emb,
-                "graph": graph_emb,
-                "manifest": manifest_emb,
-                "joint": joint_emb,
-            }
-            expert_logits = {
-                "api": api_logits,
-                "graph": graph_logits,
-                "manifest": manifest_logits,
-                "joint": joint_logits,
-            }
-            expert_alive = {**atomic_alive, "joint": joint_alive}
-            expert_probabilities = {
-                name: torch.softmax(expert_logits[name].float(), dim=-1).to(
-                    dtype=dtype
-                )
-                for name in EXPERT_NAMES
-            }
-            extra.update(
-                {
-                    "joint_logits_aux": joint_logits,
-                    "expert_embeddings": expert_embeddings,
-                    "expert_logits": expert_logits,
-                    "expert_probabilities": expert_probabilities,
-                    "expert_alive": expert_alive,
-                }
-            )
-            competence_output = None
-            if (
-                self.anchored_fusion_active
-                or self.competence_diagnostics_active
-            ):
-                competence_output = self.competence_estimator(
-                    expert_embeddings,
-                    expert_logits,
-                    expert_alive,
-                )
-                for name in EXPERT_NAMES:
-                    extra[f"predicted_competence_{name}"] = (
-                        competence_output.competence[name]
-                    )
-            if self.anchored_fusion_active:
-                if competence_output is None:
-                    raise RuntimeError(
-                        "Active anchored fusion has no competence output"
-                    )
-                anchored_output = self.anchored_fusion(
-                    expert_probabilities,
-                    competence_output.competence,
-                    expert_alive,
-                )
-                probability = anchored_output.probability.clamp_min(1.0e-8)
-                probability = probability / probability.sum(
-                    dim=-1, keepdim=True
-                ).clamp_min(1.0e-8)
-                logits = probability.log()
-                gate_weights = anchored_output.atomic_weights
-                extra["final_is_log_probability"] = True
-                extra["uncalibrated_final_log_prob"] = logits
-                extra["joint_probability"] = anchored_output.joint_probability
-                extra["late_probability"] = anchored_output.late_probability
-                extra["late_gate"] = anchored_output.late_gate
-                joint_weight = (
-                    (1.0 - anchored_output.late_gate)
-                    * anchored_output.has_joint.to(
-                        anchored_output.late_gate
-                    )
-                )
-                extra["joint_weight"] = joint_weight
-                extra["late_competence"] = anchored_output.late_competence
-                for index, name in enumerate(ATOMIC_EXPERT_NAMES):
-                    extra[f"late_weight_{name}"] = anchored_output.atomic_weights[
-                        :, index
-                    ]
-                    extra[f"fusion_weight_{name}"] = (
-                        anchored_output.late_gate
-                        * anchored_output.atomic_weights[:, index]
-                    )
-                extra["fusion_weight_joint"] = joint_weight
-            else:
-                # Stage A selects the real joint expert. The Stage-B heads are
-                # frozen and are not consulted before their TCP supervision.
-                # Joint was trained only where all three inputs are alive.
-                # Therefore both Stage-A validation and a selection-guard
-                # deployment use an explicit uniform atomic fallback whenever
-                # Joint is ineligible; they never extrapolate Joint to a
-                # missing-modality state it did not see.
-                atomic_alive_matrix = torch.stack(
-                    [atomic_alive[name] for name in ATOMIC_EXPERT_NAMES],
-                    dim=-1,
-                )
-                gate_weights = atomic_alive_matrix.to(dtype=dtype)
-                gate_weights = gate_weights / gate_weights.sum(
-                    dim=-1,
-                    keepdim=True,
-                ).clamp_min(1.0)
-                uniform_probability = torch.full_like(
-                    expert_probabilities["joint"],
-                    1.0 / float(self.num_classes),
-                )
-                late_probability = sum(
-                    gate_weights[:, index].unsqueeze(-1)
-                    * expert_probabilities[name]
-                    for index, name in enumerate(ATOMIC_EXPERT_NAMES)
-                )
-                has_atomic = atomic_alive_matrix.any(dim=-1)
-                late_probability = torch.where(
-                    has_atomic.unsqueeze(-1),
-                    late_probability,
-                    uniform_probability,
-                )
-                probability = torch.where(
-                    joint_alive.unsqueeze(-1),
-                    expert_probabilities["joint"],
-                    late_probability,
-                )
-                probability = probability / probability.sum(
-                    dim=-1,
-                    keepdim=True,
-                ).clamp_min(1.0e-8)
-                logits = probability.clamp_min(1.0e-8).log()
-                extra["final_is_log_probability"] = True
-                extra["uncalibrated_final_log_prob"] = logits
-                fallback_gate = (
-                    (~joint_alive) & has_atomic
-                ).to(dtype=dtype)
-                extra["joint_weight"] = joint_alive.to(dtype=dtype)
-                extra["late_gate"] = fallback_gate
-                extra["fusion_weight_joint"] = joint_alive.to(dtype=dtype)
-                for index, name in enumerate(ATOMIC_EXPERT_NAMES):
-                    extra[f"late_weight_{name}"] = gate_weights[:, index]
-                    extra[f"fusion_weight_{name}"] = (
-                        fallback_gate * gate_weights[:, index]
-                    )
-        else:
-            handler = FUSION_DISPATCH[self.fusion_mode]
-            logits, gate_weights, extra = handler(
-                self,
-                batch_size,
-                device,
-                dtype,
-                fusion_tensors,
-                extra,
-            )
-
-        primary_available = torch.cat(
-            [api_available, graph_available, manifest_available], dim=-1
-        ).bool()
+        handler = FUSION_DISPATCH[self.fusion_mode]
+        logits, gate_weights, extra = handler(
+            self,
+            batch_size,
+            device,
+            dtype,
+            fusion_tensors,
+            extra,
+        )
         if self.fusion_mode == "api_only":
             selective_eligible = primary_available[:, 0]
         elif self.fusion_mode == "graph_only":
@@ -1370,9 +469,9 @@ class TriModalRobustModel(nn.Module):
         ):
             # Canonical logit baselines use cross entropy, so zero logits are
             # the explicit uniform-predictive fallback when every branch that
-            # the method consumes is unavailable. The routed evidential path
-            # already returns normalized log probabilities and must retain its
-            # own log(1 / K) fallback.
+            # the method consumes is unavailable. Fixed evidential fusion
+            # already returns normalized log probabilities and retains its own
+            # log(1 / K) fallback.
             logits = torch.where(
                 selective_eligible.unsqueeze(-1),
                 logits,

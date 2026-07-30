@@ -3,6 +3,7 @@ defaults:
 
 method:
   name: baseline_tri_modal_concat
+  protocol_id: baseline_tri_modal_concat_v1
 
 train:
   exp_name: baseline_tri_modal_concat

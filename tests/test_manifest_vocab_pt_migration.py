@@ -207,6 +207,17 @@ def _write_previous_vocab_and_bind_pts(
     return vocab_out.read_bytes()
 
 
+def _declare_previous_fingerprint(config: Path, fingerprint: str) -> None:
+    raw = yaml.safe_load(config.read_text(encoding="utf-8"))
+    raw["migration"] = {
+        "allowed_previous_build_fingerprints": [fingerprint],
+    }
+    config.write_text(
+        yaml.safe_dump(raw, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
 def test_parser_defaults_to_dry_run():
     args = migration.build_parser().parse_args(
         [
@@ -394,6 +405,141 @@ def test_incompatible_code_fingerprint_hard_fails_before_write(tmp_path: Path):
 
     assert vocab_out.read_bytes() == previous_vocab_bytes
     assert before == {path.name: path.read_bytes() for path in pt_dir.glob("*.pt")}
+
+
+def test_declared_previous_fingerprint_allows_manifest_only_lineage_migration(
+    tmp_path: Path,
+):
+    train_csv, pt_dir, jsonl, config, _, _ = _fixture_pool(tmp_path)
+    vocab_out = tmp_path / "new_vocab.yaml"
+    _write_previous_vocab_and_bind_pts(config, vocab_out, pt_dir)
+    first_pt = next(pt_dir.glob("*.pt"))
+    previous_fingerprint = str(
+        torch.load(
+            first_pt,
+            map_location="cpu",
+            weights_only=True,
+        )["direct_build_meta"]["build_fingerprint"]
+    )
+
+    # Reproduce deployment after the repository has already installed the new
+    # train-only vocab: that file can no longer be used to derive the PTs'
+    # previous combined fingerprint.
+    installed_vocab = yaml.safe_load(vocab_out.read_text(encoding="utf-8"))
+    installed_vocab["permission_vocab"] = ["permission.replacement"]
+    vocab_out.write_text(
+        yaml.safe_dump(installed_vocab, sort_keys=False),
+        encoding="utf-8",
+    )
+    installed_vocab_bytes = vocab_out.read_bytes()
+    before = {path.name: path.read_bytes() for path in pt_dir.glob("*.pt")}
+
+    with pytest.raises(
+        RuntimeError,
+        match="declared migration lineage",
+    ):
+        migration.run_migration(
+            train_csv=train_csv,
+            pt_dir=pt_dir,
+            build_config=config,
+            vocab_out=vocab_out,
+            manifest_jsonl=[jsonl],
+            apply=True,
+        )
+    assert before == {path.name: path.read_bytes() for path in pt_dir.glob("*.pt")}
+    assert vocab_out.read_bytes() == installed_vocab_bytes
+
+    target_vocab = yaml.safe_load(vocab_out.read_text(encoding="utf-8"))
+    cfg_without_lineage = migration._load_direct_config(config)
+    target_fingerprint_without_lineage = migration._build_fingerprint(
+        migration._fingerprint_config(cfg_without_lineage),
+        target_vocab,
+    )
+    _declare_previous_fingerprint(config, previous_fingerprint)
+    cfg_with_lineage = migration._load_direct_config(config)
+    target_fingerprint_with_lineage = migration._build_fingerprint(
+        migration._fingerprint_config(cfg_with_lineage),
+        target_vocab,
+    )
+    assert target_fingerprint_with_lineage == target_fingerprint_without_lineage
+
+    report = migration.run_migration(
+        train_csv=train_csv,
+        pt_dir=pt_dir,
+        build_config=config,
+        vocab_out=vocab_out,
+        manifest_jsonl=[jsonl],
+        apply=True,
+    )
+    assert report["declared_previous_build_fingerprints"] == [
+        previous_fingerprint
+    ]
+    assert report["after"]["build_fingerprint_counts"] == {
+        report["proposed_build_fingerprint"]: 2
+    }
+    for path in pt_dir.glob("*.pt"):
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        assert (
+            payload["direct_build_meta"]["build_fingerprint"]
+            == report["proposed_build_fingerprint"]
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "not-a-digest",
+        "A" * 64,
+        ["f" * 64, "f" * 64],
+    ],
+)
+def test_declared_previous_fingerprint_config_is_strict(
+    tmp_path: Path,
+    value,
+):
+    config = _write_build_config(tmp_path)
+    raw = yaml.safe_load(config.read_text(encoding="utf-8"))
+    raw["migration"] = {
+        "allowed_previous_build_fingerprints": (
+            value if isinstance(value, list) else [value]
+        )
+    }
+    config.write_text(
+        yaml.safe_dump(raw, sort_keys=False),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="allowed_previous_build_fingerprints"):
+        migration._load_direct_config(config)
+
+
+@pytest.mark.parametrize(
+    ("migration_settings", "message"),
+    [
+        ([], "migration settings must be a mapping"),
+        (
+            {"unknown_setting": []},
+            "Unsupported migration settings",
+        ),
+        (
+            {"allowed_previous_build_fingerprints": "f" * 64},
+            "allowed_previous_build_fingerprints must be a list",
+        ),
+    ],
+)
+def test_migration_settings_schema_is_strict(
+    tmp_path: Path,
+    migration_settings,
+    message: str,
+):
+    config = _write_build_config(tmp_path)
+    raw = yaml.safe_load(config.read_text(encoding="utf-8"))
+    raw["migration"] = migration_settings
+    config.write_text(
+        yaml.safe_dump(raw, sort_keys=False),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=message):
+        migration._load_direct_config(config)
 
 
 def test_late_v4_observable_failure_hard_fails_before_any_write(tmp_path: Path):

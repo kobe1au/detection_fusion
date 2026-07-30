@@ -19,22 +19,16 @@ class AvailabilityIndex:
     BASE_DIM = 3
 
 
-# Legacy three-role split defaults retained only for comparison methods that
-# still exercise the generic post-hoc implementation.  The proposed
-# competence-anchored method does not consume these values: it requires the
-# fixed schema-v2 75/25 model-selection/decision-calibration assignment.
 VALIDATION_HOLDOUT_FRACTION = 0.60
-CONFORMAL_WITHIN_HOLDOUT_FRACTION = 5.0 / 12.0
 
 class TriModalConfigDefaults:
     """Shared implementation defaults, not the identity of the paper method.
 
     Runnable experiments must select an explicit method YAML.  In particular,
-    ``competence_anchored_fusion.yaml`` replaces the legacy fusion,
-    calibration, loss, and validation sections below with its closed schema.
-    Keeping shared architecture and comparison-method defaults here avoids
-    duplicating them across the experiment catalogue without making this
-    mapping an implicit "main method".
+    CARE-Droid has a separate closed configuration and lifecycle in
+    ``fusion.care_train``. Keeping shared architecture and comparison-method
+    defaults here avoids duplicating them across the experiment catalogue
+    without making this mapping an implicit paper method.
     """
 
     CONFIG = {
@@ -49,7 +43,6 @@ class TriModalConfigDefaults:
             "deterministic": True,
             "strict_deterministic": False,
             "device": "auto",
-            "min_delta": 0.0001,
             "pin_memory": False,
             "allow_pyg_pin_memory": False,
             "persistent_workers": True,
@@ -60,13 +53,11 @@ class TriModalConfigDefaults:
             "grad_accum_steps": 1,
             "label_smoothing": 0.0,
         },
-        # Stage-1 is a separately versioned, reusable artifact.  Post-hoc I1,
-        # I2 and I3 changes must not silently retrain or mutate the encoders.
+        # Comparison-method identity. Current comparison runs always train
+        # their own model; no cross-method checkpoint reuse is supported.
         "encoder_stage": {
             "mode": "fit",
-            "protocol_id": "neutral_alive_uniform_clean_stage1_v2",
-            "checkpoint_path": None,
-            "expected_sha256": None,
+            "protocol_id": "comparison_method_specific_stage1_v1",
             "strict_identity": True,
         },
         "model": {
@@ -94,7 +85,6 @@ class TriModalConfigDefaults:
                 "drop_extracted_behavior_hints": True,
             },
             "manifest_encoder": {
-                "enabled": True,
                 "in_dim": 256,
                 "emb_dim": 128,
                 "hidden_dim": 256,
@@ -113,35 +103,9 @@ class TriModalConfigDefaults:
         "fusion": {
             "mode": "discount_probability",
             "evidence_activation": "softplus",
-            "use_i1_reliability": True,
             "use_hard_alive_mask": True,
             "force_fp32_decision": True,
             "min_discount": 1.0e-6,
-            "reliability_calibration": {
-                "enabled": True,
-                "method": "monotonic_correctness",
-                "use_evidential_certainty": True,
-                "use_prediction_margin": True,
-                "use_api_observed_support": True,
-                "use_predicted_class_intercept": True,
-                "scenario_objective_weights": {
-                    "clean": 0.50,
-                    "perturb": 0.50,
-                },
-                "loss": "bce",
-            },
-            "routing": {
-                "enabled": False,
-                "mode": "learned",
-                "posthoc_refine": True,
-                "prediction_loss_weight": 1.0,
-                "risk_conflict_enabled": True,
-                "risk_mode": "learned",
-                "risk_loss_weight": 1.0,
-                "risk_loss": "bce",
-                "initial_risk": 0.10,
-                "final_temperature_scaling": False,
-            },
         },
         "loss": {
             "branch_aux_weight": 0.25,
@@ -160,38 +124,12 @@ class TriModalConfigDefaults:
             },
         },
         "calibration": {
-            "enabled": True,
             "validation_fraction": VALIDATION_HOLDOUT_FRACTION,
-            "conformal_fraction": CONFORMAL_WITHIN_HOLDOUT_FRACTION,
             "split_seed": 42,
             "stratified_group_split": True,
-            # Post-hoc I1/I2 fitting uses a compact, explicitly declared set
-            # of representative mechanisms. Evaluation owns its independent
-            # five-strength stress suite below.
-            "fit_perturbations": [
-                "api_event_dropout",
-                "graph_sparsify",
-                "manifest_permission_mask",
-            ],
-            "perturb_strengths": [0.3, 0.5, 0.7],
-            "lr": 0.001,
-            "weight_decay": 0.0,
-            "grad_clip": 5.0,
         },
         "classification_threshold": {
             "enabled": False,
-            "objective": "macro_f1",
-            "selection_rule": "macro_f1_unconstrained_v1",
-        },
-        "selective_prediction": {
-            "enabled": True,
-            "mode": "conformal",
-            "threshold_score": "msp",
-            "class_conditional": True,
-            "target_coverage": 0.90,
-            "use_raw_conflict": False,
-            "min_calibration_malware": 1,
-            "require_feasible": False,
         },
         "eval": {
             "run_test": True,
@@ -199,8 +137,7 @@ class TriModalConfigDefaults:
             "perturb_strengths": [0.1, 0.3, 0.5, 0.7, 0.9],
             "perturb_tests": [
                 "clean",
-                # Canonical five-point curves. The middle three strengths are
-                # used by post-hoc fitting; 0.1 and 0.9 audit extrapolation.
+                # Canonical five-point controlled-degradation curves.
                 "api_event_dropout",
                 "graph_sparsify",
                 "manifest_permission_mask",

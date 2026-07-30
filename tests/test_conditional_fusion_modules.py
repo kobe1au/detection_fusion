@@ -98,7 +98,9 @@ def test_every_formal_fusion_mode_owns_only_its_specialized_module_and_forwards(
     assert any(key.startswith("api_graph_concat_head.") for key in state_keys) is needs_api_graph_concat
     assert any(key.startswith("tri_concat_head.") for key in state_keys) is needs_tri_concat
     assert any(key.startswith("dense_embedding_gate.") for key in state_keys) is needs_dense_gate
-    assert any(key.startswith("discount_fusion.") for key in state_keys) is needs_discount
+    # Fixed evidential fusion is intentionally parameter-free. Its presence is
+    # represented by the module attribute, not by a synthetic state-dict key.
+    assert not any(key.startswith("discount_fusion.") for key in state_keys)
 
     with torch.no_grad():
         logits, extra = model(_batch())
@@ -121,14 +123,9 @@ def test_removed_fusion_mode_aliases_are_rejected(removed_alias: str):
         _model(removed_alias)
 
 
-def test_non_discount_modes_expose_no_posthoc_parameters_and_reject_activation():
-    model = _model("tri_modal_fixed_gate")
-
-    assert model.calibration_parameters() == []
-    assert model.encoder_training_frozen_parameters() == []
-    model.set_calibration_active(False)
-    with pytest.raises(RuntimeError, match="only available.*discount_probability"):
-        model.set_calibration_active(True)
+def test_care_droid_is_not_a_comparison_model_mode() -> None:
+    with pytest.raises(ValueError, match="Unsupported tri-modal fusion_mode"):
+        _model("care_droid")
 
 
 @pytest.mark.parametrize(

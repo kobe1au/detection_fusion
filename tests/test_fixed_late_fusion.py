@@ -73,8 +73,8 @@ def test_fixed_late_fusion_neutralizes_unavailable_branch_logits(monkeypatch):
         {},
     )
 
-    assert torch.allclose(weights, torch.full((1, 3), 1.0 / 3.0))
-    assert torch.allclose(logits, torch.tensor([[0.0, 2.0]]))
+    assert torch.equal(weights, torch.tensor([[0.0, 0.5, 0.5]]))
+    assert torch.allclose(logits, torch.tensor([[0.0, 3.0]]))
 
 
 def test_fixed_late_fusion_all_dead_returns_zero_logits(monkeypatch):
@@ -103,5 +103,59 @@ def test_fixed_late_fusion_all_dead_returns_zero_logits(monkeypatch):
         {},
     )
 
-    assert torch.equal(weights, torch.full((1, 3), 1.0 / 3.0))
+    assert torch.equal(weights, torch.zeros(1, 3))
     assert torch.equal(logits, torch.zeros(1, 2))
+
+
+def test_fixed_late_fusion_normalizes_each_alive_subset(monkeypatch):
+    availability = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+        ]
+    )
+    monkeypatch.setattr(
+        model_module,
+        "build_fusion_availability_and_diagnostics",
+        lambda *args, **kwargs: (availability, {}),
+    )
+    tensors = {
+        "graph_data": object(),
+        "api_logits": torch.tensor([[2.0, 0.0]]).repeat(3, 1),
+        "graph_logits": torch.tensor([[0.0, 2.0]]).repeat(3, 1),
+        "manifest_logits": torch.tensor([[1.0, 1.0]]).repeat(3, 1),
+        "api_emb": torch.zeros(3, 2),
+        "graph_emb": torch.zeros(3, 2),
+        "manifest_emb": torch.zeros(3, 2),
+    }
+
+    logits, weights, _ = model_module._fusion_fixed_gate(
+        SimpleNamespace(training=False),
+        3,
+        torch.device("cpu"),
+        torch.float32,
+        tensors,
+        {},
+    )
+
+    assert torch.equal(
+        weights,
+        torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.5, 0.5, 0.0],
+                [0.0, 0.5, 0.5],
+            ]
+        ),
+    )
+    assert torch.allclose(
+        logits,
+        torch.tensor(
+            [
+                [2.0, 0.0],
+                [1.0, 1.0],
+                [0.5, 1.5],
+            ]
+        ),
+    )

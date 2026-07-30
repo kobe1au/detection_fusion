@@ -13,9 +13,6 @@ fusion:
   # Dirichlet opinions followed by the reduced Dempster combination rule.
   combination: dempster
   opinion_source: evidential
-  routing:
-    enabled: false
-    final_temperature_scaling: false
 
 loss:
   # Retains the TMC-style sum of three view-wise and one fused Dirichlet

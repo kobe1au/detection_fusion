@@ -19,7 +19,7 @@ data:
   require_manifest_vocab_provenance: true
   # Produced by config/build_pts.yaml + the current train-only Manifest vocab.
   # The migration dry-run reports this as proposed_build_fingerprint.
-  expected_pt_build_fingerprint: 7825ef23db92b98a7055b72275317f045e234d305f1d5803a063e4b0edbf25da
+  expected_pt_build_fingerprint: ababf723f4f60bbff701c326d5b31cd741c7ff449d2c59dba7553cad445906c8
   # The --apply migration report contains a stat-bound certificate for every
   # schema-v5 PT. Formal runs verify this certificate instead of reloading the
   # complete 14k-file pool before training.
@@ -40,8 +40,11 @@ train:
 # Registered paper evaluation: one representative quality degradation per
 # modality over five strengths, plus clean and three missing-modality endpoints
 # (1 + 3*5 + 3 = 19 result cells). These six transforms are the complete
-# controlled-degradation registry; unrelated legacy transforms are unsupported.
+# controlled-degradation registry; other transforms are outside this protocol.
 eval:
+  # Shared by CARE and every baseline: each controlled test view uses
+  # H(SID, mechanism, 424242), independent of model seed and worker order.
+  controlled_view_protocol_seed: 424242
   perturb_strengths: [0.1, 0.3, 0.5, 0.7, 0.9]
   perturb_tests:
     - clean

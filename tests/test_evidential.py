@@ -7,9 +7,7 @@ import torch
 from fusion.constants import AvailabilityIndex
 from fusion.discount_fusion import DiscountProbabilityFusion
 from fusion.evidential import (
-    combine_conflict_weighted_opinions,
     combine_ecml_opinions,
-    predictive_opinion_conflict,
     combine_opinions,
     combine_opinions_with_diagnostics,
     evidential_loss,
@@ -124,32 +122,6 @@ def test_cumulative_combination_is_finite_at_dogmatic_limit():
     )
 
 
-def test_conflict_weighted_opinion_is_valid_and_conflict_sensitive():
-    aligned_beliefs = [
-        torch.tensor([[0.8, 0.0]]),
-        torch.tensor([[0.7, 0.1]]),
-        torch.tensor([[0.75, 0.05]]),
-    ]
-    conflict_beliefs = [
-        torch.tensor([[0.8, 0.0]]),
-        torch.tensor([[0.0, 0.8]]),
-        torch.tensor([[0.75, 0.05]]),
-    ]
-    us = [torch.tensor([0.2]), torch.tensor([0.2]), torch.tensor([0.2])]
-
-    aligned_b, aligned_u, aligned_diag = combine_conflict_weighted_opinions(
-        aligned_beliefs, us
-    )
-    conflict_b, conflict_u, conflict_diag = combine_conflict_weighted_opinions(
-        conflict_beliefs, us
-    )
-
-    assert torch.allclose(aligned_b.sum(dim=-1) + aligned_u, torch.ones(1), atol=1e-5)
-    assert torch.allclose(conflict_b.sum(dim=-1) + conflict_u, torch.ones(1), atol=1e-5)
-    assert conflict_diag["raw_conflict"].item() > aligned_diag["raw_conflict"].item()
-    assert conflict_u.item() > aligned_u.item()
-
-
 def _opinion_from_evidence(evidence: torch.Tensor):
     alpha = evidence + 1.0
     strength = alpha.sum(dim=-1)
@@ -258,50 +230,6 @@ def test_ecml_aggregation_all_missing_is_vacuous_and_dogmatic_limit_is_finite():
     assert belief[0, 0] > 0.999999
 
 
-def test_predictive_opinion_conflict_detects_confident_disagreement():
-    aligned = [
-        torch.tensor([[0.85, 0.05]]),
-        torch.tensor([[0.80, 0.10]]),
-        torch.tensor([[0.82, 0.08]]),
-    ]
-    conflicting = [aligned[0], torch.tensor([[0.05, 0.85]]), aligned[2]]
-    uncertainties = [torch.tensor([0.10])] * 3
-
-    aligned_mean, aligned_max = predictive_opinion_conflict(aligned, uncertainties)
-    conflict_mean, conflict_max = predictive_opinion_conflict(conflicting, uncertainties)
-
-    assert conflict_mean.item() > aligned_mean.item()
-    assert conflict_max.item() > aligned_max.item()
-    assert 0.0 <= conflict_mean.item() <= 1.0
-
-
-def test_inactive_reliability_calibrator_uses_neutral_prefit_trust():
-    fusion = DiscountProbabilityFusion(
-        {
-            "combination": "dempster",
-            "reliability_calibration": {"enabled": True},
-        }
-    )
-    availability = torch.ones(1, AvailabilityIndex.BASE_DIM)
-    # The API certainty changes substantially, but before post-hoc calibration
-    # its prefit trust must remain the Stage-1-neutral unit value.
-    uncertain_api = torch.tensor([[0.0, 0.0]])
-    certain_api = torch.tensor([[8.0, -8.0]])
-    other = torch.tensor([[2.0, -2.0]])
-
-    uncertain = fusion(uncertain_api, other, other, availability)
-    certain = fusion(certain_api, other, other, availability)
-
-    assert fusion.calibration_active is False
-    assert uncertain["total_reliability"].item() == pytest.approx(
-        certain["total_reliability"].item()
-    )
-    assert uncertain["total_reliability"].item() == pytest.approx(1.0)
-    assert uncertain["evidential_certainty_api"].item() < certain[
-        "evidential_certainty_api"
-    ].item()
-
-
 def test_evidential_loss_is_finite_and_differentiable():
     logits = torch.tensor([[2.0, -1.0], [-3.0, 1.0]], requires_grad=True)
     labels = torch.tensor([0, 1])
@@ -370,88 +298,17 @@ def test_evidential_fusion_path_outputs_valid_distribution():
     assert torch.allclose(out["fusion_weights"].sum(dim=-1), torch.ones(2))
 
 
-def test_routed_fusion_is_active_before_and_after_posthoc_calibration():
-    fusion = DiscountProbabilityFusion(
-        {
-            "combination": "routed",
-            "routing": {"enabled": True},
-            "reliability_calibration": {
-                "enabled": True,
-                "hidden_dim": 8,
-            },
-        }
-    )
-    training_output = fusion(*_logits(), _availability())
-    assert torch.equal(training_output["routing_active"], torch.ones(2))
-    assert torch.equal(training_output["calibration_active"], torch.zeros(2))
-    assert torch.allclose(
-        training_output["final_prob"].sum(dim=-1), torch.ones(2), atol=1e-6
-    )
-
-    fusion.set_calibration_active(True)
-    routed = fusion(*_logits(), _availability())
-    assert torch.equal(routed["routing_active"], torch.ones(2))
-    assert torch.allclose(routed["final_prob"].sum(dim=-1), torch.ones(2), atol=1e-6)
-    assert torch.allclose(routed["fusion_weights"].sum(dim=-1), torch.ones(2), atol=1e-6)
-    assert routed["fusion_weights"].shape == (2, 3)
-    assert "routing_weight_risk" not in routed
-    assert torch.all(
-        (routed["routing_risk_probability"] >= 0.0)
-        & (routed["routing_risk_probability"] <= 1.0)
-    )
-
-
-def test_routed_fusion_keeps_router_frozen_before_posthoc_calibration():
-    fusion = DiscountProbabilityFusion(
-        {
-            "combination": "routed",
-            "routing": {"enabled": True},
-            "reliability_calibration": {"enabled": True, "hidden_dim": 8},
-        }
-    )
-    output = fusion(*_logits(), _availability())
-    torch.nn.functional.nll_loss(
-        output["final_logits"], torch.tensor([0, 1])
-    ).backward()
-
-    assert output["routing_active"].sum().item() == 2.0
-    assert torch.equal(
-        output["routing_learned_components_active"], torch.zeros(2)
-    )
-    assert all(
-        parameter.grad is None
-        for parameter in fusion.routing_calibration_parameters()
-    )
-    assert all(
-        parameter.grad is None
-        for parameter in fusion.encoder_training_frozen_parameters()
-    )
-
-
-def test_routed_fusion_masks_unavailable_modality_exactly():
-    fusion = DiscountProbabilityFusion(
-        {
-            "combination": "routed",
-            "routing": {"enabled": True},
-            "reliability_calibration": {"enabled": True},
-        }
-    )
-    fusion.set_calibration_active(True)
-    availability = _availability()
-    availability[:, AvailabilityIndex.API_ALIVE] = 0.0
-    routed = fusion(*_logits(), availability)
-    assert torch.equal(routed["fusion_weight_api"], torch.zeros(2))
-
-
-def test_missing_modality_logits_do_not_change_routed_fusion_or_conflict():
-    fusion = DiscountProbabilityFusion(
-        {
-            "combination": "routed",
-            "routing": {"enabled": True},
-            "reliability_calibration": {"enabled": True},
-        }
-    )
-    fusion.set_calibration_active(True)
+@pytest.mark.parametrize(
+    "rule",
+    (
+        "dempster",
+        "cumulative",
+        "log_pool",
+        "ecml",
+    ),
+)
+def test_missing_modality_logits_do_not_change_fixed_fusion_or_conflict(rule):
+    fusion = DiscountProbabilityFusion({"combination": rule})
     availability = _availability()
     availability[:, AvailabilityIndex.API_ALIVE] = 0.0
     base_logits = list(_logits())
@@ -466,14 +323,48 @@ def test_missing_modality_logits_do_not_change_routed_fusion_or_conflict():
     for key in (
         "final_prob",
         "fusion_weights",
-        "predictive_conflict",
-        "predictive_conflict_max",
     ):
         assert torch.allclose(reference[key], changed[key], atol=1.0e-7)
 
 
-@pytest.mark.parametrize("rule", ["ecml", "conflict_weighted_opinion"])
-def test_ecml_evidential_fusion_outputs_valid_distribution(rule):
+@pytest.mark.parametrize(
+    "rule",
+    (
+        "dempster",
+        "cumulative",
+        "log_pool",
+        "ecml",
+    ),
+)
+def test_all_dead_fixed_fusion_is_uniform_and_has_no_branch_gradient(rule):
+    fusion = DiscountProbabilityFusion({"combination": rule})
+    availability = _availability()
+    availability[:, : AvailabilityIndex.BASE_DIM] = 0.0
+    logits = list(_logits())
+
+    outputs = fusion(*logits, availability)
+
+    assert torch.allclose(
+        outputs["final_prob"],
+        torch.full_like(outputs["final_prob"], 0.5),
+        atol=1.0e-7,
+    )
+    assert torch.equal(
+        outputs["fusion_weights"],
+        torch.zeros_like(outputs["fusion_weights"]),
+    )
+    assert torch.equal(
+        outputs["dirichlet_alpha_fused"],
+        torch.ones_like(outputs["dirichlet_alpha_fused"]),
+    )
+    outputs["final_prob"].sum().backward()
+    for branch_logits in logits:
+        assert branch_logits.grad is not None
+        assert torch.equal(branch_logits.grad, torch.zeros_like(branch_logits.grad))
+
+
+def test_ecml_evidential_fusion_outputs_valid_distribution():
+    rule = "ecml"
     fusion = DiscountProbabilityFusion({"combination": rule})
     logits = (
         torch.tensor([[-4.0, 4.0], [-4.0, 4.0]], requires_grad=True),
@@ -484,7 +375,6 @@ def test_ecml_evidential_fusion_outputs_valid_distribution(rule):
     assert torch.all(out["final_prob"] >= 0.0)
     assert out["final_prob"].sum(dim=-1).allclose(torch.ones(2), atol=1e-5)
     assert torch.all(out["raw_conflict"] >= 0.0)
-    assert torch.all(out["fused_uncertainty"] >= 0.0)
 
 
 def test_evidential_dead_modality_gets_zero_weight():
@@ -494,6 +384,11 @@ def test_evidential_dead_modality_gets_zero_weight():
         *_logits(), availability
     )
     assert torch.equal(out["fusion_weight_api"], torch.zeros(2))
+    assert torch.equal(out["uncertainty_proxy_api"], torch.ones(2))
+    assert torch.equal(
+        out["dirichlet_alpha_api"],
+        torch.ones_like(out["dirichlet_alpha_api"]),
+    )
 
 
 def test_evidential_fp32_for_half_inputs():
@@ -501,7 +396,7 @@ def test_evidential_fp32_for_half_inputs():
     logits = tuple(value.half() for value in _logits())
     out = fusion(*logits, _availability().half())
     assert out["final_logits"].dtype == torch.float32
-    assert out["acceptance_score"].dtype == torch.float32
+    assert out["final_prob"].dtype == torch.float32
 
 
 def _toy_batch():
@@ -569,7 +464,6 @@ def test_full_evidential_pipeline_forward_loss_backward():
         manifest_hidden_dim=64,
         discount_fusion_config={
             "combination": "dempster",
-            "reliability_calibration": {"enabled": True},
         },
     )
     batch = _toy_batch()
@@ -578,7 +472,7 @@ def test_full_evidential_pipeline_forward_loss_backward():
     assert extra["fusion_weights"].shape == (2, 3)
     assert torch.allclose(extra["fusion_weights"].sum(dim=-1), torch.ones(2))
     assert torch.allclose(logits.exp().sum(dim=-1), torch.ones(2), atol=1e-4)  # log-prob
-    assert "acceptance_score" in extra and "fused_uncertainty" in extra
+    assert "dirichlet_alpha_fused" in extra and "raw_conflict" in extra
 
     loss, parts = compute_robust_loss(
         logits,

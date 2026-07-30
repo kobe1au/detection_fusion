@@ -170,6 +170,9 @@ def _load_direct_config(path: Path) -> dict[str, Any]:
     manifest = raw.get("manifest") or {}
     storage = raw.get("storage") or {}
     execution = raw.get("execution") or {}
+    migration = raw.get("migration", {})
+    if migration is None:
+        migration = {}
     allowed_execution_keys = {
         "workers",
         "resume",
@@ -180,6 +183,49 @@ def _load_direct_config(path: Path) -> dict[str, Any]:
     unknown_execution_keys = sorted(set(execution) - allowed_execution_keys)
     if unknown_execution_keys:
         raise ValueError(f"Unsupported execution settings: {unknown_execution_keys}")
+    if not isinstance(migration, dict):
+        raise ValueError("migration settings must be a mapping")
+    allowed_migration_keys = {"allowed_previous_build_fingerprints"}
+    unknown_migration_keys = sorted(set(migration) - allowed_migration_keys)
+    if unknown_migration_keys:
+        raise ValueError(
+            f"Unsupported migration settings: {unknown_migration_keys}"
+        )
+    raw_previous_fingerprints = migration.get(
+        "allowed_previous_build_fingerprints", []
+    )
+    if raw_previous_fingerprints is None:
+        raw_previous_fingerprints = []
+    if not isinstance(raw_previous_fingerprints, list):
+        raise ValueError(
+            "migration.allowed_previous_build_fingerprints must be a list"
+        )
+    allowed_previous_build_fingerprints: list[str] = []
+    for raw_fingerprint in raw_previous_fingerprints:
+        if not isinstance(raw_fingerprint, str):
+            raise ValueError(
+                "migration.allowed_previous_build_fingerprints entries must "
+                f"be lowercase SHA-256 digest strings, got {raw_fingerprint!r}"
+            )
+        fingerprint = raw_fingerprint.strip()
+        if (
+            fingerprint != raw_fingerprint
+            or fingerprint != fingerprint.lower()
+            or len(fingerprint) != 64
+            or any(
+            char not in "0123456789abcdef" for char in fingerprint
+            )
+        ):
+            raise ValueError(
+                "migration.allowed_previous_build_fingerprints entries must "
+                f"be lowercase SHA-256 digests, got {raw_fingerprint!r}"
+            )
+        if fingerprint in allowed_previous_build_fingerprints:
+            raise ValueError(
+                "migration.allowed_previous_build_fingerprints contains a "
+                f"duplicate digest: {fingerprint}"
+            )
+        allowed_previous_build_fingerprints.append(fingerprint)
 
     splits = [str(value) for value in data.get("splits", [])]
     split_dirs = {str(key): Path(value) for key, value in (data.get("split_dirs") or {}).items()}
@@ -231,6 +277,9 @@ def _load_direct_config(path: Path) -> dict[str, Any]:
         "allow_empty_splits": bool(execution.get("allow_empty_splits", False)),
         "fail_on_error": bool(execution.get("fail_on_error", False)),
         "failed_json": failed_json,
+        "migration_allowed_previous_build_fingerprints": (
+            allowed_previous_build_fingerprints
+        ),
     }
     if cfg["rebuild_vocab"] and cfg["resume"]:
         raise ValueError("manifest.rebuild_vocab=true is incompatible with execution.resume=true")

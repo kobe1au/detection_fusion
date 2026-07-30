@@ -3,6 +3,7 @@ defaults:
 
 method:
   name: baseline_api_graph_concat
+  protocol_id: baseline_api_graph_concat_v1
 
 train:
   exp_name: baseline_api_graph_concat

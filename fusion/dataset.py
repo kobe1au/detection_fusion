@@ -17,7 +17,6 @@ from torch_geometric.data import Batch, Data
 
 from fusion.perturbations import (
     EVAL_PERTURB_TYPES,
-    GRADED_PERTURBATIONS,
     apply_perturbation,
 )
 from fusion.semantic_categories import (
@@ -44,6 +43,50 @@ logger = logging.getLogger(__name__)
 _PT_PREFLIGHT_CACHE: dict[tuple[Any, ...], tuple[int, ...]] = {}
 _PT_AUDIT_CERTIFICATE_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 _PT_PREFLIGHT_MAX_REPORTED_FAILURES = 10
+
+
+def _care_model_input_sha256(data: Data) -> str:
+    """Hash exactly the tensors exposed by one deterministic CARE view.
+
+    The digest is audit metadata only and is never collated into a model
+    feature.  It lets the frozen view manifest prove that two model seeds saw
+    byte-identical perturbed inputs.
+    """
+
+    digest = hashlib.sha256()
+    fields = (
+        "x",
+        "edge_index",
+        "sensitive_mask",
+        "api_ids",
+        "api_type_ids",
+        "api_sensitive_mask",
+        "manifest_x",
+        "api_alive",
+        "graph_alive",
+        "manifest_alive",
+        "graph_encoder_budget_max_nodes",
+    )
+    for name in fields:
+        value = getattr(data, name, None)
+        if not isinstance(value, torch.Tensor):
+            raise FatalDatasetConfigError(
+                f"CARE view digest requires tensor field {name!r}"
+            )
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(
+            json.dumps(list(tensor.shape), separators=(",", ":")).encode(
+                "ascii"
+            )
+        )
+        digest.update(b"\0")
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _load_pt_weights_only(path: str | Path) -> Any:
@@ -158,12 +201,6 @@ def build_package_isolation_groups(
     return groups
 
 
-def _stable_seed(*parts: object) -> int:
-    text = "|".join(str(p) for p in parts)
-    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="little", signed=False) % (2**31 - 1)
-
-
 @contextmanager
 def _temporary_random_seed(seed: int):
     py_state = random.getstate()
@@ -238,12 +275,6 @@ class RobustTriModalDataset(Dataset):
         pt_dir: str,
         csv_path: str,
         is_train: bool = True,
-        eval_perturb_type: str | None = None,
-        eval_perturb_strength: float = 0.0,
-        train_perturbations: tuple[str, ...] | list[str] | None = None,
-        train_perturb_strength_min: float = 0.1,
-        train_perturb_strength_max: float = 0.9,
-        train_perturb_seed: int = 42,
         max_api_events_per_sample: int | None = None,
         max_graph_nodes_per_sample: int = 12288,
         manifest_dim: int = 256,
@@ -254,7 +285,6 @@ class RobustTriModalDataset(Dataset):
         manifest_feature_dim: int = 32,
         drop_graph_behavior_hints: bool = False,
         num_classes: int = 2,
-        label_map: dict | None = None,
         strict_split_integrity: bool = True,
         allow_pt_superset: bool = False,
         expected_manifest_vocab_sha256: str | None = None,
@@ -264,49 +294,30 @@ class RobustTriModalDataset(Dataset):
         pt_audit_certificate: str | None = None,
         require_pt_audit_certificate: bool = False,
     ):
-        if eval_perturb_type not in EVAL_PERTURB_TYPES:
-            raise ValueError(f"Unsupported eval_perturb_type: {eval_perturb_type}")
+        boolean_fields = {
+            "is_train": is_train,
+            "drop_graph_behavior_hints": drop_graph_behavior_hints,
+            "strict_split_integrity": strict_split_integrity,
+            "allow_pt_superset": allow_pt_superset,
+            "require_pt_audit_certificate": require_pt_audit_certificate,
+        }
+        invalid_booleans = {
+            name: value
+            for name, value in boolean_fields.items()
+            if not isinstance(value, bool)
+        }
+        if invalid_booleans:
+            raise ValueError(
+                "Dataset boolean settings must be real booleans: "
+                f"{invalid_booleans}"
+            )
         self.pt_dir = Path(pt_dir)
-        self.is_train = bool(is_train)
-        self.eval_perturb_type = eval_perturb_type
-        self.eval_perturb_strength = float(eval_perturb_strength)
-        if not math.isfinite(self.eval_perturb_strength) or not 0.0 <= self.eval_perturb_strength <= 1.0:
-            raise ValueError(
-                f"eval_perturb_strength must be within [0, 1], got {self.eval_perturb_strength}"
-            )
-        raw_train_perturbations = tuple(train_perturbations or ())
-        unsupported_train_perturbations = sorted(
-            set(raw_train_perturbations) - set(GRADED_PERTURBATIONS)
-        )
-        if unsupported_train_perturbations:
-            raise ValueError(
-                "train_perturbations supports exactly the registered graded "
-                f"single-modality mechanisms; unsupported={unsupported_train_perturbations}"
-            )
-        if len(raw_train_perturbations) != len(set(raw_train_perturbations)):
-            raise ValueError("train_perturbations must not contain duplicates")
-        if raw_train_perturbations and not self.is_train:
-            raise ValueError(
-                "train_perturbations can only be enabled on a training dataset"
-            )
-        self.train_perturbations = raw_train_perturbations
-        self.train_perturb_strength_min = float(train_perturb_strength_min)
-        self.train_perturb_strength_max = float(train_perturb_strength_max)
-        if (
-            not math.isfinite(self.train_perturb_strength_min)
-            or not math.isfinite(self.train_perturb_strength_max)
-            or not 0.0 < self.train_perturb_strength_min
-            <= self.train_perturb_strength_max
-            <= 1.0
-        ):
-            raise ValueError(
-                "train perturbation strengths must satisfy "
-                "0 < min <= max <= 1"
-            )
-        self.train_perturb_seed = strict_finite_integer(
-            train_perturb_seed,
-            field_name="train_perturb_seed",
-        )
+        self.is_train = is_train
+        # Controlled evaluation has one closed interface: an immutable
+        # per-sample (mechanism, strength, seed) plan constructed by the shared
+        # view protocol.  There is no second aggregate perturbation path.
+        self.eval_perturb_plan: tuple[tuple[str, float, int], ...] | None = None
+        self.care_digest_view = False
         self.max_api_events_per_sample = (
             strict_finite_integer(
                 max_api_events_per_sample,
@@ -334,9 +345,9 @@ class RobustTriModalDataset(Dataset):
         self.manifest_permission_dim = int(manifest_permission_dim)
         self.manifest_intent_dim = int(manifest_intent_dim)
         self.manifest_feature_dim = int(manifest_feature_dim)
-        self.drop_graph_behavior_hints = bool(drop_graph_behavior_hints)
-        self.strict_split_integrity = bool(strict_split_integrity)
-        self.allow_pt_superset = bool(allow_pt_superset)
+        self.drop_graph_behavior_hints = drop_graph_behavior_hints
+        self.strict_split_integrity = strict_split_integrity
+        self.allow_pt_superset = allow_pt_superset
         self.expected_pt_build_fingerprint = str(
             expected_pt_build_fingerprint or ""
         ).strip().lower()
@@ -345,7 +356,7 @@ class RobustTriModalDataset(Dataset):
             if str(pt_audit_certificate or "").strip()
             else None
         )
-        self.require_pt_audit_certificate = bool(require_pt_audit_certificate)
+        self.require_pt_audit_certificate = require_pt_audit_certificate
         if self.require_pt_audit_certificate and self.pt_audit_certificate is None:
             raise ValueError(
                 "data.pt_audit_certificate is required for this formal run"
@@ -414,59 +425,34 @@ class RobustTriModalDataset(Dataset):
             raise ValueError(
                 f"CSV {csv_path} contains duplicate sample IDs; "
                 f"count={len(duplicate_csv_ids)} examples={duplicate_csv_ids[:10]}"
+        )
+        parsed_labels: list[int] = []
+        invalid_label_rows: list[Any] = []
+        for row_index, raw_value in df["label"].items():
+            try:
+                parsed_labels.append(
+                    strict_binary_integer(
+                        raw_value,
+                        field_name=f"CSV label at row {row_index}",
+                    )
+                )
+            except ValueError:
+                invalid_label_rows.append(row_index)
+        if invalid_label_rows:
+            bad = (
+                df.loc[invalid_label_rows, [id_col, "label"]]
+                .head(10)
+                .to_dict("records")
             )
-        raw_labels = df["label"].astype(str).str.strip()
-        if label_map is not None:
-            if not isinstance(label_map, dict) or not label_map:
-                raise ValueError("data.label_map must be a non-empty mapping when provided")
-            normalized_map: dict[str, int] = {}
-            for raw_key, raw_value in label_map.items():
-                key = str(raw_key).strip()
-                if not key:
-                    raise ValueError("data.label_map contains an empty normalized key")
-                if key in normalized_map:
-                    raise ValueError(
-                        f"data.label_map contains duplicate normalized key {key!r}"
-                    )
-                normalized_map[key] = strict_binary_integer(
-                    raw_value,
-                    field_name=f"data.label_map[{key!r}]",
-                )
-            if df["label"].isna().any():
-                bad = df.loc[df["label"].isna(), [id_col, "label"]].head(10).to_dict("records")
-                raise ValueError(f"CSV {csv_path} contains missing labels; examples={bad}")
-            mapped = raw_labels.map(normalized_map)
-            if mapped.isna().any():
-                bad = df.loc[mapped.isna(), [id_col, "label"]].head(10).to_dict("records")
-                raise ValueError(
-                    f"CSV {csv_path} contains labels not covered by data.label_map; "
-                    f"examples={bad}"
-                )
-            label_series = mapped.astype("int64")
-        else:
-            parsed_labels: list[int] = []
-            invalid_label_rows: list[Any] = []
-            for row_index, raw_value in df["label"].items():
-                try:
-                    parsed_labels.append(
-                        strict_binary_integer(
-                            raw_value,
-                            field_name=f"CSV label at row {row_index}",
-                        )
-                    )
-                except ValueError:
-                    invalid_label_rows.append(row_index)
-            if invalid_label_rows:
-                bad = (
-                    df.loc[invalid_label_rows, [id_col, "label"]]
-                    .head(10)
-                    .to_dict("records")
-                )
-                raise ValueError(
-                    f"CSV {csv_path} contains labels that are not finite binary integers; "
-                    f"examples={bad}"
-                )
-            label_series = pd.Series(parsed_labels, index=df.index, dtype="int64")
+            raise ValueError(
+                f"CSV {csv_path} contains labels that are not finite binary integers; "
+                f"examples={bad}"
+            )
+        label_series = pd.Series(
+            parsed_labels,
+            index=df.index,
+            dtype="int64",
+        )
         num_classes = strict_finite_integer(num_classes, field_name="num_classes")
         if num_classes != 2:
             raise ValueError(
@@ -479,7 +465,7 @@ class RobustTriModalDataset(Dataset):
             raise ValueError(
                 f"CSV {csv_path} contains labels outside [0, {num_classes - 1}] "
                 f"for num_classes={num_classes}; label_counts={counts}; examples={bad}. "
-                "Fix the CSV labels or set data.label_map in the config."
+                "Fix the CSV labels."
             )
         labels = dict(zip(sid_series, label_series))
         if year_col:
@@ -1140,9 +1126,8 @@ class RobustTriModalDataset(Dataset):
                     "PT file changed after split preflight; recreate the dataset "
                     "only after the PT pool is stable"
                 )
-            # PT files are intentionally left unchanged.  mmap only changes how
-            # their storages are paged into CPU memory and avoids eagerly reading
-            # large extraction fields that this runtime does not consume.
+            # PT files are intentionally left unchanged. mmap only changes how
+            # their storages are paged into CPU memory.
             raw = _load_pt_weights_only(pt_path)
             # The certificate removes the redundant all-pool startup load, but
             # the sample being consumed still passes the complete schema
@@ -1169,39 +1154,70 @@ class RobustTriModalDataset(Dataset):
             ):
                 data[key] = observable[key]
             refresh_hard_availability(data)
-            if self.is_train and self.train_perturbations:
-                # Stage B assigns each train identity exactly one deterministic
-                # single-modality degradation. The strength is continuous
-                # across identities, but repeated cache construction remains
-                # bitwise reproducible. These values create the current input;
-                # neither the mechanism nor its strength is consumed by the
-                # model.
-                seed = _stable_seed(
-                    sid,
-                    "anchored_stage_b",
-                    self.train_perturb_seed,
-                )
-                with _temporary_random_seed(seed):
-                    perturb_type = random.choice(self.train_perturbations)
-                    perturb_strength = random.uniform(
-                        self.train_perturb_strength_min,
-                        self.train_perturb_strength_max,
+            # Establish the exact graph tensor visible to the encoder before
+            # applying any controlled graph degradation.  Otherwise an edge
+            # removed from a node that the runtime budget later discards would
+            # be logged as a degradation even though the model received the
+            # same graph. API events are already budgeted in
+            # ``_aggregate_api_graph`` and Manifest has no runtime truncation.
+            data = apply_graph_encoder_budget(
+                data,
+                self.max_graph_nodes_per_sample,
+            )
+            if not self.is_train and getattr(
+                self, "eval_perturb_plan", None
+            ) is not None:
+                eval_perturb_plan = self.eval_perturb_plan
+                if len(eval_perturb_plan) != len(self.samples):
+                    raise FatalDatasetConfigError(
+                        "eval_perturb_plan length does not match the dataset"
                     )
+                plan_item = eval_perturb_plan[idx]
+                if (
+                    not isinstance(plan_item, (tuple, list))
+                    or len(plan_item) != 3
+                ):
+                    raise FatalDatasetConfigError(
+                        "eval_perturb_plan entries must be "
+                        "(mechanism, strength, seed)"
+                    )
+                perturb_type = str(plan_item[0]).strip().lower()
+                perturb_strength = float(plan_item[1])
+                perturb_seed = strict_finite_integer(
+                    plan_item[2],
+                    field_name="eval_perturb_plan.seed",
+                )
+                if perturb_type not in EVAL_PERTURB_TYPES or perturb_type in {
+                    None,
+                    "clean",
+                }:
+                    raise FatalDatasetConfigError(
+                        f"Unsupported planned evaluation perturbation "
+                        f"{perturb_type!r}"
+                    )
+                if (
+                    not math.isfinite(perturb_strength)
+                    or not 0.0 <= perturb_strength <= 1.0
+                ):
+                    raise FatalDatasetConfigError(
+                        "Planned evaluation perturbation strength must lie "
+                        "within [0, 1]"
+                    )
+                # ``eval_perturb_plan`` already carries the protocol-defined
+                # seed H(SID, mechanism, protocol_seed).  Re-hashing it here
+                # would silently change the frozen view identity.
+                with _temporary_random_seed(perturb_seed):
                     data = apply_perturbation(
                         data,
                         perturb_type,
                         perturb_strength,
                     )
-            elif not self.is_train and self.eval_perturb_type:
-                # Keep aggregate perturbation subtypes stable across strength sweeps.
-                seed = _stable_seed(sid, self.eval_perturb_type)
-                with _temporary_random_seed(seed):
-                    data = apply_perturbation(data, self.eval_perturb_type, self.eval_perturb_strength)
-            data = apply_graph_encoder_budget(
-                data,
-                self.max_graph_nodes_per_sample,
-            )
             obj = self._to_data_object(data, label, sid, year)
+            if not self.is_train and (
+                getattr(self, "eval_perturb_plan", None) is not None
+                or bool(getattr(self, "care_digest_view", False))
+            ):
+                obj.care_view_output_digest = _care_model_input_sha256(obj)
             # Runtime-only isolation metadata from the split CSV. It is not
             # persisted into, or required from, the APK-derived PT payload.
             obj.sample_group = str(self.sample_groups[idx])
@@ -1240,6 +1256,10 @@ def robust_collate_fn(data_list):
     api_aug_types = [getattr(d, "api_aug_type", "none") for d in valid_items]
     graph_aug_types = [getattr(d, "graph_aug_type", "none") for d in valid_items]
     manifest_aug_types = [getattr(d, "manifest_aug_type", "none") for d in valid_items]
+    care_view_output_digests = [
+        str(getattr(d, "care_view_output_digest", ""))
+        for d in valid_items
+    ]
     years = torch.stack([d.year for d in valid_items]).view(-1)
     labels = torch.stack([d.y for d in valid_items])
     graph_list = []
@@ -1316,6 +1336,7 @@ def robust_collate_fn(data_list):
         "api_aug_types": api_aug_types,
         "graph_aug_types": graph_aug_types,
         "manifest_aug_types": manifest_aug_types,
+        "care_view_output_digests": care_view_output_digests,
         "years": years,
         "num_failed": 0,
         "num_valid": len(valid_items),

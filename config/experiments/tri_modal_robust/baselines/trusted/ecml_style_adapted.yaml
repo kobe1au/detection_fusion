@@ -13,9 +13,6 @@ fusion:
   # binary averaging of API -> Graph -> Manifest evidence.
   combination: ecml
   opinion_source: evidential
-  routing:
-    enabled: false
-    final_temperature_scaling: false
 
 loss:
   # Retains ECML-style fused/per-view evidential objectives and its

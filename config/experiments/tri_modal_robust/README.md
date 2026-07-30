@@ -1,308 +1,186 @@
-# Tri-Modal Competence-Anchored Fusion Experiments
+# CARE-Droid Experiments
 
 This directory is the formal experiment catalog for the API/Graph/Manifest
-malware detector. The paper asks one question: when the useful information in
-the three modalities differs from sample to sample, can fusion remain strong
-on clean inputs while adapting safely to an unreliable or missing modality?
+malware detector. The only proposed method is `care_droid_v1`, configured by
+`care_droid.yaml`. It runs through `python -m fusion.care_train`; ordinary
+paper baselines run through `python -m fusion.baseline_train`.
 
-The registered method is `tcp_joint_anchor_crc_v1`, configured by
-`competence_anchored_fusion.yaml`.
+## Frozen method contract
 
-## Method lifecycle
+### Four fixed prediction paths
 
-### Stage A: Joint anchor plus atomic experts
+CARE-Droid exposes exactly four paths in a fixed order:
 
-One training pass learns four experts:
+- `agm`: API + Graph + Manifest;
+- `ag`: API + Graph;
+- `am`: API + Manifest;
+- `gm`: Graph + Manifest.
 
-- one Joint expert over the three encoded modalities;
-- one API expert;
-- one Graph expert;
-- one Manifest expert.
+These are not a configurable expert search space. The full `agm` path is the
+normal anchor, while the three two-modality paths provide bounded fallbacks
+when one modality is unreliable or unavailable.
 
-The clean Stage-A objective is
+### Four disjoint data roles
 
-```text
-L_stage_A = CE(Joint, y)
-          + lambda_atomic * mean_alive_m CE(atomic_m, y)
-```
+The current train split is divided by package group into:
 
-with `lambda_atomic=0.25`. Atomic losses are averaged over alive experts within
-each sample before the batch mean. The Joint expert is the primary objective
-and the clean anchor; the lower atomic weight makes the three atomic heads
-deep supervision and missing-modality fallback experts rather than co-equal
-primary tasks. It is not an average of atomic predictions. There is no EDL
-loss and no uniform-fusion checkpoint proxy in the proposed method.
+- `expert_train`: 90% used to fit the four clean path experts;
+- `expert_val`: 10% used only to select the Stage-A expert checkpoint.
 
-The checkpoint is selected by clean **Joint-anchor deployment Macro-F1** on
-the fixed `model_selection` identities: the real Joint expert is used when all
-three atomic inputs are alive, otherwise the explicit alive-uniform atomic
-fallback is used. The pure-Joint Macro-F1 and Joint-eligible fraction are
-reported separately, so the full-population checkpoint score is not
-mislabelled as a pure-Joint result.
+This assignment is deterministic with `expert_split_seed=4242`. The validation
+CSV reuses the immutable SID assignment in
+`labels/validation_roles_protocol_v3.json`:
 
-### I1: expert-local TCP competence
+- its 973 `model_selection` SIDs have CARE semantics `routing_cal`;
+- its 487 `decision_calibration` SIDs have CARE semantics `decision_cal`.
 
-After Stage A, all encoders and expert heads are frozen. For each expert `m`,
-I1 predicts
+The physical source-role names are recorded in the configuration so the
+semantic rename cannot silently change identities. `routing_cal` never selects
+Stage A, and `decision_cal` never fits experts, path risk, or routing.
 
-```text
-q_m ~= p_m[y]
-```
+### Stage A: clean path experts
 
-where `p_m[y]` is that expert's probability assigned to the true class
-(true-class probability, TCP). The competence head receives only the current
-expert embedding, its current probability vector, and its hard alive mask.
-
-I1 is fitted on train identities under clean and one randomly sampled
-single-modality degradation view. The degraded TCP loss is an auxiliary
-regularizer with weight `0.25`. Every epoch is evaluated separately on clean
-and the three fixed single-modality `model_selection` views. Selection first
-keeps epochs whose clean TCP loss is within the pre-registered 1% relative
-band of the best clean epoch, then minimizes degraded-source mean loss and
-worst-source loss. Thus no arbitrary weighted validation mixture defines the
-chosen head. Its loss also contains a small pairwise ranking term.
-Perturbation name, perturbation strength,
-pre-degradation counts, retained ratios, cross-modal conflict, and test
-statistics are not model inputs.
-
-This target is continuous: a confidently correct expert receives a target
-near one, a confidently wrong expert a target near zero, and ambiguous
-predictions remain intermediate. I1 is therefore a competence estimator, not
-the retired branch-argmax correctness calibrator.
-
-### I2: Joint-anchored adaptive late fusion
-
-I2 constructs a competence-weighted late expert from the alive atomic
-probabilities and combines it with the Joint anchor:
+All four paths are trained from clean `expert_train` samples. Stage A uses
+`loss.objective=care_stage_a_clean`, the base 60-epoch budget, and patience 8
+on clean `expert_val`. The selected expert artifact is:
 
 ```text
-score_m = b_m + beta_atomic * log(q_m)
-w_m = softmax_alive(score_m)
-p_late = sum_m w_m * p_m
-g = sigmoid(b_gate + beta_gate * (log(q_late) - log(q_joint)))
-p_final = (1 - g) * p_joint + g * p_late
+best_care_stage_a.pt
 ```
 
-Both scale parameters are constrained positive, so increasing an expert's
-competence cannot reduce its atomic score, and increasing late competence
-relative to Joint cannot reduce `g`. The small router is learned after Stage
-A. Its training contains:
+The CARE runner calls its dedicated four-path loss directly; it does not enter
+the comparison-method loss dispatcher or instantiate comparison fusion modules.
+The primary method does not use paired degraded-view supervision in Stage A.
 
-- clean classification loss;
-- single-modality degradation loss with a registered candidate-weight grid;
-- a clean KL anchor to the frozen Joint prediction.
+### Path-risk fitting and routing
 
-Each candidate and the Joint anchor independently fit an unconstrained
-Macro-F1 threshold on the same clean `model_selection` rows; those thresholds
-are then frozen across clean and all three degraded sources. Deployment is
-fail-closed: the adaptive router is enabled only if clean Macro-F1 is not below
-Joint, none of the three degraded sources is below Joint, and the mean
-degraded-source gain is strictly positive. Candidate ranking is minimum
-source delta, mean delta, clean delta, then negative NLL. Otherwise the saved
-pipeline uses the clean-thresholded Joint anchor when all
-modalities are alive, an alive-uniform atomic fallback when Joint is
-ineligible, and a uniform class distribution only when every modality is
-dead.
+After Stage A is frozen, CARE-Droid builds deterministic views of
+`routing_cal`:
 
-I1 and I2 are coupled parts of one trusted-fusion mechanism. The old I1×I2
-factorial, log-odds reliability prior, conflict risk head, source oracle,
-scenario-prior grid, and nested five-fold post-hoc stack are not part of this
-method.
+- one clean view;
+- one SID-specific view for each of `api_event_dropout`, `graph_sparsify`, and
+  `manifest_permission_mask`;
+- `api_missing`, `graph_missing`, and `manifest_missing`.
 
-The causal module ablation disables the complete Stage B and deploys the
-unchanged Joint anchor from the same Stage-A checkpoint. It does not pretend
-that I2 can operate without the I1 competence values that define its atomic
-late expert.
+For a graded view, strength is
+`H(SID, mechanism, protocol_seed)` mapped uniformly into `[0.1, 0.9]`.
+`protocol_seed=424242`. View identity and strength are audit metadata and are
+never model inputs.
 
-### I3: malware false-negative risk control
+The shared path-risk head is fitted with three
+`StratifiedGroupKFold` folds. It uses fixed 20-epoch fits, batch size 256,
+hidden width 16, AdamW mini-batch updates, and no early stopping. Fold-local
+log-odds normalization is fitted only on valid paths. OOF predictions provide
+leakage-free path-risk and routing diagnostics; they do not select epochs,
+features, architecture, or thresholds. The same fixed risk head is then
+refitted on all `routing_cal` rows for deployment.
 
-The ordinary classification threshold is selected for Macro-F1 on
-`model_selection` and then frozen. A disjoint `decision_calibration` role is
-used only by I3 to choose an acceptance threshold subject to
+Training rows are averaged at three levels—SID, view, and valid path—so an SID
+with more valid paths or views cannot dominate the BCE objective. Every
+artifact records fold membership, SID/view provenance, data digests, and
+fold-local normalization statistics.
+
+Routing is deliberately bounded:
+
+- with three live modalities, `agm` remains the anchor; only pair paths whose
+  hard prediction disagrees with AGM are candidates, and a pair replaces AGM
+  only when its predicted correctness is strictly larger;
+- with exactly two live modalities, the unique matching pair path is used;
+- with at most one live modality, the sample is rejected.
+
+`route_on_all_samples` is false in the proposed method. No perturbation label,
+strength, pre-damage count, or oracle path label is available at inference.
+
+### Natural-only decision control
+
+CARE-Droid does not fit a separate Macro-F1 classification threshold.
+`classification_threshold.enabled=false`.
+
+I3 fits only on clean, naturally observed `decision_cal` samples. It ranks
+acceptance with `care_selected_path_correctness` and controls
+`malware_conditional_accepted_fn` at `risk_level=0.05`. Artificial views do not
+enter conformal calibration. The guarantee is expected conformal risk control
+under exchangeability; it is not a high-probability guarantee under arbitrary
+distribution shift.
+
+The complete deployment artifact is:
 
 ```text
-(accepted malware false negatives + 1) / (number of malware + 1) <= alpha
+best_care_pipeline.pt
 ```
 
-with `alpha=0.05`. The score
-`malware_fn_probability_anchor` ranks samples by the deployed classifier's
-probability of making the malware-as-benign error. The code reports an
-expected conformal risk-control guarantee under exchangeability; it does not
-claim a high-probability guarantee or a guarantee under arbitrary shift.
+## Formal comparisons
 
-## Data lifecycle
+The main table contains exactly 13 registered comparison baselines: seven
+standard cells (API-only, Graph-only, Manifest-only, API+Graph concat,
+tri-modal concat, alive-normalized equal-weight logit fusion, and dense
+embedding gate) plus six
+trusted-fusion cells (Dempster, cumulative subjective logic, log pool,
+TMC-style adapted, QMF energy, and ECML-style adapted).
 
-`labels/validation_roles_protocol_v2.json` freezes a package-group-disjoint
-75/25 partition:
+Every baseline uses the same Stage-A data budget as CARE: only the deterministic
+90% `expert_train` role fits parameters and the group-disjoint 10%
+`expert_val` role selects the checkpoint by clean Macro-F1 at the fixed 0.5
+operating point. The validation `model_selection` and `decision_calibration`
+roles are reported only as audits; neither fits parameters, selects an epoch,
+nor changes the classifier. CARE and all 13 baselines use the same unfitted
+binary argmax/softmax-0.5 classification rule in the primary table.
 
-- 75% `model_selection`: Stage-A checkpoint selection, Stage-B early stopping
-  and candidate selection, and the ordinary classification threshold;
-- 25% `decision_calibration`: I3 only.
+The minimal CARE-Droid ablation set is:
 
-Stage-B parameters are fitted on train identities. Validation selects fitted
-states and hyperparameters; it is not described as unseen by I1/I2. Test data
-is never used for fitting, candidate selection, or thresholds.
+- `no_learned_routing`: use `agm` whenever all three modalities are alive,
+  while retaining the deterministic unique-pair fallback when exactly two
+  modalities are alive;
+- `route_on_all_samples`: remove the conservative routing restriction while
+  keeping the same experts and risk head;
+- `msp_acceptance`: keep CARE routing but replace the I3 acceptance score with
+  maximum softmax probability.
 
-Protocol warning for the current study: earlier method revisions were informed
-by summaries from the existing `labels/test.csv`, so that split must now be
-treated as a development test rather than an untouched confirmatory set. The
-final paper claim requires a newly locked, previously unseen test set or an
-external confirmation dataset. Code-level split isolation cannot undo
-researcher-side reuse of already inspected test results.
+These three cells reuse the frozen seed-42 pipeline because they change only
+inference or decision rules.
 
-The controlled degradation registry contains one evidence-availability stress
-test per modality:
-
-- API: `api_event_dropout`;
-- Graph: `graph_sparsify`;
-- Manifest: `manifest_permission_mask`.
-
-Training samples one mechanism and a continuous strength in `[0.1, 0.9]`.
-Stage-B selection evaluates the three fixed mechanisms at strength `0.5`.
-Formal evaluation reports five strengths `[0.1, 0.3, 0.5, 0.7, 0.9]`, plus
-clean and the three whole-modality-missing endpoints. These are controlled
-availability tests, not claims about unseen attacks or temporal
-generalization.
-
-## Comparisons and ablations
-
-Representation/fusion baselines:
-
-- API only, Graph only, Manifest only;
-- API+Graph concat and tri-modal concat;
-- fixed logit fusion;
-- dense embedding gate adapted.
-
-Trusted-fusion comparisons:
-
-- Dempster, cumulative, log-pool, conflict-weighted opinion;
-- TMC-style adapted;
-- ECML-style adapted;
-- QMF energy component.
-
-`TMC-style adapted` and `ECML-style adapted` are mandatory paper names. These
-experiments share the APK inputs and encoders but are not strict
-reproductions.
-
-All main fusion baselines receive the same fixed `model_selection` identities
-and the same unconstrained Macro-F1 threshold budget as the proposed method.
-That fitted-threshold result is the primary classification table. A separate
-fixed-0.5 table is retained as a no-threshold-tuning sensitivity analysis; I3
-remains disabled for fusion baselines and is compared in its dedicated table.
-
-The compact method ablation set is:
-
-- `no_i1_i2`: disable the complete competence/router Stage B and deploy the
-  matched Joint anchor;
-- `no_degraded_competence`: fit I1 on clean train outputs only;
-- `no_tcp_ranking`: remove only I1's ranking regularizer;
-- `router_clean_only`: remove degraded-router training;
-- `no_clean_anchor_kl`: remove I2's clean Joint-anchor regularizer;
-- `no_atomic_auxiliary`: remove Stage-A atomic supervision;
-- `no_i3`: disable only selective risk control;
-- I3 score/rule comparisons: MSP, deployed-class probability, fixed coverage,
-  marginal conformal, and class-conditional conformal.
-
-There is no I1×I2 2×2 grid because I2 is explicitly defined in terms of I1
-competence. “I2 on, I1 off” would be a different model rather than an atomic
-ablation.
-
-The I1/I2 ablations, including complete `no_i1_i2`, reuse the hash-checked
-seed-42 `best_encoder_selected.pt`; they do not retrain Stage A. The
-`no_atomic_auxiliary` cell changes the Stage-A objective and therefore trains
-its own artifact. Run `final` before `paper_ablation`; the ablation group does
-not rerun or overwrite the primary result.
+No paired-path or anchor-family appendix is registered in v1. Either would
+change the Stage-A objective and therefore requires a separately frozen
+protocol rather than a half-compatible overlay.
 
 ## Commands
 
-On AutoDL, always append the machine-path overlay:
+Append the AutoDL path overlay on the remote machine:
 
 ```bash
-# Primary seed
+# Primary CARE-Droid run.
 python run.py final \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 
-# Repeated seeds
-python run.py seed \
+# Remaining seeds after the primary seed-42 run.
+python run.py seed_2024 seed_3407 \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 
-# Main comparison methods
+# Ordinary paper baselines.
 python run.py baselines trusted_baselines \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 
-# Proposed-method ablations and I3 comparisons
+# Three minimal CARE-Droid ablations.
 python run.py paper_ablation \
   --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
 
-# Inspect without executing
+# Verify paths and runner dispatch without starting jobs.
 python run.py paper_all --dry-run
 python run.py --list
 ```
 
-Cross-method mean/std tables require repeating comparison methods with the
-registered seed overlays:
+Dry-run output includes `[fusion.care_train]` or
+`[fusion.baseline_train]`, making
+lifecycle dispatch auditable before a long experiment starts.
 
-```bash
-python run.py baselines trusted_baselines \
-  --extra-config \
-    config/experiments/tri_modal_robust/_autodl_paths.yaml \
-    config/experiments/tri_modal_robust/_seed_2024_overlay.yaml
-
-python run.py baselines trusted_baselines \
-  --extra-config \
-    config/experiments/tri_modal_robust/_autodl_paths.yaml \
-    config/experiments/tri_modal_robust/_seed_3407_overlay.yaml
-```
-
-An existing output directory is rejected. Use `--overwrite` only when
-replacement is intentional. Stage-A reuse is allowed only when the strict
-architecture, objective, data, PT provenance, RNG/loader, and validation-role
-identity checks pass:
-
-```bash
-python run.py final \
-  --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml \
-  --encoder-checkpoint /absolute/path/to/best_encoder_selected.pt \
-  --overwrite
-```
-
-Collect schema-v14 results and source-separated I1 diagnostics with:
-
-```bash
-python scripts/collect_experiment_results.py
-python scripts/analyze_reliability_evidence.py
-```
-
-The I1 analysis reports competence-versus-TCP MSE/MAE, Pearson/Spearman
-alignment, error AUROC, cross-expert ordering accuracy, and TCP calibration
-diagrams. Old EDL/reliability signal tables are intentionally unsupported.
-
-## Natural difficulty subsets
-
-After freezing the final seed-42 method, rebuild the schema-v9 subsets from
-its validation diagnostics:
-
-```bash
-python scripts/build_natural_subset_csvs.py \
-  --diagnostics \
-    results/tri_modal_robust/competence_anchored_seed_42/42/gate_diagnostics.csv \
-  --test-csv labels/test.csv \
-  --out-dir labels/natural_subsets
-
-python run.py natural_subsets \
-  --extra-config config/experiments/tri_modal_robust/_autodl_paths.yaml
-```
-
-The registered label-free subsets include branch disagreement,
-competence imbalance, and high cross-modal conflict. “Exactly one branch
-wrong” subsets use test labels and are diagnostic only. Validation chooses
-subset cutoffs; target test scores never choose them.
+Existing output directories are rejected. Use `--overwrite` only for an
+intentional replacement.
 
 ## Manifest vocabulary preflight
 
-After a split change, rebuild the vocabulary from current train identities and
-migrate only Manifest-owned PT fields. This preserves the expensive API/Graph
-payload:
+After changing the dataset split, rebuild the Manifest vocabulary from current
+train identities and migrate only Manifest-owned PT fields. API/Graph payloads
+remain unchanged:
 
 ```bash
 python scripts/migrate_manifest_vocab_pts.py \
@@ -323,5 +201,4 @@ python scripts/migrate_manifest_vocab_pts.py \
   --apply
 ```
 
-Do not run PT migration and training concurrently. Old checkpoints and
-schema-v12 summaries are intentionally incompatible with this protocol.
+Do not migrate PT files while training reads the same pool.

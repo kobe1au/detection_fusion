@@ -3,6 +3,7 @@ defaults:
 
 method:
   name: baseline_graph_only
+  protocol_id: baseline_graph_only_v1
 
 train:
   exp_name: baseline_graph_only

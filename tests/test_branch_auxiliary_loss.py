@@ -143,15 +143,5 @@ def test_auxiliary_weight_mode_resolution_uses_only_explicit_mode():
         resolve_auxiliary_weight_mode(
             {"auxiliary_weight_mode": "integrity"}
         )
-    for removed_key in (
-        "reliability_weighted_aux",
-        "integrity_weighted_aux",
-        "min_aux_weight",
-        "detach_reliability_for_aux",
-    ):
-        try:
-            resolve_auxiliary_weight_mode({removed_key: False})
-        except ValueError as exc:
-            assert "Removed loss configuration keys" in str(exc)
-        else:
-            raise AssertionError(f"removed key {removed_key} was accepted")
+    with pytest.raises(ValueError, match="Unsupported loss configuration"):
+        resolve_auxiliary_weight_mode({"unregistered_option": False})

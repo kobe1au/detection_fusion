@@ -61,8 +61,8 @@ class DenseTriModalEmbeddingGate(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, len(TRI_MODAL_EMBEDDING_BRANCHES)),
         )
-        # Begin from an alive-only uniform route.  This avoids assigning a
-        # branch-specific competence prior before the data have trained it.
+        # Begin from alive-only uniform weights so the learned comparison gate
+        # starts from a neutral, deterministic fusion rule.
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 

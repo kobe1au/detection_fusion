@@ -32,7 +32,7 @@ api:
 
 manifest:
   # This is the train-only vocabulary used by formal and external PT builds.
-  vocab_path: D:/code/detection_fusion_copy/config/manifest_vocab.yaml
+  vocab_path: config/manifest_vocab.yaml
   rebuild_vocab: false
   allow_empty_vocab: false
   manifest_dim: 256
@@ -45,6 +45,15 @@ manifest:
 storage:
   keep_method_names: false
   keep_api_tokens: false
+
+# Audited one-step lineage for the 6:2:2 -> frozen-test 7:1:2 Manifest-only
+# migration. This does not weaken formal training: after --apply every PT must
+# carry the new fingerprint, and the stat-bound audit certificate verifies it.
+# The digest was independently re-derived from the previous train-only vocab
+# and this file's code-side extraction configuration.
+migration:
+  allowed_previous_build_fingerprints:
+    - 7825ef23db92b98a7055b72275317f045e234d305f1d5803a063e4b0edbf25da
 
 execution:
   # Existing observable-v1 PTs fail the schema/fingerprint check and are

@@ -42,10 +42,7 @@ def _fusion(combination: str) -> DiscountProbabilityFusion:
             "combination": combination,
             "opinion_source": "evidential",
             "evidence_activation": "softplus",
-            "use_i1_reliability": False,
             "use_hard_alive_mask": True,
-            "reliability_calibration": {"enabled": False},
-            "routing": {"enabled": False},
         }
     )
 

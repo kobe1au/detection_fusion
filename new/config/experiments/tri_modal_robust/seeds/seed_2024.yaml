@@ -1,6 +1,0 @@
-defaults:
-  - ../care_droid.yaml
-
-train:
-  exp_name: care_droid_seed_2024
-  seed: 2024

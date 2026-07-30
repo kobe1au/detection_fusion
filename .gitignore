@@ -5,6 +5,9 @@ __pycache__/
 
 # Test / lint / type-check caches
 .pytest_cache/
+.pytest_*/
+.pytest_tmp*/
+.pytest_split*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -81,6 +84,7 @@ Obfuscapk/
 labels/
 !labels/
 labels/*
-!labels/validation_roles_protocol_v1.json
-!labels/validation_roles_protocol_v2.json
+!labels/split_metadata_7_1_2.json
+!labels/split_reassignment_7_1_2.csv
+!labels/validation_roles_protocol_v3.json
 figures/

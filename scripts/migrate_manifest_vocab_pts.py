@@ -654,7 +654,8 @@ def _audit_pool(
         ):
             raise RuntimeError(
                 "PT code-side build fingerprint is incompatible with the "
-                "supplied build config and previous Manifest vocabulary; "
+                "supplied build config, installed Manifest vocabulary, and "
+                "declared migration lineage; "
                 "refusing to relabel unchanged API/Graph tensors: "
                 f"path={path} fingerprint={existing_fingerprint!r} "
                 f"allowed={sorted(allowed_existing_fingerprints)}"
@@ -865,6 +866,7 @@ def run_migration(
     allowed_existing_fingerprints = {
         build_fingerprint,
         legacy_build_fingerprint,
+        *cfg.get("migration_allowed_previous_build_fingerprints", []),
     }
     if previous_build_fingerprint is not None:
         allowed_existing_fingerprints.add(previous_build_fingerprint)
@@ -910,6 +912,9 @@ def run_migration(
         "previous_build_fingerprint": previous_build_fingerprint,
         "legacy_previous_build_fingerprint": (
             legacy_previous_build_fingerprint
+        ),
+        "declared_previous_build_fingerprints": sorted(
+            cfg.get("migration_allowed_previous_build_fingerprints", [])
         ),
         "manifest_provenance": manifest_provenance,
         "before": before,

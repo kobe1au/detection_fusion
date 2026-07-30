@@ -14,9 +14,3 @@ train:
 fusion:
   combination: log_pool
   opinion_source: evidential
-  routing:
-    enabled: false
-    final_temperature_scaling: false
-
-selective_prediction:
-  enabled: false

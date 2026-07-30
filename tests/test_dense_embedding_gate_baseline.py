@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from pathlib import Path
 
 import pytest
@@ -11,13 +10,8 @@ from fusion.gates import (
     DenseTriModalEmbeddingGate,
     dense_embedding_late_fusion_logits,
 )
-from fusion.opinion_router import GlobalOpinionRouter
 from fusion.model import TriModalRobustModel
-from fusion.train import (
-    _validate_selective_score_fusion_compatibility,
-    build_model,
-    load_config_path,
-)
+from fusion.runtime import load_config_path
 
 
 ROOT = Path("config/experiments/tri_modal_robust")
@@ -206,104 +200,8 @@ def test_dense_embedding_gate_adapted_config_has_independent_identity():
     assert "use_perturbation_evidence" not in cfg["model"]["gate"]
     assert "apply_alive_mask" not in cfg["model"]["gate"]
     assert cfg["loss"]["auxiliary_weight_mode"] == "alive_masked_uniform"
-    assert cfg["calibration"]["enabled"] is False
-    assert cfg["calibration"]["holdout_enabled"] is True
-    # Every main-table fusion method receives the same model-selection
-    # macro-F1 threshold budget. I3 remains a separate decision layer.
-    assert cfg["classification_threshold"]["enabled"] is True
-    assert cfg["selective_prediction"]["enabled"] is False
-
-    # I3 is a model-agnostic decision layer when it consumes only final class
-    # probabilities.  The baseline must not be rejected merely because it does
-    # not instantiate the proposed evidential fusion path.
-    _validate_selective_score_fusion_compatibility(
-        selective_enabled=True,
-        score_type="msp",
-        discount_probability_mode=False,
-    )
-
-    model = build_model(cfg, feature_dim=16)
-    assert model.dense_embedding_gate is not None
-    assert model.dense_embedding_gate.detach_embeddings is False
-
-    pseudo_switch = copy.deepcopy(cfg)
-    pseudo_switch["model"]["gate"]["apply_alive_mask"] = False
-    with pytest.raises(ValueError, match="Removed model.gate input switches"):
-        build_model(pseudo_switch, feature_dim=16)
-
-    silent_evidence_switch = copy.deepcopy(cfg)
-    silent_evidence_switch["model"]["gate"]["use_conflict_evidence"] = True
-    with pytest.raises(ValueError, match="Removed model.gate input switches"):
-        build_model(silent_evidence_switch, feature_dim=16)
-
-
-def test_non_discount_models_reject_only_discount_specific_selective_scores():
-    for score_type in (
-        "msp",
-        "deployed_class_probability",
-        "predictive_entropy_certainty",
-    ):
-        _validate_selective_score_fusion_compatibility(
-            selective_enabled=True,
-            score_type=score_type,
-            discount_probability_mode=False,
-        )
-
-    for score_type in (
-        "evidential_certainty",
-        "mixture_certainty",
-        "model_acceptance",
-    ):
-        with pytest.raises(ValueError, match="requires discount_probability"):
-            _validate_selective_score_fusion_compatibility(
-                selective_enabled=True,
-                score_type=score_type,
-                discount_probability_mode=False,
-            )
-
-
-@pytest.mark.parametrize("beta", [0.5, 1.0, 2.0])
-def test_prior_only_uses_explicit_fixed_odds_beta_without_trainable_route(beta: float):
-    router = GlobalOpinionRouter(mode="prior_only", fixed_prior_beta=beta)
-    reliability = torch.tensor([0.90, 0.60, 0.20])
-    branch_probabilities = {
-        name: torch.tensor([[0.50, 0.50]])
-        for name in ("api", "graph", "manifest")
-    }
-    reliabilities = {
-        name: reliability[index : index + 1]
-        for index, name in enumerate(("api", "graph", "manifest"))
-    }
-    alive = {
-        name: torch.ones(1) for name in ("api", "graph", "manifest")
-    }
-
-    outputs = router(
-        branch_probabilities,
-        reliabilities,
-        alive,
-        learned_active=True,
-    )
-    expected = torch.softmax(beta * torch.logit(reliability), dim=-1).unsqueeze(0)
-
-    assert router.route_parameters() == []
-    assert outputs["route_prior_beta"].item() == pytest.approx(beta)
-    assert outputs["prior_only_odds_beta_active"].item() == pytest.approx(1.0)
-    assert torch.allclose(outputs["branch_distribution"], expected)
-
-
-def test_fixed_prior_beta_is_restricted_to_the_prior_only_sensitivity():
-    for invalid in (0.0, -1.0, float("inf"), float("nan")):
-        with pytest.raises(ValueError, match="finite and positive"):
-            GlobalOpinionRouter(mode="prior_only", fixed_prior_beta=invalid)
-    with pytest.raises(ValueError, match="prior_only sensitivity"):
-        GlobalOpinionRouter(mode="learned", fixed_prior_beta=0.5)
-
-
-def test_retired_prior_beta_configs_are_absent_from_formal_catalog():
-    retired = (
-        ROOT / "appendix/prior_beta_0_5.yaml",
-        ROOT / "ablations/i2/router_prior_only.yaml",
-        ROOT / "appendix/prior_beta_2_0.yaml",
-    )
-    assert all(not path.exists() for path in retired)
+    assert cfg["calibration"]["require_role_assignment"] is True
+    assert cfg["calibration"]["expert_split_seed"] == 4242
+    assert cfg["calibration"]["expert_val_fraction"] == pytest.approx(0.10)
+    # CARE and every baseline use the same unfitted argmax/0.5 classifier.
+    assert cfg["classification_threshold"] == {"enabled": False}

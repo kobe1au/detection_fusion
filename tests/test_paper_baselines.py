@@ -37,7 +37,7 @@ def _write_validation_protocol(
     role_path = tmp_path / "roles.json"
     payload = {
         "schema_version": 2,
-        "protocol": "year_label_stratified_package_group_75_25_v2",
+        "protocol": "year_label_stratified_package_group_2to1_v3",
         "validation_csv_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
         "counts": {
             "model_selection": len(model_selection),
@@ -52,20 +52,20 @@ def _write_validation_protocol(
     return csv_path, role_path
 
 
-def test_paper_validation_selection_uses_fixed_v2_roles(tmp_path):
+def test_paper_validation_selection_uses_fixed_v3_roles(tmp_path):
     frame = pd.DataFrame(
         {
-            "sha256": [f"sha-{index}" for index in range(8)],
-            "label": [index % 2 for index in range(8)],
-            "year": [2020 + index % 2 for index in range(8)],
-            "pkg_name": [f"pkg-{index // 2}" for index in range(8)],
+            "sha256": [f"sha-{index}" for index in range(6)],
+            "label": [index % 2 for index in range(6)],
+            "year": [2020 + index % 2 for index in range(6)],
+            "pkg_name": [f"pkg-{index // 2}" for index in range(6)],
         }
     )
     csv_path, role_path = _write_validation_protocol(
         tmp_path,
         frame,
-        model_selection=["sha-4", "sha-5", "sha-0", "sha-1", "sha-2", "sha-3"],
-        decision_calibration=["sha-6", "sha-7"],
+        model_selection=["sha-2", "sha-3", "sha-0", "sha-1"],
+        decision_calibration=["sha-4", "sha-5"],
     )
 
     selection, summary = validation_selection_indices(
@@ -75,28 +75,30 @@ def test_paper_validation_selection_uses_fixed_v2_roles(tmp_path):
     )
 
     calibration = summary["decision_calibration_indices"]
-    assert selection == [0, 1, 2, 3, 4, 5]
+    assert selection == [0, 1, 2, 3]
     assert selection == summary["model_selection_indices"]
     assert set(selection).isdisjoint(calibration)
     assert sorted(selection + calibration) == list(range(len(frame)))
     selection_groups = set(frame.iloc[selection]["pkg_name"])
     calibration_groups = set(frame.iloc[calibration]["pkg_name"])
     assert selection_groups.isdisjoint(calibration_groups)
-    assert summary["protocol"] == "year_label_stratified_package_group_75_25_v2"
-    assert summary["model_selection_fraction_of_validation"] == pytest.approx(0.75)
+    assert summary["protocol"] == "year_label_stratified_package_group_2to1_v3"
+    assert summary["model_selection_fraction_of_validation"] == pytest.approx(
+        2.0 / 3.0
+    )
 
 
-def test_checked_in_paper_validation_selection_matches_main_v2_protocol():
+def test_checked_in_paper_validation_selection_matches_main_v3_protocol():
     frame = read_label_csv("labels/val.csv")
     selection, summary = validation_selection_indices(
         frame,
         validation_csv_path="labels/val.csv",
     )
 
-    assert len(selection) == 2188
-    assert summary["num_decision_calibration"] == 733
+    assert len(selection) == 973
+    assert summary["num_decision_calibration"] == 487
     assert summary["validation_csv_sha256"] == (
-        "ac6ceb079246a7c59a443861ea0430bc6f4510bf0b464de35c776e9aade1ad89"
+        "6b294373d0620ce4773158e5aa21c3e8f2f59c768c8d5ef97e8ac03577d94d77"
     )
 
 
@@ -212,7 +214,6 @@ def test_paper_targets_separate_method_baselines_from_fusion_rules():
         "dempster_rule_only": "dempster",
         "cumulative_subjective_logic": "cumulative",
         "log_pool": "log_pool",
-        "conflict_weighted_opinion": "conflict_weighted_opinion",
     }
     assert FORMAL_TARGETS == {**METHOD_TARGETS, **FUSION_RULE_TARGETS}
 

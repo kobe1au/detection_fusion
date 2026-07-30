@@ -132,7 +132,18 @@ def apply_graph_sparsify(data: dict, strength: float) -> dict:
     if not isinstance(edge, torch.Tensor) or edge.ndim != 2 or edge.size(1) == 0:
         return data
 
-    keep = torch.rand(edge.size(1), device=edge.device) > strength
+    # Remove an exact strength-controlled number of edges.  Independent
+    # Bernoulli draws can leave a small graph unchanged even when the view is
+    # labelled degraded, which weakens the interpretation of the evaluation
+    # x-axis.
+    num_edges = int(edge.size(1))
+    num_to_remove = _num_to_perturb(num_edges, strength)
+    remove_positions = torch.randperm(
+        num_edges,
+        device=edge.device,
+    )[:num_to_remove]
+    keep = torch.ones((num_edges,), dtype=torch.bool, device=edge.device)
+    keep[remove_positions] = False
     data["edge_index"] = edge[:, keep]
     data["graph_aug_type"] = "graph_sparsify"
     refresh_hard_availability(data)
@@ -352,6 +363,10 @@ def apply_manifest_permission_mask(data: dict, strength: float) -> dict:
         vec,
         permission_dim,
     ) = _validated_manifest_permission_state(data)
+    # A Manifest can be valid yet contain no permissions.  Do not label that
+    # sample as degraded when the operator cannot change any model input.
+    if not tokens:
+        return data
 
     num_to_remove = _num_to_perturb(len(tokens), strength)
     remove_positions = (

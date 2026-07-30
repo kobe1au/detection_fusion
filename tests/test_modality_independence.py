@@ -1,9 +1,6 @@
-"""Modality-independence regressions for input truncation and intrinsic I1.
+"""Modality-independence regressions for encoder input truncation.
 
-The final protocol treats API / Graph / Manifest as separate evidence sources.
-Budget truncation of one modality must not depend on another modality, and I1
-must derive each branch's reliability features only from that branch's
-Dirichlet opinion. Cross-modal relations are consumed by I2 conflict, never I1.
+Budget truncation of one modality must not depend on another modality.
 """
 
 import copy
@@ -16,8 +13,6 @@ from torch_geometric.data import Batch, Data
 from fusion import graph_encoders
 from fusion.dataset import RobustTriModalDataset, apply_graph_encoder_budget
 from fusion.graph_encoders import GraphEncoderGCN, truncate_per_graph
-from fusion.reliability_calibration import build_reliability_features
-from fusion.train import build_model
 
 
 def _api_parts(method_api_edge_index, api_in_graph_mask):
@@ -265,59 +260,3 @@ def test_graph_encoder_behavior_hint_mask_paths_are_not_reconstructed(monkeypatc
     ).eval()
     monkeypatch.setattr(graph_encoders, "_IMPLICIT_ENCODER_TRUNCATION_WARNED", True)
     unhinted(truncated)
-
-
-def _cfg(combination, *, behavior_hint=False):
-    return {
-        "model": {
-            "fusion_mode": "discount_probability",
-            "max_nodes_gnn": 64,
-            "graph_encoder": {"type": "gatv2", "use_behavior_hint": behavior_hint},
-        },
-        "fusion": {
-            "mode": "discount_probability",
-            "combination": combination,
-            "reliability_calibration": {"enabled": True},
-        },
-    }
-
-
-def test_i1_features_are_branch_local_and_accept_no_cross_modal_metadata():
-    base_alpha = {
-        "api": torch.tensor([[5.0, 1.0], [1.0, 3.0]]),
-        "graph": torch.tensor([[2.0, 4.0], [3.0, 1.0]]),
-        "manifest": torch.tensor([[1.0, 2.0], [6.0, 1.0]]),
-    }
-    changed_alpha = {name: value.clone() for name, value in base_alpha.items()}
-    changed_alpha["graph"] = torch.tensor([[12.0, 1.0], [1.0, 9.0]])
-    changed_alpha["manifest"] = torch.tensor([[1.0, 10.0], [8.0, 1.0]])
-
-    base_features = build_reliability_features(base_alpha)
-    changed_features = build_reliability_features(changed_alpha)
-
-    # Changing every peer opinion cannot alter the API branch's intrinsic
-    # certainty / margin / predicted-class features.
-    torch.testing.assert_close(
-        base_features["api"], changed_features["api"], rtol=0.0, atol=0.0
-    )
-    assert not torch.equal(base_features["graph"], changed_features["graph"])
-    assert not torch.equal(
-        base_features["manifest"], changed_features["manifest"]
-    )
-
-    # The lean I1 API intentionally has no quality/perturbation argument.
-    with pytest.raises(TypeError):
-        build_reliability_features(  # type: ignore[call-arg]
-            base_alpha,
-            quality_diagnostics={"api_integrity": torch.ones(2)},
-        )
-
-
-def test_build_model_rejects_behavior_hint_under_evidential_combination():
-    with pytest.raises(ValueError, match="non-duplicated branch inputs"):
-        build_model(_cfg("dempster", behavior_hint=True), feature_dim=515)
-
-
-def test_build_model_rejects_removed_linear_combination():
-    with pytest.raises(ValueError, match="combination.*routed"):
-        build_model(_cfg("linear", behavior_hint=False), feature_dim=515)

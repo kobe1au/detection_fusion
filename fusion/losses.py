@@ -6,7 +6,6 @@ import torch.nn.functional as F
 
 from fusion.constants import AvailabilityIndex
 from fusion.evidential import dirichlet_expected_ce_loss, evidential_loss
-from fusion.opinion_router import threshold_aligned_fn_risk_state
 
 
 BRANCH_AUX_KEYS = (
@@ -21,27 +20,30 @@ BRANCH_AUX_NAMES = {
     "manifest_logits_aux": "manifest",
 }
 BRANCH_NAMES = ("api", "graph", "manifest")
-ROUTING_BRANCH_NAMES = ("api", "graph", "manifest")
 AUXILIARY_WEIGHT_MODES = (
     "alive_masked_uniform",
     "unmasked_uniform",
 )
 PAPER_EVIDENTIAL_OBJECTIVES = ("tmc", "ecml")
-ANCHORED_STAGE_A_OBJECTIVE = "anchored_stage_a"
-REMOVED_LOSS_CONFIG_KEYS = frozenset(
+LOSS_CONFIG_KEYS = frozenset(
     {
-        "reliability_weighted_aux",
-        "integrity_weighted_aux",
-        "semantic_reconstruction_weight",
-        "cross_source_consistency_weight",
-        "gate_prior_weight",
-        "reliability_calibration_weight",
-        "probability_calibration_weight",
-        "min_aux_weight",
-        "detach_reliability_for_aux",
+        "objective",
+        "label_smoothing",
+        "branch_aux_weight",
+        "branch_aux_weights",
+        "auxiliary_weight_mode",
+        "evidential_loss_weight",
+        "evidential",
+        "tmc",
+        "ecml",
     }
 )
-ROUTING_RISK_TARGETS = ("threshold_malware_false_negative",)
+
+
+def _validate_loss_config_keys(loss_cfg: dict) -> None:
+    unknown = sorted(set(loss_cfg) - LOSS_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(f"Unsupported loss configuration keys: {unknown}")
 
 
 def _availability_column(
@@ -101,12 +103,7 @@ def resolve_auxiliary_weight_mode(loss_cfg: dict | None) -> str:
     """Resolve the explicit branch-auxiliary weighting mechanism."""
 
     loss_cfg = loss_cfg or {}
-    removed = sorted(set(loss_cfg) & REMOVED_LOSS_CONFIG_KEYS)
-    if removed:
-        raise ValueError(
-            "Removed loss configuration keys are unsupported: "
-            f"{removed}. Use loss.auxiliary_weight_mode for branch weighting."
-        )
+    _validate_loss_config_keys(loss_cfg)
     mode = str(
         loss_cfg.get("auxiliary_weight_mode", "unmasked_uniform")
     ).strip().lower()
@@ -284,227 +281,6 @@ def _compute_paper_evidential_objective(
     return total, parts
 
 
-def routing_mixture_log_prob(
-    outputs: dict,
-    *,
-    eps: float = 1.0e-6,
-) -> torch.Tensor:
-    """Return I2's conditional class mixture, independent of fused risk."""
-    if not math.isfinite(float(eps)) or not 0.0 < float(eps) < 0.5:
-        raise ValueError("routing conditional-mixture eps must be within (0, 0.5)")
-    mixture = outputs.get("routing_mixture_prob")
-    if not isinstance(mixture, torch.Tensor):
-        raise ValueError("routing mixture loss requires routing_mixture_prob")
-    if mixture.ndim != 2 or mixture.size(-1) < 2:
-        raise ValueError("routing_mixture_prob must have shape [B, C>=2]")
-    mixture = mixture.float()
-    mixture = mixture.clamp_min(float(eps))
-    mixture = mixture / mixture.sum(dim=-1, keepdim=True).clamp_min(float(eps))
-    return mixture.log()
-
-
-def routing_risk_target(
-    outputs: dict,
-    labels: torch.Tensor,
-    routing_config: dict | None = None,
-    *,
-    mixture_log_prob: torch.Tensor | None = None,
-    valid_routing: torch.Tensor | None = None,
-    classification_log_odds_threshold_by_row: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, str, str]:
-    """Build the detached I2 risk target and its exact training mask.
-
-    In particular, ``threshold_malware_false_negative`` estimates malware
-    probability conditional on the fixed classifier predicting benign.  The
-    predicted-malware side is excluded from the fitting denominator rather
-    than added as abundant zero targets.  Both the public source-level loss and
-    the packed post-hoc optimizer call this helper so that this contract cannot
-    drift between paths. Strict cross-fitting supplies one fold-excluded
-    classifier cutoff per row; deployed inference uses the scalar cutoff in
-    ``routing_config``.
-    """
-    routing_config = routing_config or {}
-    risk_loss_type = str(routing_config.get("risk_loss", "bce")).strip().lower()
-    risk_target_type = str(
-        routing_config.get("risk_target", "threshold_malware_false_negative")
-    ).strip().lower()
-    if risk_loss_type not in {"bce", "brier"}:
-        raise ValueError("fusion.routing.risk_loss must be 'bce' or 'brier'")
-    if risk_target_type not in ROUTING_RISK_TARGETS:
-        raise ValueError(
-            "fusion.routing.risk_target must be one of "
-            f"{list(ROUTING_RISK_TARGETS)}, got {risk_target_type!r}"
-        )
-
-    labels = labels.long().view(-1)
-    if mixture_log_prob is None:
-        mixture_log_prob = routing_mixture_log_prob(outputs)
-    if mixture_log_prob.ndim != 2 or int(mixture_log_prob.size(0)) != labels.numel():
-        raise ValueError("routing mixture batch shape disagrees with labels")
-
-    if valid_routing is None:
-        has_available = outputs.get("routing_has_available")
-        if not isinstance(has_available, torch.Tensor):
-            raise ValueError("routing calibration requires routing_has_available")
-        valid_routing = has_available.detach().view(-1).bool()
-    else:
-        valid_routing = valid_routing.detach().view(-1).bool()
-    if valid_routing.numel() != labels.numel():
-        raise ValueError("routing_has_available batch shape disagrees with labels")
-
-    raw_log_prob = outputs.get("uncalibrated_final_log_prob")
-    if not isinstance(raw_log_prob, torch.Tensor) or (
-        raw_log_prob.ndim != 2
-        or raw_log_prob.shape != mixture_log_prob.shape
-        or raw_log_prob.size(-1) != 2
-    ):
-        raise ValueError(
-            "threshold-aligned routing risk requires "
-            "uncalibrated_final_log_prob with shape [B, 2]"
-        )
-    if classification_log_odds_threshold_by_row is None:
-        raw_threshold = routing_config.get("classification_log_odds_threshold")
-        if raw_threshold is None:
-            raise ValueError(
-                "threshold-aligned malware-FN risk requires a fitted "
-                "classification_log_odds_threshold"
-            )
-        raw_threshold = float(raw_threshold)
-        if not math.isfinite(raw_threshold):
-            raise ValueError(
-                "fusion.routing.classification_log_odds_threshold must be finite"
-            )
-        threshold: float | torch.Tensor = raw_threshold
-    else:
-        threshold = (
-            classification_log_odds_threshold_by_row.detach()
-            .to(
-                device=raw_log_prob.device,
-                dtype=raw_log_prob.dtype,
-            )
-            .view(-1)
-        )
-        if threshold.numel() != labels.numel():
-            raise ValueError(
-                "per-row classification cutoffs must match the label batch"
-            )
-        if not bool(torch.isfinite(threshold).all().item()):
-            raise ValueError("per-row classification cutoffs must be finite")
-    threshold_prediction, _ = threshold_aligned_fn_risk_state(
-        raw_log_prob.detach()[:, 1] - raw_log_prob.detach()[:, 0],
-        threshold,
-    )
-    error_target = (labels.eq(1) & ~threshold_prediction).float()
-    # Conditional FN risk is learned only where the classifier predicts
-    # benign. Predicted-malware rows are not abundant artificial negatives.
-    risk_valid = valid_routing & ~threshold_prediction
-
-    return (
-        error_target.detach(),
-        risk_valid.detach(),
-        risk_loss_type,
-        risk_target_type,
-    )
-
-
-def routing_risk_per_sample_loss(
-    predicted_error: torch.Tensor,
-    predicted_error_logit: torch.Tensor | None,
-    error_target: torch.Tensor,
-    risk_valid: torch.Tensor,
-    *,
-    loss_type: str,
-) -> torch.Tensor:
-    """Return the unreduced risk-head loss with invalid rows made numerically safe."""
-    loss_type = str(loss_type).strip().lower()
-    if loss_type not in {"bce", "brier"}:
-        raise ValueError("fusion.routing.risk_loss must be 'bce' or 'brier'")
-    predicted_error = predicted_error.float().view(-1)
-    error_target = error_target.detach().float().view(-1)
-    risk_valid = risk_valid.detach().view(-1).bool()
-    if not (
-        predicted_error.numel() == error_target.numel() == risk_valid.numel()
-    ):
-        raise ValueError("routing risk tensors disagree on their batch shape")
-    safe_target = torch.where(
-        risk_valid, error_target, torch.zeros_like(error_target)
-    )
-    if loss_type == "brier":
-        return (predicted_error - safe_target).square()
-    if not isinstance(predicted_error_logit, torch.Tensor):
-        raise ValueError("routing BCE risk loss requires routing_risk_logit")
-    predicted_error_logit = predicted_error_logit.float().view(-1)
-    if predicted_error_logit.numel() != error_target.numel():
-        raise ValueError("routing risk logit batch shape disagrees with its target")
-    safe_logit = torch.where(
-        risk_valid,
-        predicted_error_logit,
-        torch.zeros_like(predicted_error_logit),
-    )
-    return F.binary_cross_entropy_with_logits(
-        safe_logit, safe_target, reduction="none"
-    )
-
-
-def reliability_correctness_target(
-    branch_logits: torch.Tensor,
-    labels: torch.Tensor,
-) -> torch.Tensor:
-    """Return the detached branch-correctness target used by I1."""
-    if not isinstance(branch_logits, torch.Tensor) or branch_logits.ndim != 2:
-        raise ValueError("I1 branch logits must have shape [B, C]")
-    labels = labels.long().view(-1)
-    if int(branch_logits.size(0)) != int(labels.numel()):
-        raise ValueError("I1 branch logits and labels disagree on batch shape")
-    return branch_logits.detach().argmax(dim=-1).eq(labels).float()
-
-
-def reliability_per_sample_loss(
-    predicted_reliability: torch.Tensor,
-    predicted_reliability_logit: torch.Tensor | None,
-    correctness: torch.Tensor,
-    *,
-    loss_type: str,
-) -> torch.Tensor:
-    """Return the unreduced proper loss used by both packed and public I1."""
-    loss_type = str(loss_type).strip().lower()
-    if loss_type not in {"bce", "brier"}:
-        raise ValueError("reliability_calibration.loss must be 'bce' or 'brier'")
-    reliability = predicted_reliability.view(-1).float().clamp(
-        1.0e-6, 1.0 - 1.0e-6
-    )
-    correctness = correctness.detach().float().view(-1)
-    if reliability.numel() != correctness.numel():
-        raise ValueError("I1 reliability and correctness disagree on batch shape")
-    if loss_type == "brier":
-        return (reliability - correctness).square()
-    # The formal I1 path exports its raw correctness logit.  Using the fused
-    # BCE kernel keeps LBFGS strong-Wolfe line searches stable at extreme
-    # logits and avoids sigmoid/clamp saturation.  Fixtures that expose only a
-    # probability retain the finite logit-equivalent fallback.
-    if isinstance(predicted_reliability_logit, torch.Tensor):
-        bce_logit = predicted_reliability_logit.view(-1).float()
-        if bce_logit.numel() != correctness.numel():
-            raise ValueError("I1 reliability logit batch shape disagrees with target")
-    else:
-        bce_logit = torch.logit(reliability)
-    return F.binary_cross_entropy_with_logits(
-        bce_logit,
-        correctness,
-        reduction="none",
-    )
-
-
-def reliability_alive_mask(
-    availability: torch.Tensor, branch: str
-) -> torch.Tensor:
-    """Return the exact detached availability mask used by the public I1 loss."""
-    branch = str(branch).strip().lower()
-    if branch not in BRANCH_NAMES:
-        raise ValueError(f"unsupported I1 branch {branch!r}")
-    return _branch_alive_masks(availability)[branch].view(-1)
-
-
 def _weighted_cross_entropy(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -608,106 +384,6 @@ def compute_branch_auxiliary_loss(
     return total, diagnostics
 
 
-def _anchored_stage_a_loss(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    outputs: dict,
-    availability: torch.Tensor | None,
-    loss_cfg: dict,
-) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
-    """Train a clean Joint expert plus independently useful atomic experts.
-
-    The primary logits are the real Joint expert.  Atomic losses are first
-    averaged across the alive experts *within each sample* and then across
-    samples.  This prevents a batch with one frequently alive modality from
-    changing the relative objective merely through missingness frequency.
-    All-dead rows train neither Joint nor atomic head bias.
-    """
-
-    if not isinstance(availability, torch.Tensor):
-        raise ValueError(
-            "loss.objective='anchored_stage_a' requires fusion availability"
-        )
-    _validate_availability(
-        availability,
-        context="anchored Stage-A availability",
-    )
-    if float(loss_cfg.get("evidential_loss_weight", 0.0)) != 0.0:
-        raise ValueError(
-            "anchored Stage A has no EDL objective; remove "
-            "loss.evidential_loss_weight or set it to zero"
-        )
-    if "branch_aux_weight" in loss_cfg:
-        raise ValueError(
-            "anchored Stage A uses loss.atomic_aux_weight; remove the legacy "
-            "loss.branch_aux_weight key"
-        )
-    atomic_weight = float(loss_cfg.get("atomic_aux_weight", 0.25))
-    if not math.isfinite(atomic_weight) or atomic_weight < 0.0:
-        raise ValueError(
-            "loss.atomic_aux_weight must be finite and non-negative"
-        )
-    label_smoothing = float(loss_cfg.get("label_smoothing", 0.0))
-    if not math.isfinite(label_smoothing) or not 0.0 <= label_smoothing < 1.0:
-        raise ValueError("loss.label_smoothing must lie within [0, 1)")
-
-    alive = _branch_alive_masks(availability)
-    joint_alive = torch.stack(
-        [alive[name].bool() for name in BRANCH_NAMES],
-        dim=-1,
-    ).all(dim=-1).to(dtype=logits.dtype)
-    joint_loss = _weighted_cross_entropy(
-        logits,
-        labels,
-        joint_alive,
-        label_smoothing,
-    )
-
-    per_atomic: list[torch.Tensor] = []
-    atomic_masks: list[torch.Tensor] = []
-    for key in BRANCH_AUX_KEYS:
-        branch = BRANCH_AUX_NAMES[key]
-        branch_logits = outputs.get(key)
-        if (
-            not isinstance(branch_logits, torch.Tensor)
-            or branch_logits.shape != logits.shape
-        ):
-            raise ValueError(
-                "anchored Stage A requires exact API/Graph/Manifest "
-                f"auxiliary logits; missing or invalid {key!r}"
-            )
-        per_atomic.append(
-            F.cross_entropy(
-                branch_logits,
-                labels.long(),
-                reduction="none",
-                label_smoothing=label_smoothing,
-            )
-        )
-        atomic_masks.append(alive[branch].to(dtype=logits.dtype))
-    atomic_loss_matrix = torch.stack(per_atomic, dim=-1)
-    atomic_alive_matrix = torch.stack(atomic_masks, dim=-1)
-    atomic_count = atomic_alive_matrix.sum(dim=-1)
-    per_sample_atomic = (
-        atomic_loss_matrix * atomic_alive_matrix
-    ).sum(dim=-1) / atomic_count.clamp_min(1.0)
-    valid_atomic = atomic_count.gt(0).to(dtype=logits.dtype)
-    atomic_loss = (
-        per_sample_atomic * valid_atomic
-    ).sum() / valid_atomic.sum().clamp_min(1.0)
-    atomic_loss = atomic_loss * valid_atomic.sum().gt(0).to(atomic_loss)
-
-    total = joint_loss + atomic_weight * atomic_loss
-    return total, {
-        "loss": total.detach(),
-        "joint_ce": joint_loss.detach(),
-        "atomic_ce": atomic_loss.detach(),
-        "atomic_aux_weight": atomic_weight,
-        "joint_active_fraction": joint_alive.mean().detach(),
-        "atomic_active_fraction": valid_atomic.mean().detach(),
-    }
-
-
 def compute_robust_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -722,6 +398,7 @@ def compute_robust_loss(
     """Robust objective with independently attributable auxiliary terms."""
     extra = extra or {}
     loss_cfg = loss_cfg or {}
+    _validate_loss_config_keys(loss_cfg)
     label_smoothing = float(loss_cfg.get("label_smoothing", 0.0))
     # Keep the standalone loss API identical to the registered Stage-1
     # protocol; callers that bypass config resolution must not silently train
@@ -735,30 +412,7 @@ def compute_robust_loss(
     for name, value in named_weights.items():
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"{name} must be finite and non-negative, got {value}")
-    removed_loss_keys = sorted(set(loss_cfg) & REMOVED_LOSS_CONFIG_KEYS)
-    if removed_loss_keys:
-        raise ValueError(
-            "Removed loss configuration keys are unsupported: "
-            f"{removed_loss_keys}. Use loss.auxiliary_weight_mode for branch weighting."
-        )
-
     objective = str(loss_cfg.get("objective", "standard")).strip().lower()
-    if objective == ANCHORED_STAGE_A_OBJECTIVE:
-        total, parts = _anchored_stage_a_loss(
-            logits,
-            labels,
-            extra,
-            availability,
-            loss_cfg,
-        )
-        if materialize_diagnostics:
-            parts = {
-                key: float(value.item())
-                if isinstance(value, torch.Tensor)
-                else float(value)
-                for key, value in parts.items()
-            }
-        return total, parts
     if objective in PAPER_EVIDENTIAL_OBJECTIVES:
         total, parts = _compute_paper_evidential_objective(
             extra,
@@ -778,7 +432,7 @@ def compute_robust_loss(
         return total, parts
     if objective not in {"standard", "default", "generic"}:
         raise ValueError(
-            "loss.objective must be anchored_stage_a, standard, tmc, or ecml; "
+            "loss.objective must be standard, tmc, or ecml; "
             f"got {objective!r}"
         )
 

@@ -5,6 +5,11 @@ The input universe is exactly the union of labels/train.csv, labels/val.csv,
 and labels/test.csv. Package groups are indivisible, so the same package name
 cannot leak across output splits. Existing package assignments are retained
 whenever possible, and single-row groups fill each year/label quota exactly.
+
+For a protocol revision after the test set has already been inspected, pass
+``--freeze-test``.  The test CSV then remains byte-for-byte unchanged, while
+only the existing train+val pool is reassigned to meet the requested
+year-by-label quotas as closely as integer samples allow.
 """
 
 from __future__ import annotations
@@ -37,6 +42,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--freeze-test",
+        action="store_true",
+        help=(
+            "Keep every existing test identity/package in test and leave "
+            "test.csv byte-for-byte unchanged."
+        ),
+    )
+    parser.add_argument(
         "--write",
         action="store_true",
         help="Back up and replace train.csv, val.csv, and test.csv.",
@@ -48,11 +61,37 @@ def stable_digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sample_id_digest(rows: list[dict[str, str]]) -> str:
+    digest = hashlib.sha256()
+    for sid in sorted(row["_sha_key"] for row in rows):
+        encoded = sid.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, byteorder="big"))
+        digest.update(encoded)
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def ratio_tag(ratios: tuple[float, float, float]) -> str:
+    """Return a stable compact tag such as ``7_1_2``."""
+
+    scaled = [int(round(value * 1000)) for value in ratios]
+    divisor = math.gcd(math.gcd(scaled[0], scaled[1]), scaled[2])
+    return "_".join(str(value // divisor) for value in scaled)
+
+
 def normalized_group(row: dict[str, str]) -> str:
     package = (row.get("pkg_name") or "").strip().casefold()
-    if package:
-        return f"pkg:{package}"
-    return f"sha:{(row.get('sha256') or '').strip().lower()}"
+    if package not in {"", "nan", "none", "null"}:
+        return f"package:{package}"
+    return f"sample:{(row.get('sha256') or '').strip().lower()}"
 
 
 def integer_targets(
@@ -122,14 +161,34 @@ def build_assignment(
     rows: list[dict[str, str]],
     ratios: tuple[float, float, float],
     seed: int,
+    *,
+    freeze_test: bool = False,
 ) -> tuple[dict[str, str], dict[tuple[int, int], dict[str, int]]]:
     cell_totals: Counter[tuple[int, int]] = Counter(
         (int(row["_year_key"]), int(row["_label_key"])) for row in rows
     )
-    targets = {
+    targets: dict[tuple[int, int], dict[str, int]] = {
         cell: integer_targets(count, ratios, seed, cell)
         for cell, count in sorted(cell_totals.items())
     }
+    if freeze_test:
+        frozen_test_counts: Counter[tuple[int, int]] = Counter(
+            (int(row["_year_key"]), int(row["_label_key"]))
+            for row in rows
+            if row["_old_split"] == "test"
+        )
+        for cell, count in sorted(cell_totals.items()):
+            # Keep the Hamilton-rounded validation quota. Any integer mismatch
+            # between the requested test ratio and the already-published test
+            # set is absorbed by train, never by changing test membership.
+            targets[cell]["test"] = frozen_test_counts[cell]
+            targets[cell]["train"] = (
+                count - targets[cell]["val"] - targets[cell]["test"]
+            )
+            if targets[cell]["train"] < 0:
+                raise RuntimeError(
+                    f"Frozen test plus validation quota exceeds cell {cell}"
+                )
 
     groups: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in rows:
@@ -224,6 +283,18 @@ def build_assignment(
             raise RuntimeError(
                 f"Year/label quota mismatch for {cell}: {actual} != {split_targets}"
             )
+    if freeze_test:
+        changed_test_rows = [
+            row["_sha_key"]
+            for row in rows
+            if (row["_old_split"] == "test")
+            != (assignment[row["_group_key"]] == "test")
+        ]
+        if changed_test_rows:
+            raise RuntimeError(
+                "Frozen-test assignment changed test membership for "
+                f"{len(changed_test_rows)} rows; examples={changed_test_rows[:5]}"
+            )
     return assignment, targets
 
 
@@ -314,7 +385,21 @@ def main() -> None:
         raise ValueError(f"Ratios must be positive and sum to 1, got {ratios}")
 
     rows, fieldnames = read_inputs(labels_dir)
-    assignment, targets = build_assignment(rows, ratios, args.seed)
+    input_csv_sha256 = {
+        split: file_sha256(labels_dir / f"{split}.csv") for split in SPLITS
+    }
+    input_identity_sha256 = {
+        split: sample_id_digest(
+            [row for row in rows if row["_old_split"] == split]
+        )
+        for split in SPLITS
+    }
+    assignment, targets = build_assignment(
+        rows,
+        ratios,
+        args.seed,
+        freeze_test=bool(args.freeze_test),
+    )
     summary = summarize(rows, assignment)
     old_new = Counter(
         (row["_old_split"], assignment[row["_group_key"]]) for row in rows
@@ -322,12 +407,22 @@ def main() -> None:
     moved = sum(
         int(row["_old_split"] != assignment[row["_group_key"]]) for row in rows
     )
+    tag = ratio_tag(ratios)
+    protocol_id = (
+        f"year_label_stratified_package_group_fixed_test_{tag}_v1"
+        if args.freeze_test
+        else f"year_label_stratified_package_group_{tag}_v1"
+    )
     metadata: dict[str, Any] = {
-        "protocol": "year-label stratified, package-group disjoint",
+        "protocol": protocol_id,
+        "description": "year-label stratified, package-group disjoint",
         "ratios": dict(zip(SPLITS, ratios)),
         "seed": args.seed,
+        "frozen_split": "test" if args.freeze_test else None,
         "total_samples": len(rows),
         "moved_samples": moved,
+        "input_csv_sha256": input_csv_sha256,
+        "input_identity_sha256": input_identity_sha256,
         "summary": summary,
         "targets": {
             f"{year}:{label}": split_targets
@@ -341,13 +436,18 @@ def main() -> None:
 
     if args.write:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_dir = labels_dir / f"backup_before_split_6_2_2_{stamp}"
+        backup_dir = labels_dir / f"backup_before_split_{tag}_{stamp}"
         backup_dir.mkdir(parents=False, exist_ok=False)
         for split in SPLITS:
             shutil.copy2(labels_dir / f"{split}.csv", backup_dir / f"{split}.csv")
         metadata["backup_dir"] = str(backup_dir)
 
-        for split in SPLITS:
+        writable_splits = (
+            tuple(split for split in SPLITS if split != "test")
+            if args.freeze_test
+            else SPLITS
+        )
+        for split in writable_splits:
             write_csv(
                 labels_dir / f"{split}.csv",
                 rows,
@@ -355,8 +455,32 @@ def main() -> None:
                 assignment,
                 split,
             )
-        write_mapping(labels_dir / "split_reassignment_6_2_2.csv", rows, assignment)
-        with (labels_dir / "split_metadata_6_2_2.json").open(
+        output_csv_sha256 = {
+            split: file_sha256(labels_dir / f"{split}.csv") for split in SPLITS
+        }
+        output_identity_sha256 = {
+            split: sample_id_digest(
+                [
+                    row
+                    for row in rows
+                    if assignment[row["_group_key"]] == split
+                ]
+            )
+            for split in SPLITS
+        }
+        metadata["output_csv_sha256"] = output_csv_sha256
+        metadata["output_identity_sha256"] = output_identity_sha256
+        if (
+            args.freeze_test
+            and (
+                output_csv_sha256["test"] != input_csv_sha256["test"]
+                or output_identity_sha256["test"]
+                != input_identity_sha256["test"]
+            )
+        ):
+            raise RuntimeError("Frozen test.csv changed by bytes or identity")
+        write_mapping(labels_dir / f"split_reassignment_{tag}.csv", rows, assignment)
+        with (labels_dir / f"split_metadata_{tag}.json").open(
             "w", encoding="utf-8"
         ) as handle:
             json.dump(metadata, handle, ensure_ascii=False, indent=2)

@@ -1,13 +1,8 @@
-﻿"""Clean robust API + Graph + Manifest fusion package."""
+"""API, graph, and Manifest malware-detection package.
 
-from fusion.model import TriModalRobustModel
-from fusion.dataset import RobustTriModalDataset, prepare_robust_batch, robust_collate_fn
-from fusion.losses import compute_robust_loss
+The package initializer deliberately performs no eager imports. CARE-Droid
+and registered comparison methods have separate runtime dependency graphs;
+callers import the concrete model, dataset, or loss module they use.
+"""
 
-__all__ = [
-    "TriModalRobustModel",
-    "RobustTriModalDataset",
-    "robust_collate_fn",
-    "prepare_robust_batch",
-    "compute_robust_loss",
-]
+__all__: list[str] = []
